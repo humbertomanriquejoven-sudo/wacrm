@@ -10,6 +10,7 @@ import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
+import { transcribeAudio } from '@/lib/ai/transcribe'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
 import {
   handleTemplateWebhookChange,
@@ -1019,9 +1020,19 @@ async function parseMessageContent(
 
     case 'audio':
       if (message.audio?.id) {
+        const mediaUrl = await verifyAndBuildUrl(message.audio.id)
+        let contentText: string | null = null
+        try {
+          const info = await getMediaUrl({ mediaId: message.audio.id, accessToken })
+          const { buffer } = await downloadMedia({ downloadUrl: info.url, accessToken })
+          contentText = await transcribeAudio(buffer, message.audio.mime_type)
+        } catch (err) {
+          console.warn('[webhook] audio transcription failed:', (err as Error).message)
+        }
         return {
           ...empty,
-          mediaUrl: await verifyAndBuildUrl(message.audio.id),
+          contentText,
+          mediaUrl,
           mediaType: message.audio.mime_type,
         }
       }

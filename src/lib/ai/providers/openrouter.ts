@@ -5,6 +5,7 @@ import {
   normalizeUsage,
   providerHttpError,
   toNetworkError,
+  toOpenAiContent,
   type ProviderArgs,
 } from './shared'
 
@@ -27,6 +28,12 @@ interface OpenRouterResponse {
 export async function generateOpenRouter(args: ProviderArgs): Promise<ProviderResult> {
   const { apiKey, model, systemPrompt, messages, timeoutMs } = args
 
+  const merged = mergeConsecutive(messages)
+  const msgPayload = merged.map((m) => ({
+    role: m.role,
+    content: toOpenAiContent(m),
+  }))
+
   let res: Response
   try {
     res = await fetch(OPENROUTER_URL, {
@@ -39,10 +46,7 @@ export async function generateOpenRouter(args: ProviderArgs): Promise<ProviderRe
       },
       body: JSON.stringify({
         model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          ...mergeConsecutive(messages),
-        ],
+        messages: [{ role: 'system', content: systemPrompt }, ...msgPayload],
         max_tokens: MAX_OUTPUT_TOKENS,
       }),
       signal: AbortSignal.timeout(timeoutMs),

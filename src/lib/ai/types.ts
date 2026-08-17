@@ -35,6 +35,8 @@ export interface AiConfig {
 export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
+  /** Optional base64-encoded images for vision-capable models. */
+  images?: string[]
 }
 
 /**

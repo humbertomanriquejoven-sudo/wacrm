@@ -5,6 +5,7 @@ import {
   normalizeUsage,
   providerHttpError,
   toNetworkError,
+  toAnthropicContent,
   type ProviderArgs,
 } from './shared'
 
@@ -42,6 +43,12 @@ function normalizeForAnthropic(messages: ChatMessage[]): ChatMessage[] {
 export async function generateAnthropic(args: ProviderArgs): Promise<ProviderResult> {
   const { apiKey, model, systemPrompt, messages, timeoutMs } = args
 
+  const normalized = normalizeForAnthropic(messages)
+  const msgPayload = normalized.map((m) => ({
+    role: m.role,
+    content: toAnthropicContent(m),
+  }))
+
   let res: Response
   try {
     res = await fetch(ANTHROPIC_URL, {
@@ -55,7 +62,7 @@ export async function generateAnthropic(args: ProviderArgs): Promise<ProviderRes
         model,
         system: systemPrompt,
         max_tokens: MAX_OUTPUT_TOKENS,
-        messages: normalizeForAnthropic(messages),
+        messages: msgPayload,
       }),
       signal: AbortSignal.timeout(timeoutMs),
     })

@@ -5,6 +5,7 @@ import {
   normalizeUsage,
   providerHttpError,
   toNetworkError,
+  toOpenAiContent,
   type ProviderArgs,
 } from './shared'
 
@@ -27,6 +28,12 @@ interface OpenAiResponse {
 export async function generateOpenAi(args: ProviderArgs): Promise<ProviderResult> {
   const { apiKey, model, systemPrompt, messages, timeoutMs } = args
 
+  const merged = mergeConsecutive(messages)
+  const msgPayload = merged.map((m) => ({
+    role: m.role,
+    content: toOpenAiContent(m),
+  }))
+
   let res: Response
   try {
     res = await fetch(OPENAI_URL, {
@@ -37,10 +44,7 @@ export async function generateOpenAi(args: ProviderArgs): Promise<ProviderResult
       },
       body: JSON.stringify({
         model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          ...mergeConsecutive(messages),
-        ],
+        messages: [{ role: 'system', content: systemPrompt }, ...msgPayload],
         max_completion_tokens: MAX_OUTPUT_TOKENS,
       }),
       signal: AbortSignal.timeout(timeoutMs),

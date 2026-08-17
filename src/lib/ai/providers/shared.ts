@@ -94,16 +94,64 @@ export async function providerHttpError(
  * Collapse consecutive same-role turns into one (joined with blank
  * lines). Anthropic requires strictly alternating roles; merging is
  * also harmless for OpenAI and keeps the transcript compact.
+ *
+ * When images are present, consecutive same-role messages are NOT
+ * collapsed so each image URL stays on its own message block.
  */
 export function mergeConsecutive(messages: ChatMessage[]): ChatMessage[] {
   const out: ChatMessage[] = []
   for (const m of messages) {
     const last = out[out.length - 1]
-    if (last && last.role === m.role) {
+    if (last && last.role === m.role && !m.images?.length && !last.images?.length) {
       last.content = `${last.content}\n\n${m.content}`
     } else {
-      out.push({ role: m.role, content: m.content })
+      out.push({ role: m.role, content: m.content, images: m.images })
     }
   }
   return out
+}
+
+/**
+ * Build an OpenAI-compatible multimodal content array for a single
+ * message. Returns a plain string when there are no images (backwards
+ * compatible), or an array of content blocks when images are present.
+ */
+export function toOpenAiContent(
+  msg: ChatMessage,
+): string | Array<{ type: string; text?: string; image_url?: { url: string } }> {
+  if (!msg.images || msg.images.length === 0) return msg.content
+  const blocks: Array<{ type: string; text?: string; image_url?: { url: string } }> = []
+  if (msg.content) {
+    blocks.push({ type: 'text', text: msg.content })
+  }
+  for (const url of msg.images) {
+    blocks.push({
+      type: 'image_url',
+      image_url: { url },
+    })
+  }
+  return blocks
+}
+
+/**
+ * Build an Anthropic-compatible multimodal content array for a single
+ * message. Anthropic requires base64-encoded images, so image URLs are
+ * included as text references instead (Anthropic does not fetch URLs).
+ * When no images are present, returns a plain string.
+ */
+export function toAnthropicContent(
+  msg: ChatMessage,
+): string | Array<{ type: string; text?: string; source?: object }> {
+  if (!msg.images || msg.images.length === 0) return msg.content
+  const blocks: Array<{ type: string; text?: string; source?: object }> = []
+  if (msg.content) {
+    blocks.push({ type: 'text', text: msg.content })
+  }
+  for (const url of msg.images) {
+    blocks.push({
+      type: 'text',
+      text: `[Image: ${url}]`,
+    })
+  }
+  return blocks
 }
