@@ -58,7 +58,11 @@ export async function dispatchInboundToAiReply(
     if (convErr || !conv) return
     if (conv.assigned_agent_id) return
     if (conv.ai_autoreply_disabled) return
-    if (conv.ai_reply_count >= config.autoReplyMaxPerConversation) return
+    if (
+      config.autoReplyMaxPerConversation > 0 &&
+      conv.ai_reply_count >= config.autoReplyMaxPerConversation
+    )
+      return
 
     const messages = await buildConversationContext(db, conversationId)
     if (messages.length === 0) return

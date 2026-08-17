@@ -73,7 +73,7 @@ export function AiConfig() {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [isActive, setIsActive] = useState(false);
   const [autoReplyEnabled, setAutoReplyEnabled] = useState(false);
-  const [maxPerConversation, setMaxPerConversation] = useState(3);
+  const [maxPerConversation, setMaxPerConversation] = useState(0);
   // Empty string = leave unassigned (shared queue).
   const [handoffAgentId, setHandoffAgentId] = useState('');
   const [members, setMembers] = useState<AccountMember[]>([]);
@@ -449,12 +449,12 @@ export function AiConfig() {
               <Input
                 id="ai-max"
                 type="number"
-                min={1}
+                min={0}
                 max={20}
                 value={maxPerConversation}
                 onChange={(e) =>
                   setMaxPerConversation(
-                    Math.min(20, Math.max(1, Number(e.target.value) || 1)),
+                    Math.min(20, Math.max(0, Number(e.target.value) || 0)),
                   )
                 }
                 disabled={disabled || !autoReplyEnabled}
