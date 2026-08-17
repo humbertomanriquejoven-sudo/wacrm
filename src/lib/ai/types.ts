@@ -21,13 +21,7 @@ export interface AiConfig {
   isActive: boolean
   autoReplyEnabled: boolean
   autoReplyMaxPerConversation: number
-  /** Where auto-reply hands a conversation off when the model bails: an
-   *  agent's `auth.users.id`, or null to leave it unassigned (drop into
-   *  the shared queue). */
   handoffAgentId: string | null
-  /** Optional OpenAI-compatible key for embeddings. When set, the
-   *  knowledge base is embedded and semantic retrieval turns on; when
-   *  null, retrieval falls back to lexical full-text search. */
   embeddingsApiKey: string | null
 }
 
@@ -35,15 +29,9 @@ export interface AiConfig {
 export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
-  /** Optional base64-encoded images for vision-capable models. */
   images?: string[]
 }
 
-/**
- * Token counts for one provider call, normalized across OpenAI
- * (`prompt`/`completion`) and Anthropic (`input`/`output`). Null when
- * the provider didn't return usage. Logged to `ai_usage_log`.
- */
 export interface AiUsage {
   promptTokens: number
   completionTokens: number
@@ -54,16 +42,40 @@ export interface AiUsage {
 export interface ProviderResult {
   text: string
   usage: AiUsage | null
+  toolCalls?: ToolCall[]
 }
 
 /** Outcome of a generation call. */
 export interface GenerateResult {
-  /** The reply text, with any handoff sentinel stripped. */
   text: string
-  /** True when the model asked to hand off to a human (auto-reply mode). */
   handoff: boolean
-  /** Provider token usage for this call, or null when unavailable. */
   usage: AiUsage | null
+  toolCalls?: ToolCall[]
+}
+
+/** A tool call the model wants to execute. */
+export interface ToolCall {
+  id: string
+  name: string
+  arguments: Record<string, unknown>
+}
+
+/** Schema definition for a tool the model can invoke. */
+export interface ToolDefinition {
+  name: string
+  description: string
+  parameters: {
+    type: 'object'
+    properties: Record<
+      string,
+      {
+        type: string
+        description?: string
+        enum?: string[]
+      }
+    >
+    required?: string[]
+  }
 }
 
 /**

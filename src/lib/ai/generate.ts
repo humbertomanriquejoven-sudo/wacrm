@@ -4,6 +4,7 @@ import {
   type AiUsage,
   type ChatMessage,
   type GenerateResult,
+  type ToolDefinition,
 } from './types'
 import { HANDOFF_SENTINEL, aiRequestTimeoutMs } from './defaults'
 import { generateOpenAi } from './providers/openai'
@@ -12,10 +13,9 @@ import { generateOpenRouter } from './providers/openrouter'
 
 export interface GenerateArgs {
   config: AiConfig
-  /** Fully-built system prompt (see `buildSystemPrompt`). */
   systemPrompt: string
-  /** Recent conversation turns, oldest first. */
   messages: ChatMessage[]
+  tools?: ToolDefinition[]
 }
 
 /**
@@ -24,7 +24,7 @@ export interface GenerateArgs {
  * of the raw text. Throws `AiError` on any provider/network failure.
  */
 export async function generateReply(args: GenerateArgs): Promise<GenerateResult> {
-  const { config, systemPrompt, messages } = args
+  const { config, systemPrompt, messages, tools } = args
   const timeoutMs = aiRequestTimeoutMs()
   const providerArgs = {
     apiKey: config.apiKey,
@@ -32,9 +32,10 @@ export async function generateReply(args: GenerateArgs): Promise<GenerateResult>
     systemPrompt,
     messages,
     timeoutMs,
+    tools,
   }
 
-  let result: { text: string; usage: AiUsage | null }
+  let result: { text: string; usage: AiUsage | null; toolCalls?: { id: string; name: string; arguments: Record<string, unknown> }[] }
   switch (config.provider) {
     case 'openai':
       result = await generateOpenAi(providerArgs)
@@ -52,7 +53,9 @@ export async function generateReply(args: GenerateArgs): Promise<GenerateResult>
       })
   }
 
-  return parseGeneration(result.text, result.usage)
+  const parsed = parseGeneration(result.text, result.usage)
+  parsed.toolCalls = result.toolCalls
+  return parsed
 }
 
 /**
