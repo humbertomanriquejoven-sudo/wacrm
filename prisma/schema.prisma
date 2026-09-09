@@ -1,0 +1,66 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Contacto {
+  id            Int       @id @default(autoincrement())
+  waId          String    @unique
+  nombre        String?
+  ventanaExpira DateTime?
+  botActivo     Boolean   @default(true)
+  creadoEn      DateTime  @default(now())
+  mensajes      Mensaje[]
+  citas         Cita[]
+}
+
+model Mensaje {
+  id          Int       @id @default(autoincrement())
+  contactoId  Int
+  contacto    Contacto  @relation(fields: [contactoId], references: [id], onDelete: Cascade)
+  waMessageId String    @unique
+  tipo        String
+  direccion   String
+  texto       String
+  creadoEn    DateTime  @default(now())
+  media       Media?
+}
+
+model Media {
+  id        Int     @id @default(autoincrement())
+  messageId Int     @unique
+  mensaje   Mensaje @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  tipo      String
+  mime      String
+  datos     Bytes
+}
+
+model Cita {
+  id            Int      @id @default(autoincrement())
+  contactoId    Int
+  contacto      Contacto @relation(fields: [contactoId], references: [id], onDelete: Cascade)
+  googleEventId String
+  inicio        DateTime
+  fin           DateTime
+  cancelada     Boolean  @default(false)
+  notas         String?
+}
+
+model Job {
+  id            Int      @id @default(autoincrement())
+  tipo          String
+  clave         String
+  correrEn      DateTime
+  estado        String   @default("PENDIENTE")
+  intentos      Int      @default(0)
+  payload       String?
+  error         String?
+  actualizadoEn DateTime @updatedAt
+
+  @@index([tipo, clave, estado])
+  @@index([estado, correrEn])
+}

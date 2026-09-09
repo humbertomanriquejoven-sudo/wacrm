@@ -1,175 +1,93 @@
-# wacrm — CRM Template for WhatsApp
+# Agente de citas por WhatsApp
 
-> Self-hostable CRM template for WhatsApp® — shared inbox, contacts,
-> sales pipelines, broadcasts, and no-code automations. Fork it, brand
-> it, host it.
+Agente conversacional que agenda, reagenda y cancela citas en Google Calendar a través de WhatsApp. Incluye panel de visualización con agenda, calendario y conversaciones.
 
-<p align="center">
-  <a href="https://www.hostinger.com/web-apps-hosting?REFERRALCODE=WACRMHOST">
-    <img src="./.github/assets/hostinger-deploy.png" alt="Ship your Node.js app in one click — Deploy to Hostinger" width="900">
-  </a>
-</p>
+## Variables de entorno
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-violet.svg)](./LICENSE)
-[![CI](https://github.com/ArnasDon/wacrm/actions/workflows/ci.yml/badge.svg)](https://github.com/ArnasDon/wacrm/actions/workflows/ci.yml)
-[![Next.js 16](https://img.shields.io/badge/Next.js-16-black?logo=nextdotjs)](https://nextjs.org)
-[![Supabase](https://img.shields.io/badge/Supabase-Postgres%20%2B%20Auth-3ecf8e?logo=supabase)](https://supabase.com)
-[![Stars](https://img.shields.io/github/stars/ArnasDon/wacrm?style=social)](https://github.com/ArnasDon/wacrm/stargazers)
+Todas son obligatorias (la app no arranca si falta alguna):
 
-The marketing site and self-host docs live in a separate repo:
-[ArnasDon/wacrm-site](https://github.com/ArnasDon/wacrm-site)
-([wacrm.tech](https://wacrm.tech)). This repo is the product —
-clone or fork it to run your own CRM.
+| Variable | Descripción |
+|---|---|
+| `WA_TOKEN` | Token de acceso de la API de WhatsApp Business |
+| `WA_PHONE_NUMBER_ID` | ID del número de teléfono de WhatsApp Business |
+| `WA_VERIFY_TOKEN` | Token que usas en la configuración del webhook de Meta |
+| `WA_APP_SECRET` | Secreto de la app de Meta (para validar firmas HMAC) |
+| `OPENROUTER_API_KEY` | API key de OpenRouter |
+| `OPENROUTER_MODEL` | Modelo principal (ej: `anthropic/claude-sonnet-4-20250514`) |
+| `OPENROUTER_MODEL_MEDIA` | Modelo para entender imágenes y audio (ej: `openai/gpt-4o-mini`) |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | JSON de la service account de Google o Base64 del mismo |
+| `GOOGLE_CALENDAR_ID` | ID del calendario donde agendar |
+| `DATABASE_URL` | `file:/app/data/agente.db` (ya configurada en Dockerfile) |
 
-## What you get out of the box
+## Despliegue en Easypanel
 
-- **Shared inbox** on the official WhatsApp Business API — multiple
-  agents working one number, per-conversation assignment, status, and
-  notes.
-- **Contacts + tags + custom fields**, CSV import, deduplication.
-- **Sales pipelines** (Kanban) with deals linked to conversations.
-- **Broadcasts** with Meta-approved templates, delivery + read
-  tracking, per-recipient variable substitution.
-- **No-code automations** — triggers on inbound messages, new
-  contacts, keywords, or schedule; conditional branches, waits,
-  tags, webhooks. Visual builder.
-- **AI reply assistant** — bring your own OpenAI or Anthropic key
-  (stored encrypted; no per-seat AI fee, your data stays yours).
-  One-click AI-drafted replies in the inbox, plus an optional
-  auto-reply bot with a per-conversation cap and clean human handoff.
-  Add a **knowledge base** (FAQs, policies, product docs) and it
-  answers from your own content — hybrid retrieval (Postgres full-text,
-  or semantic pgvector when an embeddings key is set).
-- **Real-time dashboard** — response times, daily volume, pipeline
-  value, cross-module activity feed.
-- **Team accounts** — invite teammates by link, role-based access
-  (owner / admin / agent / viewer), ownership transfer. Every install
-  is account-scoped, so one shared inbox can be staffed by a whole
-  team. Solo use stays single-user with zero setup.
-- **Account management** — email, password, avatar, global sign-out.
-- **Public REST API** (`/api/v1`) with scoped, revocable API keys —
-  build your own automations on top of your CRM. See
-  [docs/public-api.md](./docs/public-api.md).
-- **MCP server** — drive your CRM from Claude, Cursor, and other AI
-  assistants over the [Model Context Protocol](https://modelcontextprotocol.io).
-  Read-only by default, opt-in writes. See [docs/mcp.md](./docs/mcp.md)
-  (server in [`mcp-server/`](./mcp-server)).
+1. Crear un nuevo servicio **App** y seleccionar **Dockerfile** como método.
+2. Configurar el **Puerto** del contenedor en `3000`.
+3. **Antes del primer despliegue**, montar un volumen en `/app/data` para que la base de datos no se pierda al reiniciar. Si ya desplegaste sin el volumen, borra el servicio y vuelve a crearlo con el volumen antes de desplegar.
+4. Configurar las variables de entorno en el paso **Environment Variables**.
+5. Desplegar. Usa **1 réplica** (el worker de la cola está embebido en el proceso y no está pensado para múltiples instancias).
+6. **Después** de desplegar, ve al **panel de Meta** → tu app → WhatsApp → Configuración → Webhook y marca el campo **messages** como paso propio (este paso se hace aparte porque se configura después del despliegue).
 
-## Why fork this?
+> **Aviso**: el log de build de Easypanel imprime todas las variables de entorno en claro, porque las pasa como `--build-arg`. Si tu despliegue es público, borra ese log después de verificar que el build funciona.
 
-This is a **template**, not a product. Forking means you get:
+> **Sin login**: el panel no tiene autenticación. Si necesitas acceso restringido, ponlo detrás de un proxy con auth.
 
-- **Full ownership** — your code, your Supabase project, your domain,
-  your data. No SaaS lock-in, no seat pricing, no trust dance.
-- **Full customisation** — add the fields your team needs, remove the
-  modules you don't, redesign anything. The stack is boring on
-  purpose (Next.js + Supabase + Tailwind) so the learning curve is
-  short.
-- **Zero ops to start** — [Hostinger](https://www.hostinger.com/web-apps-hosting?REFERRALCODE=WACRMHOST)
-  Managed Node.js deploys a fork in a few clicks. No Docker, no
-  Kubernetes, no infra team needed.
-  ([See below ↓](#-deploy-on-hostinger-recommended))
-- **Real security primitives** — token encryption (AES-256-GCM), RLS
-  on every table, HMAC-verified webhooks, CSP, rate limiting, CI
-  typecheck/build on every PR.
+## Google Calendar
 
-Not a framework. Not an SDK. A concrete, working CRM you can stand up
-in an afternoon and make yours.
+La app usa una **service account** de Google para operar el calendario. Hay dos caminos:
 
-## Quick start
+**Opción A (recomendada): Compartir un calendario existente con la service account**
+1. Abre Google Calendar en el navegador.
+2. En la configuración del calendario, busca "Compartir calendario".
+3. Añade el email de la service account (el campo `client_email` del JSON).
+4. Dale permiso de **"Hacer cambios en los eventos"**.
+5. Usa ese calendario como `GOOGLE_CALENDAR_ID`.
+
+**Opción B: Crear un calendario nuevo vía API**
+1. La app puede crear un calendario automáticamente y asignar permisos vía ACL.
+2. Usa el email de la service account como propietario.
+
+**Limitaciones de la service account**:
+- **No puede** crear reuniones de Google Meet.
+- **No puede** enviar invitaciones por correo electrónico.
+- Si el cliente pide Meet o link de videoconferencia, sugiere otra vía de contacto.
+
+## Verificación post-despliegue
+
+1. **Webhook**: En el panel de Meta, haz clic en "Verificar" con la URL `https://tu-dominio/api/webhook/whatsapp`. Debería devolver un 200.
+2. **Mensaje de texto**: Envía un mensaje de texto a tu número. Debería responder en segundos.
+3. **Agente**: Pregunta "¿Cuáles son tus horarios?" y verifica que devuelve horarios reales del calendario.
+4. **Agendar**: Pide una cita con nombre y horario. Debería crear el evento en Google Calendar.
+5. **Reagendar**: Pide mover la cita a otro horario. Verifica que el evento se mueve.
+6. **Cancelar**: Pide cancelar la cita. Verifica que el evento se borra.
+7. **Bot off**: En el panel, pausa el bot para una conversación. Envía un mensaje y verifica que no responde.
+8. **Ventana de 24 h**: Espera 24 h sin que el cliente escriba. Verifica que el agente no responde hasta que el cliente vuelva a escribir.
+9. **Nota de voz**: Envía una nota de voz. Verifica que la transcribe y responde.
+10. **Imagen**: Envía una imagen. Verifica que la describe.
+11. **Panel**: Abre `https://tu-dominio/` y verifica que se ven las métricas y las citas agrupadas por día.
+12. **Calendario**: Abre `https://tu-dominio/calendario` y verifica la vista semanal con eventos verdes (agente) y ámbar (Google).
+13. **Conversaciones**: Abre `https://tu-dominio/conversaciones`, busca por nombre/número, filtra por "Ventana abierta" y "Con cita".
+14. **Enviar manual**: En el hilo de una conversación con ventana abierta, envía un mensaje manual y verifica que se envía.
+15. **Borrar conversación**: Borra una conversación y verifica que se redirige a la bandeja.
+16. **Fuentes**: Verifica que los textos se ven con Inter y las horas con JetBrains Mono (fuentes locales, sin carga externa).
+
+## Desarrollo local
 
 ```bash
-# Fork on GitHub first: https://github.com/ArnasDon/wacrm → Fork
-git clone https://github.com/<your-username>/wacrm.git
-cd wacrm
+cp .env.example .env
+# Rellena las variables en .env
 npm install
-cp .env.local.example .env.local   # fill in Supabase + Meta creds
+npx prisma migrate dev
 npm run dev
 ```
 
-Open <http://localhost:3000>. You'll be redirected to `/login` (or
-`/dashboard` if already signed in).
+## Estructura
 
-Prefer containers? See [docs/docker.md](./docs/docker.md) for the
-Dockerfile + Docker Compose setup.
+- `src/lib/` — lógica del agente, cola, calendario, WhatsApp, configuración
+- `src/app/` — panel (App Router) y webhook
+- `prisma/` — esquema de la base de datos SQLite
+- `src/app/fuentes/` — fuentes Inter y JetBrains Mono (woff2, SIL Open Font License)
 
-## 🚀 Deploy on Hostinger (recommended)
+## Licencia de fuentes
 
-<p align="center">
-  <a href="https://www.hostinger.com/web-apps-hosting?REFERRALCODE=WACRMHOST">
-    <img src="./.github/assets/hostinger-deploy.png" alt="Ship your Node.js app in one click — Deploy to Hostinger" width="1000">
-  </a>
-</p>
-<p align="center">
-  <a href="https://wacrm.tech/docs/deployment-hostinger">
-    <img src="https://img.shields.io/badge/Step--by--step_guide-wacrm.tech%2Fdocs-111?style=for-the-badge" alt="Step-by-step guide" height="44">
-  </a>
-</p>
-
-**wacrm is built to run on [Hostinger](https://www.hostinger.com/web-apps-hosting?REFERRALCODE=WACRMHOST).**
-It's the path we test, document, and recommend — and the fastest way
-to get a production-grade CRM live without owning a VPS or a
-Kubernetes cluster.
-
-### Why Hostinger?
-
-| | |
-|---|---|
-| **One-click Git deploy** | Connect your fork, push to `main`, Hostinger builds and ships it. No SSH, no Docker, no CI to wire up — this repo's own `main` deploys this way. |
-| **Managed Node.js** | Next.js 16 (App Router, server actions, ISR) runs out of the box on [Premium, Business, and Cloud](https://www.hostinger.com/web-apps-hosting?REFERRALCODE=WACRMHOST) shared plans. You don't manage Node versions, processes, or reverse proxies. |
-| **Free SSL + free domain** | Automatic Let's Encrypt on your custom domain (or a free one included with annual plans). HTTPS is on by default — required for the WhatsApp Business webhook. |
-| **Global CDN + LiteSpeed** | Static assets cached at the edge, dynamic routes served from LiteSpeed. Snappy dashboards out of the box, no Cloudflare setup required. |
-| **Env vars + logs in hPanel** | Set `SUPABASE_*`, `WHATSAPP_*`, and `ENCRYPTION_KEY` from the panel — no `.env` on the server. Live application logs in the same UI. |
-| **DDoS protection + daily backups** | Built-in, no add-ons. The webhook endpoint is a public target — having protection at the edge matters. |
-| **Cheaper than a VPS** | Plans start at a few dollars a month — order-of-magnitude less than a comparable managed Node.js host, and you don't pay extra for the database (that's Supabase). |
-| **24/7 human support** | Live chat support in 20+ languages — useful when your CRM is the thing your team relies on to talk to customers. |
-
-### The 60-second version
-
-1. **Fork** this repo on GitHub.
-2. In **hPanel → Websites → Create**, pick **Node.js** and connect
-   your fork.
-3. Paste your Supabase + Meta env vars into hPanel.
-4. Push to `main`. Hostinger builds and serves it. Done.
-
-Full walkthrough with screenshots:
-**[wacrm.tech/docs/deployment-hostinger](https://wacrm.tech/docs/deployment-hostinger)**.
-
-> _Note: wacrm is MIT-licensed and runs anywhere Node.js does
-> (Vercel, Railway, your own VPS). Hostinger is recommended, not
-> required._
-
-## Documentation
-
-Full self-host documentation — Supabase migrations, WhatsApp Business
-API config, and production deploy — lives at
-**[wacrm.tech/docs](https://wacrm.tech/docs)**
-(source: [ArnasDon/wacrm-site](https://github.com/ArnasDon/wacrm-site)).
-
-Key pages:
-- [Getting started](https://wacrm.tech/docs/getting-started)
-- [Supabase setup](https://wacrm.tech/docs/supabase-setup)
-- [WhatsApp setup](https://wacrm.tech/docs/whatsapp-setup)
-- [Environment variables](https://wacrm.tech/docs/environment-variables)
-- [Deploy on Hostinger](https://wacrm.tech/docs/deployment-hostinger)
-- [Architecture](https://wacrm.tech/docs/architecture)
-- [Troubleshooting](https://wacrm.tech/docs/troubleshooting)
-
-## Stack
-
-- **App** — Next.js 16 (App Router), React 19, TypeScript, Tailwind v4.
-- **Data** — Supabase (Postgres + Auth + Storage + RLS).
-- **WhatsApp** — Meta Cloud API (official WhatsApp Business API).
-
-## Contributing
-
-This is a template, not a collaborative product — the expected flow is
-fork → customise → deploy, **not** upstream contribution. Bug reports
-and security issues are welcome; feature PRs often belong in your fork
-rather than here. Details in
-[`CONTRIBUTING.md`](./CONTRIBUTING.md) and
-[`.github/SECURITY.md`](./.github/SECURITY.md).
-
-## License
-
-[MIT](./LICENSE). Fork it, brand it, host it.
+Inter y JetBrains Mono están bajo la **SIL Open Font License**. Los archivos woff2 están incluidos en `src/app/fuentes/`.
