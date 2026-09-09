@@ -15,6 +15,16 @@ import type { ChatMessage } from './types'
 /** Maximum tool-call rounds per inbound to avoid infinite loops. */
 const MAX_TOOL_ROUNDS = 3
 
+/**
+ * Ventana de debounce para agrupar mensajes consecutivos del mismo cliente.
+ * Cuando el usuario envía varios mensajes cortos y rápidos ("Hola", "???",
+ * "Hola?"), espera DEBOUNCE_MS desde el último mensaje antes de responder; si
+ * llega uno nuevo se reinicia el reloj. El tope MAX_AGGREGATION_MS evita que
+ * un flujo constante de mensajes deje la respuesta para siempre.
+ */
+const DEBOUNCE_MS = 3000
+const MAX_AGGREGATION_MS = 10_000
+
 interface DispatchArgs {
   accountId: string
   conversationId: string
@@ -22,17 +32,75 @@ interface DispatchArgs {
   configOwnerUserId: string
 }
 
+interface Pendiente {
+  timer: NodeJS.Timeout | null
+  resolve: () => void
+  promise?: Promise<void>
+  inicio: number
+  args: DispatchArgs
+}
+
+// Una entrada por conversación: el debounce es PER conversación, no global,
+// para que dos clientes distintos nunca se bloqueen entre sí.
+const pendientes = new Map<string, Pendiente>()
+
+/**
+ * Debounce de la entrada del webhook. Programa `ejecutarAutoReply` para
+ * DEBOUNCE_MS después del último mensaje recibido en esa conversación y
+ * devuelve la misma promesa a todos los webhooks concurrentes del mismo
+ * cliente, de forma que el `after()` del route los mantenga vivos hasta que
+ * la respuesta se haya generado (y no se quede congelado a mitad de camino).
+ */
+function programarAutoReply(args: DispatchArgs): Promise<void> {
+  const clave = `${args.accountId}:${args.conversationId}`
+  const ahora = Date.now()
+  let pendiente = pendientes.get(clave)
+
+  if (!pendiente) {
+    pendiente = {
+      timer: null,
+      resolve: () => {},
+      inicio: ahora,
+      args,
+    }
+    pendientes.set(clave, pendiente)
+    pendiente.promise = new Promise<void>((r) => {
+      pendiente!.resolve = r
+    })
+  } else {
+    pendiente.args = args
+  }
+
+  // Se dispara lo antes posible de entre [último mensaje + DEBOUNCE, inicio + MAX].
+  const vencimiento = Math.min(
+    ahora + DEBOUNCE_MS,
+    pendiente.inicio + MAX_AGGREGATION_MS,
+  )
+  if (pendiente.timer) clearTimeout(pendiente.timer)
+  pendiente.timer = setTimeout(() => {
+    pendientes.delete(clave)
+    void ejecutarAutoReply(pendiente!.args).finally(() => pendiente!.resolve())
+  }, Math.max(0, vencimiento - Date.now()))
+
+  return pendiente.promise!
+}
+
 /**
  * AI auto-reply for a freshly-arrived inbound message.
  *
  * Invoked from the WhatsApp webhook's `after()` block, only when no
- * deterministic flow consumed the message (flows win). Mirrors the flow
- * runner's contract: it owns its try/catch and NEVER throws — a failing
- * or slow LLM call must not affect the webhook's 200 to Meta.
+ * deterministic flow consumed the message (flows win). Agrupa mensajes
+ * consecutivos del mismo cliente (debounce) y luego ejecuta la respuesta real.
+ * Mirrors the flow runner's contract: it owns its try/catch and NEVER throws —
+ * a failing or slow LLM call must not affect the webhook's 200 to Meta.
  */
-export async function dispatchInboundToAiReply(
+export function dispatchInboundToAiReply(
   args: DispatchArgs,
 ): Promise<void> {
+  return programarAutoReply(args)
+}
+
+async function ejecutarAutoReply(args: DispatchArgs): Promise<void> {
   const { accountId, conversationId, contactId, configOwnerUserId } = args
 
   try {

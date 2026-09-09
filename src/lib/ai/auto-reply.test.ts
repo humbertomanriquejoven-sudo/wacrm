@@ -82,6 +82,7 @@ function aiConfig(overrides: Partial<AiConfig> = {}): AiConfig {
 }
 
 beforeEach(() => {
+  vi.useFakeTimers()
   h.state.conv = {
     assigned_agent_id: null,
     ai_autoreply_disabled: false,
@@ -98,9 +99,18 @@ beforeEach(() => {
   h.engineSendText.mockResolvedValue({ whatsapp_message_id: 'm1' })
 })
 
+// El auto-reply agrupa mensajes consecutivos con un debounce por conversación:
+// los tests avanzan el reloj para que la respuesta se ejecute de inmediato y
+// el estado (Map de pendientes) quede limpio entre tests.
+async function activarAutoReply() {
+  const pendiente = dispatchInboundToAiReply(ARGS)
+  await vi.advanceTimersByTimeAsync(4000)
+  await pendiente
+}
+
 describe('dispatchInboundToAiReply — eligibility gates', () => {
   it('claims a slot and sends on the happy path', async () => {
-    await dispatchInboundToAiReply(ARGS)
+    await activarAutoReply()
     expect(h.state.rpcCalls).toEqual([
       {
         name: 'claim_ai_reply_slot',
@@ -114,7 +124,7 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
 
   it('grounds the reply in retrieved knowledge', async () => {
     h.retrieveKnowledge.mockResolvedValue(['Returns accepted within 30 days.'])
-    await dispatchInboundToAiReply(ARGS)
+    await activarAutoReply()
     expect(h.retrieveKnowledge).toHaveBeenCalled()
     const systemPrompt = h.generateReply.mock.calls[0][0].systemPrompt as string
     expect(systemPrompt).toContain('Returns accepted within 30 days.')
@@ -122,14 +132,14 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
 
   it('stands down when an active message-level automation exists', async () => {
     h.state.autoResponders = [{ id: 'auto-1' }]
-    await dispatchInboundToAiReply(ARGS)
+    await activarAutoReply()
     expect(h.generateReply).not.toHaveBeenCalled()
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
   it('does not send when the atomic slot claim loses the race', async () => {
     h.state.claim = false
-    await dispatchInboundToAiReply(ARGS)
+    await activarAutoReply()
     // It still attempts the claim, but the send is skipped.
     expect(h.state.rpcCalls).toHaveLength(1)
     expect(h.engineSendText).not.toHaveBeenCalled()
@@ -137,14 +147,14 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
 
   it('skips when AI is off / not configured', async () => {
     h.loadAiConfig.mockResolvedValue(null)
-    await dispatchInboundToAiReply(ARGS)
+    await activarAutoReply()
     expect(h.generateReply).not.toHaveBeenCalled()
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
   it('skips when auto-reply is disabled for the account', async () => {
     h.loadAiConfig.mockResolvedValue(aiConfig({ autoReplyEnabled: false }))
-    await dispatchInboundToAiReply(ARGS)
+    await activarAutoReply()
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
@@ -154,7 +164,7 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
       ai_autoreply_disabled: false,
       ai_reply_count: 0,
     }
-    await dispatchInboundToAiReply(ARGS)
+    await activarAutoReply()
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
@@ -164,7 +174,7 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
       ai_autoreply_disabled: true,
       ai_reply_count: 0,
     }
-    await dispatchInboundToAiReply(ARGS)
+    await activarAutoReply()
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
@@ -174,7 +184,7 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
       ai_autoreply_disabled: false,
       ai_reply_count: 3,
     }
-    await dispatchInboundToAiReply(ARGS)
+    await activarAutoReply()
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
@@ -185,7 +195,7 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
       ai_autoreply_disabled: false,
       ai_reply_count: 50,
     }
-    await dispatchInboundToAiReply(ARGS)
+    await activarAutoReply()
     expect(h.engineSendText).toHaveBeenCalledWith(
       expect.objectContaining({ text: 'Hello!' }),
     )
@@ -193,7 +203,7 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
 
   it('skips when there is nothing to reply to', async () => {
     h.buildConversationContext.mockResolvedValue([])
-    await dispatchInboundToAiReply(ARGS)
+    await activarAutoReply()
     expect(h.generateReply).not.toHaveBeenCalled()
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
@@ -202,7 +212,7 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
 describe('dispatchInboundToAiReply — handoff', () => {
   it('disables auto-reply, writes a summary, and does not send on handoff', async () => {
     h.generateReply.mockResolvedValue({ text: '', handoff: true })
-    await dispatchInboundToAiReply(ARGS)
+    await activarAutoReply()
     expect(h.engineSendText).not.toHaveBeenCalled()
     expect(h.state.rpcCalls).toHaveLength(0)
     expect(h.state.updatePayload).toMatchObject({ ai_autoreply_disabled: true })
@@ -216,7 +226,7 @@ describe('dispatchInboundToAiReply — handoff', () => {
   it('routes to the configured handoff agent on handoff', async () => {
     h.loadAiConfig.mockResolvedValue(aiConfig({ handoffAgentId: 'agent-7' }))
     h.generateReply.mockResolvedValue({ text: '', handoff: true })
-    await dispatchInboundToAiReply(ARGS)
+    await activarAutoReply()
     expect(h.state.updatePayload).toMatchObject({
       ai_autoreply_disabled: true,
       assigned_agent_id: 'agent-7',
