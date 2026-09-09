@@ -40,8 +40,8 @@ ENV HOSTNAME="0.0.0.0"
 ENV PORT="3000"
 EXPOSE 3000
 
-USER node
-
 RUN mkdir -p /app/data && chown node:node /app/data
+
+USER node
 
 CMD ["sh", "-c", "node /app/node_modules/prisma/build/index.js migrate deploy --schema /app/prisma/schema.prisma && node server.js"]
