@@ -38,6 +38,7 @@ COPY --chown=node:node . .
 
 ENV HOSTNAME="0.0.0.0"
 ENV PORT="3000"
+ENV DATABASE_URL="file:/app/data/agente.db"
 EXPOSE 3000
 
 RUN mkdir -p /app/data && chown node:node /app/data

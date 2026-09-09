@@ -4,6 +4,7 @@ import "./globals.css";
 import { inter, jetbrainsMono } from "./fuentes";
 import { Nav } from "./nav";
 import { resumenCola } from "@/lib/cola";
+import { variablesFaltantes } from "@/lib/config";
 
 export const metadata: Metadata = {
   title: "Agente de citas por WhatsApp",
@@ -12,6 +13,7 @@ export const metadata: Metadata = {
 
 export default async function RootLayout({ children }: { children: ReactNode }) {
   const cola = await resumenCola().catch(() => ({ pendientes: 0, fallidos: 0 }));
+  const faltan = variablesFaltantes();
 
   return (
     <html lang="es" className={`${inter.variable} ${jetbrainsMono.variable}`}>
@@ -32,7 +34,15 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
               </>
             }
           />
-          <main className="contenido">{children}</main>
+          <main className="contenido">
+            {faltan.length > 0 && (
+              <div className="aviso">
+                <strong>Faltan variables de entorno:</strong> {faltan.join(", ")}. El
+                agente no responderá hasta configurarlas en Easypanel.
+              </div>
+            )}
+            {children}
+          </main>
         </div>
       </body>
     </html>
