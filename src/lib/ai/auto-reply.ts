@@ -213,7 +213,19 @@ async function ejecutarAutoReply(args: DispatchArgs): Promise<void> {
       usage: finalUsage,
     })
 
-    if (handoff || !finalText) {
+    if (!finalText && !handoff) {
+      // El modelo respondió vacío sin pedir handoff: nunca quedarse en
+      // silencio. Se retoma la última propuesta enviada o, si no hay,
+      // se saluda pidiendo en qué ayudar.
+      const ultimaPropuesta = [...messages]
+        .reverse()
+        .find((m) => m.role === 'assistant' && m.content.trim())
+      finalText = ultimaPropuesta
+        ? `¡Hola de nuevo! Retomando lo que hablábamos sobre "${ultimaPropuesta.content.trim().slice(0, 120)}", dime, ¿en qué te puedo colaborar el día de hoy?`
+        : '¡Hola de nuevo! Dime, ¿en qué te puedo colaborar el día de hoy con tu proyecto?'
+    }
+
+    if (handoff) {
       const summary = buildHandoffSummary({
         messages,
         replyCount: conv.ai_reply_count ?? 0,

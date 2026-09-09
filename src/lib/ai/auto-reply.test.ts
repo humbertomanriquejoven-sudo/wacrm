@@ -232,4 +232,31 @@ describe('dispatchInboundToAiReply — handoff', () => {
       assigned_agent_id: 'agent-7',
     })
   })
+
+  it('never stays silent: empty text without handoff triggers a fallback reply', async () => {
+    h.generateReply.mockResolvedValue({ text: '', handoff: false })
+    await activarAutoReply()
+    expect(h.generateReply).toHaveBeenCalled()
+    expect(h.state.updatePayload).toBeNull()
+    expect(h.state.rpcCalls).toHaveLength(1)
+    expect(h.engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: '¡Hola de nuevo! Dime, ¿en qué te puedo colaborar el día de hoy con tu proyecto?',
+      }),
+    )
+  })
+
+  it('fallback picks up the last assistant proposal when one exists', async () => {
+    h.generateReply.mockResolvedValue({ text: '', handoff: false })
+    h.buildConversationContext.mockResolvedValue([
+      { role: 'user', content: 'hola' },
+      { role: 'assistant', content: 'Te ofrezco el paquete premium por 500.' },
+    ])
+    await activarAutoReply()
+    expect(h.engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('Te ofrezco el paquete premium por 500.'),
+      }),
+    )
+  })
 })
