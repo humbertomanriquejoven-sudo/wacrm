@@ -56,6 +56,39 @@ export async function findExistingContact(
 }
 
 /**
+ * Find a contact in `accountId` with the given name but NO phone number
+ * assigned yet (empty / null `phone`). The WhatsApp webhook uses this as
+ * a fallback when an inbound message's number matches nothing, but the
+ * sender's profile name matches a number-less contact row (e.g. one
+ * created from the form or CSV without a phone). Matching on name alone
+ * is too loose to use generally, so it is deliberately restricted to
+ * rows that have no usable phone — the one case where only the name can
+ * tie an inbound message to an existing customer.
+ */
+export async function findContactByNameWithoutPhone(
+  db: SupabaseClient,
+  accountId: string,
+  name: string,
+): Promise<ExistingContact | null> {
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+
+  const { data, error } = await db
+    .from("contacts")
+    .select("*")
+    .eq("account_id", accountId)
+    .eq("name", trimmed);
+
+  if (error || !data) return null;
+
+  return (
+    (data as ExistingContact[]).find(
+      (c) => !normalizePhone(c.phone ?? ""),
+    ) ?? null
+  );
+}
+
+/**
  * True when an existing contact is an *exact* normalized match for
  * `phone` (vs only a fuzzy trunk-variant match). The form hard-blocks
  * exact matches but only warns on fuzzy ones.

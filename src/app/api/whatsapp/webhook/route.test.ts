@@ -29,6 +29,22 @@ const h = vi.hoisted(() => ({
     }[],
     /** Error the next storage upload resolves with, if any. */
     storageUploadError: null as { message: string } | null,
+    /** findExistingContact return value (caller-configurable per test). */
+    existingContactResult: null as {
+      id: string
+      name: string | null
+      phone: string
+    } | null,
+    /** findContactByNameWithoutPhone return value. */
+    contactByNameResult: null as {
+      id: string
+      name: string | null
+      phone: string
+    } | null,
+    /** Patches applied via contacts.update. */
+    contactUpdateCalls: [] as { id?: unknown; patch: Record<string, unknown> }[],
+    /** Rows inserted via contacts.insert. */
+    contactInsertCalls: [] as Record<string, unknown>[],
   },
 }))
 
@@ -94,6 +110,42 @@ vi.mock('@supabase/supabase-js', () => ({
                 }),
               }),
             }),
+          }
+        case 'contacts':
+          // findContactByNameWithoutPhone: select().eq().eq()
+          return {
+            select: () => ({
+              eq: () => ({
+                eq: () =>
+                  Promise.resolve({
+                    data: h.state.contactByNameResult
+                      ? [h.state.contactByNameResult]
+                      : [],
+                    error: null,
+                  }),
+              }),
+            }),
+            update: (patch: Record<string, unknown>) => ({
+              eq: (_col: string, value: unknown) => {
+                h.state.contactUpdateCalls.push({
+                  id: value,
+                  patch,
+                })
+                return Promise.resolve({ data: null, error: null })
+              },
+            }),
+            insert: (row: Record<string, unknown>) => {
+              h.state.contactInsertCalls.push(row)
+              return {
+                select: () => ({
+                  single: () =>
+                    Promise.resolve({
+                      data: { id: 'inserted-1', ...row },
+                      error: null,
+                    }),
+                }),
+              }
+            },
           }
         case 'messages':
           return {
@@ -175,11 +227,8 @@ vi.mock('@/lib/whatsapp/meta-api', () => ({
   downloadMedia: vi.fn(),
 }))
 vi.mock('@/lib/contacts/dedupe', () => ({
-  findExistingContact: vi.fn(async () => ({
-    id: 'contact-1',
-    name: 'Ada',
-    phone: '15551230000',
-  })),
+  findExistingContact: vi.fn(),
+  findContactByNameWithoutPhone: vi.fn(),
   isUniqueViolation: () => false,
 }))
 vi.mock('@/lib/whatsapp/webhook-signature', () => ({
@@ -204,9 +253,15 @@ vi.mock('@/lib/webhooks/deliver', () => ({
 
 import { POST } from './route'
 import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
+import {
+  findExistingContact,
+  findContactByNameWithoutPhone,
+} from '@/lib/contacts/dedupe'
 
 const mockGetMediaUrl = vi.mocked(getMediaUrl)
 const mockDownloadMedia = vi.mocked(downloadMedia)
+const mockFindExistingContact = vi.mocked(findExistingContact)
+const mockFindContactByNameWithoutPhone = vi.mocked(findContactByNameWithoutPhone)
 
 const TEXT_MESSAGE = {
   id: 'wamid.TEST1',
@@ -260,6 +315,10 @@ beforeEach(() => {
   h.state.mirrorInboundMedia = true
   h.state.storageUploads = []
   h.state.storageUploadError = null
+  h.state.existingContactResult = null
+  h.state.contactByNameResult = null
+  h.state.contactUpdateCalls = []
+  h.state.contactInsertCalls = []
   mockGetMediaUrl.mockResolvedValue({
     url: 'https://lookaside.fbsbx.com/whatsapp/abc',
     mimeType: 'image/jpeg',
@@ -272,6 +331,12 @@ beforeEach(() => {
   h.dispatchInboundToFlows.mockResolvedValue({ consumed: false })
   h.dispatchInboundToAiReply.mockResolvedValue(undefined)
   h.dispatchWebhookEvent.mockResolvedValue(undefined)
+  mockFindExistingContact.mockResolvedValue({
+    id: 'contact-1',
+    name: 'Ada',
+    phone: '15551230000',
+  })
+  mockFindContactByNameWithoutPhone.mockResolvedValue(null)
   h.runAutomationsForTrigger.mockImplementation(() => {
     h.state.automationStarted++
     return new Promise<void>((resolve) => {
@@ -536,5 +601,82 @@ describe('inbound webhook: after() awaits automations (#368)', () => {
     // If the dispatches were fire-and-forget, completed would still be 0
     // here — the callback would have resolved before the timers fired.
     expect(h.state.automationCompleted).toBe(3)
+  })
+})
+
+describe('inbound webhook: contact auto-creation / backfill', () => {
+  it('creates a new contact with the WhatsApp profile name and number', async () => {
+    mockFindExistingContact.mockResolvedValue(null)
+
+    await runWebhook()
+
+    const insert = h.state.contactInsertCalls[0]
+    expect(insert).toMatchObject({
+      account_id: 'acc-1',
+      user_id: 'user-1',
+      phone: '15551230000',
+      name: 'Ada',
+    })
+  })
+
+  it('updates an existing contact that is missing a name', async () => {
+    // Phone already matches the sender exactly; only name is backfilled.
+    mockFindExistingContact.mockResolvedValue({
+      id: 'contact-1',
+      name: null,
+      phone: '15551230000',
+    })
+
+    await runWebhook()
+
+    expect(h.state.contactUpdateCalls).toHaveLength(1)
+    expect(h.state.contactUpdateCalls[0].id).toBe('contact-1')
+    expect(h.state.contactUpdateCalls[0].patch).toMatchObject({
+      name: 'Ada',
+      updated_at: expect.any(String),
+    })
+    // The phone didn't change — it already equals the sender number.
+    expect(h.state.contactUpdateCalls[0].patch).not.toHaveProperty('phone')
+  })
+
+  it('promotes a fuzzy phone match to the exact sender number', async () => {
+    // Stored with a country trunk prefix (00) that differs from the
+    // exact digits Meta delivers — the row still resolves via the
+    // last-8-digit fuzzy match, then gets rewritten to the sender number.
+    mockFindExistingContact.mockResolvedValue({
+      id: 'contact-1',
+      name: 'Ada',
+      phone: '0015551230000',
+    })
+
+    await runWebhook()
+
+    expect(h.state.contactUpdateCalls).toHaveLength(1)
+    expect(h.state.contactUpdateCalls[0].patch).toMatchObject({
+      phone: '15551230000',
+      updated_at: expect.any(String),
+    })
+  })
+
+  it('adopts a number-less contact matched solely by profile name', async () => {
+    // No row matches the number, but an existing contact has the same
+    // WhatsApp profile name and no phone assigned.
+    mockFindExistingContact.mockResolvedValue(null)
+    mockFindContactByNameWithoutPhone.mockResolvedValue({
+      id: 'contact-2',
+      name: 'Ada',
+      phone: '',
+    })
+
+    await runWebhook()
+
+    expect(mockFindContactByNameWithoutPhone).toHaveBeenCalledTimes(1)
+    expect(h.state.contactInsertCalls).toHaveLength(0)
+    expect(h.state.contactUpdateCalls).toHaveLength(1)
+    expect(h.state.contactUpdateCalls[0].patch).toMatchObject({
+      name: 'Ada',
+      phone: '15551230000',
+      updated_at: expect.any(String),
+    })
   })
 })

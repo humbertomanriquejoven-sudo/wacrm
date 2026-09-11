@@ -4,7 +4,11 @@ import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
 import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
 import { mirrorInboundMedia } from '@/lib/whatsapp/mirror-inbound-media'
 import { normalizePhone } from '@/lib/whatsapp/phone-utils'
-import { findExistingContact, isUniqueViolation } from '@/lib/contacts/dedupe'
+import {
+  findExistingContact,
+  findContactByNameWithoutPhone,
+  isUniqueViolation,
+} from '@/lib/contacts/dedupe'
 import { reopenClosedConversation } from '@/lib/conversations/reopen'
 import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
@@ -1142,14 +1146,38 @@ async function findOrCreateContact(
   )
 
   if (existingContact) {
-    // Update name if it changed
-    if (name && name !== existingContact.name) {
+    // Backfill whatever the inbound payload tells us that the record is
+    // missing, so replies to this customer always go to the number they
+    // actually message from and carry their WhatsApp profile name:
+    //   - name:  set it when the row has none or a stale one.
+    //   - phone: promote a fuzzy (trunk-prefix / format) match to the
+    //     exact sender number so outbound sends don't fail.
+    const updates: { name?: string; phone?: string } = {}
+    if (name && name !== existingContact.name) updates.name = name
+    if (phone && normalizePhone(existingContact.phone) !== phone) {
+      updates.phone = phone
+    }
+    if (Object.keys(updates).length > 0) {
       await supabaseAdmin()
         .from('contacts')
-        .update({ name, updated_at: new Date().toISOString() })
+        .update({ ...updates, updated_at: new Date().toISOString() })
         .eq('id', existingContact.id)
     }
     return { contact: existingContact, wasCreated: false }
+  }
+
+  // No phone match. Before creating a new row, check whether an existing
+  // contact with this WhatsApp profile name exists but has no number
+  // assigned yet — adopt it rather than silently duplicating the customer.
+  const nameOnlyContact = name
+    ? await findContactByNameWithoutPhone(supabaseAdmin(), accountId, name)
+    : null
+  if (nameOnlyContact) {
+    await supabaseAdmin()
+      .from('contacts')
+      .update({ name, phone, updated_at: new Date().toISOString() })
+      .eq('id', nameOnlyContact.id)
+    return { contact: nameOnlyContact, wasCreated: false }
   }
 
   // Create new contact. account_id is the tenancy column;
