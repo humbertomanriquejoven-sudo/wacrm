@@ -1052,7 +1052,8 @@ export async function downloadMedia(
     signal: AbortSignal.timeout(10_000),
   })
   if (!response.ok) {
-    throw new Error(`Media download failed: ${response.status}`)
+    const detail = await response.text().catch(() => '')
+    throw new Error(`Media download failed: ${response.status} ${detail.slice(0, 300)}`)
   }
   const contentType =
     response.headers.get('content-type') || 'application/octet-stream'

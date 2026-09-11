@@ -1057,49 +1057,68 @@ async function parseMessageContent(
 
     case 'audio': {
       if (message.audio?.id) {
+        // Voice-note hot path: resolve + download the bytes ONCE, then
+        // reuse the same buffer for both the mirror and the
+        // transcription. The previous shape fetched getMediaUrl twice
+        // and downloaded the file twice (once for the mirror, once for
+        // transcription), doubling audio latency on the way to the AI
+        // reply.
+        let info: Awaited<ReturnType<typeof getMediaUrl>>
+        let buffer: Buffer
         try {
-          // Voice-note hot path: resolve + download the bytes ONCE, then
-          // reuse the same buffer for both the mirror and the
-          // transcription. The previous shape fetched getMediaUrl twice
-          // and downloaded the file twice (once for the mirror, once for
-          // transcription), doubling audio latency on the way to the AI
-          // reply.
-          const info = await getMediaUrl({ mediaId: message.audio.id, accessToken })
-          const { buffer } = await downloadMedia({
-            downloadUrl: info.url,
-            accessToken,
-          })
-
-          let mediaUrl: string | null = null
-          if (mirror) {
-            mediaUrl = await mirrorInboundMedia({
-              storage: supabaseAdmin().storage,
-              accountId: mirror.accountId,
-              mediaId: message.audio.id,
-              downloadUrl: info.url,
-              accessToken,
-              mimeType: info.mimeType,
-              fileSize: info.fileSize,
-              messageTimestamp: message.timestamp,
-              // Serve the mirror from the bytes we already hold instead of
-              // a second CDN round-trip (mirrorInboundMedia only uses the
-              // injected download when it needs the media).
-              download: async () => ({
-                buffer,
-                contentType: info.mimeType,
-              }),
-            })
-          }
-          mediaUrl ??= `/api/whatsapp/media/${message.audio.id}`
-
-          // The transcript becomes the message's content so the AI bot
-          // replies to what was actually said.
-          const contentText = await transcribeAudio(buffer, message.audio.mime_type)
-          return { ...empty, contentText, mediaUrl, mediaType: message.audio.mime_type }
+          info = await getMediaUrl({ mediaId: message.audio.id, accessToken })
+          buffer = (await downloadMedia({ downloadUrl: info.url, accessToken })).buffer
         } catch (err) {
-          console.warn('[webhook] audio processing failed:', (err as Error).message)
+          console.error(
+            '[webhook][audio] Meta media fetch/download failed:',
+            {
+              mediaId: message.audio.id,
+              mimeType: message.audio.mime_type,
+              error: err instanceof Error ? err.message : err,
+            },
+          )
           return { ...empty, mediaType: message.audio.mime_type }
         }
+
+        let mediaUrl: string | null = null
+        if (mirror) {
+          mediaUrl = await mirrorInboundMedia({
+            storage: supabaseAdmin().storage,
+            accountId: mirror.accountId,
+            mediaId: message.audio.id,
+            downloadUrl: info.url,
+            accessToken,
+            mimeType: info.mimeType,
+            fileSize: info.fileSize,
+            messageTimestamp: message.timestamp,
+            // Serve the mirror from the bytes we already hold instead of
+            // a second CDN round-trip (mirrorInboundMedia only uses the
+            // injected download when it needs the media).
+            download: async () => ({
+              buffer,
+              contentType: info.mimeType,
+            }),
+          })
+        }
+        mediaUrl ??= `/api/whatsapp/media/${message.audio.id}`
+
+        // The transcript becomes the message's content so the AI bot
+        // replies to what was actually said. transcribeAudio never
+        // throws (each provider failure is logged with detail and the
+        // next provider is tried), so a null here means every configured
+        // provider failed.
+        const contentText = await transcribeAudio(buffer, message.audio.mime_type)
+        if (!contentText) {
+          console.error(
+            '[webhook][audio] transcription failed across all providers — sending text fallback:',
+            {
+              mediaId: message.audio.id,
+              mimeType: message.audio.mime_type,
+              audioBytes: buffer.byteLength,
+            },
+          )
+        }
+        return { ...empty, contentText, mediaUrl, mediaType: message.audio.mime_type }
       }
       return empty
     }

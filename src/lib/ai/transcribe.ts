@@ -4,6 +4,11 @@ const WHISPER_MODEL = 'whisper-1'
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1/chat/completions'
 const GEMINI_TRANSCRIBE_MODEL = 'google/gemini-2.5-flash-lite'
 
+// The exact instruction sent to the multimodal model with the audio bytes.
+// Kept in Spanish and unquoted so transcripts come back as plain text.
+const TRANSCRIBE_INSTRUCTION =
+  'Escucha este audio y transcribe con exactitud lo que dice el cliente en texto plano.'
+
 // Strict ceilings so a stuck provider can't hang the WhatsApp webhook.
 // Transcription is on the inbound hot path — every second here delays
 // the bot's reply to the customer.
@@ -36,9 +41,10 @@ export async function transcribeAudio(
       const text = await callGemini(openrouterKey, buffer, mimeType)
       if (text) return text
     } catch (err) {
-      console.warn(
-        '[transcribe] Gemini (gemini-2.5-flash-lite) failed:',
+      console.error(
+        '[transcribe][openrouter] google/gemini-2.5-flash-lite transcription failed:',
         err instanceof Error ? err.message : err,
+        { mimeType, audioBytes: buffer.byteLength, model: GEMINI_TRANSCRIBE_MODEL },
       )
     }
   }
@@ -53,7 +59,10 @@ export async function transcribeAudio(
       )
       if (text) return text
     } catch (err) {
-      console.warn('[transcribe] OpenAI Whisper failed:', (err as Error).message)
+      console.error('[transcribe][openai] Whisper failed:', (err as Error).message, {
+        mimeType,
+        audioBytes: buffer.byteLength,
+      })
     }
   }
 
@@ -67,7 +76,10 @@ export async function transcribeAudio(
       )
       if (text) return text
     } catch (err) {
-      console.warn('[transcribe] Groq Whisper failed:', (err as Error).message)
+      console.error('[transcribe][groq] Whisper failed:', (err as Error).message, {
+        mimeType,
+        audioBytes: buffer.byteLength,
+      })
     }
   }
 
@@ -105,7 +117,7 @@ async function callGemini(
         {
           role: 'user',
           content: [
-            { type: 'text', text: 'Transcribe this voice note.' },
+            { type: 'text', text: TRANSCRIBE_INSTRUCTION },
             {
               type: 'input_audio',
               input_format: audioInputFormat(mimeType),
