@@ -245,6 +245,7 @@ describe('reagendar_cita / cancelar_cita', () => {
                       id: 'cita-1',
                       account_id: 'acct-1',
                       google_event_id: 'evt-123',
+                      fecha_inicio: '2026-09-08T10:00:00-05:00',
                     },
                     error: null,
                   }),
@@ -275,6 +276,113 @@ describe('reagendar_cita / cancelar_cita', () => {
         }),
       }),
     )
+  })
+
+  it('ignores the appointment\'s OWN slot as busy when rescheduling', async () => {
+    // The new time equals the current time (a no-op move). freebusy
+    // reports the event's own interval as busy; reagendar must NOT
+    // treat that self-slot as an obstacle.
+    const selfStart = '2026-09-10T10:00:00-05:00'
+    const selfEnd = '2026-09-10T11:00:00-05:00'
+    h.freebusy.mockResolvedValue({
+      data: {
+        calendars: {
+          [process.env.GOOGLE_CALENDAR_ID!]: {
+            busy: [{ start: selfStart, end: selfEnd }],
+          },
+        },
+      },
+    })
+    const supabase = {
+      from: (table: string) => {
+        if (table === 'citas') {
+          return {
+            select: () => ({
+              eq: () => ({
+                eq: () => ({
+                  maybeSingle: async () => ({
+                    data: {
+                      id: 'cita-1',
+                      account_id: 'acct-1',
+                      google_event_id: 'evt-123',
+                      fecha_inicio: selfStart,
+                    },
+                    error: null,
+                  }),
+                }),
+              }),
+            }),
+            update: () => ({
+              eq: () => ({ eq: () => Promise.resolve({ error: null }) }),
+            }),
+          }
+        }
+        return {}
+      },
+    } as never
+    const out = await reagendar_cita({
+      db: supabase,
+      accountId: 'acct-1',
+      idCita: 'cita-1',
+      nuevoInicio: selfStart,
+    })
+    expect(out).toContain('Cita reagendada')
+    expect(h.freebusy).toHaveBeenCalledTimes(1)
+  })
+
+  it('still rejects a NEW slot that is truly busy', async () => {
+    // Different slot from the event's own window, genuinely occupied by
+    // another event → reagendar must refuse.
+    h.freebusy.mockResolvedValue({
+      data: {
+        calendars: {
+          [process.env.GOOGLE_CALENDAR_ID!]: {
+            busy: [
+              {
+                start: '2026-09-11T15:00:00-05:00',
+                end: '2026-09-11T16:00:00-05:00',
+              },
+            ],
+          },
+        },
+      },
+    })
+    const supabase = {
+      from: (table: string) => {
+        if (table === 'citas') {
+          return {
+            select: () => ({
+              eq: () => ({
+                eq: () => ({
+                  maybeSingle: async () => ({
+                    data: {
+                      id: 'cita-1',
+                      account_id: 'acct-1',
+                      google_event_id: 'evt-123',
+                      fecha_inicio: '2026-09-08T10:00:00-05:00',
+                    },
+                    error: null,
+                  }),
+                }),
+              }),
+            }),
+            update: () => ({
+              eq: () => ({ eq: () => Promise.resolve({ error: null }) }),
+            }),
+          }
+        }
+        return {}
+      },
+    } as never
+    const out = await reagendar_cita({
+      db: supabase,
+      accountId: 'acct-1',
+      idCita: 'cita-1',
+      nuevoInicio: '2026-09-11T15:00:00-05:00',
+    })
+    expect(out).toContain('ya está ocupado')
+    // The busy slot belongs to a different window → it must NOT be excluded.
+    expect(h.patch).not.toHaveBeenCalled()
   })
 
   it('deletes the remote event and marks the row cancelled', async () => {

@@ -58,6 +58,7 @@ export function buildSystemPrompt(args: {
   contactEmail?: string | null
   contactLocation?: string | null
   calendarEnabled?: boolean
+  citas?: { id: string; fecha_inicio: string; estado: string }[] | null
 }): string {
   const {
     userPrompt,
@@ -67,6 +68,7 @@ export function buildSystemPrompt(args: {
     contactEmail,
     contactLocation,
     calendarEnabled,
+    citas,
   } = args
   const parts: string[] = [
     'You are a customer-messaging assistant for a business that uses a WhatsApp CRM. ' +
@@ -105,7 +107,20 @@ export function buildSystemPrompt(args: {
         '3) Only after the customer confirms a slot, call agendar_cita with that start time and their name (and the reason if mentioned); ' +
         '4) Confirm the booked date/time in your reply. ' +
         'For changes, call reagendar_cita(idCita, nuevoInicio); to cancel, call cancelar_cita(idCita) — always check ver_disponibilidad first. ' +
-        'Never invent availability: always use ver_disponibilidad before promising a time.',
+        'Never invent availability, times, or slot lists: only offer times that ver_disponibilidad actually returned, and never promise a time without calling it.',
+    )
+  }
+
+  // The contact's current appointments, so the model can react to
+  // reschedule/cancel requests with the actual `idCita` values.
+  const activeCitas = citas && citas.length > 0 ? citas : []
+  if (activeCitas.length > 0) {
+    parts.push(
+      'This client currently has these confirmed appointments (use the idCita value, NOT the date, ' +
+        'when calling reagendar_cita or cancelar_cita): ' +
+        activeCitas
+          .map((c, i) => `${i + 1}) idCita="${c.id}" at ${c.fecha_inicio}`)
+          .join('; '),
     )
   }
 

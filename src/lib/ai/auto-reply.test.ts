@@ -11,6 +11,7 @@ const h = vi.hoisted(() => ({
   state: {
     conv: null as Record<string, unknown> | null,
     autoResponders: [] as { id: string }[],
+    citas: [] as { id: string; fecha_inicio: string; estado: string }[],
     claim: true as boolean,
     updatePayload: null as Record<string, unknown> | null,
     rpcCalls: [] as { name: string; args: unknown }[],
@@ -36,7 +37,18 @@ vi.mock('./admin-client', () => ({
         }
         return chain
       }
-      // conversations
+      if (table === 'citas') {
+        // loadContactContext: .select().eq('contact_id').eq('estado')
+        return {
+          select: () => ({
+            eq: () => ({
+              eq: () =>
+                Promise.resolve({ data: h.state.citas, error: null }),
+            }),
+          }),
+        }
+      }
+      // contacts (reads) + conversations (reads + writes)
       return {
         select: () => ({
           eq: () => ({
@@ -88,6 +100,7 @@ beforeEach(() => {
     ai_reply_count: 0,
   }
   h.state.autoResponders = []
+  h.state.citas = []
   h.state.claim = true
   h.state.updatePayload = null
   h.state.rpcCalls = []
@@ -118,6 +131,16 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.retrieveKnowledge).toHaveBeenCalled()
     const systemPrompt = h.generateReply.mock.calls[0][0].systemPrompt as string
     expect(systemPrompt).toContain('Returns accepted within 30 days.')
+  })
+
+  it('injects the contact\'s active citas ids into the system prompt', async () => {
+    h.state.citas = [
+      { id: 'cita-9', fecha_inicio: '2026-09-10T10:00:00-05:00', estado: 'confirmada' },
+    ]
+    await dispatchInboundToAiReply(ARGS)
+    const systemPrompt = h.generateReply.mock.calls[0][0].systemPrompt as string
+    expect(systemPrompt).toContain('idCita="cita-9"')
+    expect(systemPrompt).toContain('2026-09-10T10:00:00-05:00')
   })
 
   it('stands down when an active message-level automation exists', async () => {

@@ -97,6 +97,7 @@ export async function dispatchInboundToAiReply(
       contactEmail: contactCtx?.email,
       contactLocation: contactCtx?.location,
       calendarEnabled: calendarConfigured(),
+      citas: contactCtx?.citas,
     })
 
     // Tool execution loop: the model may request tool calls before

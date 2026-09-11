@@ -110,13 +110,16 @@ export const REAGENDAR_CITA_TOOL: ToolDefinition = {
   name: 'reagendar_cita',
   description:
     'Reschedule an existing appointment to a new start time. ' +
-    'Call ver_disponibilidad first to find a free slot.',
+    'Call ver_disponibilidad first to find a free slot; the appointment\'s own ' +
+    'current slot is excluded from availability checks, so moving it back to its ' +
+    'current time is allowed. Use the idCita value of this client\'s ' +
+    'confirmed appointment (listed in your instructions), not a date.',
   parameters: {
     type: 'object',
     properties: {
       idCita: {
         type: 'string',
-        description: 'The appointment id returned when it was booked',
+        description: 'The appointment id of one of this client\'s confirmed appointments',
       },
       nuevoInicio: {
         type: 'string',
@@ -138,7 +141,7 @@ export const CANCELAR_CITA_TOOL: ToolDefinition = {
     properties: {
       idCita: {
         type: 'string',
-        description: 'The appointment id returned when it was booked',
+        description: 'The appointment id of one of this client\'s confirmed appointments',
       },
     },
     required: ['idCita'],
@@ -250,17 +253,37 @@ async function handleUpdateClientProfile(
 }
 
 /**
- * Load the contact record for context injection into the system prompt.
+ * Contact context loaded for the system prompt: profile fields plus the
+ * contact's currently-confirmed appointments so the model can pick the
+ * right `idCita` for reagendar_cita / cancelar_cita.
+ */
+export interface ContactContext {
+  name: string | null
+  email: string | null
+  location: string | null
+  citas: { id: string; fecha_inicio: string; estado: string }[]
+}
+
+/**
+ * Load the contact record (profile + active citas) for context
+ * injection into the system prompt.
  */
 export async function loadContactContext(
   db: SupabaseClient,
   contactId: string,
-): Promise<{ name: string | null; email: string | null; location: string | null } | null> {
-  const { data, error } = await db
-    .from('contacts')
-    .select('name, email, company')
-    .eq('id', contactId)
-    .maybeSingle()
+): Promise<ContactContext | null> {
+  const [{ data, error }, { data: citas }] = await Promise.all([
+    db
+      .from('contacts')
+      .select('name, email, company')
+      .eq('id', contactId)
+      .maybeSingle(),
+    db
+      .from('citas')
+      .select('id, fecha_inicio, estado')
+      .eq('contact_id', contactId)
+      .eq('estado', 'confirmada'),
+  ])
 
   if (error || !data) return null
 
@@ -268,5 +291,6 @@ export async function loadContactContext(
     name: data.name ?? null,
     email: data.email ?? null,
     location: data.company ?? null,
+    citas: Array.isArray(citas) ? citas : [],
   }
 }

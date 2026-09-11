@@ -161,9 +161,15 @@ interface BusyInterval {
   end: Date
 }
 
+/** True when interval `a` is fully contained in interval `b`. */
+function isInside(a: BusyInterval, b: BusyInterval): boolean {
+  return a.start.getTime() >= b.start.getTime() && a.end.getTime() <= b.end.getTime()
+}
+
 async function fetchBusy(
   from: Date,
   to: Date,
+  exclude?: BusyInterval | null,
 ): Promise<BusyInterval[]> {
   const cal = calendarClient()
   const res = await cal.freebusy.query({
@@ -178,6 +184,7 @@ async function fetchBusy(
   return busy
     .filter((b) => b.start && b.end)
     .map((b) => ({ start: new Date(b.start!), end: new Date(b.end!) }))
+    .filter((b) => !exclude || !isInside(b, exclude))
     .sort((a, b) => a.start.getTime() - b.start.getTime())
 }
 
@@ -361,7 +368,7 @@ export async function reagendar_cita(
 
   const { data: cita, error: findErr } = await db
     .from('citas')
-    .select('id, google_event_id, account_id')
+    .select('id, google_event_id, account_id, fecha_inicio')
     .eq('id', idCita)
     .eq('account_id', accountId)
     .maybeSingle()
@@ -369,8 +376,26 @@ export async function reagendar_cita(
     return 'Error: no se encontró la cita indicada.'
   }
 
+  // The event being moved still occupies its current slot in the
+  // calendar until we PATCH it, so its own window must not count as
+  // "busy" when checking availability for the new start time.
+  const oldStart = new Date(cita.fecha_inicio)
+  const oldInterval: BusyInterval | null =
+    Number.isNaN(oldStart.getTime())
+      ? null
+      : {
+          start: oldStart,
+          end: new Date(
+            oldStart.getTime() + APPOINTMENT_DURATION_MIN * 60_000,
+          ),
+        }
+
   try {
-    const busy = await fetchBusy(start, new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000))
+    const busy = await fetchBusy(
+      start,
+      new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000),
+      oldInterval,
+    )
     if (busy.length > 0) {
       return 'Error: ese horario ya está ocupado. Consulta ver_disponibilidad antes de reagendar.'
     }
