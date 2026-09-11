@@ -103,10 +103,16 @@ export function mergeConsecutive(messages: ChatMessage[]): ChatMessage[] {
   const out: ChatMessage[] = []
   for (const m of messages) {
     const last = out[out.length - 1]
-    if (last && last.role === m.role && !m.images?.length && !last.images?.length) {
+    const sameRole =
+      last &&
+      last.role === m.role &&
+      last.role !== 'tool' &&
+      !m.images?.length &&
+      !last.images?.length
+    if (sameRole) {
       last.content = `${last.content}\n\n${m.content}`
     } else {
-      out.push({ role: m.role, content: m.content, images: m.images })
+      out.push({ ...m })
     }
   }
   return out

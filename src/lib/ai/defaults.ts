@@ -57,8 +57,17 @@ export function buildSystemPrompt(args: {
   contactName?: string | null
   contactEmail?: string | null
   contactLocation?: string | null
+  calendarEnabled?: boolean
 }): string {
-  const { userPrompt, mode, knowledge, contactName, contactEmail, contactLocation } = args
+  const {
+    userPrompt,
+    mode,
+    knowledge,
+    contactName,
+    contactEmail,
+    contactLocation,
+    calendarEnabled,
+  } = args
   const parts: string[] = [
     'You are a customer-messaging assistant for a business that uses a WhatsApp CRM. ' +
       'You are shown the recent WhatsApp conversation between the business (assistant) and a customer (user). ' +
@@ -84,6 +93,19 @@ export function buildSystemPrompt(args: {
     parts.push(
       'If the customer shares personal information (name, email, location, project type, budget), ' +
         'invoke the update_client_profile tool to save it for future interactions.',
+    )
+  }
+
+  if (calendarEnabled) {
+    parts.push(
+      'Appointment booking is available. Business hours (America/Lima): Monday to Friday 09:00-18:00, Saturday 09:00-13:00. ' +
+        'When the customer asks for an appointment, follow this flow: ' +
+        '1) Call ver_disponibilidad with the date(s) the customer wants to see available slots; ' +
+        '2) Show the customer the free times and ask which one they prefer; ' +
+        '3) Only after the customer confirms a slot, call agendar_cita with that start time and their name (and the reason if mentioned); ' +
+        '4) Confirm the booked date/time in your reply. ' +
+        'For changes, call reagendar_cita(idCita, nuevoInicio); to cancel, call cancelar_cita(idCita) — always check ver_disponibilidad first. ' +
+        'Never invent availability: always use ver_disponibilidad before promising a time.',
     )
   }
 

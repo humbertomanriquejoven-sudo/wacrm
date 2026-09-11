@@ -42,10 +42,33 @@ export async function generateOpenAi(
   const { apiKey, model, systemPrompt, messages, timeoutMs, tools } = args
 
   const merged = mergeConsecutive(messages)
-  const msgPayload = merged.map((m) => ({
-    role: m.role,
-    content: toOpenAiContent(m),
-  }))
+  const msgPayload = merged.map((m) => {
+    if (m.role === 'tool') {
+      return {
+        role: 'tool',
+        tool_call_id: m.toolCallId,
+        content: m.content,
+      }
+    }
+    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
+      return {
+        role: 'assistant',
+        content: m.content || null,
+        tool_calls: m.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: 'function',
+          function: {
+            name: tc.name,
+            arguments: JSON.stringify(tc.arguments),
+          },
+        })),
+      }
+    }
+    return {
+      role: m.role,
+      content: toOpenAiContent(m),
+    }
+  })
 
   const body: Record<string, unknown> = {
     model,

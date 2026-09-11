@@ -27,9 +27,13 @@ export interface AiConfig {
 
 /** A single conversation turn in the shape both providers accept. */
 export interface ChatMessage {
-  role: 'user' | 'assistant'
+  role: 'user' | 'assistant' | 'tool'
   content: string
   images?: string[]
+  /** For `role: 'tool'` — the id of the tool call this result answers. */
+  toolCallId?: string
+  /** For `role: 'assistant'` — tool calls the model requested. */
+  toolCalls?: ToolCall[]
 }
 
 export interface AiUsage {

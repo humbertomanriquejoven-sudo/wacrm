@@ -8,6 +8,7 @@ import { buildHandoffSummary } from './handoff'
 import { logAiUsage } from './usage'
 import { latestUserMessage } from './query'
 import { AI_TOOLS, executeToolCall, loadContactContext } from './tools'
+import { calendarConfigured } from '@/lib/calendar'
 import { engineSendText } from '@/lib/flows/meta-send'
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit'
 import type { ChatMessage } from './types'
@@ -95,6 +96,7 @@ export async function dispatchInboundToAiReply(
       contactName: contactCtx?.name,
       contactEmail: contactCtx?.email,
       contactLocation: contactCtx?.location,
+      calendarEnabled: calendarConfigured(),
     })
 
     // Tool execution loop: the model may request tool calls before
@@ -118,15 +120,24 @@ export async function dispatchInboundToAiReply(
 
       // If the model returned tool calls, execute them and continue.
       if (result.toolCalls && result.toolCalls.length > 0) {
+        const toolResults: ChatMessage[] = []
         for (const tc of result.toolCalls) {
-          await executeToolCall(db, accountId, contactId, tc)
+          const output = await executeToolCall(db, accountId, contactId, tc)
+          toolResults.push({
+            role: 'tool',
+            content: output,
+            toolCallId: tc.id,
+          })
         }
-        // Append a synthetic assistant message + tool results so the
-        // model sees the tools were called, then loop for a final reply.
+        // Append the assistant message carrying the requested tool_calls
+        // plus the results so the model can reason over them on the next
+        // round, then loop for a final reply.
         conversationMessages.push({
           role: 'assistant',
-          content: result.text || '(tool call)',
+          content: result.text || '',
+          toolCalls: result.toolCalls,
         })
+        conversationMessages.push(...toolResults)
         continue
       }
 

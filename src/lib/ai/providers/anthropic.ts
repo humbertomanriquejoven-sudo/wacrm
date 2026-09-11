@@ -18,6 +18,8 @@ interface AnthropicContent {
   id?: string
   name?: string
   input?: Record<string, unknown>
+  tool_use_id?: string
+  content?: string | AnthropicContent[]
 }
 
 interface AnthropicResponse {
@@ -38,6 +40,78 @@ function normalizeForAnthropic(messages: ChatMessage[]): ChatMessage[] {
 }
 
 /**
+ * Build the Anthropic `messages` payload. Tool calls come back as
+ * `tool_use` content blocks on the assistant message; tool results are
+ * `tool_result` blocks on a `user` message (Anthropic's protocol has no
+ * `role: 'tool'`). Consecutive tool results are packed into a single
+ * user message with multiple blocks, so the old text-annotated approach
+ * also stays compatible.
+ */
+function buildAnthropicPayload(
+  merged: ChatMessage[],
+): Array<{ role: ChatMessage['role']; content: AnthropicContent[] | string }> {
+  const out: Array<{
+    role: ChatMessage['role']
+    content: AnthropicContent[] | string
+  }> = []
+
+  for (const m of merged) {
+    if (m.role === 'tool') {
+      out.push({
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: m.toolCallId ?? '',
+            content: m.content,
+          },
+        ],
+      })
+      continue
+    }
+
+    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
+      const blocks: AnthropicContent[] = []
+      if (m.content) blocks.push({ type: 'text', text: m.content })
+      for (const tc of m.toolCalls) {
+        blocks.push({
+          type: 'tool_use',
+          id: tc.id,
+          name: tc.name,
+          input: tc.arguments,
+        })
+      }
+      out.push({ role: 'assistant', content: blocks })
+      continue
+    }
+
+    out.push({ role: m.role, content: toAnthropicContent(m) })
+  }
+
+  // Anthropic requires strictly alternating roles, and every tool_result
+  // user message must directly follow the assistant tool_use block.
+  // Merge consecutive tool-result user messages into one, and if a lone
+  // tool user message ever precedes a user message (no assistant between
+  // them), leave it as-is — Anthropic handles adjacent tool results.
+  const collapsed: typeof out = []
+  for (const msg of out) {
+    const last = collapsed[collapsed.length - 1]
+    if (
+      last &&
+      last.role === 'user' &&
+      msg.role === 'user' &&
+      Array.isArray(last.content) &&
+      last.content[0]?.type === 'tool_result'
+    ) {
+      last.content = [...(last.content as AnthropicContent[]), ...(msg.content as AnthropicContent[])]
+      continue
+    }
+    collapsed.push({ ...msg })
+  }
+  return collapsed
+}
+
+/**
  * Call Anthropic's Messages endpoint with the caller's own key.
  * Returns the raw assistant text + token usage (handoff parsing happens
  * in `generateReply`).
@@ -48,10 +122,7 @@ export async function generateAnthropic(
   const { apiKey, model, systemPrompt, messages, timeoutMs, tools } = args
 
   const normalized = normalizeForAnthropic(messages)
-  const msgPayload = normalized.map((m) => ({
-    role: m.role,
-    content: toAnthropicContent(m),
-  }))
+  const msgPayload = buildAnthropicPayload(normalized)
 
   const body: Record<string, unknown> = {
     model,
