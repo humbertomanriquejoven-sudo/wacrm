@@ -129,6 +129,29 @@ export interface ContactTag {
   tag_id: string;
 }
 
+/**
+ * Appointment row from the `citas` table (migration 042). The Google
+ * Calendar event is the source of truth; this row is the CRM link
+ * (contact + stable uuid). `google_event_id` is the remote event id.
+ */
+export interface Cita {
+  id: string;
+  account_id: string;
+  contact_id: string;
+  google_event_id: string;
+  fecha_inicio: string;
+  fecha_fin: string;
+  estado: "confirmada" | "cancelada";
+  motivo: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Cita with the related contact hydrated (embedded FK `contact`). */
+export interface CitaWithContact extends Cita {
+  contact?: Pick<Contact, "id" | "name" | "phone" | "email"> | null;
+}
+
 export interface CustomField {
   id: string;
   user_id: string;
