@@ -79,15 +79,18 @@ export async function dispatchInboundToAiReply(
       return
     }
 
-    const knowledge = await retrieveKnowledge(
-      db,
-      accountId,
-      config,
-      latestUserMessage(messages),
-    )
-
-    // Load contact context for the system prompt.
-    const contactCtx = await loadContactContext(db, contactId)
+    // Pre-LLM context is fetched in parallel (knowledge retrieval and
+    // the contact profile/citas are independent) so the reply isn't held
+    // for two sequential DB + embedding round trips.
+    const [knowledge, contactCtx] = await Promise.all([
+      retrieveKnowledge(
+        db,
+        accountId,
+        config,
+        latestUserMessage(messages),
+      ),
+      loadContactContext(db, contactId),
+    ])
 
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,

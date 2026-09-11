@@ -1015,6 +1015,9 @@ export async function getMediaUrl(
   const { mediaId, accessToken } = args
   const response = await fetch(`${META_API_BASE}/${mediaId}`, {
     headers: { Authorization: `Bearer ${accessToken}` },
+    // Strict ceiling — a stuck Meta call must not block the webhook's
+    // `after()` pipeline (which feeds the AI reply).
+    signal: AbortSignal.timeout(10_000),
   })
   if (!response.ok) {
     await throwMetaError(response, `Media fetch failed: ${response.status}`)
@@ -1046,6 +1049,7 @@ export async function downloadMedia(
   const { downloadUrl, accessToken } = args
   const response = await fetch(downloadUrl, {
     headers: { Authorization: `Bearer ${accessToken}` },
+    signal: AbortSignal.timeout(10_000),
   })
   if (!response.ok) {
     throw new Error(`Media download failed: ${response.status}`)

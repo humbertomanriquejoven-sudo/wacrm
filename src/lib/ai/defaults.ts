@@ -27,7 +27,11 @@ export const HANDOFF_SENTINEL = '[[HANDOFF]]'
  *  bounds token spend on the caller's own key. */
 export const MAX_OUTPUT_TOKENS = 1024
 
-const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+// Per-call ceiling tuned for sub-5s bot replies: a stuck provider call
+// must fail fast and hand back to the retry/next-inbound path instead of
+// holding the webhook's `after()` pipeline. Override with
+// `AI_REQUEST_TIMEOUT_MS`.
+const DEFAULT_REQUEST_TIMEOUT_MS = 8_000
 const DEFAULT_CONTEXT_MESSAGE_LIMIT = 20
 
 /** Per-call provider timeout. Override with `AI_REQUEST_TIMEOUT_MS`. */

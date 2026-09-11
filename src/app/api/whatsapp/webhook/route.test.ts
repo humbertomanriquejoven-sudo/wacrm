@@ -250,9 +250,17 @@ vi.mock('@/lib/ai/auto-reply', () => ({
 vi.mock('@/lib/webhooks/deliver', () => ({
   dispatchWebhookEvent: h.dispatchWebhookEvent,
 }))
+vi.mock('@/lib/ai/transcribe', () => ({
+  transcribeAudio: vi.fn(),
+}))
+vi.mock('@/lib/flows/meta-send', () => ({
+  engineSendText: vi.fn(),
+}))
 
 import { POST } from './route'
 import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
+import { transcribeAudio } from '@/lib/ai/transcribe'
+import { engineSendText } from '@/lib/flows/meta-send'
 import {
   findExistingContact,
   findContactByNameWithoutPhone,
@@ -260,6 +268,8 @@ import {
 
 const mockGetMediaUrl = vi.mocked(getMediaUrl)
 const mockDownloadMedia = vi.mocked(downloadMedia)
+const mockTranscribeAudio = vi.mocked(transcribeAudio)
+const mockEngineSendText = vi.mocked(engineSendText)
 const mockFindExistingContact = vi.mocked(findExistingContact)
 const mockFindContactByNameWithoutPhone = vi.mocked(findContactByNameWithoutPhone)
 
@@ -328,6 +338,8 @@ beforeEach(() => {
     buffer: Buffer.alloc(2048),
     contentType: 'image/jpeg',
   })
+  mockTranscribeAudio.mockResolvedValue(null)
+  mockEngineSendText.mockResolvedValue({ whatsapp_message_id: 'wamid.FALLBACK' })
   h.dispatchInboundToFlows.mockResolvedValue({ consumed: false })
   h.dispatchInboundToAiReply.mockResolvedValue(undefined)
   h.dispatchWebhookEvent.mockResolvedValue(undefined)
@@ -452,6 +464,67 @@ describe('inbound webhook: template quick-reply buttons (#478)', () => {
       content_text: 'Track my order',
       interactive_reply_id: 'Track my order',
     })
+  })
+})
+
+describe('inbound webhook: voice notes', () => {
+  // OGG opus from WhatsApp (default voice note envelope).
+  const AUDIO_MESSAGE = {
+    id: 'wamid.VOICE1',
+    from: '15551230000',
+    timestamp: '1700000000',
+    type: 'audio',
+    audio: { id: 'media-1', mime_type: 'audio/ogg; codecs=opus' },
+  }
+
+  it('transcribes the note and fans out on the transcript', async () => {
+    mockTranscribeAudio.mockResolvedValue(
+      'Quiero agendar una cita para el martes',
+    )
+
+    await runWebhook(AUDIO_MESSAGE)
+
+    expect(mockTranscribeAudio).toHaveBeenCalledWith(
+      expect.any(Buffer),
+      'audio/ogg; codecs=opus',
+    )
+    expect(h.state.upsertCalls[0].row).toMatchObject({
+      content_type: 'audio',
+      content_text: 'Quiero agendar una cita para el martes',
+    })
+    // Downstream fan-out runs on the transcript, as if it were text.
+    expect(h.dispatchInboundToFlows).toHaveBeenCalledTimes(1)
+    expect(h.dispatchInboundToAiReply).toHaveBeenCalledTimes(1)
+    expect(h.dispatchWebhookEvent).toHaveBeenCalledTimes(1)
+    expect(mockEngineSendText).not.toHaveBeenCalled()
+  })
+
+  it('sends a friendly fallback when transcription fails', async () => {
+    mockTranscribeAudio.mockResolvedValue(null)
+
+    await runWebhook(AUDIO_MESSAGE)
+
+    // The note is still persisted for the record.
+    expect(h.state.upsertCalls).toHaveLength(1)
+    expect(h.state.upsertCalls[0].row).toMatchObject({
+      content_type: 'audio',
+      content_text: null,
+      media_type: 'audio/ogg; codecs=opus',
+    })
+    // Friendly ask-it-in-text reply goes out.
+    expect(mockEngineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('nota de voz'),
+        contactId: 'contact-1',
+        conversationId: 'conv-1',
+      }),
+    )
+    // With nothing to act on, flows / automations / AI stay out.
+    expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
+    expect(h.runAutomationsForTrigger).not.toHaveBeenCalled()
+    expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
+    // message.received still fires so external listeners know it arrived.
+    expect(h.dispatchWebhookEvent).toHaveBeenCalledTimes(1)
   })
 })
 

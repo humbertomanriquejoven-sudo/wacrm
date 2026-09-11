@@ -169,6 +169,7 @@ describe('agendar_cita', () => {
           start: expect.objectContaining({ dateTime: expect.stringContaining('2026-09-14T10:00:00') }),
         }),
       }),
+      expect.objectContaining({ timeout: 5000 }),
     )
     const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
     expect(insert).toMatchObject({
@@ -275,6 +276,7 @@ describe('reagendar_cita / cancelar_cita', () => {
           start: expect.objectContaining({ dateTime: expect.stringContaining('2026-09-15T11:00:00') }),
         }),
       }),
+      expect.objectContaining({ timeout: 5000 }),
     )
   })
 
@@ -416,6 +418,7 @@ describe('reagendar_cita / cancelar_cita', () => {
     expect(out).toContain('Cita cancelada')
     expect(h.del).toHaveBeenCalledWith(
       expect.objectContaining({ calendarId: process.env.GOOGLE_CALENDAR_ID, eventId: 'evt-123' }),
+      expect.objectContaining({ timeout: 5000 }),
     )
   })
 

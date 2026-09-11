@@ -13,6 +13,7 @@ import { reopenClosedConversation } from '@/lib/conversations/reopen'
 import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
+import { engineSendText } from '@/lib/flows/meta-send'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
 import { transcribeAudio } from '@/lib/ai/transcribe'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
@@ -642,6 +643,12 @@ async function processMessage(
       mirrorMedia ? { accountId } : null
     )
 
+  // Voice notes that couldn't be transcribed carry no text for flows,
+  // automations or the AI to act on — the note is still stored below so
+  // the inbox shows the attachment, and we politely ask the customer to
+  // fall back to text further down.
+  const audioFailedTranscription = message.type === 'audio' && !contentText
+
   // Resolve swipe-reply context if present. A missing parent is fine —
   // we just store NULL and the UI renders the message without a quote.
   let replyToInternalId: string | null = null
@@ -773,6 +780,32 @@ async function processMessage(
   // so the broadcast's `replied_count` advances (via the aggregate
   // trigger installed in migration 003).
   await flagBroadcastReplyIfAny(accountId, contactRecord.id)
+
+  // Voice note we couldn't transcribe: ask the customer kindly to send
+  // text. The deterministic engine, automations and the AI have nothing
+  // to act on (no transcript), so we surface message.received and stop.
+  if (audioFailedTranscription) {
+    try {
+      await engineSendText({
+        accountId,
+        userId: configOwnerUserId,
+        conversationId: conversation.id,
+        contactId: contactRecord.id,
+        text: 'No pude procesar tu nota de voz. ¿Me la escribes con texto, por favor?',
+      })
+    } catch (err) {
+      console.error('[webhook] audio fallback reply failed:', err)
+    }
+
+    await dispatchWebhookEvent(supabaseAdmin(), accountId, 'message.received', {
+      conversation_id: conversation.id,
+      contact_id: contactRecord.id,
+      whatsapp_message_id: message.id,
+      content_type: contentType,
+      text: contentText,
+    })
+    return
+  }
 
   // ============================================================
   // Flow runner dispatch.
@@ -1022,25 +1055,54 @@ async function parseMessageContent(
       }
       return empty
 
-    case 'audio':
+    case 'audio': {
       if (message.audio?.id) {
-        const mediaUrl = await verifyAndBuildUrl(message.audio.id)
-        let contentText: string | null = null
         try {
+          // Voice-note hot path: resolve + download the bytes ONCE, then
+          // reuse the same buffer for both the mirror and the
+          // transcription. The previous shape fetched getMediaUrl twice
+          // and downloaded the file twice (once for the mirror, once for
+          // transcription), doubling audio latency on the way to the AI
+          // reply.
           const info = await getMediaUrl({ mediaId: message.audio.id, accessToken })
-          const { buffer } = await downloadMedia({ downloadUrl: info.url, accessToken })
-          contentText = await transcribeAudio(buffer, message.audio.mime_type)
+          const { buffer } = await downloadMedia({
+            downloadUrl: info.url,
+            accessToken,
+          })
+
+          let mediaUrl: string | null = null
+          if (mirror) {
+            mediaUrl = await mirrorInboundMedia({
+              storage: supabaseAdmin().storage,
+              accountId: mirror.accountId,
+              mediaId: message.audio.id,
+              downloadUrl: info.url,
+              accessToken,
+              mimeType: info.mimeType,
+              fileSize: info.fileSize,
+              messageTimestamp: message.timestamp,
+              // Serve the mirror from the bytes we already hold instead of
+              // a second CDN round-trip (mirrorInboundMedia only uses the
+              // injected download when it needs the media).
+              download: async () => ({
+                buffer,
+                contentType: info.mimeType,
+              }),
+            })
+          }
+          mediaUrl ??= `/api/whatsapp/media/${message.audio.id}`
+
+          // The transcript becomes the message's content so the AI bot
+          // replies to what was actually said.
+          const contentText = await transcribeAudio(buffer, message.audio.mime_type)
+          return { ...empty, contentText, mediaUrl, mediaType: message.audio.mime_type }
         } catch (err) {
-          console.warn('[webhook] audio transcription failed:', (err as Error).message)
-        }
-        return {
-          ...empty,
-          contentText,
-          mediaUrl,
-          mediaType: message.audio.mime_type,
+          console.warn('[webhook] audio processing failed:', (err as Error).message)
+          return { ...empty, mediaType: message.audio.mime_type }
         }
       }
       return empty
+    }
 
     case 'sticker':
       // Stickers are images under the hood. Treat them as such so the

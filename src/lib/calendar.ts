@@ -26,6 +26,14 @@ const SVC_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON ?? ''
 const CAL_TIMEZONE = 'America/Lima'
 export const APPOINTMENT_DURATION_MIN = 60
 
+/**
+ * Strict per-request timeout for every Google Calendar network call. A
+ * hung freebusy/event call must not block the AI tool round (or the
+ * webhook pipeline); it fails fast and the tool returns a readable
+ * error instead of stalling the bot.
+ */
+const CALENDAR_TIMEOUT_MS = 5_000
+
 export const BUSINESS_HOURS: Record<
   number,
   { openMin: number; closeMin: number } | undefined
@@ -179,7 +187,7 @@ async function fetchBusy(
       timeZone: CAL_TIMEZONE,
       items: [{ id: CAL_ID }],
     },
-  })
+  }, { timeout: CALENDAR_TIMEOUT_MS })
   const busy = res.data.calendars?.[CAL_ID]?.busy ?? []
   return busy
     .filter((b) => b.start && b.end)
@@ -320,7 +328,7 @@ export async function agendar_cita(
           timeZone: CAL_TIMEZONE,
         },
       },
-    })
+    }, { timeout: CALENDAR_TIMEOUT_MS })
     event = { id: created.data.id }
   } catch (err) {
     console.error('[calendar] events.insert failed:', err)
@@ -416,7 +424,7 @@ export async function reagendar_cita(
           timeZone: CAL_TIMEZONE,
         },
       },
-    })
+    }, { timeout: CALENDAR_TIMEOUT_MS })
   } catch (err) {
     console.error('[calendar] events.patch failed:', err)
     return 'Error: Google Calendar no pudo reagendar la cita.'
@@ -468,7 +476,7 @@ export async function cancelar_cita(
     await cal.events.delete({
       calendarId: CAL_ID,
       eventId: cita.google_event_id,
-    })
+    }, { timeout: CALENDAR_TIMEOUT_MS })
   } catch (err) {
     console.error('[calendar] events.delete failed:', err)
     return 'Error: Google Calendar no pudo eliminar la cita.'
