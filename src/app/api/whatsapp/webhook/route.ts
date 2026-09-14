@@ -1,7 +1,7 @@
 import { NextResponse, after } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
-import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
+import { getMediaUrl, downloadMedia, sendTypingIndicator } from '@/lib/whatsapp/meta-api'
 import { mirrorInboundMedia } from '@/lib/whatsapp/mirror-inbound-media'
 import { normalizePhone } from '@/lib/whatsapp/phone-utils'
 import {
@@ -324,6 +324,9 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
           // the admin who saved the WhatsApp config.
           config.user_id,
           decryptedAccessToken,
+          // The number the inbound hit — used for the typing indicator
+          // sent back to the customer on the bot reply path.
+          config.phone_number_id,
           // Default ON: the column is NOT NULL DEFAULT TRUE, but a row
           // read before migration 039 lands would have it undefined,
           // and losing attachments is the failure mode worth avoiding.
@@ -596,12 +599,37 @@ async function processMessage(
   // WhatsApp config; the choice is arbitrary post-017 but stable.
   configOwnerUserId: string,
   accessToken: string,
+  // The WhatsApp number this inbound arrived on — drives the outbound
+  // typing indicator for the bot's reply path.
+  phoneNumberId: string,
   // Per-account opt-out for the inbound-media mirror (migration 039).
   // See parseMessageContent for what it turns off.
   mirrorMedia: boolean
 ) {
   const senderPhone = normalizePhone(message.from)
   const contactName = contact.profile.name
+
+  // Show the WhatsApp typing indicator IMMEDIATELY so the customer sees
+  // the bot "is typing" while we process text / voice notes. Fire-and-
+  // forget and strictly best-effort: a failed indicator must never break
+  // inbound processing. Meta dismisses it automatically when the reply
+  // message is delivered, or after 25 seconds, whichever comes first.
+  if (
+    message.type === 'text' ||
+    message.type === 'audio' ||
+    message.type === 'voice'
+  ) {
+    sendTypingIndicator({
+      phoneNumberId,
+      accessToken,
+      messageId: message.id,
+    }).catch((err) => {
+      console.error(
+        '[webhook] typing indicator failed:',
+        err instanceof Error ? err.message : err,
+      )
+    })
+  }
 
   // Find or create contact
   const contactOutcome = await findOrCreateContact(

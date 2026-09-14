@@ -660,6 +660,60 @@ export async function deleteMessageTemplate(
 }
 
 // ============================================================
+// Typing indicator (read receipt + "…" bubble)
+// ============================================================
+
+// Typing indicators were introduced after v21.0 (the base version used
+// by the send helpers) — the official docs show this call on v24+, so
+// it gets its own version constant rather than bumping every endpoint.
+const TYPING_INDICATOR_API_VERSION = 'v24.0'
+
+export interface SendTypingIndicatorArgs {
+  phoneNumberId: string
+  accessToken: string
+  /** Meta's id of the inbound message being answered (webhook `messages[].id`). */
+  messageId: string
+}
+
+/**
+ * Show a WhatsApp typing indicator for a received message.
+ *
+ * Meta has no dedicated "composing" endpoint — the way to display the
+ * typing bubble is a single message request with `status: 'read'` plus
+ * a `typing_indicator` block. It marks the inbound as read (blue double
+ * checks) and shows the "…" indicator on the customer's device until we
+ * reply (which dismisses it automatically) or 25 seconds elapse,
+ * whichever comes first. The response is `{ success: true }`, not a
+ * message-id envelope.
+ *
+ * Best-effort by nature: callers should fire-and-forget it — a failed
+ * indicator must never block webhook processing. Throws only on a
+ * non-2xx from Meta (consistent with the other helpers).
+ */
+export async function sendTypingIndicator(
+  args: SendTypingIndicatorArgs,
+): Promise<void> {
+  const { phoneNumberId, accessToken, messageId } = args
+  const url = `https://graph.facebook.com/${TYPING_INDICATOR_API_VERSION}/${phoneNumberId}/messages`
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      status: 'read',
+      message_id: messageId,
+      typing_indicator: { type: 'text' },
+    }),
+  })
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`)
+  }
+}
+
+// ============================================================
 // Reactions
 // ============================================================
 

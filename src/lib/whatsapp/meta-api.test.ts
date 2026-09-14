@@ -3,6 +3,7 @@ import {
   INTERACTIVE_LIMITS,
   sendInteractiveButtons,
   sendInteractiveList,
+  sendTypingIndicator,
 } from "./meta-api";
 
 // All assertions in this file run BEFORE the network call. We stub fetch
@@ -265,5 +266,72 @@ describe("sendInteractiveList — validation", () => {
         },
       },
     });
+  });
+});
+
+describe("sendTypingIndicator", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn(neverFetch));
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("sends the read-receipt + typing_indicator payload on the newer API version", async () => {
+    let captured: { url: string; body: unknown; method: string; headers: HeadersInit } | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit) => {
+        captured = {
+          url,
+          method: init.method ?? "GET",
+          body: JSON.parse(String(init.body)),
+          headers: init.headers as HeadersInit,
+        };
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+      }),
+    );
+
+    await sendTypingIndicator({
+      phoneNumberId: "test-phone",
+      accessToken: "test-token",
+      messageId: "wamid.INBOUND_1",
+    });
+
+    expect(captured).not.toBeNull();
+    expect(captured!.method).toBe("POST");
+    expect(captured!.url).toBe(
+      "https://graph.facebook.com/v24.0/test-phone/messages",
+    );
+    expect(captured!.body).toEqual({
+      messaging_product: "whatsapp",
+      status: "read",
+      message_id: "wamid.INBOUND_1",
+      typing_indicator: { type: "text" },
+    });
+    expect(captured!.headers).toMatchObject({
+      "Content-Type": "application/json",
+      Authorization: "Bearer test-token",
+    });
+  });
+
+  it("throws with Meta's error message when the API rejects the indicator", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({ error: { message: "Unsupported API version" } }),
+          { status: 400 },
+        ),
+      ),
+    );
+
+    await expect(
+      sendTypingIndicator({
+        phoneNumberId: "test-phone",
+        accessToken: "test-token",
+        messageId: "wamid.INBOUND_1",
+      }),
+    ).rejects.toThrow("Unsupported API version");
   });
 });

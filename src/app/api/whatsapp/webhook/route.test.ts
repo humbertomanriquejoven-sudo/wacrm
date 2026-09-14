@@ -80,6 +80,7 @@ vi.mock('@supabase/supabase-js', () => ({
                     {
                       account_id: 'acc-1',
                       user_id: 'user-1',
+                      phone_number_id: 'pn-1',
                       access_token: 'enc',
                       mirror_inbound_media: h.state.mirrorInboundMedia,
                     },
@@ -249,6 +250,7 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
 vi.mock('@/lib/whatsapp/meta-api', () => ({
   getMediaUrl: vi.fn(),
   downloadMedia: vi.fn(),
+  sendTypingIndicator: vi.fn(),
 }))
 vi.mock('@/lib/contacts/dedupe', () => ({
   findExistingContact: vi.fn(),
@@ -282,7 +284,7 @@ vi.mock('@/lib/flows/meta-send', () => ({
 }))
 
 import { POST } from './route'
-import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
+import { getMediaUrl, downloadMedia, sendTypingIndicator } from '@/lib/whatsapp/meta-api'
 import { transcribeAudio } from '@/lib/ai/transcribe'
 import { engineSendText } from '@/lib/flows/meta-send'
 import {
@@ -292,6 +294,7 @@ import {
 
 const mockGetMediaUrl = vi.mocked(getMediaUrl)
 const mockDownloadMedia = vi.mocked(downloadMedia)
+const mockSendTypingIndicator = vi.mocked(sendTypingIndicator)
 const mockTranscribeAudio = vi.mocked(transcribeAudio)
 const mockEngineSendText = vi.mocked(engineSendText)
 const mockFindExistingContact = vi.mocked(findExistingContact)
@@ -366,6 +369,7 @@ beforeEach(() => {
   })
   mockTranscribeAudio.mockResolvedValue(null)
   mockEngineSendText.mockResolvedValue({ whatsapp_message_id: 'wamid.FALLBACK' })
+  mockSendTypingIndicator.mockResolvedValue(undefined)
   h.dispatchInboundToFlows.mockResolvedValue({ consumed: false })
   h.dispatchInboundToAiReply.mockResolvedValue(undefined)
   h.dispatchWebhookEvent.mockResolvedValue(undefined)
@@ -428,6 +432,61 @@ describe('inbound webhook: atomic unread bump (#369)', () => {
       name: 'bump_conversation_on_inbound',
       args: { p_conversation_id: 'conv-1' },
     })
+  })
+})
+
+describe('inbound webhook: typing indicator', () => {
+  it('shows the WhatsApp typing indicator immediately for text inbound', async () => {
+    await runWebhook(TEXT_MESSAGE)
+
+    expect(mockSendTypingIndicator).toHaveBeenCalledTimes(1)
+    expect(mockSendTypingIndicator).toHaveBeenCalledWith({
+      phoneNumberId: 'pn-1',
+      accessToken: 'plain-token',
+      messageId: 'wamid.TEST1',
+    })
+  })
+
+  it('shows the typing indicator immediately for audio inbound', async () => {
+    mockTranscribeAudio.mockResolvedValue('hola')
+    const audio = {
+      id: 'wamid.AUDIO_TYPING',
+      from: '15551230000',
+      timestamp: '1700000000',
+      type: 'audio',
+      audio: { id: 'media-9', mime_type: 'audio/ogg; codecs=opus' },
+    }
+
+    await runWebhook(audio)
+
+    expect(mockSendTypingIndicator).toHaveBeenCalledWith({
+      phoneNumberId: 'pn-1',
+      accessToken: 'plain-token',
+      messageId: 'wamid.AUDIO_TYPING',
+    })
+  })
+
+  it('does not show the typing indicator for attachment-only inbound', async () => {
+    await runWebhook({
+      id: 'wamid.IMG_TYPING',
+      from: '15551230000',
+      timestamp: '1700000000',
+      type: 'image',
+      image: { id: 'img-1', mime_type: 'image/jpeg' },
+    })
+
+    expect(mockSendTypingIndicator).not.toHaveBeenCalled()
+  })
+
+  it('fails silently when Meta rejects the indicator (best-effort)', async () => {
+    mockSendTypingIndicator.mockRejectedValueOnce(new Error('Meta API error: 400'))
+
+    await runWebhook(TEXT_MESSAGE)
+
+    // The webhook still processes the message and fans out — the typing
+    // indicator must never break inbound processing.
+    expect(h.state.upsertCalls).toHaveLength(1)
+    expect(h.dispatchInboundToFlows).toHaveBeenCalledTimes(1)
   })
 })
 
