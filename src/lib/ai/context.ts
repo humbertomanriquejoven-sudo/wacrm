@@ -14,8 +14,9 @@ interface DbMessage {
  * Fetch the last N messages of a conversation and map them to the
  * provider-neutral chat shape. Text messages carry their content;
  * image messages carry a placeholder and their media_url for the
- * vision pipeline. Other media types (video, document, audio with no
- * transcription) are skipped.
+ * vision pipeline. Audio rows carry the voice-note transcript in
+ * content_text, so they read like text. Other media types (video,
+ * document, audio with no transcription) are skipped.
  *
  * Ordered oldest-first (chronological) so the transcript reads
  * naturally and the most recent customer message lands last.
@@ -29,7 +30,7 @@ export async function buildConversationContext(
     .from('messages')
     .select('sender_type, content_text, content_type, media_url, media_type')
     .eq('conversation_id', conversationId)
-    .in('content_type', ['text', 'image'])
+    .in('content_type', ['text', 'image', 'audio'])
     .order('created_at', { ascending: false })
     .limit(limit)
 

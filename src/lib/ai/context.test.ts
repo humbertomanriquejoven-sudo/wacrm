@@ -51,4 +51,23 @@ describe('buildConversationContext', () => {
     )
     expect(out).toEqual([{ role: 'user', content: 'real' }])
   })
+
+  it('includes transcribed audio rows (voice notes) in the context', async () => {
+    // The webhook stores the transcript on content_type='audio' rows.
+    const out = await buildConversationContext(
+      fakeDb([
+        {
+          sender_type: 'customer',
+          content_type: 'audio',
+          content_text: 'Quiero agendar una cita',
+        },
+        { sender_type: 'customer', content_type: 'text', content_text: 'hola' },
+      ]),
+      'conv-1',
+    )
+    expect(out).toEqual([
+      { role: 'user', content: 'hola' },
+      { role: 'user', content: 'Quiero agendar una cita' },
+    ])
+  })
 })

@@ -51,6 +51,12 @@ interface WhatsAppMessage {
   video?: { id: string; mime_type: string; caption?: string }
   document?: { id: string; mime_type: string; filename?: string; caption?: string }
   audio?: { id: string; mime_type: string }
+  /**
+   * Non-Meta gateways (YCloud, on-prem, etc.) deliver voice notes under
+   * `type: 'voice'` with the envelope in `voice`; Meta uses `type:
+   * 'audio'`. Same shape, so both share the audio transcription path.
+   */
+  voice?: { id: string; mime_type: string }
   sticker?: { id: string; mime_type: string }
   location?: { latitude: number; longitude: number; name?: string; address?: string }
   reaction?: { message_id: string; emoji: string }
@@ -647,7 +653,8 @@ async function processMessage(
   // automations or the AI to act on — the note is still stored below so
   // the inbox shows the attachment, and we politely ask the customer to
   // fall back to text further down.
-  const audioFailedTranscription = message.type === 'audio' && !contentText
+  const audioFailedTranscription =
+    (message.type === 'audio' || message.type === 'voice') && !contentText
 
   // Resolve swipe-reply context if present. A missing parent is fine —
   // we just store NULL and the UI renders the message without a quote.
@@ -686,7 +693,9 @@ async function processMessage(
       ? 'image'         // stickers are images
       : message.type === 'button'
         ? 'interactive' // template quick-reply tap (issue #478)
-        : 'text'        // reaction, unknown → text fallback
+        : message.type === 'voice'
+          ? 'audio'     // non-Meta gateways deliver voice notes as "voice"
+          : 'text'      // reaction, unknown → text fallback
 
   // Determine whether this is the contact's very first inbound message
   // BEFORE we insert, so the count is accurate. Covers the case where
@@ -1055,8 +1064,13 @@ async function parseMessageContent(
       }
       return empty
 
-    case 'audio': {
-      if (message.audio?.id) {
+    case 'audio':
+    case 'voice': {
+      // Meta delivers voice notes as type "audio"; YCloud and other
+      // gateways use a separate "voice" envelope. Either way the media
+      // lives in the same shape, so both share this one pipeline.
+      const media = message.audio ?? message.voice
+      if (media?.id) {
         // Voice-note hot path: resolve + download the bytes ONCE, then
         // reuse the same buffer for both the mirror and the
         // transcription. The previous shape fetched getMediaUrl twice
@@ -1066,18 +1080,18 @@ async function parseMessageContent(
         let info: Awaited<ReturnType<typeof getMediaUrl>>
         let buffer: Buffer
         try {
-          info = await getMediaUrl({ mediaId: message.audio.id, accessToken })
+          info = await getMediaUrl({ mediaId: media.id, accessToken })
           buffer = (await downloadMedia({ downloadUrl: info.url, accessToken })).buffer
         } catch (err) {
           console.error(
             '[webhook][audio] Meta media fetch/download failed:',
             {
-              mediaId: message.audio.id,
-              mimeType: message.audio.mime_type,
+              mediaId: media.id,
+              mimeType: media.mime_type,
               error: err instanceof Error ? err.message : err,
             },
           )
-          return { ...empty, mediaType: message.audio.mime_type }
+          return { ...empty, mediaType: media.mime_type }
         }
 
         let mediaUrl: string | null = null
@@ -1085,7 +1099,7 @@ async function parseMessageContent(
           mediaUrl = await mirrorInboundMedia({
             storage: supabaseAdmin().storage,
             accountId: mirror.accountId,
-            mediaId: message.audio.id,
+            mediaId: media.id,
             downloadUrl: info.url,
             accessToken,
             mimeType: info.mimeType,
@@ -1100,25 +1114,25 @@ async function parseMessageContent(
             }),
           })
         }
-        mediaUrl ??= `/api/whatsapp/media/${message.audio.id}`
+        mediaUrl ??= `/api/whatsapp/media/${media.id}`
 
         // The transcript becomes the message's content so the AI bot
         // replies to what was actually said. transcribeAudio never
         // throws (each provider failure is logged with detail and the
         // next provider is tried), so a null here means every configured
         // provider failed.
-        const contentText = await transcribeAudio(buffer, message.audio.mime_type)
+        const contentText = await transcribeAudio(buffer, media.mime_type)
         if (!contentText) {
           console.error(
             '[webhook][audio] transcription failed across all providers — sending text fallback:',
             {
-              mediaId: message.audio.id,
-              mimeType: message.audio.mime_type,
+              mediaId: media.id,
+              mimeType: media.mime_type,
               audioBytes: buffer.byteLength,
             },
           )
         }
-        return { ...empty, contentText, mediaUrl, mediaType: message.audio.mime_type }
+        return { ...empty, contentText, mediaUrl, mediaType: media.mime_type }
       }
       return empty
     }

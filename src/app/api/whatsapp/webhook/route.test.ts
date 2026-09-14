@@ -526,6 +526,38 @@ describe('inbound webhook: voice notes', () => {
     // message.received still fires so external listeners know it arrived.
     expect(h.dispatchWebhookEvent).toHaveBeenCalledTimes(1)
   })
+
+  it('treats a non-Meta "voice" envelope like an audio note', async () => {
+    // YCloud and other gateways deliver voice notes under `type: "voice"`
+    // with the envelope in `voice` rather than Meta's `audio`.
+    mockTranscribeAudio.mockResolvedValue('Quiero agendar una cita')
+    const VOICE_MESSAGE = {
+      id: 'wamid.VOICE2',
+      from: '15551230000',
+      timestamp: '1700000000',
+      type: 'voice',
+      voice: { id: 'media-2', mime_type: 'audio/ogg; codecs=opus' },
+    }
+
+    await runWebhook(VOICE_MESSAGE)
+
+    // Same pipeline as audio: fetch → download → mirror → transcribe.
+    expect(mockTranscribeAudio).toHaveBeenCalledWith(
+      expect.any(Buffer),
+      'audio/ogg; codecs=opus',
+    )
+    expect(h.state.storageUploads).toHaveLength(1)
+    expect(h.state.upsertCalls[0].row).toMatchObject({
+      content_type: 'audio',
+      content_text: 'Quiero agendar una cita',
+      media_type: 'audio/ogg; codecs=opus',
+    })
+    // Fans out on the transcript exactly like an audio note.
+    expect(h.dispatchInboundToFlows).toHaveBeenCalledTimes(1)
+    expect(h.dispatchInboundToAiReply).toHaveBeenCalledTimes(1)
+    expect(h.dispatchWebhookEvent).toHaveBeenCalledTimes(1)
+    expect(mockEngineSendText).not.toHaveBeenCalled()
+  })
 })
 
 describe('inbound webhook: inbound media is mirrored (#466)', () => {
