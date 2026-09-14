@@ -9,7 +9,7 @@ import { logAiUsage } from './usage'
 import { latestUserMessage } from './query'
 import { AI_TOOLS, executeToolCall, loadContactContext } from './tools'
 import { calendarConfigured } from '@/lib/calendar'
-import { engineSendText } from '@/lib/flows/meta-send'
+import { engineSendAiReply } from '@/lib/flows/meta-send'
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit'
 import type { ChatMessage } from './types'
 
@@ -21,6 +21,9 @@ interface DispatchArgs {
   conversationId: string
   contactId: string
   configOwnerUserId: string
+  /** Meta id (wamid) of the inbound message being answered — used to
+   *  keep WhatsApp's typing indicator alive across the multi-part reply. */
+  composeMessageId?: string
 }
 
 /**
@@ -189,13 +192,14 @@ export async function dispatchInboundToAiReply(
     }
     if (claimed !== true) return
 
-    await engineSendText({
+    await engineSendAiReply({
       accountId,
       userId: configOwnerUserId,
       conversationId,
       contactId,
       text: finalText,
       aiGenerated: true,
+      composeMessageId: args.composeMessageId,
     })
   } catch (err) {
     console.error('[ai auto-reply] dispatch failed:', err)

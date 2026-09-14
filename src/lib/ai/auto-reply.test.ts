@@ -8,6 +8,7 @@ const h = vi.hoisted(() => ({
   retrieveKnowledge: vi.fn(),
   generateReply: vi.fn(),
   engineSendText: vi.fn(),
+  engineSendAiReply: vi.fn(),
   state: {
     conv: null as Record<string, unknown> | null,
     autoResponders: [] as { id: string }[],
@@ -22,7 +23,10 @@ vi.mock('./config', () => ({ loadAiConfig: h.loadAiConfig }))
 vi.mock('./context', () => ({ buildConversationContext: h.buildConversationContext }))
 vi.mock('./knowledge', () => ({ retrieveKnowledge: h.retrieveKnowledge }))
 vi.mock('./generate', () => ({ generateReply: h.generateReply }))
-vi.mock('@/lib/flows/meta-send', () => ({ engineSendText: h.engineSendText }))
+vi.mock('@/lib/flows/meta-send', () => ({
+  engineSendText: h.engineSendText,
+  engineSendAiReply: h.engineSendAiReply,
+}))
 vi.mock('./admin-client', () => ({
   supabaseAdmin: () => ({
     from: (table: string) => {
@@ -109,6 +113,7 @@ beforeEach(() => {
   h.retrieveKnowledge.mockResolvedValue([])
   h.generateReply.mockResolvedValue({ text: 'Hello!', handoff: false })
   h.engineSendText.mockResolvedValue({ whatsapp_message_id: 'm1' })
+  h.engineSendAiReply.mockResolvedValue({ whatsapp_message_id: 'm1' })
 })
 
 describe('dispatchInboundToAiReply — eligibility gates', () => {
@@ -120,8 +125,16 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
         args: { conversation_id: 'conv-1', max_replies: 3 },
       },
     ])
-    expect(h.engineSendText).toHaveBeenCalledWith(
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
       expect.objectContaining({ conversationId: 'conv-1', text: 'Hello!' }),
+    )
+  })
+
+  it('forwards the inbound composeMessageId to the fragment sender', async () => {
+    await dispatchInboundToAiReply({ ...ARGS, composeMessageId: 'wamid.IN_1' })
+
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ composeMessageId: 'wamid.IN_1' }),
     )
   })
 
@@ -209,7 +222,7 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
       ai_reply_count: 50,
     }
     await dispatchInboundToAiReply(ARGS)
-    expect(h.engineSendText).toHaveBeenCalledWith(
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
       expect.objectContaining({ text: 'Hello!' }),
     )
   })

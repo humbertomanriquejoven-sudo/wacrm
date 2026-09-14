@@ -996,6 +996,9 @@ async function processMessage(
       conversationId: conversation.id,
       contactId: contactRecord.id,
       configOwnerUserId,
+      // The inbound wamid — lets the bot keep WhatsApp's typing
+      // indicator alive while it streams a multi-part reply.
+      composeMessageId: message.id,
     })
   }
 

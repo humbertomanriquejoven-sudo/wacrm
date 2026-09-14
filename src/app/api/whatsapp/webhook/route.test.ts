@@ -281,6 +281,7 @@ vi.mock('@/lib/ai/transcribe', () => ({
 }))
 vi.mock('@/lib/flows/meta-send', () => ({
   engineSendText: vi.fn(),
+  engineSendAiReply: vi.fn(),
 }))
 
 import { POST } from './route'
