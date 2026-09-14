@@ -47,12 +47,82 @@ export function aiContextMessageLimit(): number {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CONTEXT_MESSAGE_LIMIT
 }
 
+// ============================================================
+// Current date/time context
+// ============================================================
+
+/**
+ * IANA zone used to stamp "today" into the system prompt. Defaults to
+ * the business wall-clock (same as the calendar, America/Lima) rather
+ * than the server box's timezone, so the model resolves relative dates
+ * ("mañana", "este viernes") against the appointment clock. Both
+ * America/Lima and America/Bogota are UTC-5 without DST, so either is
+ * correct here. Override with `AI_TIMEZONE`.
+ */
+const DEFAULT_AI_TIMEZONE = 'America/Lima'
+
+/** IANA zone for the current date/time prompt context. */
+export function aiTimeZone(): string {
+  return process.env.AI_TIMEZONE || DEFAULT_AI_TIMEZONE
+}
+
+/**
+ * Current wall-clock stamps for the system prompt, computed live in the
+ * business timezone on every call:
+ *   - `weekday` in Spanish (lunes … domingo),
+ *   - `date` as YYYY-MM-DD,
+ *   - `time` as 24-hour HH:MM.
+ */
+export function currentDateTimeContext(): {
+  weekday: string
+  date: string
+  time: string
+} {
+  const timeZone = aiTimeZone()
+  const now = new Date()
+  const weekday = new Intl.DateTimeFormat('es', {
+    weekday: 'long',
+    timeZone,
+  }).format(now)
+  // en-CA renders a bare YYYY-MM-DD; the AI line is Spanish, the format is not.
+  const date = new Intl.DateTimeFormat('en-CA', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    timeZone,
+  }).format(now)
+  // 24h HH:MM — strip any locale glyphs that some ICU builds insert
+  // around the separator.
+  const time = new Intl.DateTimeFormat('es-CO', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+    timeZone,
+  })
+    .format(now)
+    .replace(/[^\d:]/g, '')
+  return { weekday, date, time }
+}
+
+/**
+ * The "today is …" line injected at the very top of every system prompt,
+ * so the model can compute absolute dates from the customer's relative
+ * expressions (e.g. "hoy a las 4pm", "el próximo lunes") when scheduling.
+ */
+export function todayContextLine(): string {
+  const { weekday, date, time } = currentDateTimeContext()
+  return `INFORMACIÓN DE FECHA Y HORA ACTUAL: Hoy es ${weekday}, ${date}, hora local ${time} (${aiTimeZone()})`
+}
+
 /**
  * Build the system prompt shared by draft + auto-reply. The account's
  * own `system_prompt` (business context / persona / tone) is appended
  * to a fixed scaffold so behaviour stays predictable regardless of what
  * the user typed. Auto-reply mode additionally teaches the handoff
  * protocol.
+ *
+ * The current date/time (business timezone) is always prepended as the
+ * opening line — see `todayContextLine`.
  */
 export function buildSystemPrompt(args: {
   userPrompt: string | null
@@ -75,6 +145,7 @@ export function buildSystemPrompt(args: {
     citas,
   } = args
   const parts: string[] = [
+    todayContextLine(),
     'You are a customer-messaging assistant for a business that uses a WhatsApp CRM. ' +
       'You are shown the recent WhatsApp conversation between the business (assistant) and a customer (user). ' +
       'Write the next reply the business should send to the customer.',
