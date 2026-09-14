@@ -642,19 +642,14 @@ async function processMessage(
   }
 
   // Parse message content based on type
-  const { contentText, mediaUrl, mediaType, interactiveReplyId } =
-    await parseMessageContent(
-      message,
-      accessToken,
-      mirrorMedia ? { accountId } : null
-    )
-
-  // Voice notes that couldn't be transcribed carry no text for flows,
-  // automations or the AI to act on — the note is still stored below so
-  // the inbox shows the attachment, and we politely ask the customer to
-  // fall back to text further down.
-  const audioFailedTranscription =
-    (message.type === 'audio' || message.type === 'voice') && !contentText
+  const parsed = await parseMessageContent(
+    message,
+    accessToken,
+    mirrorMedia ? { accountId } : null
+  )
+  const { mediaUrl, mediaType, interactiveReplyId, pendingAudio } = parsed
+  // Reassigned below when a voice-note transcript lands after the insert.
+  let contentText = parsed.contentText
 
   // Resolve swipe-reply context if present. A missing parent is fine —
   // we just store NULL and the UI renders the message without a quote.
@@ -790,10 +785,17 @@ async function processMessage(
   // trigger installed in migration 003).
   await flagBroadcastReplyIfAny(accountId, contactRecord.id)
 
-  // Voice note we couldn't transcribe: ask the customer kindly to send
-  // text. The deterministic engine, automations and the AI have nothing
-  // to act on (no transcript), so we surface message.received and stop.
-  if (audioFailedTranscription) {
+  // Voice notes transcribe in the BACKGROUND. The row above was saved
+  // immediately (content_text null) so the inbox update is real-time —
+  // transcription latency no longer gates the insert. Here, after the
+  // insert, the transcript is written back onto the row and treated as
+  // the message payload for flows / automations / the AI.
+  const isVoiceNote = message.type === 'audio' || message.type === 'voice'
+
+  // Shared "please write instead" reply for voice notes with no
+  // transcript: either the media fetch failed before we could download
+  // the bytes, or every transcription provider failed.
+  const sendVoiceFallback = async () => {
     try {
       await engineSendText({
         accountId,
@@ -811,9 +813,51 @@ async function processMessage(
       contact_id: contactRecord.id,
       whatsapp_message_id: message.id,
       content_type: contentType,
-      text: contentText,
+      text: null,
     })
-    return
+  }
+
+  if (isVoiceNote) {
+    if (pendingAudio) {
+      const transcript = await transcribeAudio(
+        pendingAudio.buffer,
+        pendingAudio.mimeType
+      )
+      if (!transcript) {
+        console.error(
+          '[webhook][audio] transcription failed across all providers — sending text fallback:',
+          {
+            messageId: message.id,
+            mimeType: pendingAudio.mimeType,
+            audioBytes: pendingAudio.buffer.byteLength,
+          },
+        )
+        await sendVoiceFallback()
+        return
+      }
+
+      // Transcription succeeded: persist the transcript back onto the row
+      // (fires a second realtime event that swaps the audio bubble for
+      // readable text) and refresh the conversation-list summary, which
+      // the unread bump stamped with `[audio]` a moment ago.
+      contentText = transcript
+      const { error: transcriptError } = await supabaseAdmin()
+        .from('messages')
+        .update({ content_text: transcript })
+        .eq('id', insertedRows[0].id)
+      if (transcriptError) {
+        console.error('[webhook][audio] failed to persist transcript:', transcriptError)
+      }
+      await supabaseAdmin()
+        .from('conversations')
+        .update({ last_message_text: transcript })
+        .eq('id', conversation.id)
+    } else if (!contentText) {
+      // Media fetch/download failed in parseMessageContent — no bytes to
+      // transcribe or mirror reliably.
+      await sendVoiceFallback()
+      return
+    }
   }
 
   // ============================================================
@@ -961,6 +1005,14 @@ async function parseMessageContent(
    * tap with the right affordance. Null for everything else.
    */
   interactiveReplyId: string | null
+  /**
+   * Audio messages only. The already-downloaded bytes that carry the
+   * voice note, handed to the caller so transcription can run in the
+   * background AFTER the message row is saved — keeps the insert (and
+   * the inbox realtime event) off the transcription latency path.
+   * Undefined for every other message type.
+   */
+  pendingAudio?: { buffer: Buffer; mimeType: string }
 }> {
   // getMediaUrl signature is (mediaId, accessToken) — earlier code had
   // the args swapped, so every verification hit an invalid Meta URL and
@@ -1116,23 +1168,19 @@ async function parseMessageContent(
         }
         mediaUrl ??= `/api/whatsapp/media/${media.id}`
 
-        // The transcript becomes the message's content so the AI bot
-        // replies to what was actually said. transcribeAudio never
-        // throws (each provider failure is logged with detail and the
-        // next provider is tried), so a null here means every configured
-        // provider failed.
-        const contentText = await transcribeAudio(buffer, media.mime_type)
-        if (!contentText) {
-          console.error(
-            '[webhook][audio] transcription failed across all providers — sending text fallback:',
-            {
-              mediaId: media.id,
-              mimeType: media.mime_type,
-              audioBytes: buffer.byteLength,
-            },
-          )
+        // Deferred transcription: the message row is saved immediately (with
+        // content_text null) so the inbox shows the note in real time;
+        // the caller transcribes these bytes in the background and writes
+        // the transcript back. transcribeAudio never throws (each
+        // provider failure is logged with detail and the next provider
+        // is tried).
+        return {
+          ...empty,
+          contentText: null,
+          mediaUrl,
+          mediaType: media.mime_type,
+          pendingAudio: { buffer, mimeType: media.mime_type },
         }
-        return { ...empty, contentText, mediaUrl, mediaType: media.mime_type }
       }
       return empty
     }

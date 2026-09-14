@@ -45,6 +45,16 @@ const h = vi.hoisted(() => ({
     contactUpdateCalls: [] as { id?: unknown; patch: Record<string, unknown> }[],
     /** Rows inserted via contacts.insert. */
     contactInsertCalls: [] as Record<string, unknown>[],
+    /** Transcripts written back onto messages rows ('id' → patch). */
+    messageTranscriptUpdates: [] as {
+      id: unknown
+      patch: Record<string, unknown>
+    }[],
+    /** conversation-list last_message_text refreshes after transcription. */
+    conversationSummaryUpdates: [] as {
+      id: unknown
+      patch: Record<string, unknown>
+    }[],
   },
 }))
 
@@ -93,6 +103,13 @@ vi.mock('@supabase/supabase-js', () => ({
                   }),
                 }),
               }),
+            }),
+            // Post-transcription last_message_text refresh.
+            update: (patch: Record<string, unknown>) => ({
+              eq: (_col: string, value: unknown) => {
+                h.state.conversationSummaryUpdates.push({ id: value, patch })
+                return Promise.resolve({ data: null, error: null })
+              },
             }),
           }
         case 'broadcast_recipients':
@@ -187,6 +204,13 @@ vi.mock('@supabase/supabase-js', () => ({
                   }),
               }
             },
+            // Background transcription writes the transcript back onto the row.
+            update: (patch: Record<string, unknown>) => ({
+              eq: (_col: string, value: unknown) => {
+                h.state.messageTranscriptUpdates.push({ id: value, patch })
+                return Promise.resolve({ data: null, error: null })
+              },
+            }),
           }
         default:
           throw new Error(`unexpected table: ${table}`)
@@ -329,6 +353,8 @@ beforeEach(() => {
   h.state.contactByNameResult = null
   h.state.contactUpdateCalls = []
   h.state.contactInsertCalls = []
+  h.state.messageTranscriptUpdates = []
+  h.state.conversationSummaryUpdates = []
   mockGetMediaUrl.mockResolvedValue({
     url: 'https://lookaside.fbsbx.com/whatsapp/abc',
     mimeType: 'image/jpeg',
@@ -488,10 +514,26 @@ describe('inbound webhook: voice notes', () => {
       expect.any(Buffer),
       'audio/ogg; codecs=opus',
     )
+    // Saved immediately (content_text null) — the insert is NOT gated on
+    // the transcription, so the inbox realtime event fires at once.
     expect(h.state.upsertCalls[0].row).toMatchObject({
       content_type: 'audio',
-      content_text: 'Quiero agendar una cita para el martes',
+      content_text: null,
     })
+    // The transcript is then written back onto the row and the
+    // conversation-list summary the unread bump stamped as `[audio]`.
+    expect(h.state.messageTranscriptUpdates).toEqual([
+      {
+        id: 'msg-1',
+        patch: { content_text: 'Quiero agendar una cita para el martes' },
+      },
+    ])
+    expect(h.state.conversationSummaryUpdates).toEqual([
+      {
+        id: 'conv-1',
+        patch: { last_message_text: 'Quiero agendar una cita para el martes' },
+      },
+    ])
     // Downstream fan-out runs on the transcript, as if it were text.
     expect(h.dispatchInboundToFlows).toHaveBeenCalledTimes(1)
     expect(h.dispatchInboundToAiReply).toHaveBeenCalledTimes(1)
@@ -504,13 +546,17 @@ describe('inbound webhook: voice notes', () => {
 
     await runWebhook(AUDIO_MESSAGE)
 
-    // The note is still persisted for the record.
+    // The note is still persisted for the record — with null_ content
+    // text, immediately (not after transcription).
     expect(h.state.upsertCalls).toHaveLength(1)
     expect(h.state.upsertCalls[0].row).toMatchObject({
       content_type: 'audio',
       content_text: null,
       media_type: 'audio/ogg; codecs=opus',
     })
+    // Nothing is written back since there is no transcript.
+    expect(h.state.messageTranscriptUpdates).toHaveLength(0)
+    expect(h.state.conversationSummaryUpdates).toHaveLength(0)
     // Friendly ask-it-in-text reply goes out.
     expect(mockEngineSendText).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -547,11 +593,16 @@ describe('inbound webhook: voice notes', () => {
       'audio/ogg; codecs=opus',
     )
     expect(h.state.storageUploads).toHaveLength(1)
+    // Inserted immediately with content_text null; transcript written
+    // back in the background.
     expect(h.state.upsertCalls[0].row).toMatchObject({
       content_type: 'audio',
-      content_text: 'Quiero agendar una cita',
+      content_text: null,
       media_type: 'audio/ogg; codecs=opus',
     })
+    expect(h.state.messageTranscriptUpdates).toEqual([
+      { id: 'msg-1', patch: { content_text: 'Quiero agendar una cita' } },
+    ])
     // Fans out on the transcript exactly like an audio note.
     expect(h.dispatchInboundToFlows).toHaveBeenCalledTimes(1)
     expect(h.dispatchInboundToAiReply).toHaveBeenCalledTimes(1)
