@@ -27,13 +27,6 @@ export interface CitaFormDialogProps {
   onSaved: () => void
 }
 
-function toLocalInput(iso: string): string {
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return ""
-  const pad = (n: number) => String(n).padStart(2, "0")
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-
 export function CitaFormDialog({
   open,
   onOpenChange,
@@ -52,15 +45,23 @@ export function CitaFormDialog({
   const [searching, setSearching] = useState(false)
   const searchSeq = useRef(0)
 
-  useEffect(() => {
-    if (open) {
-      setInicio(defaultInicio ?? "")
-      setMotivo("")
-      setSelected(null)
-      setSearch("")
-      setResults([])
-    }
-  }, [open, defaultInicio])
+  // Reset the form each time the dialog opens (or when defaultInicio
+  // changes while open). Done during render rather than in an effect:
+  // the state only changes in response to the (open, defaultInicio)
+  // props, so this converges in one pass — the documented replacement
+  // for resetting state inside an effect.
+  const [lastSeen, setLastSeen] = useState({ open, defaultInicio })
+  if (
+    open &&
+    (open !== lastSeen.open || defaultInicio !== lastSeen.defaultInicio)
+  ) {
+    setLastSeen({ open, defaultInicio })
+    setInicio(defaultInicio ?? "")
+    setMotivo("")
+    setSelected(null)
+    setSearch("")
+    setResults([])
+  }
 
   // Search live as the user types: name or phone substring, top 8.
   const runSearch = useCallback(

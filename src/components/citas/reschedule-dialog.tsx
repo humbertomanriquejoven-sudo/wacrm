@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useState } from "react"
 import { toast } from "sonner"
 import { useTranslations } from "next-intl"
 import {
@@ -42,9 +42,14 @@ export function RescheduleDialog({
   const [inicio, setInicio] = useState("")
   const [saving, setSaving] = useState(false)
 
-  useEffect(() => {
-    if (open && cita) setInicio(toLocalInput(cita.fecha_inicio))
-  }, [open, cita])
+  // Seed the datetime input each time the dialog opens for a given cita.
+  // Done during render rather than in an effect: the state only changes
+  // in response to the (open, cita) props, so it converges in one pass.
+  const [lastSeen, setLastSeen] = useState({ open, cita })
+  if (open && (open !== lastSeen.open || cita !== lastSeen.cita)) {
+    setLastSeen({ open, cita })
+    if (cita) setInicio(toLocalInput(cita.fecha_inicio))
+  }
 
   async function handleSubmit() {
     if (!cita || !inicio) return

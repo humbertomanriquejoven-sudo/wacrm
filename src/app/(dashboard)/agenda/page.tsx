@@ -1,9 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslations } from "next-intl";
-import { createClient } from "@/lib/supabase/client";
-import { toast } from "sonner";
 import { useCitas } from "@/hooks/use-citas";
 import { useCan } from "@/hooks/use-can";
 import { GatedButton } from "@/components/ui/gated-button";
@@ -53,7 +51,6 @@ type VentanaFilter = "proximas" | "hoy" | "todas";
 
 export default function AgendaPage() {
   const t = useTranslations("Agenda.page");
-  const supabase = createClient();
   const { citas, loading, refresh } = useCitas();
   const canEdit = useCan("send-messages");
 
