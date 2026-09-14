@@ -59,17 +59,42 @@ export async function generateReply(args: GenerateArgs): Promise<GenerateResult>
 }
 
 /**
+ * Strip a leading `model` role token from raw model output.
+ *
+ * When a Google Gemini model is served through OpenRouter's OpenAI-
+ * shaped endpoint, some revisions echo the candidate role as the first
+ * part of `message.content`, so the reply arrives as `model\n…text…`.
+ * The label is a provider artifact, never part of the answer — drop it
+ * before the text goes anywhere (WhatsApp, drafts, handoff summaries).
+ *
+ * Only a standalone leading `model` token followed by whitespace or the
+ * end of input is removed, so a reply that genuinely begins with the
+ * English word "model" (e.g. the customer's car) is left intact. Any
+ * other leading whitespace is trimmed as part of the cleanup.
+ */
+export function stripModelPrefix(text: string): string {
+  let out = text.trim()
+  while (/^model(?:$|\s)/i.test(out)) {
+    out = out.replace(/^model(?:$|\s)/i, '').trim()
+  }
+  return out
+}
+
+/**
  * Split the raw model output into `{ text, handoff, usage }`. The
  * sentinel can appear alone or trailing a partial reply; either way we
  * treat the turn as a handoff and strip the marker from any remaining
  * text. `usage` is passed straight through (null when the provider
  * didn't report it).
+ *
+ * The raw text also passes through `stripModelPrefix` so no Gemini
+ * `model` role echo ever reaches the customer.
  */
 export function parseGeneration(
   raw: string,
   usage: AiUsage | null = null,
 ): GenerateResult {
   const handoff = raw.includes(HANDOFF_SENTINEL)
-  const text = raw.split(HANDOFF_SENTINEL).join('').trim()
+  const text = stripModelPrefix(raw.split(HANDOFF_SENTINEL).join(''))
   return { text, handoff, usage }
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { generateReply, parseGeneration } from './generate'
+import { generateReply, parseGeneration, stripModelPrefix } from './generate'
 import { AiError, type AiConfig } from './types'
 
 function config(overrides: Partial<AiConfig> = {}): AiConfig {
@@ -67,6 +67,32 @@ describe('parseGeneration', () => {
       handoff: false,
       usage,
     })
+  })
+
+  it('strips a leading Gemini "model" role token', () => {
+    expect(parseGeneration('model\nHola, ¿en qué puedo ayudarte?').text).toBe(
+      'Hola, ¿en qué puedo ayudarte?',
+    )
+    expect(parseGeneration('model Hola').text).toBe('Hola')
+    expect(parseGeneration('MODEL\n   Hola').text).toBe('Hola')
+    expect(
+      parseGeneration('model\nmodel\n\n¡Hola de nuevo!').text,
+    ).toBe('¡Hola de nuevo!')
+  })
+
+  it('keeps replies that merely contain the word "model", not as a leading token', () => {
+    expect(parseGeneration('modelo deportivo 2026').text).toBe('modelo deportivo 2026')
+    expect(parseGeneration('este modelo es el mejor').text).toBe(
+      'este modelo es el mejor',
+    )
+    expect(parseGeneration('model.').text).toBe('model.')
+  })
+})
+
+describe('stripModelPrefix', () => {
+  it('only removes a standalone leading token, not mid-text occurrences', () => {
+    expect(stripModelPrefix('model\nrespuesta')).toBe('respuesta')
+    expect(stripModelPrefix('el modelo es este')).toBe('el modelo es este')
   })
 })
 
