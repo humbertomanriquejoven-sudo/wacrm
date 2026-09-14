@@ -118,10 +118,18 @@ async function callGemini(
           role: 'user',
           content: [
             { type: 'text', text: TRANSCRIBE_INSTRUCTION },
+            // OpenRouter's /chat/completions expects the OpenAI-style
+            // `input_audio: { data, format }` part. The flat
+            // `{ input_format, data }` variant of the same part is
+            // silently DROPPED by OpenRouter (usage.audio_tokens stays
+            // 0), so the model never hears the clip and hallucinates a
+            // transcript. Verified against google/gemini-2.5-flash-lite.
             {
               type: 'input_audio',
-              input_format: audioInputFormat(mimeType),
-              data: buffer.toString('base64'),
+              input_audio: {
+                data: buffer.toString('base64'),
+                format: audioInputFormat(mimeType),
+              },
             },
           ],
         },
@@ -179,19 +187,22 @@ async function callWhisper(
 }
 
 /**
- * Map a WhatsApp MIME type to the `input_format` key the multimodal
- * endpoint understands. Meta sends `audio/ogg; codecs=opus` for voice
- * notes; the rest are edge cases (audio/mp4 recording, audio/aac, ...).
+ * Map a WhatsApp MIME type to the `format` key OpenRouter's `input_audio`
+ * part understands. OpenRouter documents wav/mp3/aiff/aac/ogg/flac/m4a/
+ * pcm16/pcm24 — anything else (mp4, webm, amr) has no canonical mapping
+ * and can be rejected upstream, so the closest supported value is used.
+ * Meta sends `audio/ogg; codecs=opus` for Android voice notes and
+ * `audio/mp4` for iPhone recordings.
  */
 function audioInputFormat(mime: string): string {
   const base = (mime || '').split(';')[0].trim().toLowerCase()
   if (base.includes('ogg')) return 'ogg'
   if (base.includes('mp3') || base.includes('mpeg')) return 'mp3'
-  if (base.includes('mp4') || base.includes('m4a') || base.includes('aac')) return 'mp4'
+  if (base.includes('mp4') || base.includes('m4a') || base.includes('aac')) return 'm4a'
   if (base.includes('wav')) return 'wav'
   if (base.includes('flac')) return 'flac'
-  if (base.includes('webm')) return 'webm'
-  if (base.includes('amr')) return 'amr'
+  if (base.includes('webm')) return 'ogg'
+  if (base.includes('amr')) return 'ogg'
   return 'ogg'
 }
 
