@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { calendar as calendarV3 } from '@googleapis/calendar'
 import { JWT } from 'google-auth-library'
 import type { SupabaseClient } from '@supabase/supabase-js'
@@ -22,6 +23,8 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 
 const CAL_ID = process.env.GOOGLE_CALENDAR_ID ?? ''
 const SVC_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON ?? ''
+const SVC_CLIENT_EMAIL = process.env.GOOGLE_CALENDAR_CLIENT_EMAIL ?? ''
+const SVC_PRIVATE_KEY = process.env.GOOGLE_CALENDAR_PRIVATE_KEY ?? ''
 
 const CAL_TIMEZONE = 'America/Lima'
 export const APPOINTMENT_DURATION_MIN = 60
@@ -47,7 +50,9 @@ export const BUSINESS_HOURS: Record<
 }
 
 function isCalendarConfigured(): boolean {
-  return Boolean(CAL_ID.trim() && SVC_JSON.trim())
+  const hasJson = Boolean(SVC_JSON.trim())
+  const hasPair = Boolean(SVC_CLIENT_EMAIL.trim() && SVC_PRIVATE_KEY.trim())
+  return Boolean(CAL_ID.trim() && (hasJson || hasPair))
 }
 
 /** Whether the Google Calendar env vars are set (tools are available). */
@@ -58,34 +63,42 @@ export function calendarConfigured(): boolean {
 function calendarClient() {
   if (!isCalendarConfigured()) {
     throw new Error(
-      'Google Calendar is not configured: set GOOGLE_CALENDAR_ID and GOOGLE_SERVICE_ACCOUNT_JSON.',
+      'Google Calendar is not configured: set GOOGLE_CALENDAR_ID and either GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_CALENDAR_CLIENT_EMAIL + GOOGLE_CALENDAR_PRIVATE_KEY.',
     )
   }
 
-  let creds: {
-    client_email?: string
-    private_key?: string
-  }
-  try {
-    creds = JSON.parse(SVC_JSON) as {
+  let email: string
+  let key: string
+  if (SVC_JSON.trim()) {
+    let creds: {
       client_email?: string
       private_key?: string
     }
-  } catch (err) {
-    throw new Error(
-      `GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    )
+    try {
+      creds = JSON.parse(SVC_JSON) as {
+        client_email?: string
+        private_key?: string
+      }
+    } catch (err) {
+      throw new Error(
+        `GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      )
+    }
+
+    // The JSON may have kept the private key double-escaped (\\n); the
+    // JWT client needs real newlines.
+    email = (creds.client_email ?? '').trim()
+    key = (creds.private_key ?? '').replace(/\\n/g, '\n').trim()
+  } else {
+    email = SVC_CLIENT_EMAIL.trim()
+    key = SVC_PRIVATE_KEY.trim().replace(/\\n/g, '\n')
   }
 
-  // The JSON may have kept the private key double-escaped (\\n); the
-  // JWT client needs real newlines.
-  const privateKey = (creds.private_key ?? '').replace(/\\n/g, '\n').trim()
-
   const auth = new JWT({
-    email: creds.client_email,
-    key: privateKey,
+    email,
+    key,
     scopes: ['https://www.googleapis.com/auth/calendar'],
   })
 
@@ -316,9 +329,11 @@ export async function agendar_cita(
   const title = motivo && motivo.trim() ? `${name} — ${motivo.trim()}` : name
 
   let event: { id?: string | null }
+  let meetUrl: string | null = null
   try {
     const created = await cal.events.insert({
       calendarId: CAL_ID,
+      conferenceDataVersion: 1,
       requestBody: {
         summary: title,
         description: motivo?.trim() || undefined,
@@ -327,8 +342,15 @@ export async function agendar_cita(
           dateTime: limaIso(new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000)),
           timeZone: CAL_TIMEZONE,
         },
+        conferenceData: {
+          createRequest: {
+            requestId: randomUUID(),
+            conferenceSolutionKey: { type: 'hangoutsMeet' },
+          },
+        },
       },
     }, { timeout: CALENDAR_TIMEOUT_MS })
+    meetUrl = created.data.hangoutLink ?? null
     event = { id: created.data.id }
   } catch (err) {
     console.error('[calendar] events.insert failed:', err)
@@ -341,6 +363,7 @@ export async function agendar_cita(
       account_id: accountId,
       contact_id: contactoId,
       google_event_id: event.id ?? '',
+      meet_link: meetUrl,
       fecha_inicio: start.toISOString(),
       fecha_fin: new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000).toISOString(),
       estado: 'confirmada',
@@ -354,7 +377,9 @@ export async function agendar_cita(
     return `Error: la cita se creó en Google Calendar pero no se pudo guardar en el CRM (${error.message}).`
   }
 
-  return `Cita agendada: ${limaIso(start)} (60 minutos), cliente: ${name}.`
+  return meetUrl
+    ? `Cita agendada: ${limaIso(start)} (60 minutos), cliente: ${name}. Reunión Meet: ${meetUrl}`
+    : `Cita agendada: ${limaIso(start)} (60 minutos), cliente: ${name}.`
 }
 
 export interface ReagendarCitaArgs {

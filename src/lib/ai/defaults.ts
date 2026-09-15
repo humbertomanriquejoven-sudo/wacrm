@@ -180,7 +180,8 @@ export function buildSystemPrompt(args: {
         '1) Call ver_disponibilidad with the date(s) the customer wants to see available slots; ' +
         '2) Show the customer the free times and ask which one they prefer; ' +
         '3) Only after the customer confirms a slot, call agendar_cita with that start time and their name (and the reason if mentioned); ' +
-        '4) Confirm the booked date/time in your reply. ' +
+        '4) Confirm the booked date/time in your reply, and if agendar_cita returned a Meet link, include it so the customer can join the call. ' +
+        'Never invent a Meet link: only ever quote the one the tool actually returned (and never quote a link you did not receive). ' +
         'For changes, call reagendar_cita(idCita, nuevoInicio); to cancel, call cancelar_cita(idCita) — always check ver_disponibilidad first. ' +
         'Never invent availability, times, or slot lists: only offer times that ver_disponibilidad actually returned, and never promise a time without calling it.',
     )

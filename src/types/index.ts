@@ -139,6 +139,10 @@ export interface Cita {
   account_id: string;
   contact_id: string;
   google_event_id: string;
+  /** Google Meet hangout link (`hangoutLink`), persisted from the
+   *  created conference. Null while Meet is disabled or not yet
+   *  available. Migration 043. */
+  meet_link?: string | null;
   fecha_inicio: string;
   fecha_fin: string;
   estado: "confirmada" | "cancelada";

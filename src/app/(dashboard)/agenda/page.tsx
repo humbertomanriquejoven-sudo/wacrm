@@ -38,6 +38,7 @@ import {
   CalendarDays,
   CalendarClock,
   CalendarX2,
+  ExternalLink,
   Loader2,
   MoreHorizontal,
   Plus,
@@ -189,6 +190,17 @@ export default function AgendaPage() {
                       <span className="text-sm text-foreground font-medium">
                         {formatCitaDateTime(cita.fecha_inicio)}
                       </span>
+                      {cita.meet_link && (
+                        <a
+                          href={cita.meet_link}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="mt-0.5 inline-flex items-center gap-1 text-xs text-primary underline-offset-4 hover:underline"
+                        >
+                          <ExternalLink className="size-3 shrink-0" />
+                          {t("meetLink")}
+                        </a>
+                      )}
                       {cita.fecha_fin && cita.fecha_fin !== cita.fecha_inicio && (
                         <span className="text-xs text-muted-foreground">
                           → {formatCitaDateTime(cita.fecha_fin)}
