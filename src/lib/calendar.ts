@@ -30,12 +30,12 @@ const CAL_TIMEZONE = 'America/Lima'
 export const APPOINTMENT_DURATION_MIN = 60
 
 /**
- * Strict per-request timeout for every Google Calendar network call. A
- * hung freebusy/event call must not block the AI tool round (or the
- * webhook pipeline); it fails fast and the tool returns a readable
+ * Strict per-request timeout for every Google Calendar network call. A?
+ * hung freebusy/event call must not block the AI tool round (or the?
+ * webhook pipeline); it fails fast and the tool returns a readable?
  * error instead of stalling the bot.
  */
-const CALENDAR_TIMEOUT_MS = 5_000
+const CALENDAR_TIMEOUT_MS = 8_000
 
 export const BUSINESS_HOURS: Record<
   number,
