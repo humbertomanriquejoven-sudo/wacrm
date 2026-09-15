@@ -329,6 +329,7 @@ export async function agendar_cita(
   const title = motivo && motivo.trim() ? `${name} — ${motivo.trim()}` : name
 
   let event: { id?: string | null }
+  let calendarSynced = true
   let meetUrl: string | null = null
   try {
     const created = await cal.events.insert({
@@ -353,8 +354,10 @@ export async function agendar_cita(
     meetUrl = created.data.hangoutLink ?? null
     event = { id: created.data.id }
   } catch (err) {
-    console.error('[calendar] events.insert failed:', err)
-    return 'Error: Google Calendar rechazó la creación de la cita.'
+    console.warn('[calendar] events.insert failed:', err)
+    event = { id: 'local-' + randomUUID() }
+    meetUrl = null
+    calendarSynced = false
   }
 
   const { error } = await db
@@ -377,9 +380,11 @@ export async function agendar_cita(
     return `Error: la cita se creó en Google Calendar pero no se pudo guardar en el CRM (${error.message}).`
   }
 
-  return meetUrl
+return calendarSynced
+  ? meetUrl
     ? `Cita agendada: ${limaIso(start)} (60 minutos), cliente: ${name}. Reunión Meet: ${meetUrl}`
     : `Cita agendada: ${limaIso(start)} (60 minutos), cliente: ${name}.`
+  : `Cita agendada: ${limaIso(start)} (60 minutos), cliente: ${name}. (Google Calendar no disponible; la cita quedó guardada en el CRM sin enlace de Meet.)`
 }
 
 export interface ReagendarCitaArgs {
