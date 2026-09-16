@@ -46,7 +46,6 @@ for (let i = 0; i < lines.length; i++) {
   const key = m[1]
   const val = ln.slice(ln.indexOf('=') + 1).trim()
   const nQuote = (val.match(/"/g) || []).length
-  const nCR = (ln.match(/[\r\n]/g) || []).length
 
   if (JSON_KEYS.has(key)) {
     let jsonOk = false

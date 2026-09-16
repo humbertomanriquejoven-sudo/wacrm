@@ -2,7 +2,7 @@
 // .env.local: length, char set, the standard RSA-2048 PKCS#8 marker prefix
 // (MIIEv...), decode-byte estimate attempt. Never prints the key itself.
 // ASCII. OUT=<temp>.
-import { readFileSync, writeFileSync, tmpdirSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 

@@ -68,7 +68,7 @@ export function calendarConfigured(): boolean {
  * a clean, valid key.
  */
 export function canonicalizePrivateKey(raw: string): string {
-  let s = (raw ?? '').replace(/\\n/g, '\n').trim()
+  const s = (raw ?? '').replace(/\\n/g, '\n').trim()
   const begin = s.indexOf('-----BEGIN')
   const end = s.indexOf('-----END')
   if (begin === -1 || end === -1 || end < begin) {
@@ -370,7 +370,7 @@ export async function agendar_cita(
     // y el calendario pertenece a una cuenta personal (gmail.com, no
     // Workspace): en ese caso reintentamos SIN conferencia para que el evento
     // igual quede creado en el calendario (meetUrl queda null).
-    const tryInsert = async (withConference: boolean): Promise<Awaited<ReturnType<typeof cal.events.insert>>> =>
+    const tryInsert = async (withConference: boolean): Promise<{ data: import('@googleapis/calendar').calendar_v3.Schema$Event }> =>
       cal.events.insert(
         withConference
           ? {
@@ -390,7 +390,7 @@ export async function agendar_cita(
         { timeout: CALENDAR_TIMEOUT_MS },
       )
 
-    let created: Awaited<ReturnType<typeof cal.events.insert>> | null = null
+    let created: { data: import('@googleapis/calendar').calendar_v3.Schema$Event } | null = null
     try {
       created = await tryInsert(true)
     } catch (firstErr) {

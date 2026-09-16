@@ -14,9 +14,9 @@
 //   3) DB: intento insert+delete en tabla `citas` vía Supabase (si hay credenciales).
 // Escribe un reporte ASCII a TEMP y hace echo de OUT=<path>.
 
-const fs = require('node:fs')
-const os = require('node:os')
-const path = require('node:path')
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 
 function log(s) { out.push(s) }
 
@@ -79,15 +79,9 @@ log(`ENV present: GOOGLE_CALENDAR_ID=${calId ? 'YES' : 'NO'} GOOGLE_SERVICE_ACCO
 // Convertir el env a un objeto process.env-compatible (sin imprimir valores).
 for (const [k, v] of envMap) { try { process.env[k] = /^"[\s\S]*"$/.test(v) ? JSON.parse(v) : v } catch { process.env[k] = v } }
 
-const GOOGLE = (() => {
-  try { return require('@googleapis/calendar') } catch { return null }
-})()
-const GAUTH = (() => {
-  try { return require('google-auth-library') } catch { return null }
-})()
-const SUPABASE = (() => {
-  try { return require('@supabase/supabase-js') } catch { return null }
-})()
+import * as GOOGLE from '@googleapis/calendar'
+import * as GAUTH from 'google-auth-library'
+import * as SUPABASE from '@supabase/supabase-js'
 
 async function googlePhase() {
   if (!GOOGLE || !GAUTH) { log('GOOGLE deps missing: FAIL'); return }
