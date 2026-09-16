@@ -60,6 +60,27 @@ export function calendarConfigured(): boolean {
   return isCalendarConfigured()
 }
 
+/**
+ * Produce a canonical PEM private key from whatever mess the env delivered:
+ * literal `\n` escapes, real newlines, or stray spaces inside the base64
+ * body (a classic paste artifact). The body is stripped of ALL whitespace
+ * and re-wrapped at 64 columns so google-auth-library's decoder always sees
+ * a clean, valid key.
+ */
+export function canonicalizePrivateKey(raw: string): string {
+  let s = (raw ?? '').replace(/\\n/g, '\n').trim()
+  const begin = s.indexOf('-----BEGIN')
+  const end = s.indexOf('-----END')
+  if (begin === -1 || end === -1 || end < begin) {
+    return s.replace(/\s+/g, ' ').trim()
+  }
+  const header = s.slice(begin, s.indexOf('\n', begin) === -1 ? begin + '-----BEGIN PRIVATE KEY-----'.length : s.indexOf('\n', begin)).trim()
+  const footer = s.slice(end, s.indexOf('\n', end) === -1 ? s.length : s.indexOf('\n', end)).trim()
+  const body = s.slice(begin + header.length, end).replace(/\s+/g, '')
+  const lines = body.match(/.{1,64}/g) ?? []
+  return `${header}\n${lines.join('\n')}\n${footer}`
+}
+
 function calendarClient() {
   if (!isCalendarConfigured()) {
     throw new Error(
@@ -87,13 +108,15 @@ function calendarClient() {
       )
     }
 
-    // The JSON may have kept the private key double-escaped (\\n); the
-    // JWT client needs real newlines.
+    // The JSON may have kept the private key double-escaped (\\n) or padded
+    // with stray whitespace when pasted; canonicalize so the JWT client
+    // always gets a valid, tightly-packed PEM (real newlines, base64 body
+    // stripped of every space/newline and re-wrapped at 64 columns).
     email = (creds.client_email ?? '').trim()
-    key = (creds.private_key ?? '').replace(/\\n/g, '\n').trim()
+    key = canonicalizePrivateKey(creds.private_key ?? '')
   } else {
     email = SVC_CLIENT_EMAIL.trim()
-    key = SVC_PRIVATE_KEY.trim().replace(/\\n/g, '\n')
+    key = canonicalizePrivateKey(SVC_PRIVATE_KEY)
   }
 
   const auth = new JWT({
@@ -332,25 +355,61 @@ export async function agendar_cita(
   let calendarSynced = true
   let meetUrl: string | null = null
   try {
-    const created = await cal.events.insert({
-      calendarId: CAL_ID,
-      conferenceDataVersion: 1,
-      requestBody: {
-        summary: title,
-        description: motivo?.trim() || undefined,
-        start: { dateTime: limaIso(start), timeZone: CAL_TIMEZONE },
-        end: {
-          dateTime: limaIso(new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000)),
-          timeZone: CAL_TIMEZONE,
-        },
-        conferenceData: {
-          createRequest: {
-            requestId: randomUUID(),
-            conferenceSolutionKey: { type: 'hangoutsMeet' },
-          },
-        },
+    const baseBody = {
+      summary: title,
+      description: motivo?.trim() || undefined,
+      start: { dateTime: limaIso(start), timeZone: CAL_TIMEZONE },
+      end: {
+        dateTime: limaIso(new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000)),
+        timeZone: CAL_TIMEZONE,
       },
-    }, { timeout: CALENDAR_TIMEOUT_MS })
+    }
+
+    // Intentar crear un Google Meet (hangoutsMeet). Google lo rechaza (400
+    // "Invalid conference type value") cuando el emisor es una service account
+    // y el calendario pertenece a una cuenta personal (gmail.com, no
+    // Workspace): en ese caso reintentamos SIN conferencia para que el evento
+    // igual quede creado en el calendario (meetUrl queda null).
+    const tryInsert = async (withConference: boolean): Promise<Awaited<ReturnType<typeof cal.events.insert>>> =>
+      cal.events.insert(
+        withConference
+          ? {
+              calendarId: CAL_ID,
+              conferenceDataVersion: 1,
+              requestBody: {
+                ...baseBody,
+                conferenceData: {
+                  createRequest: {
+                    requestId: randomUUID(),
+                    conferenceSolutionKey: { type: 'hangoutsMeet' },
+                  },
+                },
+              },
+            }
+          : { calendarId: CAL_ID, requestBody: { ...baseBody } },
+        { timeout: CALENDAR_TIMEOUT_MS },
+      )
+
+    let created: Awaited<ReturnType<typeof cal.events.insert>> | null = null
+    try {
+      created = await tryInsert(true)
+    } catch (firstErr) {
+      const isConferenceError = /invalid conference|conference type value|conference data/i.test(
+        String((firstErr as Error)?.message ?? ''),
+      )
+      if (isConferenceError) {
+        // service account + cuenta personal => Meet no soportado, crear plano.
+        try {
+          created = await tryInsert(false)
+        } catch {
+          created = null
+        }
+      } else {
+        throw firstErr
+      }
+    }
+    if (!created) throw new Error('events.insert failed (Meet y reintento plano)')
+
     meetUrl = created.data.hangoutLink ?? null
     event = { id: created.data.id }
   } catch (err) {
