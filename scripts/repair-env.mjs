@@ -26,6 +26,8 @@ const KEY = /^\s*([A-Z0-9_]+)\s*=/
 // contain quotes + escaped chars). We treat these specially.
 const JSON_KEYS = new Set(['GOOGLE_SERVICE_ACCOUNT_JSON'])
 // Keys whose value must be a plain quoted string (exactly 0 or 2 double quotes).
+const OAUTH_KEYS = new Set(['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN'])
+
 const STRING_KEYS = new Set([
   'GOOGLE_CALENDAR_ID',
   'GOOGLE_SERVICE_ACCOUNT_CLIENT_EMAIL',
@@ -62,6 +64,17 @@ for (let i = 0; i < lines.length; i++) {
     } else {
       log(`L${i + 1} JSON_OK key=${key} len=${val.length}`)
     }
+    continue
+  }
+
+  if (OAUTH_KEYS.has(key)) {
+    const ov = val.replace(/^"|"$/g, '').trim()
+    let fmt = 'OK'
+    if (!ov) fmt = 'EMPTY'
+    else if (key === 'GOOGLE_CLIENT_ID' && !/^\d{6,}-[A-Za-z0-9_.-]+$/.test(ov)) fmt = 'FORMAT_ID'
+    else if (key === 'GOOGLE_CLIENT_SECRET' && ov.length < 12) fmt = 'SHORT_SECRET'
+    else if (key === 'GOOGLE_REFRESH_TOKEN' && !/^[A-Za-z0-9._-]{6,}$/.test(ov)) fmt = 'FORMAT_REFRESH'
+    if (fmt !== 'OK') { log(`L${i + 1} OAUTH:${key}=${fmt} len=${ov.length}`); changed++ } else { log(`L${i + 1} OAUTH:${key}=OK len=${ov.length}`) }
     continue
   }
 
