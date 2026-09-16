@@ -10,6 +10,7 @@ import {
 } from '@/lib/whatsapp/meta-api'
 import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive'
 import { decrypt } from '@/lib/whatsapp/encryption'
+import { cleanAiReplyText } from '@/lib/whatsapp/clean-ai-text'
 import {
   sanitizePhoneForMeta,
   isValidE164,
@@ -205,7 +206,7 @@ export async function engineSendAiReply(
   }
 
   const accessToken = decrypt(config.access_token)
-  const fragments = splitAiReply(args.text)
+  const fragments = splitAiReply(cleanAiReplyText(args.text))
   if (fragments.length === 0) {
     throw new Error('empty reply text')
   }
