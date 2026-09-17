@@ -89,7 +89,8 @@ export const AGENDAR_CITA_TOOL: ToolDefinition = {
     'motivo is optional and defaults to "Consulta / Valoración" when omitted. ' +
     'Google creates a Meet link (or returns the calendar event URL as fallback) and emails the customer an invitation. ' +
     'Pass the customer email when you know it, so they receive the invite with the link. ' +
-    'On success the tool returns confirmado:true plus the exact link to share with the customer.',
+    'On success the tool returns confirmado:true plus the exact link (hangoutLink or htmlLink; meet.google.com/new as last fallback) to share with the customer. ' +
+    'The confirmation WhatsApp message to the customer MUST ALWAYS include the Google Meet URL — never send a booking confirmation without it.',
   parameters: {
     type: 'object',
     properties: {

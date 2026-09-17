@@ -696,7 +696,7 @@ describe('agendar_cita — enlace del evento', () => {
     )
   })
 
-  it('confirms the appointment even with no link at all', async () => {
+  it('stores the Meet fallback link when Google returns no link at all', async () => {
     h.insert.mockResolvedValue({ data: { id: 'evt-plain' } })
     const supabase = db()
     const out = await agendar_cita({
@@ -707,8 +707,11 @@ describe('agendar_cita — enlace del evento', () => {
       nombre: 'Ana',
     })
     expect(out).toContain('Cita agendada')
+    expect(out).toContain('Reunión Meet: https://meet.google.com/new')
     const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
-    expect((insert!.row as { meet_link: string | null }).meet_link).toBeNull()
+    expect((insert!.row as { meet_link: string | null }).meet_link).toBe(
+      'https://meet.google.com/new',
+    )
   })
 
   it('books directly when the freebusy check fails (no blocking)', async () => {
@@ -782,9 +785,11 @@ describe('agendar_cita — enlace del evento', () => {
       expect(out).toContain('Cita agendada')
       expect(out).toContain('Google Calendar no disponible')
       const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
-      expect((insert!.row as { meet_link: string | null }).meet_link).toBeNull()
+      expect((insert!.row as { meet_link: string | null }).meet_link).toBe(
+        'https://meet.google.com/new',
+      )
       expect(out).toContain('"exito":true')
-      expect(out).toContain('"link":null')
+      expect(out).toContain('"link":"https://meet.google.com/new"')
     } finally {
       vi.useRealTimers()
     }

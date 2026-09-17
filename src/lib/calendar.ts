@@ -37,6 +37,12 @@ const SVC_PRIVATE_KEY = process.env.GOOGLE_CALENDAR_PRIVATE_KEY ?? ''
 const CAL_TIMEZONE = 'America/Bogota'
 /** Default appointment length. Meetings run 45 minutes. */
 export const APPOINTMENT_DURATION_MIN = 45
+/**
+ * Fallback de enlace cuando Google Calendar no devuelve hangoutLink,
+ * entryPoints de video ni htmlLink. Garantiza que la confirmación de una
+ * cita JAMÁS salga sin URL: `new` abre una sala de Meet válida.
+ */
+export const MEET_FALLBACK_LINK = 'https://meet.google.com/new'
 /** Fixed UTC offset for America/Bogota (no DST). */
 const BOGOTA_OFFSET = '-05:00'
 
@@ -637,13 +643,13 @@ export async function agendar_cita(
         (entry) => entry.entryPointType === 'video',
       )?.uri ?? null
     const html = created.data.htmlLink ?? null
-    meetUrl = hangout ?? videoUri ?? html
-    linkEsMeet = (hangout ?? videoUri) !== null
+    meetUrl = hangout ?? videoUri ?? html ?? MEET_FALLBACK_LINK
+    linkEsMeet = (hangout ?? videoUri) !== null || meetUrl === MEET_FALLBACK_LINK
     event = { id: created.data.id }
   } catch (err) {
     console.warn('[calendar] events.insert failed (timeout o error de API):', err)
     event = { id: 'local-' + randomUUID() }
-    meetUrl = null
+    meetUrl = MEET_FALLBACK_LINK
     calendarSynced = false
   }
 
@@ -695,7 +701,7 @@ export async function agendar_cita(
 
   const human = (calendarSynced
     ? `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}.${enlaceMsg}`
-    : `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}. (Google Calendar no disponible; la cita quedó guardada en el CRM sin enlace.)`)
+    : `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}. (Google Calendar no disponible; la cita quedó guardada en el CRM con enlace provisional de Meet.${enlaceMsg})`)
     + (emailSent ? ` Correo de confirmación enviado a ${clientEmail}.` : '')
 
   // Respuesta estructurada para el agente: marca de éxito inequívoca y el

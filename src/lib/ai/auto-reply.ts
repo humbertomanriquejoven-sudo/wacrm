@@ -13,7 +13,7 @@ import {
   loadContactContext,
   type BookingToolResult,
 } from './tools'
-import { calendarConfigured } from '@/lib/calendar'
+import { calendarConfigured, MEET_FALLBACK_LINK } from '@/lib/calendar'
 import { gmailConfigured } from '@/lib/gmail'
 import { engineSendAiReply } from '@/lib/flows/meta-send'
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit'
@@ -21,14 +21,6 @@ import type { ChatMessage } from './types'
 
 /** Maximum tool-call rounds per inbound to avoid infinite loops. */
 const MAX_TOOL_ROUNDS = 3
-
-/**
- * Tope efectivo de auto-respuestas por conversación. 99999 reflexiona el
- * objetivo "la IA responde SIEMPRE": mientras ningún humano esté asignado,
- * el valor guardado en el panel (configurado históricamente con topes
- * bajos como 1-20) nunca vuelve a silenciar al bot.
- */
-const AUTO_REPLY_MAX_PER_CONVERSATION = 99999
 
 /**
  * Customer-facing fallback when a scheduling tool ran but we could not
@@ -43,10 +35,9 @@ export const AGENDAR_FALLBACK_MESSAGE =
  * agendar_cita tool result (fecha/hora/link) — it does not depend on the
  * model echoing the link back. Dispatched by the backend the instant a
  * booking succeeds, so a booked appointment ALWAYS reaches the customer
- * in ONE bubble, with the link never empty:
- *  - confirmed + link  → the mandated format with the Google Meet link.
- *  - confirmed + no link (Google timed out; cita guardada en la BD) → a
- *    confirmation of the LOCAL booking without inventing any URL.
+ * in ONE bubble. The Google Meet URL is MANDATORY: it uses the real link
+ * returned by the tool (hangoutLink/htmlLink) or the MEET_FALLBACK_LINK —
+ * the message is never sent without a URL.
  * Returns null when the booking was not confirmed.
  */
 export function buildBookingConfirmationMessage(
@@ -57,11 +48,8 @@ export function buildBookingConfirmationMessage(
   const nombre = contactName?.trim() || 'Humberto'
   const fecha = booking.fecha ?? (booking.inicio?.slice(0, 10) ?? '')
   const hora = booking.hora ?? (booking.inicio?.slice(11, 16) ?? '')
-  const header = `¡Claro, ${nombre}! Te confirmo que nuestra reunión ha sido agendada para el ${fecha} a las ${hora}.`
-  if (!booking.link) {
-    return `${header}\n\nTe enviamos la confirmación a tu correo; el enlace de Google Meet se está generando y te lo haremos llegar en cuanto esté listo.`
-  }
-  return `${header}\n\nPuedes conectarte a través de este enlace de Google Meet:\n${booking.link}`
+  const link = booking.link || MEET_FALLBACK_LINK
+  return `¡Claro, ${nombre}! Te confirmo que nuestra reunión ha sido agendada para el ${fecha} a las ${hora}.\nPuedes conectarte a través de este enlace de Google Meet: ${link}`
 }
 
 /**
@@ -109,13 +97,14 @@ function looksLikeBookingConfirmation(text: string): boolean {
  * Deterministic guard against hallucinated bookings. Runs on the final
  * message BEFORE it is sent:
  *  - real agendar_cita success + link  → replace every Meet/calendar URL
- *    with that real link (append it if the model omitted it),
- *  - real success but no link         → strip every Meet/calendar URL,
+ *    with that link (append it if the model omitted it),
+ *  - real success but no link         → use MEET_FALLBACK_LINK, keeping a
+ *    Google Meet URL in any confirmation,
  *  - no real success this turn: never promise a booking. When the text
  *    claims a booking (and the customer was trying to schedule) OR is an
  *    intermediate "un momento…" wait message (always, booking or not)
- *    return null so the caller hands off silently; anything else keeps
- *    its fake URLs stripped.
+ *    return null so the caller skips the turn without muting; anything
+ *    else keeps its fake URLs stripped.
  */
 export function guardBookingReply(
   text: string,
@@ -125,18 +114,15 @@ export function guardBookingReply(
   if (!text) return text
 
   const confirmed = booking?.confirmado === true
-  const link = booking?.link ?? null
+  // Un mensaje de confirmación NUNCA queda sin URL: el link real si la
+  // tool lo devolvió, si no el fallback de Meet.
+  const resolvedLink: string = booking?.link || MEET_FALLBACK_LINK
 
-  if (confirmed && link) {
-    const replaced = text.replace(FAKE_LINK_RE, link)
-    return replaced.includes(link)
-      ? replaced
-      : `${replaced}\n\nAquí tienes el enlace de tu reunión: ${link}`
-  }
   if (confirmed) {
-    return link
-      ? text.replace(FAKE_LINK_RE, link)
-      : text.replace(FAKE_LINK_RE, '')
+    const replaced = text.replace(FAKE_LINK_RE, resolvedLink)
+    return replaced.includes(resolvedLink)
+      ? replaced
+      : `${replaced}\nAquí tienes el enlace de tu reunión: ${resolvedLink}`
   }
 
   // NUNCA enviar un texto que prometa un enlace de Meet/meeting sin que la
@@ -212,11 +198,9 @@ export async function dispatchInboundToAiReply(
         `[ai auto-reply] cleared stale mute on conversation ${conversationId} — new message re-enables the agent.`,
       )
     }
-    if (
-      AUTO_REPLY_MAX_PER_CONVERSATION > 0 &&
-      conv.ai_reply_count >= AUTO_REPLY_MAX_PER_CONVERSATION
-    )
-      return
+    // Sin límite de auto-respuestas: si ningún humano está asignado, la IA
+    // responde SIEMPRE a cada mensaje entrante (no se compara ai_reply_count
+    // con ningún máximo).
 
     const messages = await buildConversationContext(db, conversationId)
     if (messages.length === 0) return
@@ -423,7 +407,8 @@ export async function dispatchInboundToAiReply(
       'claim_ai_reply_slot',
       {
         conversation_id: conversationId,
-        max_replies: AUTO_REPLY_MAX_PER_CONVERSATION,
+        // 0 = ilimitado: el RPC claim_ai_reply_slot siempre otorga el slot.
+        max_replies: 0,
       },
     )
     if (claimErr) {
