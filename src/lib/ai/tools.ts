@@ -60,7 +60,7 @@ export const VER_DISPONIBILIDAD_TOOL: ToolDefinition = {
   description:
     'List available appointment slots in the business calendar. ' +
     'Call this BEFORE agendar_cita or reagendar_cita to confirm the customer\'s requested date/time. ' +
-    'Business hours: Monday to Friday 09:00-18:00, Saturday 09:00-13:00 (America/Bogota, UTC-5). ' +
+    'Business hours: Monday to Sunday 08:00-23:00 (America/Bogota, UTC-5). ' +
     'Pass the date range the customer is asking about.',
   parameters: {
     type: 'object',

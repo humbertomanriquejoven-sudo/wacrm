@@ -92,17 +92,17 @@ describe('ver_disponibilidad', () => {
     const out = await ver_disponibilidad('2026-09-14', '2026-09-18')
     expect(out).toContain('lunes 2026-09-14')
     expect(out).toContain('viernes 2026-09-18')
-    // Weekday 09:00-18:00, 45-min slots → starts 09:00..17:00 (17 slots).
+    // Weekday 08:00-23:00, 45-min slots → starts 08:00..22:00 (29 slots).
     const mondayLine = out.split('\n').find((l) => l.startsWith('lunes'))
-    expect(mondayLine?.match(/-05:00/g)).toHaveLength(17)
+    expect(mondayLine?.match(/-05:00/g)).toHaveLength(29)
     expect(out).not.toMatch(/s[áa]bado|domingo/)
   })
 
-  it('honors business hours on Saturday (09:00-13:00)', async () => {
+  it('honors business hours on Saturday (08:00-23:00)', async () => {
     const out = await ver_disponibilidad('2026-09-19', '2026-09-19')
     const saturdayLine = out.split('\n').find((l) => l.startsWith('sábado'))
-    // 09:00..12:00 → 7 starts.
-    expect(saturdayLine?.match(/-05:00/g)).toHaveLength(7)
+    // 08:00..22:00 → 29 starts.
+    expect(saturdayLine?.match(/-05:00/g)).toHaveLength(29)
   })
 
   it('excludes slots that overlap busy periods', async () => {
@@ -224,7 +224,7 @@ describe('agendar_cita', () => {
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
-      inicio: '2026-09-14T19:00:00-05:00',
+      inicio: '2026-09-14T23:30:00-05:00',
       nombre: 'X',
     })
     expect(out).toContain('Error')

@@ -14,10 +14,10 @@ export const CAL_TZ = 'America/Bogota'
 /** Monday..Sunday short labels used by the grid header. */
 export const DIAS_CORTOS = ['LUN', 'MAR', 'MIÉ', 'JUE', 'VIE', 'SÁB', 'DOM'] as const
 
-/** Business day window (Mon-Fri). The column height is this span. */
-export const INICIO_LABORAL_MIN = 9 * 60 // 09:00
-export const FIN_LABORAL_MIN = 18 * 60 // 18:00
-export const DURACION_LABORAL_MIN = FIN_LABORAL_MIN - INICIO_LABORAL_MIN // 540
+/** Business day window (Mon-Sun). The column height is this span. */
+export const INICIO_LABORAL_MIN = 8 * 60 // 08:00
+export const FIN_LABORAL_MIN = 23 * 60 // 23:00
+export const DURACION_LABORAL_MIN = FIN_LABORAL_MIN - INICIO_LABORAL_MIN // 900
 
 export interface BogotaClock {
   year: number
@@ -188,15 +188,15 @@ export function clampSemana(anio: number, semana: number): { anio: number; seman
 }
 
 // ------------------------------------------------------------
-// Grid geometry (block placement within a 540px-tall day column).
-// Positions are offsets in minutes relative to 09:00 (INICIO_LABORAL_MIN);
-// the column is DURACION_LABORAL_MIN = 540min, so top/height in px = value.
+// Grid geometry (block placement within a 900px-tall day column).
+// Positions are offsets in minutes relative to 08:00 (INICIO_LABORAL_MIN);
+// the column is DURACION_LABORAL_MIN = 900min, so top/height in px = value.
 // ------------------------------------------------------------
 
 export interface BloqueRango {
-  /** px offset from the top of the day column (0 = 09:00 Bogota). */
+  /** px offset from the top of the day column (0 = 08:00 Bogota). */
   inicioMin: number
-  /** px offset of the block's bottom edge (540 = 18:00 Bogota). */
+  /** px offset of the block's bottom edge (900 = 23:00 Bogota). */
   finMin: number
 }
 

@@ -164,7 +164,7 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.state.rpcCalls).toEqual([
       {
         name: 'claim_ai_reply_slot',
-        args: { conversation_id: 'conv-1', max_replies: 3 },
+        args: { conversation_id: 'conv-1', max_replies: 99999 },
       },
     ])
     expect(h.engineSendAiReply).toHaveBeenCalledWith(
@@ -264,14 +264,18 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.engineSendAiReply).not.toHaveBeenCalled()
   })
 
-  it('skips when the per-conversation cap is reached (max > 0)', async () => {
+  it('skips when the per-conversation cap is reached (a low stored value never blocks)', async () => {
+    h.loadAiConfig.mockResolvedValue(aiConfig({ autoReplyMaxPerConversation: 3 }))
     h.state.conv = {
       assigned_agent_id: null,
       ai_autoreply_disabled: false,
-      ai_reply_count: 3,
+      ai_reply_count: 50,
     }
     await dispatchInboundToAiReply(ARGS)
-    expect(h.engineSendText).not.toHaveBeenCalled()
+    // The effective cap is 99999, so the AI still answers this inbound.
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'Hello!' }),
+    )
   })
 
   it('replies unlimited when autoReplyMaxPerConversation is 0', async () => {
@@ -296,27 +300,21 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
 })
 
 describe('dispatchInboundToAiReply — handoff', () => {
-  it('disables auto-reply, writes a summary, and does not send on handoff', async () => {
+  it('never mutes nor sends when the model yields nothing (empty handoff)', async () => {
     h.generateReply.mockResolvedValue({ text: '', handoff: true })
     await dispatchInboundToAiReply(ARGS)
     expect(h.engineSendText).not.toHaveBeenCalled()
     expect(h.state.rpcCalls).toHaveLength(0)
-    expect(h.state.updatePayload).toMatchObject({ ai_autoreply_disabled: true })
-    expect(h.state.updatePayload?.ai_handoff_summary).toContain(
-      'AI agent handed off',
-    )
-    // No handoff target configured → conversation left unassigned.
-    expect(h.state.updatePayload).not.toHaveProperty('assigned_agent_id')
+    // The conversation is NOT silenced and NOT auto-assigned to a human.
+    expect(h.state.updatePayload).toBeNull()
   })
 
-  it('routes to the configured handoff agent on handoff', async () => {
+  it('never auto-assigns to the handoff agent when the model yields nothing', async () => {
     h.loadAiConfig.mockResolvedValue(aiConfig({ handoffAgentId: 'agent-7' }))
     h.generateReply.mockResolvedValue({ text: '', handoff: true })
     await dispatchInboundToAiReply(ARGS)
-    expect(h.state.updatePayload).toMatchObject({
-      ai_autoreply_disabled: true,
-      assigned_agent_id: 'agent-7',
-    })
+    expect(h.engineSendText).not.toHaveBeenCalled()
+    expect(h.state.updatePayload).toBeNull()
   })
 })
 
@@ -433,7 +431,7 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     expect(sent).not.toContain('xxx-yyyy-zzz')
   })
 
-  it('never sends a booking confirmation that has no real tool success — silent handoff', async () => {
+  it('never sends a booking confirmation that has no real tool success — dropped without muting', async () => {
     h.buildConversationContext.mockResolvedValue([
       { role: 'user', content: 'Hola, quiero agendar una cita para mañana a las 10 am' },
     ])
@@ -447,7 +445,7 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     expect(h.generateReply).toHaveBeenCalledTimes(1)
     expect(h.executeToolCall).not.toHaveBeenCalled()
     expect(h.engineSendAiReply).not.toHaveBeenCalled()
-    expect(h.state.updatePayload).toMatchObject({ ai_autoreply_disabled: true })
+    expect(h.state.updatePayload).toBeNull()
   })
 
   it('never sends an intermediate "un momento…" wait message and does NOT mute the chat', async () => {

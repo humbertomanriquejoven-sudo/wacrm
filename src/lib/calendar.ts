@@ -18,8 +18,8 @@ import { enviarConfirmacionCita } from '@/lib/gmail'
 // the event; `citas` links it to a CRM contact so the AI/bot can
 // PATCH/cancel by stable UUID.
 //
-// Business hours are fixed (America/Bogota):
-//   Mon-Fri 09:00-18:00, Sat 09:00-13:00, Sun closed.
+// Business hours are fixed (America/Bogota), same every day:
+//   Monday to Sunday 08:00-23:00.
 // ============================================================
 
 const CAL_ID = process.env.GOOGLE_CALENDAR_ID ?? ''
@@ -58,14 +58,15 @@ const AGENDAR_TIMEOUT_MS = 4_000
 
 export const BUSINESS_HOURS: Record<
   number,
-  { openMin: number; closeMin: number } | undefined
+  { openMin: number; closeMin: number }
 > = {
-  1: { openMin: 9 * 60, closeMin: 18 * 60 },
-  2: { openMin: 9 * 60, closeMin: 18 * 60 },
-  3: { openMin: 9 * 60, closeMin: 18 * 60 },
-  4: { openMin: 9 * 60, closeMin: 18 * 60 },
-  5: { openMin: 9 * 60, closeMin: 18 * 60 },
-  6: { openMin: 9 * 60, closeMin: 13 * 60 },
+  0: { openMin: 8 * 60, closeMin: 23 * 60 },
+  1: { openMin: 8 * 60, closeMin: 23 * 60 },
+  2: { openMin: 8 * 60, closeMin: 23 * 60 },
+  3: { openMin: 8 * 60, closeMin: 23 * 60 },
+  4: { openMin: 8 * 60, closeMin: 23 * 60 },
+  5: { openMin: 8 * 60, closeMin: 23 * 60 },
+  6: { openMin: 8 * 60, closeMin: 23 * 60 },
 }
 
 function isCalendarConfigured(): boolean {

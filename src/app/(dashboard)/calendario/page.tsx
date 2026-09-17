@@ -33,7 +33,12 @@ import type { CitaWithContact } from "@/types"
 // `cacheComponents` is not enabled in next.config.
 export const dynamic = "force-dynamic"
 
-const HOURS = Array.from({ length: 9 }, (_, i) => 9 + i) // 09:00 .. 17:00 labels
+// Hour labels aligned with the business window (08:00..22:00 → 15 labels
+// × 60px = 900px, matching DURACION_LABORAL_MIN).
+const HOURS = Array.from(
+  { length: (FIN_LABORAL_MIN - INICIO_LABORAL_MIN) / 60 },
+  (_, i) => INICIO_LABORAL_MIN / 60 + i,
+)
 
 const fmtDia = new Intl.DateTimeFormat("es-CO", {
   timeZone: CAL_TZ,

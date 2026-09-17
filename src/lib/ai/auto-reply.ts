@@ -4,7 +4,6 @@ import { buildConversationContext } from './context'
 import { retrieveKnowledge } from './knowledge'
 import { generateReply } from './generate'
 import { buildSystemPrompt } from './defaults'
-import { buildHandoffSummary } from './handoff'
 import { logAiUsage } from './usage'
 import { latestUserMessage } from './query'
 import {
@@ -22,6 +21,14 @@ import type { ChatMessage } from './types'
 
 /** Maximum tool-call rounds per inbound to avoid infinite loops. */
 const MAX_TOOL_ROUNDS = 3
+
+/**
+ * Tope efectivo de auto-respuestas por conversación. 99999 reflexiona el
+ * objetivo "la IA responde SIEMPRE": mientras ningún humano esté asignado,
+ * el valor guardado en el panel (configurado históricamente con topes
+ * bajos como 1-20) nunca vuelve a silenciar al bot.
+ */
+const AUTO_REPLY_MAX_PER_CONVERSATION = 99999
 
 /**
  * Customer-facing fallback when a scheduling tool ran but we could not
@@ -206,8 +213,8 @@ export async function dispatchInboundToAiReply(
       )
     }
     if (
-      config.autoReplyMaxPerConversation > 0 &&
-      conv.ai_reply_count >= config.autoReplyMaxPerConversation
+      AUTO_REPLY_MAX_PER_CONVERSATION > 0 &&
+      conv.ai_reply_count >= AUTO_REPLY_MAX_PER_CONVERSATION
     )
       return
 
@@ -255,7 +262,6 @@ export async function dispatchInboundToAiReply(
     // re-generate up to MAX_TOOL_ROUNDS times.
     let finalText: string | null = ''
     let finalUsage = null
-    let handoff = false
     let toolFallback: string | null = null
     // Latest REAL successful booking from agendar_cita's JSON_RESULT.
     // Everything else that looks like a confirmation is hallucination.
@@ -271,7 +277,6 @@ export async function dispatchInboundToAiReply(
       })
 
       finalUsage = result.usage
-      handoff = result.handoff
 
       // If the model returned tool calls, execute them and continue.
       if (result.toolCalls && result.toolCalls.length > 0) {
@@ -338,7 +343,6 @@ export async function dispatchInboundToAiReply(
       if (deterministic) {
         finalText = deterministic
         toolFallback = null
-        handoff = false
       }
     }
 
@@ -346,7 +350,7 @@ export async function dispatchInboundToAiReply(
     // tool-free generation so the model turns the tool output (the Meet
     // link, the booked time) into a customer-facing confirmation even
     // when the round budget was exhausted by repeated tool calls.
-    if (!finalText && !handoff) {
+    if (!finalText) {
       try {
         const final = await generateReply({
           config,
@@ -354,7 +358,6 @@ export async function dispatchInboundToAiReply(
           messages: conversationMessages,
         })
         finalUsage = final.usage ?? finalUsage
-        handoff = final.handoff
         finalText = final.text
       } catch (err) {
         console.error('[ai auto-reply] final confirmation pass failed:', err)
@@ -363,7 +366,7 @@ export async function dispatchInboundToAiReply(
 
     // Last resort: if a scheduling tool failed and the model still said
     // nothing, send the fallback rather than going silent.
-    if (!finalText && !handoff && toolFallback) {
+    if (!finalText && toolFallback) {
       finalText = toolFallback
     }
 
@@ -374,7 +377,7 @@ export async function dispatchInboundToAiReply(
     // momento…") only skips that turn WITHOUT muting the conversation —
     // the next message is answered normally instead of leaving the chat
     // permanently silent.
-    if (finalText && !handoff) {
+    if (finalText) {
       const raw = finalText
       finalText = guardBookingReply(finalText, realBooking, {
         bookingContext: hasBookingIntent(messages),
@@ -388,7 +391,12 @@ export async function dispatchInboundToAiReply(
         )
         return
       }
-      if (finalText === null) handoff = true
+      if (finalText === null) {
+        console.log(
+          '[ai auto-reply] dropped an ungrounded text (no mute, no handoff).',
+        )
+        return
+      }
     }
 
     // Record token spend on the account's BYO key.
@@ -401,19 +409,13 @@ export async function dispatchInboundToAiReply(
       usage: finalUsage,
     })
 
-    if (handoff || !finalText) {
-      const summary = buildHandoffSummary({
-        messages,
-        replyCount: conv.ai_reply_count ?? 0,
-      })
-      const update: Record<string, unknown> = {
-        ai_autoreply_disabled: true,
-        ai_handoff_summary: summary,
-      }
-      if (config.handoffAgentId && !conv.assigned_agent_id) {
-        update.assigned_agent_id = config.handoffAgentId
-      }
-      await db.from('conversations').update(update).eq('id', conversationId)
+    // Si no hay texto final, no hay nada que enviar — pero JAMÁS se marca
+    // la conversación como muda (ai_autoreply_disabled) ni se la asigna a
+    // un humano automáticamente: el siguiente mensaje se responde normal.
+    if (!finalText) {
+      console.log(
+        '[ai auto-reply] no final text to send — skipping without muting.',
+      )
       return
     }
 
@@ -421,7 +423,7 @@ export async function dispatchInboundToAiReply(
       'claim_ai_reply_slot',
       {
         conversation_id: conversationId,
-        max_replies: config.autoReplyMaxPerConversation,
+        max_replies: AUTO_REPLY_MAX_PER_CONVERSATION,
       },
     )
     if (claimErr) {

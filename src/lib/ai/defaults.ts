@@ -181,7 +181,7 @@ export function buildSystemPrompt(args: {
 
   if (calendarEnabled) {
     parts.push(
-      'Appointment booking is available. Business hours (America/Bogota, UTC-5): Monday to Friday 09:00-18:00, Saturday 09:00-13:00. ' +
+      'Appointment booking is available. Business hours (America/Bogota, UTC-5): Monday to Sunday 08:00-23:00. ' +
         'Appointments last 45 minutes by default; send start times as ISO 8601 with the Bogota offset (e.g. 2026-09-17T15:00:00-05:00). ' +
         'Every booking automatically requests Google to create a Google Meet link (conferenceData); when the account cannot create Meet, ' +
         'the system returns the calendar event URL (htmlLink) instead — either one is the link to share. ' +

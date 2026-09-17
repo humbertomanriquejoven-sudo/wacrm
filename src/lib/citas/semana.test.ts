@@ -32,10 +32,10 @@ describe('constantes', () => {
     expect(DIAS_CORTOS).toEqual(['LUN', 'MAR', 'MIÉ', 'JUE', 'VIE', 'SÁB', 'DOM'])
   })
 
-  it('spans a 540-minute business day (09:00-18:00)', () => {
-    expect(INICIO_LABORAL_MIN).toBe(540)
-    expect(FIN_LABORAL_MIN).toBe(1080)
-    expect(DURACION_LABORAL_MIN).toBe(540)
+  it('spans a 900-minute business day (08:00-23:00)', () => {
+    expect(INICIO_LABORAL_MIN).toBe(480)
+    expect(FIN_LABORAL_MIN).toBe(1380)
+    expect(DURACION_LABORAL_MIN).toBe(900)
   })
 })
 
@@ -114,12 +114,12 @@ describe('semanas ISO', () => {
 })
 
 describe('geometría del grid', () => {
-  it('places a 09:00-09:45 appointment at the top of the column', () => {
+  it('places an 08:00-08:45 appointment at the top of the column', () => {
     expect(
       citaRango(
         '2026-09-14',
-        '2026-09-14T14:00:00.000Z',
-        '2026-09-14T14:45:00.000Z',
+        '2026-09-14T13:00:00.000Z',
+        '2026-09-14T13:45:00.000Z',
       ),
     ).toEqual({ inicioMin: 0, finMin: 45 })
   })
@@ -130,15 +130,15 @@ describe('geometría del grid', () => {
     ).toBeNull()
   })
 
-  it('clips a partially out-of-hours appointment', () => {
-    // 08:30-09:30 Bogota (13:30-14:30 UTC): clamped to 09:00-09:30.
+  it('places a mid-morning appointment without clipping (inside 08:00-23:00)', () => {
+    // 08:30-09:30 Bogota (13:30-14:30 UTC): fully inside, no clip.
     expect(
       citaRango(
         '2026-09-14',
         '2026-09-14T13:30:00.000Z',
         '2026-09-14T14:30:00.000Z',
       ),
-    ).toEqual({ inicioMin: 0, finMin: 30 })
+    ).toEqual({ inicioMin: 30, finMin: 90 })
   })
 
   it('rejects an appointment entirely outside business hours', () => {
@@ -151,7 +151,7 @@ describe('geometría del grid', () => {
     ).toBeNull()
   })
 
-  it('clips a busy interval to the 09:00-18:00 window', () => {
+  it('clips a busy interval to the 08:00-23:00 window', () => {
     // 08:00-19:00 Bogota (13:00Z-00:00Z next day).
     expect(
       ocupadoRango(
@@ -159,7 +159,7 @@ describe('geometría del grid', () => {
         '2026-09-14T13:00:00.000Z',
         '2026-09-15T00:00:00.000Z',
       ),
-    ).toEqual({ inicioMin: 0, finMin: 540 })
+    ).toEqual({ inicioMin: 0, finMin: 660 })
   })
 
   it('ignores busy intervals outside the day', () => {
