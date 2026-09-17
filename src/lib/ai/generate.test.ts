@@ -219,3 +219,129 @@ describe('generateReply — Anthropic', () => {
     expect(body.messages).toHaveLength(1)
   })
 })
+
+describe('generateReply — tool-calling safeguards', () => {
+  const tools = [
+    {
+      name: 'ver_disponibilidad',
+      description: 'list slots',
+      parameters: { type: 'object' as const, properties: {} },
+    },
+    {
+      name: 'agendar_cita',
+      description: 'book',
+      parameters: { type: 'object' as const, properties: {} },
+    },
+  ]
+
+  it('sends tool_choice "auto" to OpenAI when tools are present', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(okResponse({ choices: [{ message: { content: 'Hola' } }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await generateReply({
+      config: config({ provider: 'openai' }),
+      systemPrompt: 'sys',
+      messages: [{ role: 'user', content: 'Hola' }],
+      tools,
+    })
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(body.tool_choice).toBe('auto')
+    expect(body.tools).toHaveLength(2)
+  })
+
+  it('sends tool_choice {type:auto} to Anthropic when tools are present', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(okResponse({ content: [{ type: 'text', text: 'Hola' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await generateReply({
+      config: config({ provider: 'anthropic' }),
+      systemPrompt: 'sys',
+      messages: [{ role: 'user', content: 'Hola' }],
+      tools,
+    })
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(body.tool_choice).toEqual({ type: 'auto' })
+  })
+
+  it('strips leaked tool-call text and recovers the call when the provider sent none', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        okResponse({
+          choices: [
+            {
+              message: {
+                content:
+                  'step_0: print(default_api.agendar_cita(inicio="2026-09-18T14:00:00-05:00", nombre="Carlos"))',
+              },
+            },
+          ],
+        }),
+      ),
+    )
+
+    const res = await generateReply({
+      config: config({ provider: 'openai' }),
+      systemPrompt: 'sys',
+      messages: [{ role: 'user', content: 'agenda una cita' }],
+      tools,
+    })
+
+    expect(res.text).toBe('')
+    expect(res.toolCalls).toEqual([
+      {
+        id: 'text-call-agendar_cita-0',
+        name: 'agendar_cita',
+        arguments: {
+          inicio: '2026-09-18T14:00:00-05:00',
+          nombre: 'Carlos',
+        },
+      },
+    ])
+  })
+
+  it('never leaks scaffolding text even when structured tool_calls are present', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        okResponse({
+          choices: [
+            {
+              message: {
+                content: 'step_0: print(default_api.ver_disponibilidad(desde="a", hasta="b"))',
+                tool_calls: [
+                  {
+                    id: 'call-1',
+                    type: 'function',
+                    function: {
+                      name: 'ver_disponibilidad',
+                      arguments: '{"desde":"a","hasta":"b"}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      ),
+    )
+
+    const res = await generateReply({
+      config: config({ provider: 'openai' }),
+      systemPrompt: 'sys',
+      messages: [{ role: 'user', content: 'hay cupo?' }],
+      tools,
+    })
+
+    expect(res.text).not.toContain('step_0')
+    expect(res.text).not.toContain('default_api')
+    expect(res.toolCalls).toHaveLength(1)
+    expect(res.toolCalls?.[0].id).toBe('call-1')
+  })
+})

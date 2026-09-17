@@ -137,6 +137,9 @@ export async function generateAnthropic(
       description: t.description,
       input_schema: t.parameters,
     }))
+    // Let the model decide when to invoke a tool (Anthropic's explicit
+    // "auto" default), so it emits tool_use blocks rather than prose.
+    body.tool_choice = { type: 'auto' }
   }
 
   let res: Response

@@ -7,6 +7,7 @@ import {
   type ToolDefinition,
 } from './types'
 import { HANDOFF_SENTINEL, aiRequestTimeoutMs } from './defaults'
+import { extractLeakedToolCalls } from './tool-call-text'
 import { generateOpenAi } from './providers/openai'
 import { generateAnthropic } from './providers/anthropic'
 import { generateOpenRouter } from './providers/openrouter'
@@ -54,7 +55,26 @@ export async function generateReply(args: GenerateArgs): Promise<GenerateResult>
   }
 
   const parsed = parseGeneration(result.text, result.usage)
-  parsed.toolCalls = result.toolCalls
+
+  // Provider tool-call safety net. A model that printed the invocation
+  // as text (Gemini "step_0: print(default_api.…)") would otherwise have
+  // that scaffolding delivered verbatim to the customer. Strip it always
+  // (even for draft/playground turns that pass no tools); when the
+  // provider returned no structured tool_calls, recover the leaked ones
+  // so the tool still executes instead of being dropped.
+  const knownNames = tools?.map((t) => t.name) ?? []
+  const { text, toolCalls: leaked } = extractLeakedToolCalls(
+    parsed.text,
+    knownNames,
+  )
+  parsed.text = text
+  if (knownNames.length > 0) {
+    const structured = result.toolCalls ?? []
+    parsed.toolCalls = structured.length > 0 ? structured : leaked
+  } else {
+    parsed.toolCalls = result.toolCalls
+  }
+
   return parsed
 }
 
