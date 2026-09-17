@@ -1828,7 +1828,17 @@
       "addDoc": "Add document",
       "reindex": "Reindex",
       "reindexTooltip": "Re-embed all documents (e.g. after adding an embeddings key)",
-      "loading": "Loading…"
+      "loading": "Loading…",
+      "uploadTitle": "Title (optional)",
+      "uploadTitlePlaceholder": "e.g. Price list 2026 — defaults to file name",
+      "uploadDropzone": "Drag & drop or click to upload",
+      "uploadHint": ".xlsx .xls .csv .pdf .docx .doc .txt — up to 16 MB",
+      "uploading": "Parsing and indexing…",
+      "uploadSuccess": "File added to the knowledge base.",
+      "uploadFailed": "Upload failed.",
+      "uploadTooLarge": "File must be 16 MB or smaller.",
+      "uploadUnsupported": "Unsupported file type.",
+      "uploadEmpty": "The file is empty."
     }
   }
 }

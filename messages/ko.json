@@ -1828,7 +1828,17 @@
       "addDoc": "문서 추가",
       "reindex": "재색인",
       "reindexTooltip": "모든 문서를 다시 임베딩합니다 (예: 임베딩 키 추가 후)",
-      "loading": "불러오는 중…"
+      "loading": "불러오는 중…",
+      "uploadTitle": "제목 (선택)",
+      "uploadTitlePlaceholder": "예: 2026 가격표 — 비워두면 파일 이름으로 저장됩니다",
+      "uploadDropzone": "드래그 앤 드롭 또는 클릭하여 업로드",
+      "uploadHint": ".xlsx .xls .csv .pdf .docx .doc .txt — 최대 16 MB",
+      "uploading": "파싱 및 색인 중…",
+      "uploadSuccess": "파일이 지식베이스에 추가되었습니다.",
+      "uploadFailed": "업로드하지 못했습니다.",
+      "uploadTooLarge": "파일은 16 MB 이하여야 합니다.",
+      "uploadUnsupported": "지원하지 않는 파일 형식입니다.",
+      "uploadEmpty": "파일이 비어 있습니다."
     }
   }
 }
