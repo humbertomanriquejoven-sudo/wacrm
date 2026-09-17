@@ -210,6 +210,16 @@ export function buildSystemPrompt(args: {
         'REENVÍO DEL ENLACE: cuando el cliente pida su enlace ("mándame el link", "envíame el enlace de la reunión"), NO escribas ni inventes ninguna URL: ' +
         'el sistema lo extrae automáticamente de su última cita confirmada y lo adjunta a tu respuesta. Limítate a confirmar amablemente.'
     );
+    parts.push(
+      'REGLA OBLIGATORIA DE CONFIRMACIÓN DE CITA: ' +
+        'Cada vez que confirmes un agendamiento por WhatsApp, DEBES incluir OBLIGATORIAMENTE la URL de Google Meet que te devuelve la herramienta `agendar_cita`. ' +
+        'La herramienta `agendar_cita` comienza su resultado con la línea "ÉXITO: Cita creada para {nombre} el {fecha} a las {hora}. Enlace de Google Meet OBLIGATORIO: {url}" — ' +
+        'cita esa url tal cual, SIN inventarla ni sustituirla. ' +
+        'FORMATO EXIGIDO: "¡Listo, [Nombre]! Tu cita ha sido agendada con éxito para el [Fecha] a las [Hora]. ' +
+        'Puedes unirte a la videollamada directamente desde este enlace: [URL_DE_GOOGLE_MEET]" ' +
+        'NUNCA omitas el enlace de Google Meet. Si el usuario te pregunta por el link de una cita ya agendada, ' +
+        'busca en las citas de la conversación y vuelve a enviarle la URL completa.'
+    );
   }
 
   if (gmailEnabled) {

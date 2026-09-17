@@ -128,6 +128,20 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('ejecuta el tool_call directamente');
   });
 
+  it('forces the mandatory Meet link in every booking confirmation', () => {
+    const prompt = buildSystemPrompt({
+      userPrompt: null,
+      mode: 'auto_reply',
+      calendarEnabled: true,
+    });
+    expect(prompt).toContain('REGLA OBLIGATORIA DE CONFIRMACIÓN DE CITA');
+    expect(prompt).toContain('Enlace de Google Meet OBLIGATORIO');
+    expect(prompt).toContain('FORMATO EXIGIDO');
+    expect(prompt).toContain('Puedes unirte a la videollamada');
+    expect(prompt).toContain('NUNCA omitas el enlace de Google Meet');
+    expect(prompt).toContain('vuelve a enviarle la URL completa');
+  });
+
   it('forces strict Spanish and a single response without internal reasoning', () => {
     const prompt = buildSystemPrompt({
       userPrompt: null,

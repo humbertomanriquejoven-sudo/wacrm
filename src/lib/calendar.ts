@@ -902,6 +902,23 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
     }
   }
 
+  // Fecha (YYYY-MM-DD) y hora (HH:MM) en hora local de Bogotá — el
+  // mensaje de éxito de la tool debe citarlas tal cual al cliente.
+  const fecha = new Intl.DateTimeFormat('en-CA', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    timeZone: CAL_TIMEZONE,
+  }).format(start);
+  const hora = new Intl.DateTimeFormat('es-CO', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+    timeZone: CAL_TIMEZONE,
+  })
+    .format(start)
+    .replace(/[^\d:]/g, '');
+
   const enlaceMsg = meetUrl
     ? linkEsMeet
       ? ` Reunión Meet: ${meetUrl}`
@@ -920,21 +937,6 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
   // Respuesta estructurada para el agente: marca de éxito inequívoca y el
   // enlace exacto (hangoutLink > htmlLink) que debe citar al cliente.
   // Es un ámbito de la tool, no del mensaje al cliente.
-  const fecha = new Intl.DateTimeFormat('en-CA', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    timeZone: CAL_TIMEZONE,
-  }).format(start);
-  const hora = new Intl.DateTimeFormat('es-CO', {
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-    timeZone: CAL_TIMEZONE,
-  })
-    .format(start)
-    .replace(/[^\d:]/g, '');
-
   const structured: Record<string, unknown> = {
     exito: true,
     mensaje: 'Cita agendada correctamente',
@@ -948,7 +950,15 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
     estado: 'confirmada',
   };
 
-  return `${human}\n\nJSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ${JSON.stringify(structured)}`;
+  // Resultado textual para el modelo: la PRIMERÍSIMA línea es SIEMPRE la
+  // confirmación con el enlace de Google Meet obligatorio, en el formato
+  // exacto (nombre, fecha, hora y URL reales devueltos por la API — la
+  // tool nunca inventa un enlace). El human detallado y el JSON_RESULT
+  // se conservan para el resto del sistema (diagnóstico, determinismo,
+  // reenvío de link por BD), después de esa línea de éxito.
+  const resumenExito = `ÉXITO: Cita creada para ${name} el ${fecha} a las ${hora}. Enlace de Google Meet OBLIGATORIO: ${meetUrl}`;
+
+  return `${resumenExito}\n\n${human}\n\nJSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ${JSON.stringify(structured)}`;
 }
 
 export interface ReagendarCitaArgs {

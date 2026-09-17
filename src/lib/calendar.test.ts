@@ -950,6 +950,53 @@ describe('agendar_cita — enlace del evento', () => {
     expect(out).toContain('"link":"https://meet.google.com/shape"');
   });
 
+  it('leads the tool result with the mandatory Meet link line in the exact ÉXITO format', async () => {
+    h.insert.mockResolvedValue({
+      data: {
+        id: 'evt-exito',
+        hangoutLink: 'https://meet.google.com/exito-meet',
+      },
+    });
+    const supabase = db();
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'Ana',
+    });
+    expect(
+      out.startsWith(
+        'ÉXITO: Cita creada para Ana el 2026-09-14 a las 10:00. Enlace de Google Meet OBLIGATORIO: https://meet.google.com/exito-meet'
+      )
+    ).toBe(true);
+    expect(out).toContain('"link":"https://meet.google.com/exito-meet"');
+  });
+
+  it('keeps the mandatory Meet line even in the degraded local-only path', async () => {
+    vi.useFakeTimers();
+    try {
+      h.insert.mockReturnValue(new Promise(() => {}));
+      const supabase = db();
+      const p = agendar_cita({
+        db: supabase as never,
+        accountId: 'acct-1',
+        contactoId: 'contact-1',
+        inicio: '2026-09-14T10:00:00-05:00',
+        nombre: 'Ana',
+      });
+      await vi.advanceTimersByTimeAsync(4000);
+      const out = await p;
+      expect(
+        out.startsWith(
+          'ÉXITO: Cita creada para Ana el 2026-09-14 a las 10:00. Enlace de Google Meet OBLIGATORIO: https://meet.google.com/new'
+        )
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not hang when Google never answers — 4s timeout, saves locally and returns success', async () => {
     vi.useFakeTimers();
     try {
