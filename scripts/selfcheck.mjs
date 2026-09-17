@@ -96,14 +96,14 @@ async function googlePhase() {
   })
   const calApi = calendar({ version: 'v3', auth })
   try {
-    const fb = await calApi.freebusy.query({ requestBody: { timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + 3600e3).toISOString(), timeZone: 'America/Lima', items: [{ id: calId }] } }, { timeout: 8000 })
+    const fb = await calApi.freebusy.query({ requestBody: { timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + 3600e3).toISOString(), timeZone: 'America/Bogota', items: [{ id: calId }] } }, { timeout: 8000 })
     log(`AUTH freebusy: OK (${(fb.data.calendars?.[calId]?.busy || []).length} busy)`)
   } catch (e) { log(`AUTH freebusy: FAIL (${e.message})`); process.env.__AUTHFAIL = '1'; return }
   const start = new Date()
   start.setHours(start.getHours(), start.getMinutes() + 5, 0, 0)
   const end = new Date(start.getTime() + 15 * 60e3)
   try {
-    const created = await calApi.events.insert({ calendarId: calId, conferenceDataVersion: 1, requestBody: { summary: 'SELFCHECK - borrar', description: 'auto-test wacrm', start: { dateTime: start.toISOString(), timeZone: 'America/Lima' }, end: { dateTime: end.toISOString(), timeZone: 'America/Lima' }, conferenceData: { createRequest: { requestId: Math.random().toString(36).slice(2), conferenceSolutionKey: { type: 'hangoutsMeet' } } } } }, { timeout: 8000 })
+    const created = await calApi.events.insert({ calendarId: calId, conferenceDataVersion: 1, requestBody: { summary: 'SELFCHECK - borrar', description: 'auto-test wacrm', start: { dateTime: start.toISOString(), timeZone: 'America/Bogota' }, end: { dateTime: end.toISOString(), timeZone: 'America/Bogota' }, conferenceData: { createRequest: { requestId: Math.random().toString(36).slice(2), conferenceSolutionKey: { type: 'hangoutsMeet' } } } } }, { timeout: 8000 })
     const link = created.data.hangoutLink || created.data.conferenceData?.entryPoints?.[0]?.uri || null
     log(`MEET link: ${link ? 'OK (' + (link.includes('meet.google.com') ? 'meet.google.com' : '?)') + ')' : 'FAIL (no hangoutLink)'}`)
     try { await calApi.events.delete({ calendarId: calId, eventId: created.data.id }) } catch (e) { log('MEET cleanup: FAIL (' + e.message + ')') }

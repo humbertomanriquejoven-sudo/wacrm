@@ -53,13 +53,13 @@ export function aiContextMessageLimit(): number {
 
 /**
  * IANA zone used to stamp "today" into the system prompt. Defaults to
- * the business wall-clock (same as the calendar, America/Lima) rather
- * than the server box's timezone, so the model resolves relative dates
- * ("mañana", "este viernes") against the appointment clock. Both
- * America/Lima and America/Bogota are UTC-5 without DST, so either is
- * correct here. Override with `AI_TIMEZONE`.
+ * the business wall-clock (same as the calendar, America/Bogota) rather
+ * than the server box's timezone (UTC in production), so the model
+ * resolves relative dates ("mañana", "este viernes") against the
+ * appointment clock. America/Bogota is UTC-5 without DST. Override with
+ * `AI_TIMEZONE`.
  */
-const DEFAULT_AI_TIMEZONE = 'America/Lima'
+const DEFAULT_AI_TIMEZONE = 'America/Bogota'
 
 /** IANA zone for the current date/time prompt context. */
 export function aiTimeZone(): string {
@@ -176,7 +176,8 @@ export function buildSystemPrompt(args: {
 
   if (calendarEnabled) {
     parts.push(
-      'Appointment booking is available. Business hours (America/Lima): Monday to Friday 09:00-18:00, Saturday 09:00-13:00. ' +
+      'Appointment booking is available. Business hours (America/Bogota, UTC-5): Monday to Friday 09:00-18:00, Saturday 09:00-13:00. ' +
+        'Appointments last 45 minutes; send start times as ISO 8601 with the Bogota offset (e.g. 2026-09-17T15:00:00-05:00). ' +
         'When the customer asks for an appointment, follow this flow: ' +
         '1) Call ver_disponibilidad with the date(s) the customer wants to see available slots; ' +
         '2) Show the customer the free times and ask which one they prefer; ' +

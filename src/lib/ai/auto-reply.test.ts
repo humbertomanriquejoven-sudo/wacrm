@@ -119,7 +119,7 @@ beforeEach(() => {
   h.buildConversationContext.mockResolvedValue([{ role: 'user', content: 'hi' }])
   h.retrieveKnowledge.mockResolvedValue([])
   h.generateReply.mockResolvedValue({ text: 'Hello!', handoff: false })
-  h.executeToolCall.mockResolvedValue('Cita agendada: 2026-09-18T14:00:00 (60 minutos). Reunión Meet: https://meet.google.com/abc')
+  h.executeToolCall.mockResolvedValue('Cita agendada: 2026-09-18T14:00:00 (45 minutos). Reunión Meet: https://meet.google.com/abc')
   h.loadContactContext.mockImplementation(async () => ({
     name: null,
     email: null,

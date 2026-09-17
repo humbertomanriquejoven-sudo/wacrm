@@ -52,13 +52,13 @@ export const UPDATE_CLIENT_PROFILE_TOOL: ToolDefinition = {
   },
 }
 
-/** Google Calendar — list free 60-minute slots within business hours. */
+/** Google Calendar — list free 45-minute slots within business hours. */
 export const VER_DISPONIBILIDAD_TOOL: ToolDefinition = {
   name: 'ver_disponibilidad',
   description:
     'List available appointment slots in the business calendar. ' +
     'Call this BEFORE agendar_cita or reagendar_cita to confirm the customer\'s requested date/time. ' +
-    'Business hours: Monday to Friday 09:00-18:00, Saturday 09:00-13:00 (America/Lima). ' +
+    'Business hours: Monday to Friday 09:00-18:00, Saturday 09:00-13:00 (America/Bogota, UTC-5). ' +
     'Pass the date range the customer is asking about.',
   parameters: {
     type: 'object',
@@ -66,23 +66,23 @@ export const VER_DISPONIBILIDAD_TOOL: ToolDefinition = {
       desde: {
         type: 'string',
         description:
-          'Start of the window to check, ISO date or date-time (e.g. "2026-05-04" or "2026-05-04T09:00:00-05:00")',
+          'Start of the window to check, ISO date or date-time in Bogota time (e.g. "2026-05-04" or "2026-05-04T09:00:00-05:00")',
       },
       hasta: {
         type: 'string',
         description:
-          'End of the window to check, ISO date or date-time (e.g. "2026-05-08")',
+          'End of the window to check, ISO date or date-time in Bogota time (e.g. "2026-05-08")',
       },
     },
     required: ['desde', 'hasta'],
   },
 }
 
-/** Google Calendar — book a 60-minute appointment and link it to the contact. */
+/** Google Calendar — book a 45-minute appointment and link it to the contact. */
 export const AGENDAR_CITA_TOOL: ToolDefinition = {
   name: 'agendar_cita',
   description:
-    'Schedule a 60-minute appointment for the customer in the business calendar. ' +
+    'Schedule a 45-minute appointment for the customer in the business calendar. ' +
     'Google creates a Meet link and emails the customer an invitation. ' +
     'Pass the customer email when you know it, so they receive the invite with the Meet link.',
   parameters: {
@@ -91,7 +91,7 @@ export const AGENDAR_CITA_TOOL: ToolDefinition = {
       inicio: {
         type: 'string',
         description:
-          'Start date-time of the appointment in ISO format, e.g. "2026-05-04T10:00:00-05:00"',
+          'Start date-time of the appointment in ISO 8601 with the Bogota offset, e.g. "2026-05-04T10:00:00-05:00"',
       },
       nombre: {
         type: 'string',

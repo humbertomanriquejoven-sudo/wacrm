@@ -35,14 +35,14 @@ if (!svc || !svc.client_email || !svc.private_key) { finish() } else {
   const auth = new JWT({ email: svc.client_email, key: svc.private_key.replace(/\\n/g, '\n'), scopes: ['https://www.googleapis.com/auth/calendar'] })
   const api = calendar({ version: 'v3', auth })
   try {
-    const fb = await api.freebusy.query({ requestBody: { timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + 3600e3).toISOString(), timeZone: 'America/Lima', items: [{ id: calId }] } }, { timeout: 8000 })
+    const fb = await api.freebusy.query({ requestBody: { timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + 3600e3).toISOString(), timeZone: 'America/Bogota', items: [{ id: calId }] } }, { timeout: 8000 })
     log('P1 AUTH_FREEBUSY=' + (fb.data.calendars?.[calId] ? 'OK' : 'FAIL'))
   } catch (e) { log('P1 AUTH_FREEBUSY=FAIL ' + e.message) }
 
   try {
     const st = new Date(); st.setMinutes(st.getMinutes() + 5, 0, 0)
     const en = new Date(st.getTime() + 15 * 60e3)
-    const insRes = await api.events.insert({ calendarId: calId, conferenceDataVersion: 1, requestBody: { summary: 'SELFCHECK wacrm (borrar)', description: 'autoevaluacion', start: { dateTime: st.toISOString(), timeZone: 'America/Lima' }, end: { dateTime: en.toISOString(), timeZone: 'America/Lima' }, conferenceData: { createRequest: { requestId: Math.random().toString(36).slice(2), conferenceSolutionKey: { type: 'hangoutsMeet' } } } } }, { timeout: 8000 })
+    const insRes = await api.events.insert({ calendarId: calId, conferenceDataVersion: 1, requestBody: { summary: 'SELFCHECK wacrm (borrar)', description: 'autoevaluacion', start: { dateTime: st.toISOString(), timeZone: 'America/Bogota' }, end: { dateTime: en.toISOString(), timeZone: 'America/Bogota' }, conferenceData: { createRequest: { requestId: Math.random().toString(36).slice(2), conferenceSolutionKey: { type: 'hangoutsMeet' } } } } }, { timeout: 8000 })
     const meet = insRes.data.hangoutLink || insRes.data.conferenceData?.entryPoints?.find((e) => e.entryPointType === 'video')?.uri
     log('P2 EVENT_CREATE=' + (insRes.data.id ? 'OK' : 'FAIL'))
     log('P2 HANGOUT_LINK=' + (meet ? 'OK (meet.google.com)' : 'FAIL (no generated)'))

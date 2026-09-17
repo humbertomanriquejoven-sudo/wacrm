@@ -34,7 +34,10 @@ const SVC_CLIENT_EMAIL = process.env.GOOGLE_CALENDAR_CLIENT_EMAIL ?? ''
 const SVC_PRIVATE_KEY = process.env.GOOGLE_CALENDAR_PRIVATE_KEY ?? ''
 
 const CAL_TIMEZONE = 'America/Bogota'
-export const APPOINTMENT_DURATION_MIN = 60
+/** Default appointment length. Meetings run 45 minutes. */
+export const APPOINTMENT_DURATION_MIN = 45
+/** Fixed UTC offset for America/Bogota (no DST). */
+const BOGOTA_OFFSET = '-05:00'
 
 /**
  * Strict per-request timeout for every Google Calendar network call. A?
@@ -208,7 +211,7 @@ function bogotaParts(instant: Date): BogotaParts {
 function bogotaIso(instant: Date): string {
   const p = bogotaParts(instant)
   const pad = (n: number) => String(n).padStart(2, '0')
-  return `${p.year}-${pad(p.month)}-${pad(p.day)}T${pad(p.hour)}:${pad(p.minute)}:${pad(p.second)}-05:00`
+  return `${p.year}-${pad(p.month)}-${pad(p.day)}T${p.hour}:${pad(p.minute)}:${pad(p.second)}${BOGOTA_OFFSET}`
 }
 
 function bogotaDateKey(instant: Date): string {
@@ -239,6 +242,15 @@ function isInside(a: BusyInterval, b: BusyInterval): boolean {
   return a.start.getTime() >= b.start.getTime() && a.end.getTime() <= b.end.getTime()
 }
 
+/**
+ * True when busy interval `b` is the appointment we are moving. The remote
+ * event may be longer/shorter than the current default (legacy 60-min rows),
+ * so match on the shared start instant as well as containment.
+ */
+function isSelfSlot(b: BusyInterval, self: BusyInterval): boolean {
+  return b.start.getTime() === self.start.getTime() || isInside(b, self)
+}
+
 async function fetchBusy(
   from: Date,
   to: Date,
@@ -257,7 +269,7 @@ async function fetchBusy(
   return busy
     .filter((b) => b.start && b.end)
     .map((b) => ({ start: new Date(b.start!), end: new Date(b.end!) }))
-    .filter((b) => !exclude || !isInside(b, exclude))
+    .filter((b) => !exclude || !isSelfSlot(b, exclude))
     .sort((a, b) => a.start.getTime() - b.start.getTime())
 }
 
@@ -266,9 +278,10 @@ function overlaps(slotStart: Date, slotEnd: Date, busy: BusyInterval[]): boolean
 }
 
 /**
- * ver_disponibilidad(desde, hasta) — list free 60-minute slots within
+ * ver_disponibilidad(desde, hasta) — list free 45-minute slots within
  * business hours that fall inside the given window. `desde`/`hasta`
- * are ISO date-times (or date-only, interpreted as the full day).
+ * are ISO date-times in America/Bogota (a timezone-less value is read as
+ * Bogota wall time) or date-only, interpreted as the full day.
  * Returns a human-readable summary for the model to relay or use.
  */
 export async function ver_disponibilidad(
@@ -277,6 +290,9 @@ export async function ver_disponibilidad(
 ): Promise<string> {
   const from = parseWindowBound(desde, /* isEnd */ false)
   const to = parseWindowBound(hasta, /* isEnd */ true)
+  if (!from || !to) {
+    return 'Error: fecha inválida. Usa formato ISO 8601 en hora de Bogotá, por ejemplo 2026-09-17 o 2026-09-17T15:00:00-05:00.'
+  }
   if (from.getTime() >= to.getTime()) {
     return 'Error: el rango "desde" debe ser anterior a "hasta".'
   }
@@ -358,7 +374,7 @@ export interface AgendarCitaArgs {
   correoCliente?: string
 }
 
-/** agendar_cita — create a 60-minute event and persist the CRM row. */
+/** agendar_cita — create a 45-minute event and persist the CRM row. */
 export async function agendar_cita(
   args: AgendarCitaArgs,
 ): Promise<string> {
@@ -493,9 +509,9 @@ export async function agendar_cita(
 
 return calendarSynced
   ? meetUrl
-    ? `Cita agendada: ${bogotaIso(start)} (60 minutos), cliente: ${name}. Reunión Meet: ${meetUrl}`
-    : `Cita agendada: ${bogotaIso(start)} (60 minutos), cliente: ${name}.`
-  : `Cita agendada: ${bogotaIso(start)} (60 minutos), cliente: ${name}. (Google Calendar no disponible; la cita quedó guardada en el CRM sin enlace de Meet.)`
+    ? `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}. Reunión Meet: ${meetUrl}`
+    : `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}.`
+  : `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}. (Google Calendar no disponible; la cita quedó guardada en el CRM sin enlace de Meet.)`
 }
 
 export interface ReagendarCitaArgs {
@@ -585,7 +601,7 @@ export async function reagendar_cita(
     return `Error: el evento se movió en Google Calendar pero no se pudo actualizar el CRM (${error.message}).`
   }
 
-  return `Cita reagendada para: ${bogotaIso(start)} (60 minutos).`
+  return `Cita reagendada para: ${bogotaIso(start)} (45 minutos).`
 }
 
 export interface CancelarCitaArgs {
@@ -642,26 +658,64 @@ export async function cancelar_cita(
 // Parsing helpers
 // ------------------------------------------------------------
 
-function parseWindowBound(value: string, isEnd: boolean): Date {
+// A bare date (2026-09-17) or a naive datetime with no timezone
+// designator (2026-09-17T15:00[[:ss]] / "2026-09-17 15:00"). Both must be
+// read as America/Bogota wall time: `new Date("2026-09-17T15:00")` would
+// otherwise resolve against the server zone (UTC in production) and shift
+// the appointment 5 hours.
+const BARE_DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+const NAIVE_DATETIME_RE = /^\d{4}-\d{2}-\d{2}[T ]\d{1,2}(:\d{1,2})?(:\d{1,2})?$/
+
+/** Build a Date from an offset-less wall-clock string, pinned to -05:00. */
+function bogotaWallToDate(naive: string): Date {
+  const t = naive.replace(' ', 'T')
+  const [datePart, timePart = '00:00:00'] = t.split('T')
+  const bits = timePart.split(':')
+  while (bits.length < 3) bits.push('00')
+  const hhmmss = bits.map((b) => b.padStart(2, '0')).join(':')
+  return new Date(`${datePart}T${hhmmss}${BOGOTA_OFFSET}`)
+}
+
+/**
+ * Parse a user/model-supplied instant, interpreting a timezone-less value
+ * as America/Bogota wall time. Returns null for an invalid date so the
+ * caller can surface a clear error instead of silently defaulting to now.
+ */
+export function parseBogotaInstant(value: string): Date | null {
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  if (BARE_DATE_RE.test(trimmed) || NAIVE_DATETIME_RE.test(trimmed)) {
+    const d = bogotaWallToDate(trimmed)
+    return Number.isNaN(d.getTime()) ? null : d
+  }
+  const d = new Date(trimmed)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+/**
+ * Parse one end of a ver_disponibilidad window. An empty value falls back
+ * to "now" (start) or the end of today in Bogota (end); a bare date
+ * covers the whole Bogota day. Invalid input returns null.
+ */
+function parseWindowBound(value: string, isEnd: boolean): Date | null {
   const trimmed = value.trim()
   if (!trimmed) {
     return isEnd
-      ? new Date(new Date().setHours(23, 59, 59, 0))
+      ? new Date(`${bogotaDateKey(new Date())}T23:59:59${BOGOTA_OFFSET}`)
       : new Date()
   }
-  // A bare date (YYYY-MM-DD) means the whole (Lima) day.
-  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-    if (isEnd) return new Date(`${trimmed}T23:59:59-05:00`)
-    return new Date(`${trimmed}T00:00:00-05:00`)
+  if (BARE_DATE_RE.test(trimmed)) {
+    return new Date(
+      `${trimmed}T${isEnd ? '23:59:59' : '00:00:00'}${BOGOTA_OFFSET}`,
+    )
   }
-  const d = new Date(trimmed)
-  return Number.isNaN(d.getTime()) ? (isEnd ? new Date() : new Date()) : d
+  return parseBogotaInstant(trimmed)
 }
 
 /** Validate an appointment start: parseable AND inside business hours. */
 function parseAppointmentStart(value: string): Date | null {
-  const d = new Date(value)
-  if (Number.isNaN(d.getTime())) return null
+  const d = parseBogotaInstant(value)
+  if (!d) return null
 
   const p = bogotaParts(d)
   const hours = BUSINESS_HOURS[p.weekday]

@@ -34,9 +34,9 @@ describe('currentDateTimeContext', () => {
     })
   })
 
-  it('defaults to America/Lima when AI_TIMEZONE is unset', () => {
+  it('defaults to America/Bogota when AI_TIMEZONE is unset', () => {
     delete process.env.AI_TIMEZONE
-    expect(aiTimeZone()).toBe('America/Lima')
+    expect(aiTimeZone()).toBe('America/Bogota')
   })
 })
 

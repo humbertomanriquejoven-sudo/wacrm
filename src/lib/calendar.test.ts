@@ -42,6 +42,7 @@ import {
   cancelar_cita,
   reagendar_cita,
   ver_disponibilidad,
+  parseBogotaInstant,
   APPOINTMENT_DURATION_MIN,
 } from '@/lib/calendar'
 
@@ -84,11 +85,11 @@ describe('ver_disponibilidad', () => {
     h.freebusy.mockResolvedValue(freebusyEmpty())
   })
 
-  it('lists consecutive 30-min-aligned 60-min slots on business days', async () => {
+  it('lists consecutive 30-min-aligned 45-min slots on business days', async () => {
     const out = await ver_disponibilidad('2026-09-14', '2026-09-18')
     expect(out).toContain('lunes 2026-09-14')
     expect(out).toContain('viernes 2026-09-18')
-    // Weekday 09:00-18:00 → starts 09:00..17:00 (17 slots), each 30-min aligned.
+    // Weekday 09:00-18:00, 45-min slots → starts 09:00..17:00 (17 slots).
     const mondayLine = out.split('\n').find((l) => l.startsWith('lunes'))
     expect(mondayLine?.match(/-05:00/g)).toHaveLength(17)
     expect(out).not.toMatch(/s[áa]bado|domingo/)
@@ -141,6 +142,32 @@ describe('ver_disponibilidad', () => {
   it('rejects an inverted range', async () => {
     const out = await ver_disponibilidad('2026-09-20', '2026-09-10')
     expect(out).toContain('Error')
+  })
+
+  it('reports a clear error for an unparseable date', async () => {
+    const out = await ver_disponibilidad('no-es-fecha', '2026-09-18')
+    expect(out).toContain('fecha inválida')
+  })
+})
+
+describe('parseBogotaInstant', () => {
+  it('interprets an offset-less ISO datetime as Bogota wall time', () => {
+    const d = parseBogotaInstant('2026-09-17T15:00:00')
+    expect(d?.toISOString()).toBe('2026-09-17T20:00:00.000Z')
+  })
+
+  it('interprets a bare date as Bogota midnight', () => {
+    const d = parseBogotaInstant('2026-09-17')
+    expect(d?.toISOString()).toBe('2026-09-17T05:00:00.000Z')
+  })
+
+  it('honors an explicit -05:00 offset', () => {
+    const d = parseBogotaInstant('2026-09-17T15:00:00-05:00')
+    expect(d?.toISOString()).toBe('2026-09-17T20:00:00.000Z')
+  })
+
+  it('returns null for a non-date string', () => {
+    expect(parseBogotaInstant('mañana por la tarde')).toBeNull()
   })
 })
 
@@ -199,6 +226,44 @@ describe('agendar_cita', () => {
     })
     expect(out).toContain('Error')
     expect(h.insert).not.toHaveBeenCalled()
+  })
+
+  it('accepts an offset-less datetime as Bogota wall time', async () => {
+    const supabase = db()
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00',
+      nombre: 'X',
+    })
+    expect(out).toContain('Cita agendada')
+    const args = h.insert.mock.calls[0][0] as {
+      requestBody: { start: { dateTime: string } }
+    }
+    expect(args.requestBody.start.dateTime).toBe('2026-09-14T10:00:00-05:00')
+  })
+
+  it('books a 45-minute event (end = start + APPOINTMENT_DURATION_MIN)', async () => {
+    const supabase = db()
+    await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'X',
+    })
+    const args = h.insert.mock.calls[0][0] as {
+      requestBody: { end: { dateTime: string } }
+    }
+    expect(args.requestBody.end.dateTime).toBe('2026-09-14T10:45:00-05:00')
+    const insert = supabase.callLog.find(
+      (c) => c.op === 'insert' && c.table === 'citas',
+    )
+    const row = insert!.row as { fecha_inicio: string; fecha_fin: string }
+    expect(
+      new Date(row.fecha_fin).getTime() - new Date(row.fecha_inicio).getTime(),
+    ).toBe(45 * 60 * 1000)
   })
 
   it('refuses a slot that is already occupied', async () => {
@@ -448,7 +513,7 @@ describe('reagendar_cita / cancelar_cita', () => {
 })
 
 describe('APPOINTMENT_DURATION_MIN', () => {
-  it('is exactly 60 minutes', () => {
-    expect(APPOINTMENT_DURATION_MIN).toBe(60)
+  it('is exactly 45 minutes', () => {
+    expect(APPOINTMENT_DURATION_MIN).toBe(45)
   })
 })

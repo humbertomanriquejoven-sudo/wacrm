@@ -43,7 +43,7 @@ if (!svc || !svc.client_email || !svc.private_key) {
     // P1 freebusy = proof of valid auth + valid calendar
     try {
       const fb = await api.freebusy.query({
-        requestBody: { timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + 3600e3).toISOString(), timeZone: 'America/Lima', items: [{ id: calId }] },
+        requestBody: { timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + 3600e3).toISOString(), timeZone: 'America/Bogota', items: [{ id: calId }] },
       }, { timeout: 8000 })
       const busy = fb.data.calendars?.[calId]?.busy || []
       log('P1 AUTH_FREEBUSY=OK busy=' + busy.length)
@@ -61,8 +61,8 @@ if (!svc || !svc.client_email || !svc.private_key) {
         requestBody: {
           summary: 'AUTOEVAL wacrm (borrar)',
           description: 'test autoevaluacion calendar',
-          start: { dateTime: st.toISOString(), timeZone: 'America/Lima' },
-          end: { dateTime: en.toISOString(), timeZone: 'America/Lima' },
+          start: { dateTime: st.toISOString(), timeZone: 'America/Bogota' },
+          end: { dateTime: en.toISOString(), timeZone: 'America/Bogota' },
           conferenceData: {
             createRequest: {
               requestId: Math.random().toString(36).slice(2, 14),

@@ -88,7 +88,7 @@ async function main() {
 
   // P1 auth+freebusy
   try {
-    const fb = await api.freebusy.query({ requestBody: { timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + 3600e3).toISOString(), timeZone: 'America/Lima', items: [{ id: calId }] } }, { timeout: 8000 })
+    const fb = await api.freebusy.query({ requestBody: { timeMin: new Date().toISOString(), timeMax: new Date(Date.now() + 3600e3).toISOString(), timeZone: 'America/Bogota', items: [{ id: calId }] } }, { timeout: 8000 })
     const busy = fb.data.calendars?.[calId]?.busy || []
     log('P1 AUTH_FREE_BUSY=OK busy=' + busy.length)
   } catch (e) { log('P1 AUTH_FREE_BUSY=FAIL ' + e.message) }
@@ -99,7 +99,7 @@ async function main() {
     const en = new Date(st.getTime() + 15 * 60e3)
     const wantMeet = hasOAuth
     const conferenceData = wantMeet ? { createRequest: { requestId: Math.random().toString(36).slice(2), conferenceSolutionKey: { type: 'hangoutsMeet' } } } : undefined
-    const created = await api.events.insert({ calendarId: calId, conferenceDataVersion: wantMeet ? 1 : 0, requestBody: { summary: 'AUTOEVAL wacrm', description: 'test autoevaluacion oauth', start: { dateTime: st.toISOString(), timeZone: 'America/Lima' }, end: { dateTime: en.toISOString(), timeZone: 'America/Lima' }, ...(wantMeet ? { conferenceData } : {}) } }, { timeout: 8000 })
+    const created = await api.events.insert({ calendarId: calId, conferenceDataVersion: wantMeet ? 1 : 0, requestBody: { summary: 'AUTOEVAL wacrm', description: 'test autoevaluacion oauth', start: { dateTime: st.toISOString(), timeZone: 'America/Bogota' }, end: { dateTime: en.toISOString(), timeZone: 'America/Bogota' }, ...(wantMeet ? { conferenceData } : {}) } }, { timeout: 8000 })
     log('P2 EVENT_CREATE=OK id=' + created.data.id)
     if (wantMeet) {
       const link = created.data.hangoutLink || created.data.conferenceData?.entryPoints?.[0]?.uri || null
