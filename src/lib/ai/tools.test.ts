@@ -157,7 +157,7 @@ describe('executeToolCall — calendar dispatch', () => {
     const out = await executeToolCall(mockDb, 'a', 'c', {
       id: '11', name: 'magic_wand', arguments: {},
     })
-    expect(out).toContain('Unknown tool')
+    expect(out).toContain('Herramienta desconocida')
   })
 })
 
@@ -166,6 +166,6 @@ describe('update_client_profile handler', () => {
     const out = await executeToolCall(mockDb, 'a', 'c', {
       id: '8', name: 'update_client_profile', arguments: { something_else: 'x' },
     })
-    expect(out).toContain('No profile data to update')
+    expect(out).toContain('No hay datos de perfil para actualizar')
   })
 })

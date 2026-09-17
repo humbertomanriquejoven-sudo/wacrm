@@ -147,6 +147,51 @@ describe('ver_disponibilidad', () => {
     expect(out).toContain('Error')
   })
 
+  it('accepts a single point-in-time and expands it to a 45-minute range', async () => {
+    const out = await ver_disponibilidad(
+      '2026-09-14T18:00:00-05:00',
+      '2026-09-14T18:00:00-05:00',
+    )
+    expect(out).toContain('está disponible.')
+    expect(out).toContain('2026-09-14T18:00:00-05:00 a 2026-09-14T18:45:00-05:00')
+  })
+
+  it('expands a single point-in-time with hasta earlier on the same day', async () => {
+    const out = await ver_disponibilidad(
+      '2026-09-14T18:00:00-05:00',
+      '2026-09-14T17:00:00-05:00',
+    )
+    expect(out).toContain('está disponible.')
+    expect(out).toContain('2026-09-14T18:00:00-05:00 a 2026-09-14T18:45:00-05:00')
+  })
+
+  it('reports the single point-in-time as occupied when it overlaps a busy block', async () => {
+    h.freebusy.mockResolvedValue({
+      data: {
+        calendars: {
+          [process.env.GOOGLE_CALENDAR_ID!]: {
+            busy: [
+              { start: '2026-09-14T18:00:00-05:00', end: '2026-09-14T18:45:00-05:00' },
+            ],
+          },
+        },
+      },
+    })
+    const out = await ver_disponibilidad(
+      '2026-09-14T18:00:00-05:00',
+      '2026-09-14T18:00:00-05:00',
+    )
+    expect(out).toContain('está ocupado.')
+  })
+
+  it('rejects a single point-in-time outside business hours', async () => {
+    const out = await ver_disponibilidad(
+      '2026-09-14T01:00:00-05:00',
+      '2026-09-14T01:00:00-05:00',
+    )
+    expect(out).toContain('fuera del horario de atención')
+  })
+
   it('reports a clear error for an unparseable date', async () => {
     const out = await ver_disponibilidad('no-es-fecha', '2026-09-18')
     expect(out).toContain('fecha inválida')

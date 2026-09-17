@@ -56,7 +56,13 @@ describe('buildSystemPrompt', () => {
     expect(first).toBe(
       'INFORMACIÓN DE FECHA Y HORA ACTUAL: Hoy es lunes, 2026-09-14, hora local 07:00 (America/Bogota)',
     )
-    expect(prompt).toContain('You are a customer-messaging assistant for a business')
+    expect(prompt).toContain('Eres un asistente de mensajería al cliente para un negocio')
+  })
+
+  it('forces Spanish-only replies', () => {
+    const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' })
+    expect(prompt).toContain('responde SIEMPRE en español')
+    expect(prompt).toContain('está estrictamente prohibido responder en inglés')
   })
 
   it('orders direct booking in the same turn once the customer gave a date', () => {
@@ -65,17 +71,27 @@ describe('buildSystemPrompt', () => {
       mode: 'auto_reply',
       calendarEnabled: true,
     })
-    expect(prompt).toContain('call agendar_cita in THIS SAME TURN')
-    expect(prompt).toContain('DO NOT ask again for the date')
-    expect(prompt).toContain('never stop the flow to ask for the reason')
+    expect(prompt).toContain('EL AGENDAMIENTO DIRECTO ES OBLIGATORIO')
+    expect(prompt).toContain('NO vuelvas a preguntar la fecha')
+    expect(prompt).toContain('nunca detengas el flujo para preguntar el motivo')
     expect(prompt).toContain('confirmado: true')
-    expect(prompt).toContain('a missing email must never block the booking')
+    expect(prompt).toContain('un correo faltante nunca debe bloquear la cita')
   })
 
   it('forbids re-asking for the date range in the confirmation protocol', () => {
     const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' })
-    expect(prompt).toContain('must NOT ask a customer who already confirmed a date/time for "rangos de fechas"')
+    expect(prompt).toContain('No debes pedirle a un cliente que ya confirmó una fecha y/o hora')
     expect(prompt).toContain('"Consulta / Valoración"')
+  })
+
+  it('teaches single-point availability as a 45-minute range', () => {
+    const prompt = buildSystemPrompt({
+      userPrompt: null,
+      mode: 'auto_reply',
+      calendarEnabled: true,
+    })
+    expect(prompt).toContain('ver_disponibilidad acepta también una hora puntual')
+    expect(prompt).toContain('nunca respondas que no puedes verificar una hora puntual')
   })
 
   it('forbids inventing Meet/calendar URLs and trusts the configured credentials', () => {

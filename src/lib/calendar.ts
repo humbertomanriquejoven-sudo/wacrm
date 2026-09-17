@@ -309,6 +309,30 @@ export async function ver_disponibilidad(
   if (!from || !to) {
     return 'Error: fecha inválida. Usa formato ISO 8601 en hora de Bogotá, por ejemplo 2026-09-17 o 2026-09-17T15:00:00-05:00.'
   }
+
+  // Flexibilidad con hora puntual: si la consulta es un único instante
+  // (p. ej. desde="2026-09-18T18:00:00-05:00" con hasta igual o anterior),
+  // se interpreta como el rango de 45 minutos que comienza en esa hora
+  // (18:00 → 18:00-18:45) en lugar de rechazarlo. Así el modelo NUNCA
+  // recibe un aviso de que no se puede verificar una hora puntual.
+  if (from.getTime() >= to.getTime() && hasExplicitTime(desde)) {
+    const start = parseAppointmentStart(desde)
+    if (start === null) {
+      return 'Error: la hora indicada no es válida o cae fuera del horario de atención (lunes a domingo de 08:00 a 23:00).'
+    }
+    const end = new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000)
+    let busy: BusyInterval[]
+    try {
+      busy = await fetchBusy(start, end)
+    } catch (err) {
+      console.error('[calendar] freebusy failed:', err)
+      return 'Error: no se pudo consultar la disponibilidad del calendario.'
+    }
+    return overlaps(start, end, busy)
+      ? `El horario de ${bogotaIso(start)} a ${bogotaIso(end)} está ocupado. Consulta ver_disponibilidad con un rango de fechas para ver alternativas.`
+      : `El horario de ${bogotaIso(start)} a ${bogotaIso(end)} está disponible.`
+  }
+
   if (from.getTime() >= to.getTime()) {
     return 'Error: el rango "desde" debe ser anterior a "hasta".'
   }
@@ -889,6 +913,20 @@ export async function cancelar_cita(
 // the appointment 5 hours.
 const BARE_DATE_RE = /^\d{4}-\d{2}-\d{2}$/
 const NAIVE_DATETIME_RE = /^\d{4}-\d{2}-\d{2}[T ]\d{1,2}(:\d{1,2})?(:\d{1,2})?$/
+
+/**
+ * True when the string carries an explicit time-of-day (not just a bare
+ * date): an offset-less datetime, an ISO datetime, or a date+time with a
+ * timezone designator. Used by ver_disponibilidad to accept a single
+ * point-in-time and expand it to a 45-minute range.
+ */
+function hasExplicitTime(value: string): boolean {
+  const t = value.trim()
+  if (!t) return false
+  return (
+    NAIVE_DATETIME_RE.test(t) || (t.includes('T') && /:\d{1,2}/.test(t))
+  )
+}
 
 /** Build a Date from an offset-less wall-clock string, pinned to -05:00. */
 function bogotaWallToDate(naive: string): Date {

@@ -21,34 +21,34 @@ import { enviar_correo, leer_correos, gmailConfigured } from '@/lib/gmail'
 export const UPDATE_CLIENT_PROFILE_TOOL: ToolDefinition = {
   name: 'update_client_profile',
   description:
-    'Save or update the client profile when the customer shares personal information during the conversation. ' +
-    'Invoke this whenever the customer mentions their name, email, location (city/neighborhood), type of project, or budget. ' +
-    'You may call this tool multiple times as new information becomes available.',
+    'Guarda o actualiza el perfil del cliente cuando comparte información personal durante la conversación. ' +
+    'Invocála siempre que el cliente mencione su nombre, correo, ubicación (ciudad/barrio), tipo de proyecto o presupuesto. ' +
+    'Puedes llamarla varias veces a medida que llega información nueva.',
   parameters: {
     type: 'object',
     properties: {
       name: {
         type: 'string',
-        description: 'Full name of the customer (e.g. "Carlos Pérez")',
+        description: 'Nombre completo del cliente (p. ej. "Carlos Pérez")',
       },
       email: {
         type: 'string',
-        description: 'Email address of the customer',
+        description: 'Dirección de correo del cliente',
       },
       location: {
         type: 'string',
         description:
-          'City, neighborhood, or address of the customer (e.g. "Bogotá", "Chía", "Cajicá")',
+          'Ciudad, barrio o dirección del cliente (p. ej. "Bogotá", "Chía", "Cajicá")',
       },
       project_type: {
         type: 'string',
         description:
-          'Type of project or service the customer is interested in (e.g. "remodelación", "diseño interior", "renders 3D")',
+          'Tipo de proyecto o servicio que interesa al cliente (p. ej. "remodelación", "diseño interior", "renders 3D")',
       },
       budget: {
         type: 'string',
         description:
-          'Budget or price range mentioned by the customer (e.g. "15 millones", "5-8 millones COP")',
+          'Presupuesto o rango de precio mencionado por el cliente (p. ej. "15 millones", "5-8 millones COP")',
       },
     },
   },
@@ -58,22 +58,24 @@ export const UPDATE_CLIENT_PROFILE_TOOL: ToolDefinition = {
 export const VER_DISPONIBILIDAD_TOOL: ToolDefinition = {
   name: 'ver_disponibilidad',
   description:
-    'List available appointment slots in the business calendar. ' +
-    'Call this BEFORE agendar_cita or reagendar_cita to confirm the customer\'s requested date/time. ' +
-    'Business hours: Monday to Sunday 08:00-23:00 (America/Bogota, UTC-5). ' +
-    'Pass the date range the customer is asking about.',
+    'Lista los horarios libres para citas de 45 minutos en el calendario del negocio. ' +
+    'Llámala SOLO cuando el cliente aún NO haya elegido fecha/hora y necesites mostrarle horarios disponibles. ' +
+    'Si el cliente YA dio una fecha y hora concretas, agenda directamente con agendar_cita sin pasar por esta herramienta. ' +
+    'Horario de atención: lunes a domingo de 08:00-23:00 (America/Bogotá, UTC-5). ' +
+    'Acepta también una hora puntual en "desde" (p. ej. "2026-09-18T18:00:00-05:00") y la interpreta automáticamente como el rango de 45 minutos 18:00-18:45. ' +
+    'Pasa el rango de fechas (desde/hasta) que el cliente esté preguntando.',
   parameters: {
     type: 'object',
     properties: {
       desde: {
         type: 'string',
         description:
-          'Start of the window to check, ISO date or date-time in Bogota time (e.g. "2026-05-04" or "2026-05-04T09:00:00-05:00")',
+          'Inicio de la ventana a consultar, fecha u hora ISO en hora de Bogotá (p. ej. "2026-05-04" o "2026-05-04T09:00:00-05:00"). También acepta una hora puntual (p. ej. "2026-05-04T18:00:00-05:00").',
       },
       hasta: {
         type: 'string',
         description:
-          'End of the window to check, ISO date or date-time in Bogota time (e.g. "2026-05-08")',
+          'Fin de la ventana a consultar, fecha ISO en hora de Bogotá (p. ej. "2026-05-08")',
       },
     },
     required: ['desde', 'hasta'],
@@ -84,34 +86,36 @@ export const VER_DISPONIBILIDAD_TOOL: ToolDefinition = {
 export const AGENDAR_CITA_TOOL: ToolDefinition = {
   name: 'agendar_cita',
   description:
-    'Schedule a 45-minute appointment for the customer in the business calendar. ' +
-    'CALL IT IMMEDIATELY when the customer states a concrete date/time — do not ask again for the date/time or the reason. ' +
-    'motivo is optional and defaults to "Consulta / Valoración" when omitted. ' +
-    'Google creates a Meet link (or returns the calendar event URL as fallback) and emails the customer an invitation. ' +
-    'Pass the customer email when you know it, so they receive the invite with the link. ' +
-    'On success the tool returns confirmado:true plus the exact link (hangoutLink or htmlLink; meet.google.com/new as last fallback) to share with the customer. ' +
-    'The confirmation WhatsApp message to the customer MUST ALWAYS include the Google Meet URL — never send a booking confirmation without it.',
+    'Agenda una reunión de 45 minutos para el cliente en el calendario del negocio. ' +
+    'LLÁMALA DE INMEDIATO en cuanto el cliente indique una fecha y hora concretas (p. ej. "mañana a las 6 pm"): ' +
+    'no vuelvas a preguntar la fecha, no preguntes "cuál horario prefiere", no pidas un rango de hora de inicio/fin ni pidas confirmar la hora elegida. ' +
+    'Convierte la hora del cliente al ISO de Bogotá en el mismo turno (p. ej. "mañana a las 6 pm" → 2026-09-18T18:00:00-05:00). ' +
+    'motivo es opcional y por defecto es "Consulta / Valoración" cuando se omite. ' +
+    'Google crea un enlace de Meet (o devuelve la URL del evento del calendario como respaldo) y envía al cliente una invitación por correo. ' +
+    'Pasa el correo del cliente cuando lo conozcas, para que reciba la invitación con el enlace. ' +
+    'Al éxito, la herramienta devuelve confirmado:true más el enlace exacto (hangoutLink o htmlLink; meet.google.com/new como último respaldo) para compartir con el cliente. ' +
+    'El mensaje de confirmación por WhatsApp al cliente DEBE incluir SIEMPRE el enlace de Google Meet — nunca envíes una confirmación de cita sin él.',
   parameters: {
     type: 'object',
     properties: {
       inicio: {
         type: 'string',
         description:
-          'Start date-time of the appointment in ISO 8601 with the Bogota offset, e.g. "2026-05-04T10:00:00-05:00"',
+          'Fecha-hora de inicio de la cita en ISO 8601 con el offset de Bogotá, p. ej. "2026-05-04T10:00:00-05:00"',
       },
       nombre: {
         type: 'string',
-        description: 'Customer name to put on the calendar event',
+        description: 'Nombre del cliente que se pondrá en el evento del calendario',
       },
       motivo: {
         type: 'string',
         description:
-          'Reason or topic of the appointment (e.g. "cotización de interiores"). Optional: defaults to "Consulta / Valoración", so never block the booking by asking for it.',
+          'Motivo o tema de la cita (p. ej. "cotización de interiores"). Opcional: por defecto es "Consulta / Valoración", así que nunca bloquees la cita preguntándolo.',
       },
       email: {
         type: 'string',
         description:
-          'Customer email, used to send the Google Calendar invitation with the Meet link (optional — never block the booking if you do not have it)',
+          'Correo del cliente, usado para enviar la invitación de Google Calendar con el enlace de Meet (opcional — nunca bloquees la cita si no lo tienes)',
       },
     },
     required: ['inicio', 'nombre'],
@@ -122,22 +126,21 @@ export const AGENDAR_CITA_TOOL: ToolDefinition = {
 export const REAGENDAR_CITA_TOOL: ToolDefinition = {
   name: 'reagendar_cita',
   description:
-    'Reschedule an existing appointment to a new start time. ' +
-    'Call ver_disponibilidad first to find a free slot; the appointment\'s own ' +
-    'current slot is excluded from availability checks, so moving it back to its ' +
-    'current time is allowed. Use the idCita value of this client\'s ' +
-    'confirmed appointment (listed in your instructions), not a date.',
+    'Mueve una cita existente a una nueva hora de inicio. ' +
+    'Llama ver_disponibilidad primero para encontrar un horario libre; el horario actual de la cita se excluye de las verificaciones de disponibilidad, ' +
+    'así que es válido moverla de vuelta a su hora actual. ' +
+    'Usa el valor idCita de la cita confirmada de este cliente (listado en tus instrucciones), no una fecha.',
   parameters: {
     type: 'object',
     properties: {
       idCita: {
         type: 'string',
-        description: 'The appointment id of one of this client\'s confirmed appointments',
+        description: 'El id de una de las citas confirmadas de este cliente',
       },
       nuevoInicio: {
         type: 'string',
         description:
-          'New start date-time of the appointment in ISO format, e.g. "2026-05-05T15:00:00-05:00"',
+          'Nueva fecha-hora de inicio de la cita en formato ISO, p. ej. "2026-05-05T15:00:00-05:00"',
       },
     },
     required: ['idCita', 'nuevoInicio'],
@@ -148,13 +151,13 @@ export const REAGENDAR_CITA_TOOL: ToolDefinition = {
 export const CANCELAR_CITA_TOOL: ToolDefinition = {
   name: 'cancelar_cita',
   description:
-    'Cancel an existing appointment and mark it cancelled in the CRM.',
+    'Cancela una cita existente y la marca como cancelada en el CRM.',
   parameters: {
     type: 'object',
     properties: {
       idCita: {
         type: 'string',
-        description: 'The appointment id of one of this client\'s confirmed appointments',
+        description: 'El id de una de las citas confirmadas de este cliente',
       },
     },
     required: ['idCita'],
@@ -165,25 +168,25 @@ export const CANCELAR_CITA_TOOL: ToolDefinition = {
 export const LISTAR_EVENTOS_TOOL: ToolDefinition = {
   name: 'listar_eventos',
   description:
-    'List upcoming/oncoming events in the business calendar (default fetch is 100 items, far above the API\'s built-in 5-result cap). ' +
-    'Use this when the customer asks "¿qué tengo esta semana?", "¿hay algo agendado?", or to see the full agenda. ' +
-    'Available only when Google Calendar is configured.',
+    'Lista los eventos próximos del calendario del negocio (por defecto recupera 100 elementos, muy por encima del límite interno de 5 resultados de la API). ' +
+    'Úsala cuando el cliente pregunte "¿qué tengo esta semana?", "¿hay algo agendado?" o para ver la agenda completa. ' +
+    'Solo disponible cuando Google Calendar está configurado.',
   parameters: {
     type: 'object',
     properties: {
       desde: {
         type: 'string',
         description:
-          'Start of the window, ISO date or date-time in Bogota time (e.g. "2026-05-04" or "2026-05-04T00:00:00-05:00"). Default: now.',
+          'Inicio de la ventana, fecha u hora ISO en hora de Bogotá (p. ej. "2026-05-04" o "2026-05-04T00:00:00-05:00"). Por defecto: ahora.',
       },
       hasta: {
         type: 'string',
         description:
-          'End of the window, ISO date or date-time in Bogota time. Default: no limit (from `desde` onwards).',
+          'Fin de la ventana, fecha u hora ISO en hora de Bogotá. Por defecto: sin límite (desde `desde` en adelante).',
       },
       maxResults: {
         type: 'integer',
-        description: 'Number of events to fetch (default 100, max 250)',
+        description: 'Cantidad de eventos a recuperar (por defecto 100, máximo 250)',
       },
     },
   },
@@ -193,23 +196,23 @@ export const LISTAR_EVENTOS_TOOL: ToolDefinition = {
 export const ENVIAR_CORREO_TOOL: ToolDefinition = {
   name: 'enviar_correo',
   description:
-    'Send an email from the business Gmail account via the Gmail API. The body is HTML by default, so it renders nicely on phones. ' +
-    'Available only when the Gmail OAuth scope is configured.',
+    'Envía un correo desde la cuenta de Gmail del negocio mediante la API de Gmail. El cuerpo es HTML por defecto, así que se ve bien en el teléfono. ' +
+    'Solo disponible cuando el alcance OAuth de Gmail está configurado.',
   parameters: {
     type: 'object',
     properties: {
       to: {
         type: 'string',
-        description: 'Recipient email address',
+        description: 'Dirección de correo del destinatario',
       },
       subject: {
         type: 'string',
-        description: 'Clear subject line that names the event/cita topic',
+        description: 'Asunto claro que nombre el evento/tema de la cita',
       },
       body: {
         type: 'string',
         description:
-          'HTML body of the email (e.g. with <strong> for the date/time and a link to the Google Meet room)',
+          'Cuerpo HTML del correo (p. ej. con <strong> para la fecha/hora y un enlace a la sala de Google Meet)',
       },
     },
     required: ['to', 'subject', 'body'],
@@ -220,20 +223,20 @@ export const ENVIAR_CORREO_TOOL: ToolDefinition = {
 export const LEER_CORREOS_TOOL: ToolDefinition = {
   name: 'leer_correos',
   description:
-    'Read recent received messages in the business Gmail inbox (from, subject, date and a snippet; fetches up to 100 messages by default). ' +
-    'Use this when the customer asks about incoming emails or confirmations. ' +
-    'Available only when the Gmail OAuth scope is configured.',
+    'Lee mensajes recientes recibidos en la bandeja de entrada de Gmail del negocio (de, asunto, fecha y un extracto; recupera hasta 100 mensajes por defecto). ' +
+    'Úsala cuando el cliente pregunte por correos o confirmaciones entrantes. ' +
+    'Solo disponible cuando el alcance OAuth de Gmail está configurado.',
   parameters: {
     type: 'object',
     properties: {
       maxResults: {
         type: 'integer',
-        description: 'Number of messages to fetch (default 100, max 100)',
+        description: 'Cantidad de mensajes a recuperar (por defecto 100, máximo 100)',
       },
       query: {
         type: 'string',
         description:
-          'Optional Gmail search, e.g. "from:someone@x.com" or "is:unread"',
+          'Búsqueda opcional de Gmail, p. ej. "from:alguien@x.com" o "is:unread"',
       },
     },
   },
@@ -388,7 +391,7 @@ export async function executeToolCall(
       query: typeof query === 'string' && query.trim() ? query.trim() : undefined,
     })
   }
-  return `Unknown tool: ${toolCall.name}`
+  return `Herramienta desconocida: ${toolCall.name}`
 }
 
 async function handleUpdateClientProfile(
@@ -413,7 +416,7 @@ async function handleUpdateClientProfile(
   }
 
   if (Object.keys(updates).length === 0) {
-    return 'No profile data to update.'
+    return 'No hay datos de perfil para actualizar.'
   }
 
   updates.updated_at = new Date().toISOString()
@@ -426,13 +429,13 @@ async function handleUpdateClientProfile(
 
   if (error) {
     console.error('[ai tools] update_client_profile failed:', error)
-    return `Failed to update profile: ${error.message}`
+    return `No se pudo actualizar el perfil: ${error.message}`
   }
 
   const fields = Object.keys(updates)
     .filter((k) => k !== 'updated_at')
     .join(', ')
-  return `Profile updated: ${fields}`
+  return `Perfil actualizado: ${fields}`
 }
 
 /**
