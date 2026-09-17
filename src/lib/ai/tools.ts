@@ -82,7 +82,9 @@ export const VER_DISPONIBILIDAD_TOOL: ToolDefinition = {
 export const AGENDAR_CITA_TOOL: ToolDefinition = {
   name: 'agendar_cita',
   description:
-    'Schedule a 60-minute appointment for the customer in the business calendar and save it in the CRM.',
+    'Schedule a 60-minute appointment for the customer in the business calendar. ' +
+    'Google creates a Meet link and emails the customer an invitation. ' +
+    'Pass the customer email when you know it, so they receive the invite with the Meet link.',
   parameters: {
     type: 'object',
     properties: {
@@ -99,6 +101,11 @@ export const AGENDAR_CITA_TOOL: ToolDefinition = {
         type: 'string',
         description:
           'Reason or topic of the appointment (e.g. "cotización de interiores")',
+      },
+      email: {
+        type: 'string',
+        description:
+          'Customer email, used to send the Google Calendar invitation with the Meet link',
       },
     },
     required: ['inicio', 'nombre'],
@@ -178,7 +185,7 @@ export async function executeToolCall(
     return ver_disponibilidad(desde, hasta)
   }
   if (toolCall.name === 'agendar_cita') {
-    const { inicio, nombre, motivo } = toolCall.arguments
+    const { inicio, nombre, motivo, email } = toolCall.arguments
     if (typeof inicio !== 'string' || typeof nombre !== 'string') {
       return 'Error: agendar_cita requiere "inicio" y "nombre".'
     }
@@ -189,6 +196,7 @@ export async function executeToolCall(
       inicio,
       nombre,
       motivo: typeof motivo === 'string' ? motivo : undefined,
+      correoCliente: typeof email === 'string' ? email : undefined,
     })
   }
   if (toolCall.name === 'reagendar_cita') {

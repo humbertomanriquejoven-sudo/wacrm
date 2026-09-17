@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { calendar as calendarV3 } from '@googleapis/calendar'
-import { JWT } from 'google-auth-library'
+import { JWT, OAuth2Client } from 'google-auth-library'
 import type { SupabaseClient } from '@supabase/supabase-js'
 
 // ============================================================
@@ -17,16 +17,23 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 // the event; `citas` links it to a CRM contact so the AI/bot can
 // PATCH/cancel by stable UUID.
 //
-// Business hours are fixed (America/Lima):
+// Business hours are fixed (America/Bogota):
 //   Mon-Fri 09:00-18:00, Sat 09:00-13:00, Sun closed.
 // ============================================================
 
 const CAL_ID = process.env.GOOGLE_CALENDAR_ID ?? ''
+// OAuth2 (installed-app) credentials — the reliable path to create
+// Google Meet conferences on a personal gmail.com calendar. A service
+// account cannot host Meet on a Gmail calendar, so when these three are
+// present we prefer OAuth2 over the JWT/service-account path.
+const OAUTH_CLIENT_ID = process.env.GOOGLE_CLIENT_ID ?? ''
+const OAUTH_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET ?? ''
+const OAUTH_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN ?? ''
 const SVC_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON ?? ''
 const SVC_CLIENT_EMAIL = process.env.GOOGLE_CALENDAR_CLIENT_EMAIL ?? ''
 const SVC_PRIVATE_KEY = process.env.GOOGLE_CALENDAR_PRIVATE_KEY ?? ''
 
-const CAL_TIMEZONE = 'America/Lima'
+const CAL_TIMEZONE = 'America/Bogota'
 export const APPOINTMENT_DURATION_MIN = 60
 
 /**
@@ -50,9 +57,14 @@ export const BUSINESS_HOURS: Record<
 }
 
 function isCalendarConfigured(): boolean {
+  const hasOauth = Boolean(
+    OAUTH_CLIENT_ID.trim() &&
+      OAUTH_CLIENT_SECRET.trim() &&
+      OAUTH_REFRESH_TOKEN.trim(),
+  )
   const hasJson = Boolean(SVC_JSON.trim())
   const hasPair = Boolean(SVC_CLIENT_EMAIL.trim() && SVC_PRIVATE_KEY.trim())
-  return Boolean(CAL_ID.trim() && (hasJson || hasPair))
+  return Boolean(CAL_ID.trim() && (hasOauth || hasJson || hasPair))
 }
 
 /** Whether the Google Calendar env vars are set (tools are available). */
@@ -84,8 +96,25 @@ export function canonicalizePrivateKey(raw: string): string {
 function calendarClient() {
   if (!isCalendarConfigured()) {
     throw new Error(
-      'Google Calendar is not configured: set GOOGLE_CALENDAR_ID and either GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_CALENDAR_CLIENT_EMAIL + GOOGLE_CALENDAR_PRIVATE_KEY.',
+      'Google Calendar is not configured: set GOOGLE_CALENDAR_ID and either GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET + GOOGLE_REFRESH_TOKEN (OAuth2) or GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_CALENDAR_CLIENT_EMAIL + GOOGLE_CALENDAR_PRIVATE_KEY.',
     )
+  }
+
+  // OAuth2 installed-app flow, preferred. google-auth-library's OAuth2Client
+  // transparently refreshes the access token from GOOGLE_REFRESH_TOKEN, and
+  // `calendarV3` attaches it. Without this, Meet creation is rejected on
+  // personal (gmail.com) calendars with "Invalid conference type value".
+  if (
+    OAUTH_CLIENT_ID.trim() &&
+    OAUTH_CLIENT_SECRET.trim() &&
+    OAUTH_REFRESH_TOKEN.trim()
+  ) {
+    const auth = new OAuth2Client({
+      clientId: OAUTH_CLIENT_ID,
+      clientSecret: OAUTH_CLIENT_SECRET,
+    })
+    auth.setCredentials({ refresh_token: OAUTH_REFRESH_TOKEN })
+    return calendarV3({ version: 'v3', auth })
   }
 
   let email: string
@@ -129,11 +158,11 @@ function calendarClient() {
 }
 
 // ------------------------------------------------------------
-// Lima wall-clock helpers (America/Lima is UTC-5, no DST, but we
+// Bogota wall-clock helpers (America/Bogota is UTC-5, no DST, but we
 // still resolve the offset from the tz database rather than assume).
 // ------------------------------------------------------------
 
-const limaWallFmt = new Intl.DateTimeFormat('en', {
+const localWallFmt = new Intl.DateTimeFormat('en', {
   timeZone: CAL_TIMEZONE,
   year: 'numeric',
   month: '2-digit',
@@ -145,7 +174,7 @@ const limaWallFmt = new Intl.DateTimeFormat('en', {
   hour12: false,
 })
 
-interface LimaParts {
+interface BogotaParts {
   year: number
   month: number // 1-12
   day: number
@@ -155,9 +184,9 @@ interface LimaParts {
   weekday: number // 0=Sun .. 6=Sat
 }
 
-function limaParts(instant: Date): LimaParts {
+function bogotaParts(instant: Date): BogotaParts {
   const parts = Object.fromEntries(
-    limaWallFmt
+    localWallFmt
       .formatToParts(instant)
       .filter((p) => p.type !== 'literal')
       .map((p) => [p.type, p.value]),
@@ -175,24 +204,24 @@ function limaParts(instant: Date): LimaParts {
   }
 }
 
-/** RFC3339 (offset -05:00) of `instant` expressed in Lima wall time. */
-function limaIso(instant: Date): string {
-  const p = limaParts(instant)
+/** RFC3339 (offset -05:00) of `instant` expressed in Bogota wall time. */
+function bogotaIso(instant: Date): string {
+  const p = bogotaParts(instant)
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${p.year}-${pad(p.month)}-${pad(p.day)}T${pad(p.hour)}:${pad(p.minute)}:${pad(p.second)}-05:00`
 }
 
-function limaDateKey(instant: Date): string {
-  return limaIso(instant).slice(0, 10)
+function bogotaDateKey(instant: Date): string {
+  return bogotaIso(instant).slice(0, 10)
 }
 
-/** Instant whose Lima wall clock equals the given date + minute-of-day. */
-function instantFromLimaWall(dateKey: string, minuteOfDay: number): Date {
+/** Instant whose Bogota wall clock equals the given date + minute-of-day. */
+function instantFromBogotaWall(dateKey: string, minuteOfDay: number): Date {
   const [y, m, d] = dateKey.split('-').map(Number)
   const h = Math.floor(minuteOfDay / 60)
   const min = minuteOfDay % 60
   const approxUtc = new Date(Date.UTC(y, m - 1, d, h, min, 0, 0))
-  const offsetMin = limaParts(approxUtc).hour * 60 + limaParts(approxUtc).minute - (h * 60 + min)
+  const offsetMin = bogotaParts(approxUtc).hour * 60 + bogotaParts(approxUtc).minute - (h * 60 + min)
   return new Date(approxUtc.getTime() - offsetMin * 60_000)
 }
 
@@ -267,11 +296,11 @@ export async function ver_disponibilidad(
     t <= to.getTime() + 24 * 60 * 60 * 1000;
     t += 12 * 60 * 60 * 1000
   ) {
-    const day = limaDateKey(new Date(t))
+    const day = bogotaDateKey(new Date(t))
     if (seenDays.has(day)) continue
     seenDays.add(day)
 
-    const parts = limaParts(new Date(t))
+    const parts = bogotaParts(new Date(t))
     const hours = BUSINESS_HOURS[parts.weekday]
     if (!hours) continue
 
@@ -280,7 +309,7 @@ export async function ver_disponibilidad(
       startMin + APPOINTMENT_DURATION_MIN <= hours.closeMin;
       startMin += 30
     ) {
-      const slotStart = instantFromLimaWall(day, startMin)
+      const slotStart = instantFromBogotaWall(day, startMin)
       const slotEnd = new Date(
         slotStart.getTime() + APPOINTMENT_DURATION_MIN * 60_000,
       )
@@ -297,17 +326,17 @@ export async function ver_disponibilidad(
 
   const byDay = new Map<string, Date[]>()
   for (const s of slots) {
-    const key = limaDateKey(s)
+    const key = bogotaDateKey(s)
     byDay.set(key, [...(byDay.get(key) ?? []), s])
   }
 
-  const lines: string[] = ['Horarios disponibles (hora Lima):']
+  const lines: string[] = ['Horarios disponibles (hora Bogota):']
   for (const [day, daySlots] of [...byDay.entries()].sort()) {
-    const p = limaParts(daySlots[0])
+    const p = bogotaParts(daySlots[0])
     const weekdayName = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'][p.weekday]
     lines.push(
       `${weekdayName} ${day}: ${daySlots
-        .map((s) => limaIso(s))
+        .map((s) => bogotaIso(s))
         .join(', ')}`,
     )
   }
@@ -325,13 +354,15 @@ export interface AgendarCitaArgs {
   inicio: string
   nombre: string
   motivo?: string
+  /** Contact email used for the calendar invite attendee. */
+  correoCliente?: string
 }
 
 /** agendar_cita — create a 60-minute event and persist the CRM row. */
 export async function agendar_cita(
   args: AgendarCitaArgs,
 ): Promise<string> {
-  const { db, accountId, contactoId, inicio, nombre, motivo } = args
+  const { db, accountId, contactoId, inicio, nombre, motivo, correoCliente } = args
   const start = parseAppointmentStart(inicio)
   if (start === null) {
     return 'Error: "inicio" no es una fecha válida o cae fuera del horario de atención.'
@@ -349,7 +380,25 @@ export async function agendar_cita(
 
   const cal = calendarClient()
   const name = nombre.trim() || 'Cita'
-  const title = motivo && motivo.trim() ? `${name} — ${motivo.trim()}` : name
+  const title = `Cita con Cliente - ${name}`
+
+  // Attendee for the Google Calendar invite. Prefer the explicitly passed
+  // email; otherwise resolve it from the contact row (best-effort) so the
+  // customer receives the official invite with the Meet link attached.
+  let clientEmail = correoCliente?.trim() ?? ''
+  if (!clientEmail) {
+    try {
+      const { data: contact } = await db
+        .from('contacts')
+        .select('email')
+        .eq('id', contactoId)
+        .maybeSingle()
+      clientEmail = (contact?.email as string | null)?.trim() ?? ''
+    } catch (err) {
+      console.warn('[calendar] contact email lookup failed:', err)
+    }
+  }
+  const attendees = clientEmail ? [{ email: clientEmail }] : undefined
 
   let event: { id?: string | null }
   let calendarSynced = true
@@ -357,36 +406,39 @@ export async function agendar_cita(
   try {
     const baseBody = {
       summary: title,
-      description: motivo?.trim() || undefined,
-      start: { dateTime: limaIso(start), timeZone: CAL_TIMEZONE },
+      description: 'Reunión agendada automáticamente por el agente IA del CRM.',
+      start: { dateTime: bogotaIso(start), timeZone: CAL_TIMEZONE },
       end: {
-        dateTime: limaIso(new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000)),
+        dateTime: bogotaIso(new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000)),
         timeZone: CAL_TIMEZONE,
       },
+      ...(attendees ? { attendees } : {}),
     }
 
     // Intentar crear un Google Meet (hangoutsMeet). Google lo rechaza (400
     // "Invalid conference type value") cuando el emisor es una service account
     // y el calendario pertenece a una cuenta personal (gmail.com, no
     // Workspace): en ese caso reintentamos SIN conferencia para que el evento
-    // igual quede creado en el calendario (meetUrl queda null).
+    // igual quede creado en el calendario (meetUrl queda null). Con OAuth2
+    // (GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN) el Meet se crea correctamente.
     const tryInsert = async (withConference: boolean): Promise<{ data: import('@googleapis/calendar').calendar_v3.Schema$Event }> =>
       cal.events.insert(
         withConference
           ? {
               calendarId: CAL_ID,
               conferenceDataVersion: 1,
+              sendUpdates: 'all',
               requestBody: {
                 ...baseBody,
                 conferenceData: {
                   createRequest: {
-                    requestId: randomUUID(),
+                    requestId: `meet-crm-${Date.now()}`,
                     conferenceSolutionKey: { type: 'hangoutsMeet' },
                   },
                 },
               },
             }
-          : { calendarId: CAL_ID, requestBody: { ...baseBody } },
+          : { calendarId: CAL_ID, sendUpdates: 'all', requestBody: { ...baseBody } },
         { timeout: CALENDAR_TIMEOUT_MS },
       )
 
@@ -441,9 +493,9 @@ export async function agendar_cita(
 
 return calendarSynced
   ? meetUrl
-    ? `Cita agendada: ${limaIso(start)} (60 minutos), cliente: ${name}. Reunión Meet: ${meetUrl}`
-    : `Cita agendada: ${limaIso(start)} (60 minutos), cliente: ${name}.`
-  : `Cita agendada: ${limaIso(start)} (60 minutos), cliente: ${name}. (Google Calendar no disponible; la cita quedó guardada en el CRM sin enlace de Meet.)`
+    ? `Cita agendada: ${bogotaIso(start)} (60 minutos), cliente: ${name}. Reunión Meet: ${meetUrl}`
+    : `Cita agendada: ${bogotaIso(start)} (60 minutos), cliente: ${name}.`
+  : `Cita agendada: ${bogotaIso(start)} (60 minutos), cliente: ${name}. (Google Calendar no disponible; la cita quedó guardada en el CRM sin enlace de Meet.)`
 }
 
 export interface ReagendarCitaArgs {
@@ -506,10 +558,11 @@ export async function reagendar_cita(
     await cal.events.patch({
       calendarId: CAL_ID,
       eventId: cita.google_event_id,
+      sendUpdates: 'all',
       requestBody: {
-        start: { dateTime: limaIso(start), timeZone: CAL_TIMEZONE },
+        start: { dateTime: bogotaIso(start), timeZone: CAL_TIMEZONE },
         end: {
-          dateTime: limaIso(new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000)),
+          dateTime: bogotaIso(new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000)),
           timeZone: CAL_TIMEZONE,
         },
       },
@@ -532,7 +585,7 @@ export async function reagendar_cita(
     return `Error: el evento se movió en Google Calendar pero no se pudo actualizar el CRM (${error.message}).`
   }
 
-  return `Cita reagendada para: ${limaIso(start)} (60 minutos).`
+  return `Cita reagendada para: ${bogotaIso(start)} (60 minutos).`
 }
 
 export interface CancelarCitaArgs {
@@ -565,6 +618,7 @@ export async function cancelar_cita(
     await cal.events.delete({
       calendarId: CAL_ID,
       eventId: cita.google_event_id,
+      sendUpdates: 'all',
     }, { timeout: CALENDAR_TIMEOUT_MS })
   } catch (err) {
     console.error('[calendar] events.delete failed:', err)
@@ -609,7 +663,7 @@ function parseAppointmentStart(value: string): Date | null {
   const d = new Date(value)
   if (Number.isNaN(d.getTime())) return null
 
-  const p = limaParts(d)
+  const p = bogotaParts(d)
   const hours = BUSINESS_HOURS[p.weekday]
   if (!hours) return null
 

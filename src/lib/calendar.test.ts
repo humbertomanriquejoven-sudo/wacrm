@@ -32,6 +32,9 @@ vi.mock('@googleapis/calendar', () => ({
 
 vi.mock('google-auth-library', () => ({
   JWT: class {},
+  OAuth2Client: class {
+    setCredentials() {}
+  },
 }))
 
 import {
@@ -165,7 +168,7 @@ describe('agendar_cita', () => {
       expect.objectContaining({
         calendarId: process.env.GOOGLE_CALENDAR_ID,
         requestBody: expect.objectContaining({
-          summary: 'María Pérez — Cotización',
+          summary: 'Cita con Cliente - María Pérez',
           start: expect.objectContaining({ dateTime: expect.stringContaining('2026-09-14T10:00:00') }),
         }),
       }),
