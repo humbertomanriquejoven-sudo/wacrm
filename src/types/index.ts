@@ -1,5 +1,5 @@
-import type { AccountRole } from "@/lib/auth/roles";
-import type { InteractiveMessagePayload } from "@/lib/whatsapp/interactive";
+import type { AccountRole } from '@/lib/auth/roles';
+import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive';
 
 export type {
   InteractiveMessagePayload,
@@ -8,7 +8,7 @@ export type {
   InteractiveButton,
   InteractiveListRow,
   InteractiveListSection,
-} from "@/lib/whatsapp/interactive";
+} from '@/lib/whatsapp/interactive';
 
 export interface Profile {
   id: string;
@@ -87,7 +87,7 @@ export interface AccountInvitation {
   id: string;
   account_id: string;
   /** Roles offered via invite — owner is never offered. */
-  role: Exclude<AccountRole, "owner">;
+  role: Exclude<AccountRole, 'owner'>;
   created_by_user_id: string | null;
   label: string | null;
   created_at: string;
@@ -144,9 +144,24 @@ export interface Cita {
    *  the created event. Migration 043. Null while the calendar is
    *  unavailable and no link was produced. */
   meet_link?: string | null;
+  /** Google Calendar event title, persisted from the created event
+   *  (migration 045). Null for rows created before the column existed. */
+  summary?: string | null;
+  /** Google Calendar event description, persisted from the created
+   *  event (migration 045). Null for rows created before the column. */
+  description?: string | null;
+  /** Invited guests (Google Calendar `attendees`), persisted from the
+   *  created event (migration 045). Null when none/unknown. */
+  attendees?:
+    | {
+        email?: string | null;
+        displayName?: string | null;
+        responseStatus?: string | null;
+      }[]
+    | null;
   fecha_inicio: string;
   fecha_fin: string;
-  estado: "confirmada" | "cancelada";
+  estado: 'confirmada' | 'cancelada';
   motivo: string | null;
   created_at: string;
   updated_at: string;
@@ -154,7 +169,7 @@ export interface Cita {
 
 /** Cita with the related contact hydrated (embedded FK `contact`). */
 export interface CitaWithContact extends Cita {
-  contact?: Pick<Contact, "id" | "name" | "phone" | "email"> | null;
+  contact?: Pick<Contact, 'id' | 'name' | 'phone' | 'email'> | null;
 }
 
 export interface CustomField {
@@ -243,7 +258,8 @@ export type ContentType =
   | 'template'
   /** Customer tapped a reply button or list row on a message we sent. */
   | 'interactive';
-export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
+export type MessageStatus =
+  'sending' | 'sent' | 'delivered' | 'read' | 'failed';
 
 export interface Message {
   id: string;
@@ -418,8 +434,10 @@ export interface Deal {
   assignee?: Profile;
 }
 
-export type BroadcastStatus = 'draft' | 'scheduled' | 'sending' | 'sent' | 'failed';
-export type RecipientStatus = 'pending' | 'sent' | 'delivered' | 'read' | 'replied' | 'failed';
+export type BroadcastStatus =
+  'draft' | 'scheduled' | 'sending' | 'sent' | 'failed';
+export type RecipientStatus =
+  'pending' | 'sent' | 'delivered' | 'read' | 'replied' | 'failed';
 
 export interface Broadcast {
   id: string;
@@ -601,10 +619,7 @@ export interface WaitStepConfig {
 }
 
 export type ConditionSubject =
-  | 'contact_field'
-  | 'tag_presence'
-  | 'message_content'
-  | 'time_of_day';
+  'contact_field' | 'tag_presence' | 'message_content' | 'time_of_day';
 
 export interface ConditionStepConfig {
   subject: ConditionSubject;

@@ -1,20 +1,22 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.hoisted(() => {
-  process.env.GOOGLE_CALENDAR_ID = 'hma-test@serviceaccount.test'
+  process.env.GOOGLE_CALENDAR_ID = 'hma-test@serviceaccount.test';
   process.env.GOOGLE_SERVICE_ACCOUNT_JSON = JSON.stringify({
     type: 'service_account',
     project_id: 'test-project',
     private_key_id: 'k',
-    private_key: '-----BEGIN PRIVATE KEY-----\\nTESTKEY\\n-----END PRIVATE KEY-----\n',
+    private_key:
+      '-----BEGIN PRIVATE KEY-----\\nTESTKEY\\n-----END PRIVATE KEY-----\n',
     client_email: 'bot@test-project.iam.gserviceaccount.com',
     client_id: '123',
     auth_uri: 'https://accounts.google.com/o/oauth2/auth',
     token_uri: 'https://oauth2.googleapis.com/token',
     auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
-    client_x509_cert_url: 'https://www.googleapis.com/robot/v1/metadata/x509/bot%40test-project.iam.gserviceaccount.com',
-  })
-})
+    client_x509_cert_url:
+      'https://www.googleapis.com/robot/v1/metadata/x509/bot%40test-project.iam.gserviceaccount.com',
+  });
+});
 
 const h = vi.hoisted(() => ({
   freebusy: vi.fn(),
@@ -22,21 +24,21 @@ const h = vi.hoisted(() => ({
   insert: vi.fn(),
   patch: vi.fn(),
   del: vi.fn(),
-}))
+}));
 
 vi.mock('@googleapis/calendar', () => ({
   calendar: vi.fn(() => ({
     freebusy: { query: h.freebusy },
     events: { list: h.list, insert: h.insert, patch: h.patch, delete: h.del },
   })),
-}))
+}));
 
 vi.mock('google-auth-library', () => ({
   JWT: class {},
   OAuth2Client: class {
     setCredentials() {}
   },
-}))
+}));
 
 import {
   agendar_cita,
@@ -45,27 +47,28 @@ import {
   ver_disponibilidad,
   listar_eventos,
   consultarOcupados,
+  listar_ocupados_detalle,
   parseBogotaInstant,
   APPOINTMENT_DURATION_MIN,
-} from '@/lib/calendar'
+} from '@/lib/calendar';
 
 function db() {
-  const callLog: Array<Record<string, unknown>> = []
+  const callLog: Array<Record<string, unknown>> = [];
   return {
     callLog,
     from: (table: string) => ({
       _table: table,
       insert: (row: Record<string, unknown>) => {
-        callLog.push({ op: 'insert', table, row })
+        callLog.push({ op: 'insert', table, row });
         return {
           select: () => ({
             single: async () => ({ data: { id: 'cita-1' }, error: null }),
           }),
-        }
+        };
       },
       update: (patch: Record<string, unknown>) => {
-        callLog.push({ op: 'update', table, patch })
-        return { eq: () => ({ eq: () => Promise.resolve({ error: null }) }) }
+        callLog.push({ op: 'update', table, patch });
+        return { eq: () => ({ eq: () => Promise.resolve({ error: null }) }) };
       },
       select: () => ({
         eq: () => ({
@@ -73,37 +76,37 @@ function db() {
         }),
       }),
     }),
-  }
+  };
 }
 
 function freebusyEmpty(): { data: Record<string, unknown> } {
   return {
     data: { calendars: { [process.env.GOOGLE_CALENDAR_ID!]: { busy: [] } } },
-  }
+  };
 }
 
 describe('ver_disponibilidad', () => {
   beforeEach(() => {
-    h.freebusy.mockReset()
-    h.freebusy.mockResolvedValue(freebusyEmpty())
-  })
+    h.freebusy.mockReset();
+    h.freebusy.mockResolvedValue(freebusyEmpty());
+  });
 
   it('lists consecutive 30-min-aligned 45-min slots on business days', async () => {
-    const out = await ver_disponibilidad('2026-09-14', '2026-09-18')
-    expect(out).toContain('lunes 2026-09-14')
-    expect(out).toContain('viernes 2026-09-18')
+    const out = await ver_disponibilidad('2026-09-14', '2026-09-18');
+    expect(out).toContain('lunes 2026-09-14');
+    expect(out).toContain('viernes 2026-09-18');
     // Weekday 08:00-23:00, 45-min slots → starts 08:00..22:00 (29 slots).
-    const mondayLine = out.split('\n').find((l) => l.startsWith('lunes'))
-    expect(mondayLine?.match(/-05:00/g)).toHaveLength(29)
-    expect(out).not.toMatch(/s[áa]bado|domingo/)
-  })
+    const mondayLine = out.split('\n').find((l) => l.startsWith('lunes'));
+    expect(mondayLine?.match(/-05:00/g)).toHaveLength(29);
+    expect(out).not.toMatch(/s[áa]bado|domingo/);
+  });
 
   it('honors business hours on Saturday (08:00-23:00)', async () => {
-    const out = await ver_disponibilidad('2026-09-19', '2026-09-19')
-    const saturdayLine = out.split('\n').find((l) => l.startsWith('sábado'))
+    const out = await ver_disponibilidad('2026-09-19', '2026-09-19');
+    const saturdayLine = out.split('\n').find((l) => l.startsWith('sábado'));
     // 08:00..22:00 → 29 starts.
-    expect(saturdayLine?.match(/-05:00/g)).toHaveLength(29)
-  })
+    expect(saturdayLine?.match(/-05:00/g)).toHaveLength(29);
+  });
 
   it('excludes slots that overlap busy periods', async () => {
     h.freebusy.mockResolvedValue({
@@ -111,20 +114,23 @@ describe('ver_disponibilidad', () => {
         calendars: {
           [process.env.GOOGLE_CALENDAR_ID!]: {
             busy: [
-              { start: '2026-09-14T15:00:00-05:00', end: '2026-09-14T16:30:00-05:00' },
+              {
+                start: '2026-09-14T15:00:00-05:00',
+                end: '2026-09-14T16:30:00-05:00',
+              },
             ],
           },
         },
       },
-    })
-    const out = await ver_disponibilidad('2026-09-14', '2026-09-14')
-    const line = out.split('\n').find((l) => l.startsWith('lunes'))
+    });
+    const out = await ver_disponibilidad('2026-09-14', '2026-09-14');
+    const line = out.split('\n').find((l) => l.startsWith('lunes'));
     // 15:00, 15:30 and 16:00 are gone (busy until 16:30).
-    expect(line).not.toContain('2026-09-14T15:00:00-05:00')
-    expect(line).not.toContain('2026-09-14T15:30:00-05:00')
-    expect(line).not.toContain('2026-09-14T16:00:00-05:00')
-    expect(line).toContain('2026-09-14T16:30:00-05:00')
-  })
+    expect(line).not.toContain('2026-09-14T15:00:00-05:00');
+    expect(line).not.toContain('2026-09-14T15:30:00-05:00');
+    expect(line).not.toContain('2026-09-14T16:00:00-05:00');
+    expect(line).toContain('2026-09-14T16:30:00-05:00');
+  });
 
   it('reports no availability when everything is busy', async () => {
     h.freebusy.mockResolvedValue({
@@ -132,38 +138,45 @@ describe('ver_disponibilidad', () => {
         calendars: {
           [process.env.GOOGLE_CALENDAR_ID!]: {
             busy: [
-              { start: '2026-09-14T00:00:00-05:00', end: '2026-09-19T00:00:00-05:00' },
+              {
+                start: '2026-09-14T00:00:00-05:00',
+                end: '2026-09-19T00:00:00-05:00',
+              },
             ],
           },
         },
       },
-    })
-    const out = await ver_disponibilidad('2026-09-14', '2026-09-18')
-    expect(out).toContain('No hay horarios disponibles')
-  })
+    });
+    const out = await ver_disponibilidad('2026-09-14', '2026-09-18');
+    expect(out).toContain('No hay horarios disponibles');
+  });
 
   it('rejects an inverted range', async () => {
-    const out = await ver_disponibilidad('2026-09-20', '2026-09-10')
-    expect(out).toContain('Error')
-  })
+    const out = await ver_disponibilidad('2026-09-20', '2026-09-10');
+    expect(out).toContain('Error');
+  });
 
   it('accepts a single point-in-time and expands it to a 45-minute range', async () => {
     const out = await ver_disponibilidad(
       '2026-09-14T18:00:00-05:00',
-      '2026-09-14T18:00:00-05:00',
-    )
-    expect(out).toContain('está disponible.')
-    expect(out).toContain('2026-09-14T18:00:00-05:00 a 2026-09-14T18:45:00-05:00')
-  })
+      '2026-09-14T18:00:00-05:00'
+    );
+    expect(out).toContain('está disponible.');
+    expect(out).toContain(
+      '2026-09-14T18:00:00-05:00 a 2026-09-14T18:45:00-05:00'
+    );
+  });
 
   it('expands a single point-in-time with hasta earlier on the same day', async () => {
     const out = await ver_disponibilidad(
       '2026-09-14T18:00:00-05:00',
-      '2026-09-14T17:00:00-05:00',
-    )
-    expect(out).toContain('está disponible.')
-    expect(out).toContain('2026-09-14T18:00:00-05:00 a 2026-09-14T18:45:00-05:00')
-  })
+      '2026-09-14T17:00:00-05:00'
+    );
+    expect(out).toContain('está disponible.');
+    expect(out).toContain(
+      '2026-09-14T18:00:00-05:00 a 2026-09-14T18:45:00-05:00'
+    );
+  });
 
   it('reports the single point-in-time as occupied when it overlaps a busy block', async () => {
     h.freebusy.mockResolvedValue({
@@ -171,64 +184,67 @@ describe('ver_disponibilidad', () => {
         calendars: {
           [process.env.GOOGLE_CALENDAR_ID!]: {
             busy: [
-              { start: '2026-09-14T18:00:00-05:00', end: '2026-09-14T18:45:00-05:00' },
+              {
+                start: '2026-09-14T18:00:00-05:00',
+                end: '2026-09-14T18:45:00-05:00',
+              },
             ],
           },
         },
       },
-    })
+    });
     const out = await ver_disponibilidad(
       '2026-09-14T18:00:00-05:00',
-      '2026-09-14T18:00:00-05:00',
-    )
-    expect(out).toContain('está ocupado.')
-  })
+      '2026-09-14T18:00:00-05:00'
+    );
+    expect(out).toContain('está ocupado.');
+  });
 
   it('rejects a single point-in-time outside business hours', async () => {
     const out = await ver_disponibilidad(
       '2026-09-14T01:00:00-05:00',
-      '2026-09-14T01:00:00-05:00',
-    )
-    expect(out).toContain('fuera del horario de atención')
-  })
+      '2026-09-14T01:00:00-05:00'
+    );
+    expect(out).toContain('fuera del horario de atención');
+  });
 
   it('reports a clear error for an unparseable date', async () => {
-    const out = await ver_disponibilidad('no-es-fecha', '2026-09-18')
-    expect(out).toContain('fecha inválida')
-  })
-})
+    const out = await ver_disponibilidad('no-es-fecha', '2026-09-18');
+    expect(out).toContain('fecha inválida');
+  });
+});
 
 describe('parseBogotaInstant', () => {
   it('interprets an offset-less ISO datetime as Bogota wall time', () => {
-    const d = parseBogotaInstant('2026-09-17T15:00:00')
-    expect(d?.toISOString()).toBe('2026-09-17T20:00:00.000Z')
-  })
+    const d = parseBogotaInstant('2026-09-17T15:00:00');
+    expect(d?.toISOString()).toBe('2026-09-17T20:00:00.000Z');
+  });
 
   it('interprets a bare date as Bogota midnight', () => {
-    const d = parseBogotaInstant('2026-09-17')
-    expect(d?.toISOString()).toBe('2026-09-17T05:00:00.000Z')
-  })
+    const d = parseBogotaInstant('2026-09-17');
+    expect(d?.toISOString()).toBe('2026-09-17T05:00:00.000Z');
+  });
 
   it('honors an explicit -05:00 offset', () => {
-    const d = parseBogotaInstant('2026-09-17T15:00:00-05:00')
-    expect(d?.toISOString()).toBe('2026-09-17T20:00:00.000Z')
-  })
+    const d = parseBogotaInstant('2026-09-17T15:00:00-05:00');
+    expect(d?.toISOString()).toBe('2026-09-17T20:00:00.000Z');
+  });
 
   it('returns null for a non-date string', () => {
-    expect(parseBogotaInstant('mañana por la tarde')).toBeNull()
-  })
-})
+    expect(parseBogotaInstant('mañana por la tarde')).toBeNull();
+  });
+});
 
 describe('agendar_cita', () => {
   beforeEach(() => {
-    h.freebusy.mockReset()
-    h.freebusy.mockResolvedValue(freebusyEmpty())
-    h.insert.mockReset()
-    h.insert.mockResolvedValue({ data: { id: 'evt-123' } })
-  })
+    h.freebusy.mockReset();
+    h.freebusy.mockResolvedValue(freebusyEmpty());
+    h.insert.mockReset();
+    h.insert.mockResolvedValue({ data: { id: 'evt-123' } });
+  });
 
   it('creates the Google event and persists the CRM row', async () => {
-    const supabase = db()
+    const supabase = db();
     const out = await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
@@ -236,20 +252,24 @@ describe('agendar_cita', () => {
       inicio: '2026-09-14T10:00:00-05:00',
       nombre: 'María Pérez',
       motivo: 'Cotización',
-    })
-    expect(out).toContain('Cita agendada')
-    expect(out).toContain('2026-09-14T10:00:00-05:00')
+    });
+    expect(out).toContain('Cita agendada');
+    expect(out).toContain('2026-09-14T10:00:00-05:00');
     expect(h.insert).toHaveBeenCalledWith(
       expect.objectContaining({
         calendarId: process.env.GOOGLE_CALENDAR_ID,
         requestBody: expect.objectContaining({
           summary: 'Cita con Cliente - María Pérez',
-          start: expect.objectContaining({ dateTime: expect.stringContaining('2026-09-14T10:00:00') }),
+          start: expect.objectContaining({
+            dateTime: expect.stringContaining('2026-09-14T10:00:00'),
+          }),
         }),
       }),
-      expect.objectContaining({ timeout: 4000 }),
-    )
-    const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+      expect.objectContaining({ timeout: 4000 })
+    );
+    const insert = supabase.callLog.find(
+      (c) => c.op === 'insert' && c.table === 'citas'
+    );
     expect(insert).toMatchObject({
       row: {
         account_id: 'acct-1',
@@ -258,61 +278,61 @@ describe('agendar_cita', () => {
         estado: 'confirmada',
         motivo: 'Cotización',
       },
-    })
-    const end = insert!.row as { fecha_fin: string }
-    expect((end.fecha_fin as unknown as string).length).toBeGreaterThan(0)
-  })
+    });
+    const end = insert!.row as { fecha_fin: string };
+    expect((end.fecha_fin as unknown as string).length).toBeGreaterThan(0);
+  });
 
   it('refuses an out-of-business-hours start', async () => {
-    const supabase = db()
+    const supabase = db();
     const out = await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T23:30:00-05:00',
       nombre: 'X',
-    })
-    expect(out).toContain('Error')
-    expect(h.insert).not.toHaveBeenCalled()
-  })
+    });
+    expect(out).toContain('Error');
+    expect(h.insert).not.toHaveBeenCalled();
+  });
 
   it('accepts an offset-less datetime as Bogota wall time', async () => {
-    const supabase = db()
+    const supabase = db();
     const out = await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T10:00:00',
       nombre: 'X',
-    })
-    expect(out).toContain('Cita agendada')
+    });
+    expect(out).toContain('Cita agendada');
     const args = h.insert.mock.calls[0][0] as {
-      requestBody: { start: { dateTime: string } }
-    }
-    expect(args.requestBody.start.dateTime).toBe('2026-09-14T10:00:00-05:00')
-  })
+      requestBody: { start: { dateTime: string } };
+    };
+    expect(args.requestBody.start.dateTime).toBe('2026-09-14T10:00:00-05:00');
+  });
 
   it('books a 45-minute event (end = start + APPOINTMENT_DURATION_MIN)', async () => {
-    const supabase = db()
+    const supabase = db();
     await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T10:00:00-05:00',
       nombre: 'X',
-    })
+    });
     const args = h.insert.mock.calls[0][0] as {
-      requestBody: { end: { dateTime: string } }
-    }
-    expect(args.requestBody.end.dateTime).toBe('2026-09-14T10:45:00-05:00')
+      requestBody: { end: { dateTime: string } };
+    };
+    expect(args.requestBody.end.dateTime).toBe('2026-09-14T10:45:00-05:00');
     const insert = supabase.callLog.find(
-      (c) => c.op === 'insert' && c.table === 'citas',
-    )
-    const row = insert!.row as { fecha_inicio: string; fecha_fin: string }
+      (c) => c.op === 'insert' && c.table === 'citas'
+    );
+    const row = insert!.row as { fecha_inicio: string; fecha_fin: string };
     expect(
-      new Date(row.fecha_fin).getTime() - new Date(row.fecha_inicio).getTime(),
-    ).toBe(45 * 60 * 1000)
-  })
+      new Date(row.fecha_fin).getTime() - new Date(row.fecha_inicio).getTime()
+    ).toBe(45 * 60 * 1000);
+  });
 
   it('refuses a slot that is already occupied', async () => {
     h.freebusy.mockResolvedValue({
@@ -320,34 +340,37 @@ describe('agendar_cita', () => {
         calendars: {
           [process.env.GOOGLE_CALENDAR_ID!]: {
             busy: [
-              { start: '2026-09-14T10:00:00-05:00', end: '2026-09-14T11:00:00-05:00' },
+              {
+                start: '2026-09-14T10:00:00-05:00',
+                end: '2026-09-14T11:00:00-05:00',
+              },
             ],
           },
         },
       },
-    })
-    const supabase = db()
+    });
+    const supabase = db();
     const out = await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T10:00:00-05:00',
       nombre: 'X',
-    })
-    expect(out).toContain('ya está ocupado')
-    expect(h.insert).not.toHaveBeenCalled()
-  })
-})
+    });
+    expect(out).toContain('ya está ocupado');
+    expect(h.insert).not.toHaveBeenCalled();
+  });
+});
 
 describe('reagendar_cita / cancelar_cita', () => {
   beforeEach(() => {
-    h.freebusy.mockReset()
-    h.freebusy.mockResolvedValue(freebusyEmpty())
-    h.patch.mockReset()
-    h.patch.mockResolvedValue({ data: {} })
-    h.del.mockReset()
-    h.del.mockResolvedValue({ data: '' })
-  })
+    h.freebusy.mockReset();
+    h.freebusy.mockResolvedValue(freebusyEmpty());
+    h.patch.mockReset();
+    h.patch.mockResolvedValue({ data: {} });
+    h.del.mockReset();
+    h.del.mockResolvedValue({ data: '' });
+  });
 
   it('patches the remote event and updates the CRM row', async () => {
     const supabase = {
@@ -372,36 +395,38 @@ describe('reagendar_cita / cancelar_cita', () => {
             update: () => ({
               eq: () => ({ eq: () => Promise.resolve({ error: null }) }),
             }),
-          }
+          };
         }
-        return {}
+        return {};
       },
-    } as never
+    } as never;
     const out = await reagendar_cita({
       db: supabase,
       accountId: 'acct-1',
       idCita: 'cita-1',
       nuevoInicio: '2026-09-15T11:00:00-05:00',
-    })
-    expect(out).toContain('Cita reagendada')
+    });
+    expect(out).toContain('Cita reagendada');
     expect(h.patch).toHaveBeenCalledWith(
       expect.objectContaining({
         calendarId: process.env.GOOGLE_CALENDAR_ID,
         eventId: 'evt-123',
         requestBody: expect.objectContaining({
-          start: expect.objectContaining({ dateTime: expect.stringContaining('2026-09-15T11:00:00') }),
+          start: expect.objectContaining({
+            dateTime: expect.stringContaining('2026-09-15T11:00:00'),
+          }),
         }),
       }),
-      expect.objectContaining({ timeout: 8000 }),
-    )
-  })
+      expect.objectContaining({ timeout: 8000 })
+    );
+  });
 
-  it('ignores the appointment\'s OWN slot as busy when rescheduling', async () => {
+  it("ignores the appointment's OWN slot as busy when rescheduling", async () => {
     // The new time equals the current time (a no-op move). freebusy
     // reports the event's own interval as busy; reagendar must NOT
     // treat that self-slot as an obstacle.
-    const selfStart = '2026-09-10T10:00:00-05:00'
-    const selfEnd = '2026-09-10T11:00:00-05:00'
+    const selfStart = '2026-09-10T10:00:00-05:00';
+    const selfEnd = '2026-09-10T11:00:00-05:00';
     h.freebusy.mockResolvedValue({
       data: {
         calendars: {
@@ -410,7 +435,7 @@ describe('reagendar_cita / cancelar_cita', () => {
           },
         },
       },
-    })
+    });
     const supabase = {
       from: (table: string) => {
         if (table === 'citas') {
@@ -433,20 +458,20 @@ describe('reagendar_cita / cancelar_cita', () => {
             update: () => ({
               eq: () => ({ eq: () => Promise.resolve({ error: null }) }),
             }),
-          }
+          };
         }
-        return {}
+        return {};
       },
-    } as never
+    } as never;
     const out = await reagendar_cita({
       db: supabase,
       accountId: 'acct-1',
       idCita: 'cita-1',
       nuevoInicio: selfStart,
-    })
-    expect(out).toContain('Cita reagendada')
-    expect(h.freebusy).toHaveBeenCalledTimes(1)
-  })
+    });
+    expect(out).toContain('Cita reagendada');
+    expect(h.freebusy).toHaveBeenCalledTimes(1);
+  });
 
   it('still rejects a NEW slot that is truly busy', async () => {
     // Different slot from the event's own window, genuinely occupied by
@@ -464,7 +489,7 @@ describe('reagendar_cita / cancelar_cita', () => {
           },
         },
       },
-    })
+    });
     const supabase = {
       from: (table: string) => {
         if (table === 'citas') {
@@ -487,21 +512,21 @@ describe('reagendar_cita / cancelar_cita', () => {
             update: () => ({
               eq: () => ({ eq: () => Promise.resolve({ error: null }) }),
             }),
-          }
+          };
         }
-        return {}
+        return {};
       },
-    } as never
+    } as never;
     const out = await reagendar_cita({
       db: supabase,
       accountId: 'acct-1',
       idCita: 'cita-1',
       nuevoInicio: '2026-09-11T15:00:00-05:00',
-    })
-    expect(out).toContain('ya está ocupado')
+    });
+    expect(out).toContain('ya está ocupado');
     // The busy slot belongs to a different window → it must NOT be excluded.
-    expect(h.patch).not.toHaveBeenCalled()
-  })
+    expect(h.patch).not.toHaveBeenCalled();
+  });
 
   it('deletes the remote event and marks the row cancelled', async () => {
     const supabase = {
@@ -525,18 +550,21 @@ describe('reagendar_cita / cancelar_cita', () => {
           eq: () => ({ eq: () => Promise.resolve({ error: null }) }),
         }),
       }),
-    } as never
+    } as never;
     const out = await cancelar_cita({
       db: supabase,
       accountId: 'acct-1',
       idCita: 'cita-1',
-    })
-    expect(out).toContain('Cita cancelada')
+    });
+    expect(out).toContain('Cita cancelada');
     expect(h.del).toHaveBeenCalledWith(
-      expect.objectContaining({ calendarId: process.env.GOOGLE_CALENDAR_ID, eventId: 'evt-123' }),
-      expect.objectContaining({ timeout: 8000 }),
-    )
-  })
+      expect.objectContaining({
+        calendarId: process.env.GOOGLE_CALENDAR_ID,
+        eventId: 'evt-123',
+      }),
+      expect.objectContaining({ timeout: 8000 })
+    );
+  });
 
   it('reports when the appointment cannot be found', async () => {
     const supabase = {
@@ -549,28 +577,28 @@ describe('reagendar_cita / cancelar_cita', () => {
           }),
         }),
       }),
-    } as never
+    } as never;
     const out = await reagendar_cita({
       db: supabase,
       accountId: 'acct-1',
       idCita: 'missing',
       nuevoInicio: '2026-09-15T11:00:00-05:00',
-    })
-    expect(out).toContain('no se encontró la cita')
-  })
-})
+    });
+    expect(out).toContain('no se encontró la cita');
+  });
+});
 
 describe('listar_eventos', () => {
   beforeEach(() => {
-    h.list.mockReset()
-    h.list.mockResolvedValue({ data: {} })
-  })
+    h.list.mockReset();
+    h.list.mockResolvedValue({ data: {} });
+  });
 
   it('requests maxResults=100 by default (breaks the 5-result cap)', async () => {
-    await listar_eventos({})
-    const args = h.list.mock.calls[0][0] as { maxResults: number }
-    expect(args.maxResults).toBe(100)
-  })
+    await listar_eventos({});
+    const args = h.list.mock.calls[0][0] as { maxResults: number };
+    expect(args.maxResults).toBe(100);
+  });
 
   it('formats items with their Meet links', async () => {
     h.list.mockResolvedValue({
@@ -584,11 +612,11 @@ describe('listar_eventos', () => {
           },
         ],
       },
-    })
-    const out = await listar_eventos({})
-    expect(out).toContain('2026-09-20T09:00:00-05:00')
-    expect(out).toContain('https://meet.google.com/abc')
-  })
+    });
+    const out = await listar_eventos({});
+    expect(out).toContain('2026-09-20T09:00:00-05:00');
+    expect(out).toContain('https://meet.google.com/abc');
+  });
 
   it('falls back to htmlLink when the event has no Meet link', async () => {
     h.list.mockResolvedValue({
@@ -602,43 +630,80 @@ describe('listar_eventos', () => {
           },
         ],
       },
-    })
-    const out = await listar_eventos({})
-    expect(out).toContain('https://calendar.google.com/event?eid=abc')
-  })
+    });
+    const out = await listar_eventos({});
+    expect(out).toContain('https://calendar.google.com/event?eid=abc');
+  });
 
   it('reports an invalid window date', async () => {
-    const out = await listar_eventos({ desde: 'no-es-fecha' })
-    expect(out).toContain('fecha inválida')
-    expect(h.list).not.toHaveBeenCalled()
-  })
-})
+    const out = await listar_eventos({ desde: 'no-es-fecha' });
+    expect(out).toContain('fecha inválida');
+    expect(h.list).not.toHaveBeenCalled();
+  });
+});
 
 describe('agendar_cita — enlace del evento', () => {
   beforeEach(() => {
-    h.freebusy.mockReset()
-    h.freebusy.mockResolvedValue(freebusyEmpty())
-    h.insert.mockReset()
-  })
+    h.freebusy.mockReset();
+    h.freebusy.mockResolvedValue(freebusyEmpty());
+    h.insert.mockReset();
+  });
 
   it('persists the Meet hangoutLink in meet_link', async () => {
     h.insert.mockResolvedValue({
-      data: { id: 'evt-meet', hangoutLink: 'https://meet.google.com/abc-defg-hij' },
-    })
-    const supabase = db()
+      data: {
+        id: 'evt-meet',
+        hangoutLink: 'https://meet.google.com/abc-defg-hij',
+      },
+    });
+    const supabase = db();
     const out = await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T10:00:00-05:00',
       nombre: 'Ana',
-    })
-    expect(out).toContain('Reunión Meet: https://meet.google.com/abc-defg-hij')
-    const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+    });
+    expect(out).toContain('Reunión Meet: https://meet.google.com/abc-defg-hij');
+    const insert = supabase.callLog.find(
+      (c) => c.op === 'insert' && c.table === 'citas'
+    );
     expect((insert!.row as { meet_link: string | null }).meet_link).toBe(
-      'https://meet.google.com/abc-defg-hij',
-    )
-  })
+      'https://meet.google.com/abc-defg-hij'
+    );
+  });
+
+  it('persists summary, description and attendees alongside the link', async () => {
+    h.insert.mockResolvedValue({
+      data: {
+        id: 'evt-persist',
+        hangoutLink: 'https://meet.google.com/persist',
+        attendees: [{ email: 'ana@example.com', responseStatus: 'accepted' }],
+      },
+    });
+    const supabase = db();
+    await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'Ana',
+      correoCliente: 'ana@example.com',
+    });
+    const insert = supabase.callLog.find(
+      (c) => c.op === 'insert' && c.table === 'citas'
+    );
+    const row = insert!.row as Record<string, unknown>;
+    expect(row.summary).toBe('Cita con Cliente - Ana');
+    expect(row.description).toContain('agente IA del CRM');
+    expect(row.attendees).toEqual([
+      {
+        email: 'ana@example.com',
+        displayName: null,
+        responseStatus: 'accepted',
+      },
+    ]);
+  });
 
   it('extracts the Meet URI from conferenceData.entryPoints (video) when hangoutLink is absent', async () => {
     h.insert.mockResolvedValue({
@@ -648,26 +713,31 @@ describe('agendar_cita — enlace del evento', () => {
         conferenceData: {
           entryPoints: [
             { entryPointType: 'phone', uri: 'tel:+1-555-0100' },
-            { entryPointType: 'video', uri: 'https://meet.google.com/xyz-abcd-efg' },
+            {
+              entryPointType: 'video',
+              uri: 'https://meet.google.com/xyz-abcd-efg',
+            },
           ],
         },
       },
-    })
-    const supabase = db()
+    });
+    const supabase = db();
     const out = await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T10:00:00-05:00',
       nombre: 'Ana',
-    })
-    expect(out).toContain('Reunión Meet: https://meet.google.com/xyz-abcd-efg')
-    const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+    });
+    expect(out).toContain('Reunión Meet: https://meet.google.com/xyz-abcd-efg');
+    const insert = supabase.callLog.find(
+      (c) => c.op === 'insert' && c.table === 'citas'
+    );
     expect((insert!.row as { meet_link: string | null }).meet_link).toBe(
-      'https://meet.google.com/xyz-abcd-efg',
-    )
-    expect(out).toContain('"link":"https://meet.google.com/xyz-abcd-efg"')
-  })
+      'https://meet.google.com/xyz-abcd-efg'
+    );
+    expect(out).toContain('"link":"https://meet.google.com/xyz-abcd-efg"');
+  });
 
   it('prefers hangoutLink over the entryPoints video URI and htmlLink', async () => {
     h.insert.mockResolvedValue({
@@ -677,190 +747,223 @@ describe('agendar_cita — enlace del evento', () => {
         htmlLink: 'https://calendar.google.com/event?eid=both',
         conferenceData: {
           entryPoints: [
-            { entryPointType: 'video', uri: 'https://meet.google.com/video-second' },
+            {
+              entryPointType: 'video',
+              uri: 'https://meet.google.com/video-second',
+            },
           ],
         },
       },
-    })
-    const supabase = db()
+    });
+    const supabase = db();
     const out = await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T10:00:00-05:00',
       nombre: 'Ana',
-    })
-    expect(out).toContain('Reunión Meet: https://meet.google.com/hangout-first')
-    expect(out).not.toContain('video-second')
-    expect(out).not.toContain('event?eid=both')
-    expect(out).toContain('"link":"https://meet.google.com/hangout-first"')
-  })
+    });
+    expect(out).toContain(
+      'Reunión Meet: https://meet.google.com/hangout-first'
+    );
+    expect(out).not.toContain('video-second');
+    expect(out).not.toContain('event?eid=both');
+    expect(out).toContain('"link":"https://meet.google.com/hangout-first"');
+  });
 
   it('returns the Meet URI in the boarded event when only conferenceData links exist (no htmlLink)', async () => {
     h.insert.mockResolvedValue({
       data: {
         id: 'evt-vidonly',
         conferenceData: {
-          entryPoints: [{ entryPointType: 'video', uri: 'https://meet.google.com/vid-only' }],
+          entryPoints: [
+            {
+              entryPointType: 'video',
+              uri: 'https://meet.google.com/vid-only',
+            },
+          ],
         },
       },
-    })
-    const supabase = db()
+    });
+    const supabase = db();
     const out = await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T10:00:00-05:00',
       nombre: 'Ana',
-    })
-    const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+    });
+    const insert = supabase.callLog.find(
+      (c) => c.op === 'insert' && c.table === 'citas'
+    );
     expect((insert!.row as { meet_link: string | null }).meet_link).toBe(
-      'https://meet.google.com/vid-only',
-    )
-    expect(out).toContain('"link":"https://meet.google.com/vid-only"')
-  })
+      'https://meet.google.com/vid-only'
+    );
+    expect(out).toContain('"link":"https://meet.google.com/vid-only"');
+  });
 
   it('falls back to htmlLink and does NOT report a system error', async () => {
     h.insert.mockResolvedValue({
-      data: { id: 'evt-html', htmlLink: 'https://calendar.google.com/event?eid=xyz' },
-    })
-    const supabase = db()
+      data: {
+        id: 'evt-html',
+        htmlLink: 'https://calendar.google.com/event?eid=xyz',
+      },
+    });
+    const supabase = db();
     const out = await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T10:00:00-05:00',
       nombre: 'Ana',
-    })
-    expect(out).toContain('Cita agendada')
-    expect(out).toContain('Enlace del evento: https://calendar.google.com/event?eid=xyz')
-    expect(out).not.toContain('no disponible')
-    const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+    });
+    expect(out).toContain('Cita agendada');
+    expect(out).toContain(
+      'Enlace del evento: https://calendar.google.com/event?eid=xyz'
+    );
+    expect(out).not.toContain('no disponible');
+    const insert = supabase.callLog.find(
+      (c) => c.op === 'insert' && c.table === 'citas'
+    );
     expect((insert!.row as { meet_link: string | null }).meet_link).toBe(
-      'https://calendar.google.com/event?eid=xyz',
-    )
-  })
+      'https://calendar.google.com/event?eid=xyz'
+    );
+  });
 
   it('stores the Meet fallback link when Google returns no link at all', async () => {
-    h.insert.mockResolvedValue({ data: { id: 'evt-plain' } })
-    const supabase = db()
+    h.insert.mockResolvedValue({ data: { id: 'evt-plain' } });
+    const supabase = db();
     const out = await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T10:00:00-05:00',
       nombre: 'Ana',
-    })
-    expect(out).toContain('Cita agendada')
-    expect(out).toContain('Reunión Meet: https://meet.google.com/new')
-    const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+    });
+    expect(out).toContain('Cita agendada');
+    expect(out).toContain('Reunión Meet: https://meet.google.com/new');
+    const insert = supabase.callLog.find(
+      (c) => c.op === 'insert' && c.table === 'citas'
+    );
     expect((insert!.row as { meet_link: string | null }).meet_link).toBe(
-      'https://meet.google.com/new',
-    )
-  })
+      'https://meet.google.com/new'
+    );
+  });
 
   it('books directly when the freebusy check fails (no blocking)', async () => {
-    h.freebusy.mockRejectedValue(new Error('freebusy down'))
+    h.freebusy.mockRejectedValue(new Error('freebusy down'));
     h.insert.mockResolvedValue({
-      data: { id: 'evt-direct', htmlLink: 'https://calendar.google.com/event?eid=direct' },
-    })
-    const supabase = db()
+      data: {
+        id: 'evt-direct',
+        htmlLink: 'https://calendar.google.com/event?eid=direct',
+      },
+    });
+    const supabase = db();
     const out = await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T10:00:00-05:00',
       nombre: 'Ana',
-    })
-    expect(out).toContain('Cita agendada')
-    expect(h.insert).toHaveBeenCalled()
-    expect(out).toContain('Enlace del evento: https://calendar.google.com/event?eid=direct')
-  })
+    });
+    expect(out).toContain('Cita agendada');
+    expect(h.insert).toHaveBeenCalled();
+    expect(out).toContain(
+      'Enlace del evento: https://calendar.google.com/event?eid=direct'
+    );
+  });
 
   it('returns confirmado:true plus the exact link in JSON_RESULT', async () => {
     h.insert.mockResolvedValue({
-      data: { id: 'evt-json', hangoutLink: 'https://meet.google.com/json-meet' },
-    })
-    const supabase = db()
+      data: {
+        id: 'evt-json',
+        hangoutLink: 'https://meet.google.com/json-meet',
+      },
+    });
+    const supabase = db();
     const out = await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T10:00:00-05:00',
       nombre: 'Ana',
-    })
-    expect(out).toContain('"confirmado":true')
-    expect(out).toContain('"link":"https://meet.google.com/json-meet"')
-  })
+    });
+    expect(out).toContain('"confirmado":true');
+    expect(out).toContain('"link":"https://meet.google.com/json-meet"');
+  });
 
   it('returns the tool-shaped JSON (exito/mensaje/fecha/hora/link) resolved', async () => {
     h.insert.mockResolvedValue({
       data: { id: 'evt-shape', hangoutLink: 'https://meet.google.com/shape' },
-    })
-    const supabase = db()
+    });
+    const supabase = db();
     const out = await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T10:00:00-05:00',
       nombre: 'Ana',
-    })
-    expect(out).toContain('"exito":true')
-    expect(out).toContain('"mensaje":"Cita agendada correctamente"')
-    expect(out).toContain('"fecha":"2026-09-14"')
-    expect(out).toContain('"hora":"10:00"')
-    expect(out).toContain('"link":"https://meet.google.com/shape"')
-  })
+    });
+    expect(out).toContain('"exito":true');
+    expect(out).toContain('"mensaje":"Cita agendada correctamente"');
+    expect(out).toContain('"fecha":"2026-09-14"');
+    expect(out).toContain('"hora":"10:00"');
+    expect(out).toContain('"link":"https://meet.google.com/shape"');
+  });
 
   it('does not hang when Google never answers — 4s timeout, saves locally and returns success', async () => {
-    vi.useFakeTimers()
+    vi.useFakeTimers();
     try {
-      h.insert.mockReturnValue(new Promise(() => {}))
-      const supabase = db()
+      h.insert.mockReturnValue(new Promise(() => {}));
+      const supabase = db();
       const p = agendar_cita({
         db: supabase as never,
         accountId: 'acct-1',
         contactoId: 'contact-1',
         inicio: '2026-09-14T10:00:00-05:00',
         nombre: 'Ana',
-      })
-      await vi.advanceTimersByTimeAsync(4000)
-      const out = await p
-      expect(h.insert).toHaveBeenCalledTimes(1)
-      expect(out).toContain('Cita agendada')
-      expect(out).toContain('Google Calendar no disponible')
-      const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+      });
+      await vi.advanceTimersByTimeAsync(4000);
+      const out = await p;
+      expect(h.insert).toHaveBeenCalledTimes(1);
+      expect(out).toContain('Cita agendada');
+      expect(out).toContain('Google Calendar no disponible');
+      const insert = supabase.callLog.find(
+        (c) => c.op === 'insert' && c.table === 'citas'
+      );
       expect((insert!.row as { meet_link: string | null }).meet_link).toBe(
-        'https://meet.google.com/new',
-      )
-      expect(out).toContain('"exito":true')
-      expect(out).toContain('"link":"https://meet.google.com/new"')
+        'https://meet.google.com/new'
+      );
+      expect(out).toContain('"exito":true');
+      expect(out).toContain('"link":"https://meet.google.com/new"');
     } finally {
-      vi.useRealTimers()
+      vi.useRealTimers();
     }
-  })
+  });
 
   it('defaults the reason to "Consulta / Valoración" when omitted', async () => {
-    h.insert.mockResolvedValue({ data: { id: 'evt-def' } })
-    const supabase = db()
+    h.insert.mockResolvedValue({ data: { id: 'evt-def' } });
+    const supabase = db();
     await agendar_cita({
       db: supabase as never,
       accountId: 'acct-1',
       contactoId: 'contact-1',
       inicio: '2026-09-14T10:00:00-05:00',
       nombre: 'Ana',
-    })
-    const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+    });
+    const insert = supabase.callLog.find(
+      (c) => c.op === 'insert' && c.table === 'citas'
+    );
     expect((insert!.row as { motivo: string }).motivo).toBe(
-      'Consulta / Valoración',
-    )
-  })
-})
+      'Consulta / Valoración'
+    );
+  });
+});
 
 describe('consultarOcupados', () => {
   beforeEach(() => {
-    h.freebusy.mockReset()
-  })
+    h.freebusy.mockReset();
+  });
 
   it('returns busy intervals as ISO strings on success', async () => {
     h.freebusy.mockResolvedValue({
@@ -868,42 +971,160 @@ describe('consultarOcupados', () => {
         calendars: {
           [process.env.GOOGLE_CALENDAR_ID!]: {
             busy: [
-              { start: '2026-09-14T15:00:00-05:00', end: '2026-09-14T16:00:00-05:00' },
+              {
+                start: '2026-09-14T15:00:00-05:00',
+                end: '2026-09-14T16:00:00-05:00',
+              },
             ],
           },
         },
       },
-    })
+    });
     const res = await consultarOcupados(
       '2026-09-14T00:00:00-05:00',
-      '2026-09-15T00:00:00-05:00',
-    )
-    expect(res.ok).toBe(true)
-    expect(res.ocupados).toHaveLength(1)
-    expect(res.ocupados[0].start).toBe('2026-09-14T20:00:00.000Z')
-    expect(res.ocupados[0].end).toBe('2026-09-14T21:00:00.000Z')
-  })
+      '2026-09-15T00:00:00-05:00'
+    );
+    expect(res.ok).toBe(true);
+    expect(res.ocupados).toHaveLength(1);
+    expect(res.ocupados[0].start).toBe('2026-09-14T20:00:00.000Z');
+    expect(res.ocupados[0].end).toBe('2026-09-14T21:00:00.000Z');
+  });
 
   it('degrades to ok:false with an empty list when freebusy fails', async () => {
-    h.freebusy.mockRejectedValue(new Error('freebusy down'))
+    h.freebusy.mockRejectedValue(new Error('freebusy down'));
     const res = await consultarOcupados(
       '2026-09-14T00:00:00-05:00',
-      '2026-09-15T00:00:00-05:00',
-    )
-    expect(res.ok).toBe(false)
-    expect(res.ocupados).toEqual([])
-  })
+      '2026-09-15T00:00:00-05:00'
+    );
+    expect(res.ok).toBe(false);
+    expect(res.ocupados).toEqual([]);
+  });
 
   it('rejects invalid bounds without calling freebusy', async () => {
-    const res = await consultarOcupados('no-es-fecha', 'tampoco')
-    expect(res.ok).toBe(false)
-    expect(res.ocupados).toEqual([])
-    expect(h.freebusy).not.toHaveBeenCalled()
-  })
-})
+    const res = await consultarOcupados('no-es-fecha', 'tampoco');
+    expect(res.ok).toBe(false);
+    expect(res.ocupados).toEqual([]);
+    expect(h.freebusy).not.toHaveBeenCalled();
+  });
+});
+
+describe('listar_ocupados_detalle', () => {
+  beforeEach(() => {
+    h.list.mockReset();
+    h.list.mockResolvedValue({ data: {} });
+  });
+
+  it('maps events to busy blocks with full details', async () => {
+    h.list.mockResolvedValue({
+      data: {
+        items: [
+          {
+            id: 'evt-1',
+            summary: 'Cita con Cliente - Ana',
+            description:
+              'Reunión agendada automáticamente por el agente IA del CRM.',
+            attendees: [
+              { email: 'ana@example.com' },
+              { email: 'admin@clinic.com', responseStatus: 'accepted' },
+            ],
+            start: { dateTime: '2026-09-14T15:00:00-05:00' },
+            end: { dateTime: '2026-09-14T15:45:00-05:00' },
+            hangoutLink: 'https://meet.google.com/abc-defg-hij',
+          },
+        ],
+      },
+    });
+    const res = await listar_ocupados_detalle(
+      '2026-09-14T00:00:00-05:00',
+      '2026-09-15T00:00:00-05:00'
+    );
+    expect(res.ok).toBe(true);
+    expect(res.ocupados).toHaveLength(1);
+    const o = res.ocupados[0];
+    expect(o.start).toBe('2026-09-14T20:00:00.000Z');
+    expect(o.end).toBe('2026-09-14T20:45:00.000Z');
+    expect(o.id).toBe('evt-1');
+    expect(o.summary).toBe('Cita con Cliente - Ana');
+    expect(o.attendees?.[0]?.email).toBe('ana@example.com');
+    expect(o.attendees?.[1]?.responseStatus).toBe('accepted');
+    expect(o.meetLink).toBe('https://meet.google.com/abc-defg-hij');
+  });
+
+  it('falls back to htmlLink and skips cancelled events', async () => {
+    h.list.mockResolvedValue({
+      data: {
+        items: [
+          {
+            id: 'evt-x',
+            status: 'cancelled',
+            summary: 'Borrado',
+            start: { dateTime: '2026-09-14T16:00:00-05:00' },
+            end: { dateTime: '2026-09-14T16:30:00-05:00' },
+          },
+          {
+            id: 'evt-2',
+            summary: 'Revisión',
+            htmlLink: 'https://calendar.google.com/event?eid=2',
+            start: { dateTime: '2026-09-14T17:00:00-05:00' },
+            end: { dateTime: '2026-09-14T17:30:00-05:00' },
+          },
+        ],
+      },
+    });
+    const res = await listar_ocupados_detalle(
+      '2026-09-14T00:00:00-05:00',
+      '2026-09-15T00:00:00-05:00'
+    );
+    expect(res.ok).toBe(true);
+    expect(res.ocupados).toHaveLength(1);
+    expect(res.ocupados[0].meetLink).toBe(
+      'https://calendar.google.com/event?eid=2'
+    );
+  });
+
+  it('maps all-day events as full Bogota-day busy blocks', async () => {
+    h.list.mockResolvedValue({
+      data: {
+        items: [
+          {
+            id: 'evt-allday',
+            summary: 'Festivo',
+            start: { date: '2026-09-14' },
+            end: { date: '2026-09-15' },
+          },
+        ],
+      },
+    });
+    const res = await listar_ocupados_detalle(
+      '2026-09-14T00:00:00-05:00',
+      '2026-09-16T00:00:00-05:00'
+    );
+    expect(res.ok).toBe(true);
+    expect(res.ocupados).toHaveLength(1);
+    expect(res.ocupados[0].start).toBe('2026-09-14T05:00:00.000Z');
+    expect(res.ocupados[0].end).toBe('2026-09-15T05:00:00.000Z');
+  });
+
+  it('degrades to ok:false with an empty list when events.list fails', async () => {
+    h.list.mockRejectedValue(new Error('events down'));
+    const res = await listar_ocupados_detalle(
+      '2026-09-14T00:00:00-05:00',
+      '2026-09-15T00:00:00-05:00'
+    );
+    expect(res.ok).toBe(false);
+    expect(res.ocupados).toEqual([]);
+  });
+
+  it('rejects invalid bounds without calling events.list', async () => {
+    const res = await listar_ocupados_detalle('no-es-fecha', 'tampoco');
+    expect(res.ok).toBe(false);
+    expect(res.ocupados).toEqual([]);
+    expect(h.list).not.toHaveBeenCalled();
+  });
+});
 
 describe('APPOINTMENT_DURATION_MIN', () => {
   it('is exactly 45 minutes', () => {
-    expect(APPOINTMENT_DURATION_MIN).toBe(45)
-  })
-})
+    expect(APPOINTMENT_DURATION_MIN).toBe(45);
+  });
+});

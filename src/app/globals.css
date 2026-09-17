@@ -286,6 +286,12 @@ html[data-theme="rose"] {
   border-radius: 4px;
   background: oklch(0.78 0.16 70 / 0.28);
   border: 1px dashed oklch(0.82 0.14 70 / 0.55);
+  cursor: pointer;
+  transition: border-style 120ms ease, background 120ms ease;
+}
+.cal-busy:hover {
+  border-style: solid;
+  background: oklch(0.78 0.16 70 / 0.42);
 }
 
 .cal-linea-ahora {
