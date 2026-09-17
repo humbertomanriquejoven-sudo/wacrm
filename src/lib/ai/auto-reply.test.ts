@@ -9,6 +9,8 @@ const h = vi.hoisted(() => ({
   generateReply: vi.fn(),
   engineSendText: vi.fn(),
   engineSendAiReply: vi.fn(),
+  executeToolCall: vi.fn(),
+  loadContactContext: vi.fn(),
   state: {
     conv: null as Record<string, unknown> | null,
     autoResponders: [] as { id: string }[],
@@ -23,6 +25,11 @@ vi.mock('./config', () => ({ loadAiConfig: h.loadAiConfig }))
 vi.mock('./context', () => ({ buildConversationContext: h.buildConversationContext }))
 vi.mock('./knowledge', () => ({ retrieveKnowledge: h.retrieveKnowledge }))
 vi.mock('./generate', () => ({ generateReply: h.generateReply }))
+vi.mock('./tools', () => ({
+  AI_TOOLS: [{ name: 'agendar_cita', description: '', parameters: { type: 'object', properties: {} } }],
+  executeToolCall: h.executeToolCall,
+  loadContactContext: h.loadContactContext,
+}))
 vi.mock('@/lib/flows/meta-send', () => ({
   engineSendText: h.engineSendText,
   engineSendAiReply: h.engineSendAiReply,
@@ -73,7 +80,7 @@ vi.mock('./admin-client', () => ({
   }),
 }))
 
-import { dispatchInboundToAiReply } from './auto-reply'
+import { dispatchInboundToAiReply, AGENDAR_FALLBACK_MESSAGE } from './auto-reply'
 
 const ARGS = {
   accountId: 'acct-1',
@@ -112,6 +119,13 @@ beforeEach(() => {
   h.buildConversationContext.mockResolvedValue([{ role: 'user', content: 'hi' }])
   h.retrieveKnowledge.mockResolvedValue([])
   h.generateReply.mockResolvedValue({ text: 'Hello!', handoff: false })
+  h.executeToolCall.mockResolvedValue('Cita agendada: 2026-09-18T14:00:00 (60 minutos). Reunión Meet: https://meet.google.com/abc')
+  h.loadContactContext.mockImplementation(async () => ({
+    name: null,
+    email: null,
+    location: null,
+    citas: h.state.citas,
+  }))
   h.engineSendText.mockResolvedValue({ whatsapp_message_id: 'm1' })
   h.engineSendAiReply.mockResolvedValue({ whatsapp_message_id: 'm1' })
 })
@@ -257,5 +271,87 @@ describe('dispatchInboundToAiReply — handoff', () => {
       ai_autoreply_disabled: true,
       assigned_agent_id: 'agent-7',
     })
+  })
+})
+
+describe('dispatchInboundToAiReply — tool-call lifecycle', () => {
+  const toolCall = {
+    id: 'call-1',
+    name: 'agendar_cita',
+    arguments: { inicio: '2026-09-18T14:00:00-05:00', nombre: 'Carlos' },
+  }
+
+  it('executes the tool, then makes a second LLM pass to confirm with the Meet link', async () => {
+    h.generateReply
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
+      .mockResolvedValueOnce({
+        text: '¡Listo! Tu cita quedó para mañana a las 2:00 PM. Meet: https://meet.google.com/abc',
+        handoff: false,
+      })
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.executeToolCall).toHaveBeenCalledTimes(1)
+    expect(h.generateReply).toHaveBeenCalledTimes(2)
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('https://meet.google.com/abc'),
+      }),
+    )
+    // The tool result was fed back to the model on the confirmation pass.
+    const secondMessages = h.generateReply.mock.calls[1][0].messages as {
+      role: string
+      content: string
+    }[]
+    expect(secondMessages.some((m) => m.role === 'tool')).toBe(true)
+  })
+
+  it('forces a tool-free final pass when repeated tool calls exhaust the round budget', async () => {
+    h.generateReply
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
+      .mockResolvedValueOnce({ text: 'Confirmado para mañana a las 2:00 PM.', handoff: false })
+
+    await dispatchInboundToAiReply(ARGS)
+
+    // 4 loop rounds + 1 forced, tool-free pass.
+    expect(h.generateReply).toHaveBeenCalledTimes(5)
+    const forcedArgs = h.generateReply.mock.calls[4][0] as { tools?: unknown }
+    expect(forcedArgs.tools).toBeUndefined()
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'Confirmado para mañana a las 2:00 PM.' }),
+    )
+  })
+
+  it('never goes silent when the scheduling tool throws — sends the fallback', async () => {
+    h.executeToolCall.mockRejectedValue(new Error('network timeout'))
+    h.generateReply
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
+      .mockResolvedValueOnce({ text: '', handoff: false })
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ text: AGENDAR_FALLBACK_MESSAGE }),
+    )
+    expect(h.state.updatePayload).toBeNull()
+  })
+
+  it('relays the tool fallback message through the model on the next pass', async () => {
+    h.executeToolCall.mockRejectedValue(new Error('boom'))
+    h.generateReply
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
+      .mockResolvedValueOnce({ text: AGENDAR_FALLBACK_MESSAGE, handoff: false })
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ text: AGENDAR_FALLBACK_MESSAGE }),
+    )
   })
 })

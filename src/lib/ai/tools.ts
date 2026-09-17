@@ -189,7 +189,7 @@ export async function executeToolCall(
     if (typeof inicio !== 'string' || typeof nombre !== 'string') {
       return 'Error: agendar_cita requiere "inicio" y "nombre".'
     }
-    return agendar_cita({
+    const result = await agendar_cita({
       db,
       accountId,
       contactoId: contactId,
@@ -198,6 +198,8 @@ export async function executeToolCall(
       motivo: typeof motivo === 'string' ? motivo : undefined,
       correoCliente: typeof email === 'string' ? email : undefined,
     })
+    console.log('[agendar_cita payload]', result)
+    return result
   }
   if (toolCall.name === 'reagendar_cita') {
     const { idCita, nuevoInicio } = toolCall.arguments

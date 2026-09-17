@@ -16,6 +16,14 @@ import type { ChatMessage } from './types'
 /** Maximum tool-call rounds per inbound to avoid infinite loops. */
 const MAX_TOOL_ROUNDS = 3
 
+/**
+ * Customer-facing fallback when a scheduling tool ran but we could not
+ * produce a confirmation with a Meet link (tool threw, or the model ran
+ * out of rounds). Sent instead of leaving the customer in silence.
+ */
+export const AGENDAR_FALLBACK_MESSAGE =
+  'Tu cita ha sido procesada, pero tuvimos un inconveniente generando el enlace de Google Meet. Un asesor te contactará en breve.'
+
 interface DispatchArgs {
   accountId: string
   conversationId: string
@@ -112,6 +120,7 @@ export async function dispatchInboundToAiReply(
     let finalText = ''
     let finalUsage = null
     let handoff = false
+    let toolFallback: string | null = null
     const conversationMessages: ChatMessage[] = [...messages]
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
@@ -129,7 +138,23 @@ export async function dispatchInboundToAiReply(
       if (result.toolCalls && result.toolCalls.length > 0) {
         const toolResults: ChatMessage[] = []
         for (const tc of result.toolCalls) {
-          const output = await executeToolCall(db, accountId, contactId, tc)
+          let output: string
+          try {
+            output = await executeToolCall(db, accountId, contactId, tc)
+          } catch (err) {
+            // A thrown tool must never abort the whole turn — that would
+            // leave the customer with no message at all. Turn the failure
+            // into a tool result the model can relay, and remember a
+            // deterministic fallback for the scheduling case.
+            console.error(`[ai auto-reply] tool "${tc.name}" threw:`, err)
+            if (tc.name === 'agendar_cita') {
+              toolFallback = AGENDAR_FALLBACK_MESSAGE
+            }
+            output =
+              tc.name === 'agendar_cita'
+                ? AGENDAR_FALLBACK_MESSAGE
+                : `Error: la herramienta ${tc.name} no pudo completarse.`
+          }
           toolResults.push({
             role: 'tool',
             content: output,
@@ -151,6 +176,31 @@ export async function dispatchInboundToAiReply(
       // No tool calls — this is the final text reply.
       finalText = result.text
       break
+    }
+
+    // The tool round must NOT be the end of the turn. Force one extra,
+    // tool-free generation so the model turns the tool output (the Meet
+    // link, the booked time) into a customer-facing confirmation even
+    // when the round budget was exhausted by repeated tool calls.
+    if (!finalText && !handoff) {
+      try {
+        const final = await generateReply({
+          config,
+          systemPrompt,
+          messages: conversationMessages,
+        })
+        finalUsage = final.usage ?? finalUsage
+        handoff = final.handoff
+        finalText = final.text
+      } catch (err) {
+        console.error('[ai auto-reply] final confirmation pass failed:', err)
+      }
+    }
+
+    // Last resort: if a scheduling tool failed and the model still said
+    // nothing, send the fallback rather than going silent.
+    if (!finalText && !handoff && toolFallback) {
+      finalText = toolFallback
     }
 
     // Record token spend on the account's BYO key.
