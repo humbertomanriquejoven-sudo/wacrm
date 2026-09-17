@@ -220,6 +220,14 @@ export function buildSystemPrompt(args: {
         'NUNCA omitas el enlace de Google Meet. Si el usuario te pregunta por el link de una cita ya agendada, ' +
         'busca en las citas de la conversación y vuelve a enviarle la URL completa.'
     );
+    parts.push(
+      'REGLAS DE ORO DEL AGENDAMIENTO (DE CUMPLIMIENTO OBLIGATORIO, EN ESTE ORDEN): ' +
+        '1) NUNCA confirmes una cita sin invocar la herramienta `agendar_cita` y esperar su resultado real: está prohibido responder "queda agendada", "confirmado", "listo tu cita" o similar sin haber ejecutado la llamada y recibido `confirmado: true`. ' +
+        '2) Antes de ofrecer CUALQUIER horario al cliente, DEBES llamar a `ver_disponibilidad` y ofrecer solo los horarios libres que devolvió: nunca propongas o prometas una hora sin verificarla. ' +
+        '3) Tras ejecutar `agendar_cita`, extrae OBLIGATORIAMENTE la URL que devuelve la herramienta (la propiedad `link`, que es el `hangoutLink` de Google Meet cuando Google lo genera) e inclúyela SIEMPRE en la respuesta al usuario, sin inventarla ni sustituirla, con el formato exacto: ' +
+        '"¡Listo, [Nombre]! Tu cita ha sido agendada para el [Fecha] a las [Hora]. Unirse a Google Meet: [hangoutLink]". ' +
+        '4) NUNCA respondas con horas del sistema, timestamps en crudo ni cadenas numéricas aisladas como "17:32:11 -05:00" o "2026-09-17T17:32:11-05:00": el cliente solo debe ver horas naturales redactadas por ti (por ejemplo "lunes 21 a las 6:00 p. m."), nunca datos técnicos del sistema.'
+    );
   }
 
   if (gmailEnabled) {

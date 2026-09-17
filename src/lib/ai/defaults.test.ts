@@ -142,6 +142,20 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('vuelve a enviarle la URL completa');
   });
 
+  it('enforces the golden scheduling rules (tool-before-confirmation, hangoutLink, no raw timestamps)', () => {
+    const prompt = buildSystemPrompt({
+      userPrompt: null,
+      mode: 'auto_reply',
+      calendarEnabled: true,
+    });
+    expect(prompt).toContain('REGLAS DE ORO DEL AGENDAMIENTO');
+    expect(prompt).toContain('NUNCA confirmes una cita sin invocar la herramienta');
+    expect(prompt).toContain('DEBES llamar a `ver_disponibilidad`');
+    expect(prompt).toContain('extrae OBLIGATORIAMENTE la URL que devuelve la herramienta');
+    expect(prompt).toContain('Unirse a Google Meet: [hangoutLink]');
+    expect(prompt).toContain('17:32:11 -05:00');
+  });
+
   it('forces strict Spanish and a single response without internal reasoning', () => {
     const prompt = buildSystemPrompt({
       userPrompt: null,

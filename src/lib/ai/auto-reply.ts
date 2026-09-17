@@ -15,6 +15,7 @@ import {
 } from './tools';
 import { calendarConfigured, MEET_FALLBACK_LINK } from '@/lib/calendar';
 import { gmailConfigured } from '@/lib/gmail';
+import { stripRawTimestamps } from '@/lib/whatsapp/clean-ai-text';
 import { engineSendAiReply } from '@/lib/flows/meta-send';
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit';
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -177,6 +178,9 @@ function looksLikeBookingConfirmation(text: string): boolean {
 /**
  * Deterministic guard against hallucinated bookings. Runs on the final
  * message BEFORE it is sent:
+ *  - raw wall-clock/timestamp reads ("17:32:11 -05:00", ISO datetimes) are
+ *    stripped first so the bubble only ever carries the final text the AI
+ *    redacted for the customer,
  *  - real agendar_cita success + link  → replace every Meet/calendar URL
  *    with that link (append it if the model omitted it),
  *  - real success but no link         → use MEET_FALLBACK_LINK, keeping a
@@ -188,11 +192,17 @@ function looksLikeBookingConfirmation(text: string): boolean {
  *    else keeps its fake URLs stripped.
  */
 export function guardBookingReply(
-  text: string,
+  raw: string,
   booking: BookingToolResult | null,
   opts: { bookingContext?: boolean } = {}
 ): string | null {
-  if (!text) return text;
+  if (!raw) return raw;
+
+  // ÚNICAMENTE el texto final redactado por la IA sale por WhatsApp: se
+  // filtran marcas de hora/zona en crudo del resultado de una herramienta
+  // (p. ej. "17:32:11 -05:00" o "2026-09-17T17:32:11-05:00").
+  const text = stripRawTimestamps(raw);
+  if (!text) return null;
 
   const confirmed = booking?.confirmado === true;
   // Un mensaje de confirmación NUNCA queda sin URL: el link real si la

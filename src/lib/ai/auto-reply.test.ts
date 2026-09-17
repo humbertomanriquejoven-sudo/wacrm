@@ -911,6 +911,33 @@ describe('guardBookingReply — pure function', () => {
     );
     expect(out).toBe('Puedes confirmar tu pago aquí: ');
   });
+
+  it('never sends a raw timezone timestamp — it is stripped from the bubble', () => {
+    const out = guardBookingReply(
+      'El horario disponible es de 17:32:11 -05:00 a 18:17:11 -05:00.',
+      null
+    );
+    expect(out).toBe('El horario disponible es de a .');
+    expect(
+      guardBookingReply(
+        'Tu cita quedó para 2026-09-18T14:00:00-05:00.',
+        null
+      )
+    ).toBe('Tu cita quedó para .');
+  });
+
+  it('returns null when the only content was a raw timestamp', () => {
+    expect(guardBookingReply('2026-09-17T17:32:11-05:00', null)).toBeNull();
+    expect(guardBookingReply('17:32:11 -05:00', null)).toBeNull();
+  });
+
+  it('keeps friendly dates/times while stripping raw ones', () => {
+    const out = guardBookingReply(
+      'Agendamos para el 2026-09-18 a las 14:00 (evento 2026-09-18T14:00:00-05:00).',
+      null
+    );
+    expect(out).toBe('Agendamos para el 2026-09-18 a las 14:00 (evento ).');
+  });
 });
 
 describe('buildBookingConfirmationMessage — pure function', () => {
