@@ -704,7 +704,6 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
     console.warn('[calendar] agendar freebusy failed — booking directly:', err);
   }
 
-  const cal = calendarClient();
   const name = nombre.trim() || 'Cita';
   const title = `Cita con Cliente - ${name}`;
 
@@ -739,6 +738,10 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
     responseStatus?: string | null;
   }> | null = null;
   try {
+    // El cliente de Google se construye DENTRO del try: si las credenciales
+    // faltan o son inválidas, el fallo se degrada al guardado local en vez
+    // de lanzar y dejar al cliente sin cita ni respuesta.
+    const cal = calendarClient();
     const baseBody = {
       summary: title,
       description: 'Reunión agendada automáticamente por el agente IA del CRM.',
@@ -770,7 +773,7 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
                 ...baseBody,
                 conferenceData: {
                   createRequest: {
-                    requestId: `meet-crm-${Date.now()}`,
+                    requestId: Date.now().toString(),
                     conferenceSolutionKey: { type: 'hangoutsMeet' },
                   },
                 },

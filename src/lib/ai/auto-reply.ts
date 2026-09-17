@@ -342,6 +342,10 @@ export async function dispatchInboundToAiReply(
     let finalText: string | null = '';
     let finalUsage = null;
     let toolFallback: string | null = null;
+    // true en cuanto el modelo invocó agendar_cita este turno. Garantiza que
+    // una intención real de agendamiento NUNCA termine sin mensaje aunque el
+    // modelo devuelva texto vacío (bot "congelado").
+    let bookingAttempted = false;
     // Latest REAL successful booking from agendar_cita's JSON_RESULT.
     // Everything else that looks like a confirmation is hallucination.
     let realBooking: BookingToolResult | null = null;
@@ -382,6 +386,7 @@ export async function dispatchInboundToAiReply(
           // the outgoing message can never carry a link the tool didn't
           // return. Ignore tool results that announced an error.
           if (tc.name === 'agendar_cita') {
+            bookingAttempted = true;
             const parsed = extractBookingResult(output);
             if (parsed?.confirmado) realBooking = parsed;
           }
@@ -486,10 +491,11 @@ export async function dispatchInboundToAiReply(
       }
     }
 
-    // Last resort: if a scheduling tool failed and the model still said
-    // nothing, send the fallback rather than going silent.
-    if (!finalText && toolFallback) {
-      finalText = toolFallback;
+    // Last resort: if a scheduling tool was attempted (threw or errored) and
+    // the model still said nothing, send the fallback rather than going
+    // silent — the customer must ALWAYS get a WhatsApp reply.
+    if (!finalText && (toolFallback || bookingAttempted)) {
+      finalText = toolFallback ?? AGENDAR_FALLBACK_MESSAGE;
     }
 
     // Anti-hallucination guard: the final message must be grounded in a

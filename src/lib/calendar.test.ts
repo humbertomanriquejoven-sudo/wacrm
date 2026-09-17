@@ -283,6 +283,37 @@ describe('agendar_cita', () => {
     expect((end.fecha_fin as unknown as string).length).toBeGreaterThan(0);
   });
 
+  it('registra la cita localmente y responde aunque Google Calendar falle (insert reject)', async () => {
+    h.insert.mockRejectedValue(new Error('Calendar API down'));
+    const supabase = db();
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'María Pérez',
+      correoCliente: 'maria@example.com',
+    });
+    // Nunca lanza: devuelve un éxito degradado con enlace de Meet de
+    // respaldo y la marca calendarSynced=false para que el motor avise.
+    expect(out).toContain('ÉXITO: Cita creada');
+    expect(out).toContain('"confirmado":true');
+    expect(out).toContain('"calendarSynced":false');
+    const insert = supabase.callLog.find(
+      (c) => c.op === 'insert' && c.table === 'citas'
+    );
+    expect(insert).toMatchObject({
+      row: {
+        account_id: 'acct-1',
+        contact_id: 'contact-1',
+        estado: 'confirmada',
+      },
+    });
+    expect(
+      (insert!.row as { google_event_id: string }).google_event_id
+    ).toContain('local-');
+  });
+
   it('refuses an out-of-business-hours start', async () => {
     const supabase = db();
     const out = await agendar_cita({

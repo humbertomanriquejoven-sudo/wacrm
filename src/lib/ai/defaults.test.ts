@@ -118,8 +118,9 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('COMPENSACIÓN ANTE FALLOS DE GOOGLE CALENDAR');
     expect(prompt).toContain('NUNCA te quedes en silencio');
     expect(prompt).toContain(
-      'un asesor le enviará el enlace de Google Meet en breve'
+      'Tu cita ha sido registrada. Te contactaremos pronto con los detalles'
     );
+    expect(prompt).toContain('ninguna solicitud de cita puede terminar sin un mensaje');
   });
 
   it('forbids re-asking for the date range in the confirmation protocol', () => {

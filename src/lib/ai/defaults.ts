@@ -219,7 +219,9 @@ export function buildSystemPrompt(args: {
     );
     parts.push(
       'COMPENSACIÓN ANTE FALLOS DE GOOGLE CALENDAR: si la función de agendamiento falla o Google Calendar no puede crear el evento por cualquier motivo, NUNCA te quedes en silencio ni simules un enlace: ' +
-        'informa al cliente en WhatsApp, en español y en UNA sola burbuja, que su cita quedó registrada y que un asesor le enviará el enlace de Google Meet en breve.'
+        'la cita queda igualmente registrada en el CRM con estado "confirmada" y el sistema envía la invitación por correo cuando hay correo. ' +
+        'Responde SIEMPRE al cliente en WhatsApp, en español y en UNA sola burbuja, con el mensaje "Tu cita ha sido registrada. Te contactaremos pronto con los detalles", sin prometer un enlace que no exista. ' +
+        'Está TERMINANTEMENTE PROHIBIDO que el bot quede "congelado" o en visto: ninguna solicitud de cita puede terminar sin un mensaje de WhatsApp.'
     );
     parts.push(
       'REGLA OBLIGATORIA DE CONFIRMACIÓN DE CITA: ' +

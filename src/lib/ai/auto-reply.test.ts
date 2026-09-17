@@ -475,6 +475,24 @@ describe('dispatchInboundToAiReply — tool-call lifecycle', () => {
       expect.objectContaining({ text: AGENDAR_FALLBACK_MESSAGE })
     );
   });
+
+  it('nunca deja el bot congelado: si agendar_cita no confirma y el modelo calla, envía el fallback', async () => {
+    h.executeToolCall.mockResolvedValue('Error: ese horario ya está ocupado.');
+    h.generateReply
+      .mockResolvedValueOnce({
+        text: '',
+        handoff: false,
+        toolCalls: [toolCall],
+      })
+      .mockResolvedValueOnce({ text: '', handoff: false })
+      .mockResolvedValueOnce({ text: '', handoff: false });
+
+    await dispatchInboundToAiReply(ARGS);
+
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ text: AGENDAR_FALLBACK_MESSAGE })
+    );
+  });
 });
 
 describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
