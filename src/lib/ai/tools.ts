@@ -248,6 +248,9 @@ export interface BookingToolResult {
   link: string | null
   inicio: string | null
   idCita: string | null
+  /** Fecha (YYYY-MM-DD) y hora (HH:MM) locales devueltas por agendar_cita. */
+  fecha: string | null
+  hora: string | null
 }
 
 /**
@@ -271,6 +274,8 @@ export function extractBookingResult(output: string): BookingToolResult | null {
           : null,
       inicio: typeof parsed.inicio === 'string' ? parsed.inicio : null,
       idCita: typeof parsed.idCita === 'string' ? parsed.idCita : null,
+      fecha: typeof parsed.fecha === 'string' ? parsed.fecha : null,
+      hora: typeof parsed.hora === 'string' ? parsed.hora : null,
     }
   } catch {
     return null

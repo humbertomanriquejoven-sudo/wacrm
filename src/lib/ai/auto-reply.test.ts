@@ -41,6 +41,8 @@ vi.mock('./tools', () => ({
         link: typeof parsed.link === 'string' ? parsed.link : null,
         inicio: typeof parsed.inicio === 'string' ? parsed.inicio : null,
         idCita: typeof parsed.idCita === 'string' ? parsed.idCita : null,
+        fecha: typeof parsed.fecha === 'string' ? parsed.fecha : null,
+        hora: typeof parsed.hora === 'string' ? parsed.hora : null,
       }
     } catch {
       return null
@@ -101,6 +103,7 @@ import {
   dispatchInboundToAiReply,
   AGENDAR_FALLBACK_MESSAGE,
   guardBookingReply,
+  buildBookingConfirmationMessage,
 } from './auto-reply'
 
 const ARGS = {
@@ -143,7 +146,7 @@ beforeEach(() => {
   h.executeToolCall.mockResolvedValue(
     'Cita agendada: 2026-09-18T14:00:00-05:00 (45 minutos) para Carlos. Reunión Meet: https://meet.google.com/abc.\n\n' +
       'JSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ' +
-      '{"confirmado":true,"exito":true,"inicio":"2026-09-18T14:00:00-05:00","duracionMin":45,"idCita":"cita-1","link":"https://meet.google.com/abc","estado":"confirmada"}',
+      '{"confirmado":true,"exito":true,"inicio":"2026-09-18T14:00:00-05:00","duracionMin":45,"idCita":"cita-1","link":"https://meet.google.com/abc","fecha":"2026-09-18","hora":"14:00","estado":"confirmada"}',
   )
   h.loadContactContext.mockImplementation(async () => ({
     name: null,
@@ -331,23 +334,21 @@ describe('dispatchInboundToAiReply — tool-call lifecycle', () => {
     expect(secondMessages.some((m) => m.role === 'tool')).toBe(true)
   })
 
-  it('forces a tool-free final pass when repeated tool calls exhaust the round budget', async () => {
+  it('dispatches the booked confirmation even when repeated tool calls exhaust the round budget', async () => {
     h.generateReply
       .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
       .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
       .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
       .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [toolCall] })
-      .mockResolvedValueOnce({ text: 'Confirmado para mañana a las 2:00 PM.', handoff: false })
 
     await dispatchInboundToAiReply(ARGS)
 
-    // 4 loop rounds + 1 forced, tool-free pass.
-    expect(h.generateReply).toHaveBeenCalledTimes(5)
-    const forcedArgs = h.generateReply.mock.calls[4][0] as { tools?: unknown }
-    expect(forcedArgs.tools).toBeUndefined()
+    // 4 loop rounds; the deterministic confirmation skips the forced,
+    // tool-free pass because the link is already real and in hand.
+    expect(h.generateReply).toHaveBeenCalledTimes(4)
     expect(h.engineSendAiReply).toHaveBeenCalledWith(
       expect.objectContaining({
-        text: expect.stringContaining('Confirmado para mañana a las 2:00 PM.'),
+        text: expect.stringContaining('https://meet.google.com/abc'),
       }),
     )
   })
@@ -446,7 +447,7 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     expect(h.state.updatePayload).toMatchObject({ ai_autoreply_disabled: true })
   })
 
-  it('appends the real link when the model confirms the booking but omits the URL', async () => {
+  it('sends the mandated confirmation with the real link even when the model omits the URL', async () => {
     h.generateReply
       .mockResolvedValueOnce({
         text: '',
@@ -467,8 +468,60 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     await dispatchInboundToAiReply(ARGS)
 
     const sent = h.engineSendAiReply.mock.calls[0][0].text as string
-    expect(sent).toContain('Quedó agendada tu cita')
+    expect(sent).toContain('agendada con éxito para el 2026-09-18 a las 14:00')
     expect(sent).toContain('https://meet.google.com/abc')
+  })
+
+  it('dispatches the confirmation with the REAL link even if the final LLM pass returns empty text', async () => {
+    h.generateReply
+      .mockResolvedValueOnce({
+        text: '',
+        handoff: false,
+        toolCalls: [
+          {
+            id: 'call-1',
+            name: 'agendar_cita',
+            arguments: { inicio: '2026-09-18T14:00:00-05:00', nombre: 'Carlos' },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ text: '', handoff: false })
+
+    await dispatchInboundToAiReply(ARGS)
+
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string
+    expect(sent).toBe(
+      '¡Listo! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n\n' +
+        'Te enviamos la confirmación a tu correo. Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n' +
+        'https://meet.google.com/abc',
+    )
+  })
+
+  it('greets the contact by name in the deterministic booking confirmation', async () => {
+    h.loadContactContext.mockImplementation(async () => ({
+      name: 'Carlos',
+      email: 'carlos@example.com',
+      location: null,
+      citas: [],
+    }))
+    h.generateReply
+      .mockResolvedValueOnce({
+        text: '',
+        handoff: false,
+        toolCalls: [
+          {
+            id: 'call-1',
+            name: 'agendar_cita',
+            arguments: { inicio: '2026-09-18T14:00:00-05:00', nombre: 'Carlos' },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ text: '', handoff: false })
+
+    await dispatchInboundToAiReply(ARGS)
+
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string
+    expect(sent).toContain('¡Listo, Carlos!')
   })
 
   it('strips a stray fake URL from an ordinary (non-booking) reply', async () => {
@@ -493,6 +546,8 @@ describe('guardBookingReply — pure function', () => {
     link: 'https://meet.google.com/real-link',
     inicio: '2026-09-18T14:00:00-05:00',
     idCita: 'cita-1',
+    fecha: '2026-09-18',
+    hora: '14:00',
   }
 
   it('keeps text untouched when it already quotes the real link', () => {
@@ -547,5 +602,74 @@ describe('guardBookingReply — pure function', () => {
       null,
     )
     expect(out).toBe('Aquí tienes el enlace: ')
+  })
+})
+
+describe('buildBookingConfirmationMessage — pure function', () => {
+  it('returns null when the booking is not confirmed', () => {
+    expect(
+      buildBookingConfirmationMessage(
+        { confirmado: false, link: null, inicio: null, idCita: null, fecha: null, hora: null },
+        'Carlos',
+      ),
+    ).toBeNull()
+  })
+
+  it('returns null when there is no link to share', () => {
+    expect(
+      buildBookingConfirmationMessage(
+        { confirmado: true, link: null, inicio: null, idCita: null, fecha: null, hora: null },
+        'Carlos',
+      ),
+    ).toBeNull()
+  })
+
+  it('builds the mandated confirmation format with name, fecha, hora and link', () => {
+    expect(
+      buildBookingConfirmationMessage(
+        {
+          confirmado: true,
+          link: 'https://meet.google.com/real-link',
+          inicio: '2026-09-18T14:00:00-05:00',
+          idCita: 'cita-1',
+          fecha: '2026-09-18',
+          hora: '14:00',
+        },
+        'Carlos',
+      ),
+    ).toBe(
+      '¡Listo, Carlos! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n\n' +
+        'Te enviamos la confirmación a tu correo. Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n' +
+        'https://meet.google.com/real-link',
+    )
+  })
+
+  it('falls back to inicio when fecha/hora are missing from the JSON_RESULT', () => {
+    expect(
+      buildBookingConfirmationMessage(
+        {
+          confirmado: true,
+          link: 'https://meet.google.com/real-link',
+          inicio: '2026-09-18T14:00:00-05:00',
+          idCita: 'cita-1',
+          fecha: null,
+          hora: null,
+        },
+        null,
+      ),
+    ).toContain('para el 2026-09-18 a las 14:00')
+    expect(
+      buildBookingConfirmationMessage(
+        {
+          confirmado: true,
+          link: 'https://meet.google.com/real-link',
+          inicio: '2026-09-18T14:00:00-05:00',
+          idCita: 'cita-1',
+          fecha: null,
+          hora: null,
+        },
+        null,
+      ),
+    ).toContain('¡Listo!')
   })
 })
