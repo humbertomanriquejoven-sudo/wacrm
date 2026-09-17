@@ -595,6 +595,86 @@ describe('agendar_cita — enlace del evento', () => {
     )
   })
 
+  it('extracts the Meet URI from conferenceData.entryPoints (video) when hangoutLink is absent', async () => {
+    h.insert.mockResolvedValue({
+      data: {
+        id: 'evt-conf',
+        htmlLink: 'https://calendar.google.com/event?eid=conf',
+        conferenceData: {
+          entryPoints: [
+            { entryPointType: 'phone', uri: 'tel:+1-555-0100' },
+            { entryPointType: 'video', uri: 'https://meet.google.com/xyz-abcd-efg' },
+          ],
+        },
+      },
+    })
+    const supabase = db()
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'Ana',
+    })
+    expect(out).toContain('Reunión Meet: https://meet.google.com/xyz-abcd-efg')
+    const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+    expect((insert!.row as { meet_link: string | null }).meet_link).toBe(
+      'https://meet.google.com/xyz-abcd-efg',
+    )
+    expect(out).toContain('"link":"https://meet.google.com/xyz-abcd-efg"')
+  })
+
+  it('prefers hangoutLink over the entryPoints video URI and htmlLink', async () => {
+    h.insert.mockResolvedValue({
+      data: {
+        id: 'evt-both',
+        hangoutLink: 'https://meet.google.com/hangout-first',
+        htmlLink: 'https://calendar.google.com/event?eid=both',
+        conferenceData: {
+          entryPoints: [
+            { entryPointType: 'video', uri: 'https://meet.google.com/video-second' },
+          ],
+        },
+      },
+    })
+    const supabase = db()
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'Ana',
+    })
+    expect(out).toContain('Reunión Meet: https://meet.google.com/hangout-first')
+    expect(out).not.toContain('video-second')
+    expect(out).not.toContain('event?eid=both')
+    expect(out).toContain('"link":"https://meet.google.com/hangout-first"')
+  })
+
+  it('returns the Meet URI in the boarded event when only conferenceData links exist (no htmlLink)', async () => {
+    h.insert.mockResolvedValue({
+      data: {
+        id: 'evt-vidonly',
+        conferenceData: {
+          entryPoints: [{ entryPointType: 'video', uri: 'https://meet.google.com/vid-only' }],
+        },
+      },
+    })
+    const supabase = db()
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'Ana',
+    })
+    const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+    expect((insert!.row as { meet_link: string | null }).meet_link).toBe(
+      'https://meet.google.com/vid-only',
+    )
+    expect(out).toContain('"link":"https://meet.google.com/vid-only"')
+  })
+
   it('falls back to htmlLink and does NOT report a system error', async () => {
     h.insert.mockResolvedValue({
       data: { id: 'evt-html', htmlLink: 'https://calendar.google.com/event?eid=xyz' },

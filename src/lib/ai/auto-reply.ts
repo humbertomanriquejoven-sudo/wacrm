@@ -35,9 +35,8 @@ export const AGENDAR_FALLBACK_MESSAGE =
  * Deterministic, customer-facing booking confirmation built from the REAL
  * agendar_cita tool result (fecha/hora/link) — it does not depend on the
  * model echoing the link back. Dispatched by the backend the instant a
- * booking succeeds, so a booked appointment ALWAYS reaches the customer.
- *
- * Two variants:
+ * booking succeeds, so a booked appointment ALWAYS reaches the customer
+ * in ONE bubble, with the link never empty:
  *  - confirmed + link  → the mandated format with the Google Meet link.
  *  - confirmed + no link (Google timed out; cita guardada en la BD) → a
  *    confirmation of the LOCAL booking without inventing any URL.
@@ -51,11 +50,11 @@ export function buildBookingConfirmationMessage(
   const nombre = contactName?.trim() || 'Humberto'
   const fecha = booking.fecha ?? (booking.inicio?.slice(0, 10) ?? '')
   const hora = booking.hora ?? (booking.inicio?.slice(11, 16) ?? '')
-  const header = `¡Listo, ${nombre}! Tu cita ha sido agendada con éxito para el ${fecha} a las ${hora}.`
+  const header = `¡Claro, ${nombre}! Te confirmo que nuestra reunión ha sido agendada para el ${fecha} a las ${hora}.`
   if (!booking.link) {
-    return `${header}\n\nTe enviamos la confirmación a tu correo. El enlace de Google Meet se generó con una pequeña demora y lo recibirás en la confirmación; un asesor te contactará en breve.`
+    return `${header}\n\nTe enviamos la confirmación a tu correo; el enlace de Google Meet se está generando y te lo haremos llegar en cuanto esté listo.`
   }
-  return `${header}\n\nTe enviamos la confirmación a tu correo. Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n${booking.link}`
+  return `${header}\n\nPuedes conectarte a través de este enlace de Google Meet:\n${booking.link}`
 }
 
 /**
@@ -72,6 +71,12 @@ const FAKE_LINK_DETECT = new RegExp(FAKE_LINK_SRC, 'i')
  *  not acceptable as the final WhatsApp message for a booking request. */
 const INTERMEDIATE_ACK_RE =
   /un momento|en un momento|un instante|enseguida|estoy registrando|estoy agendando|estoy confirmando|estoy revisando|estoy verificando|d[eé]jame (?:revisar|verificar|ver|consultar|agendar)|ya te (?:confirmo|aviso|digo)|ya mismo|por favor espera|espera un moment|perm[ií]teme|un segundo/i
+
+/** Phrases that PROMISE a Meet/meeting link. A final WhatsApp message
+ *  containing one of these but no REAL link (from the tool result) would
+ *  go out as a dangling "aquí está el enlace:" — never send that. */
+const LINK_PROMISE_RE =
+  /este es el enlace|aqu[ií] tienes el enlace|a trav[eé]s de este enlace|para que te conectes|para acceder a (?:la|tu) (?:videollamada|reuni[oó]n|llamada)|[uú]nete a (?:la|tu) (?:videollamada|reuni[oó]n|llamada)|(?:el|este) enlace de (?:Google )?Meet\s*:/i
 
 /** Booking signals in the conversation: an ack/claim is only intercepted
  *  when the customer is actually trying to schedule. */
@@ -122,9 +127,15 @@ export function guardBookingReply(
       : `${replaced}\n\nAquí tienes el enlace de tu reunión: ${link}`
   }
   if (confirmed) {
-    return text.replace(FAKE_LINK_RE, '')
+    return link
+      ? text.replace(FAKE_LINK_RE, link)
+      : text.replace(FAKE_LINK_RE, '')
   }
 
+  // NUNCA enviar un texto que prometa un enlace de Meet/meeting sin que la
+  // tool lo haya devuelto: "Este es el enlace de Google Meet para que te
+  // conectes:" sin URL sería una burbuja vacía.
+  if (LINK_PROMISE_RE.test(text)) return null
   if (INTERMEDIATE_ACK_RE.test(text)) return null
   if (opts.bookingContext ?? false) {
     if (looksLikeBookingConfirmation(text)) return null
@@ -369,10 +380,11 @@ export async function dispatchInboundToAiReply(
         bookingContext: hasBookingIntent(messages),
       })
       const isWaitOnly =
-        INTERMEDIATE_ACK_RE.test(raw) && !looksLikeBookingConfirmation(raw)
+        (INTERMEDIATE_ACK_RE.test(raw) || LINK_PROMISE_RE.test(raw)) &&
+        !looksLikeBookingConfirmation(raw)
       if (finalText === null && isWaitOnly) {
         console.log(
-          '[ai auto-reply] dropped a wait-only reply (no handoff, no mute).',
+          '[ai auto-reply] dropped an empty reply without a link (no handoff, no mute).',
         )
         return
       }

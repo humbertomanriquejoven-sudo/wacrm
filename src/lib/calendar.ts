@@ -625,15 +625,19 @@ export async function agendar_cita(
       'agendar events.insert',
     )
 
-    // El evento creado puede tener un hangoutLink (Meet, con OAuth2) o, si
-    // la cuenta no puede generar conferencias, solo un htmlLink (la URL
-    // pública de Google Calendar del evento). Guardamos el mejor enlace
-    // disponible: Meet primero, htmlLink como respaldo. La cita se confirma
-    // igual con cualquiera de los dos, sin marcar error de sistema.
+    // El evento creado puede traer el Meet en hangoutLink, en
+    // conferenceData.entryPoints (video) o, si la cuenta no puede generar
+    // conferencias, solo un htmlLink (la URL pública de Google Calendar).
+    // Búsqueda en jerarquía: hangoutLink > conferenceData video URI >
+    // htmlLink. La cita se confirma igual con cualquiera de los tres.
     const hangout = created.data.hangoutLink ?? null
+    const videoUri =
+      created.data.conferenceData?.entryPoints?.find(
+        (entry) => entry.entryPointType === 'video',
+      )?.uri ?? null
     const html = created.data.htmlLink ?? null
-    meetUrl = hangout ?? html
-    linkEsMeet = hangout !== null
+    meetUrl = hangout ?? videoUri ?? html
+    linkEsMeet = (hangout ?? videoUri) !== null
     event = { id: created.data.id }
   } catch (err) {
     console.warn('[calendar] events.insert failed (timeout o error de API):', err)

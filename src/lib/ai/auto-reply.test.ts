@@ -490,7 +490,7 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     await dispatchInboundToAiReply(ARGS)
 
     const sent = h.engineSendAiReply.mock.calls[0][0].text as string
-    expect(sent).toContain('agendada con éxito para el 2026-09-18 a las 14:00')
+    expect(sent).toContain('reunión ha sido agendada para el 2026-09-18 a las 14:00')
     expect(sent).toContain('https://meet.google.com/abc')
   })
 
@@ -518,7 +518,19 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     await dispatchInboundToAiReply(ARGS)
 
     const sent = h.engineSendAiReply.mock.calls[0][0].text as string
-    expect(sent).toContain('¡Listo, Carlos!')
+    expect(sent).toContain('¡Claro, Carlos!')
+  })
+
+  it('never sends a link-promise with a fake URL — drops the turn without muting', async () => {
+    h.generateReply.mockResolvedValue({
+      text: 'Este es el enlace de Google Meet para que te conectes: https://meet.google.com/xxx-yyyy-zzz',
+      handoff: false,
+    })
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.engineSendAiReply).not.toHaveBeenCalled()
+    expect(h.state.updatePayload).toBeNull()
   })
 
   it('dispatches the confirmation with the REAL link even if the final LLM pass returns empty text', async () => {
@@ -540,8 +552,8 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
 
     const sent = h.engineSendAiReply.mock.calls[0][0].text as string
     expect(sent).toBe(
-      '¡Listo, Humberto! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n\n' +
-        'Te enviamos la confirmación a tu correo. Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n' +
+      '¡Claro, Humberto! Te confirmo que nuestra reunión ha sido agendada para el 2026-09-18 a las 14:00.\n\n' +
+        'Puedes conectarte a través de este enlace de Google Meet:\n' +
         'https://meet.google.com/abc',
     )
   })
@@ -570,7 +582,7 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     await dispatchInboundToAiReply(ARGS)
 
     const sent = h.engineSendAiReply.mock.calls[0][0].text as string
-    expect(sent).toContain('agendada con éxito para el 2026-09-18 a las 14:00')
+    expect(sent).toContain('reunión ha sido agendada para el 2026-09-18 a las 14:00')
     expect(sent).not.toContain('meet.google.com')
     expect(sent).not.toContain('calendar.google.com')
   })
@@ -647,12 +659,27 @@ describe('guardBookingReply — pure function', () => {
     expect(out).toBe('¡Listo! Agendada tu cita. Meet: ')
   })
 
-  it('strips fake URLs but keeps the text when there is no booking claim', () => {
+  it('never sends a link-promise without a real link — returns null (dangling "enlace:" bubble)', () => {
+    expect(
+      guardBookingReply('Este es el enlace de Google Meet para que te conectes:', null),
+    ).toBeNull()
+    expect(
+      guardBookingReply(
+        'Este es el enlace de Google Meet para que te conectes: https://meet.google.com/xxx-yyyy-zzz',
+        null,
+      ),
+    ).toBeNull()
+    expect(
+      guardBookingReply('Aquí tienes el enlace: https://meet.google.com/xxx', null),
+    ).toBeNull()
+  })
+
+  it('strips fake URLs but keeps the text when it does not promise a link', () => {
     const out = guardBookingReply(
-      'Aquí tienes el enlace: https://meet.google.com/xxx',
+      'Puedes confirmar tu pago aquí: https://meet.google.com/xxx',
       null,
     )
-    expect(out).toBe('Aquí tienes el enlace: ')
+    expect(out).toBe('Puedes confirmar tu pago aquí: ')
   })
 })
 
@@ -669,7 +696,7 @@ describe('buildBookingConfirmationMessage — pure function', () => {
     const out = buildBookingConfirmationMessage(
       { confirmado: true, link: null, inicio: null, idCita: null, fecha: '2026-09-18', hora: '14:00' },
     )
-    expect(out).toContain('agendada con éxito para el 2026-09-18 a las 14:00')
+    expect(out).toContain('reunión ha sido agendada para el 2026-09-18 a las 14:00')
     expect(out).not.toContain('http')
   })
 
@@ -687,8 +714,8 @@ describe('buildBookingConfirmationMessage — pure function', () => {
         null,
       ),
     ).toBe(
-      '¡Listo, Humberto! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n\n' +
-        'Te enviamos la confirmación a tu correo. Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n' +
+      '¡Claro, Humberto! Te confirmo que nuestra reunión ha sido agendada para el 2026-09-18 a las 14:00.\n\n' +
+        'Puedes conectarte a través de este enlace de Google Meet:\n' +
         'https://meet.google.com/real-link',
     )
   })
@@ -706,7 +733,7 @@ describe('buildBookingConfirmationMessage — pure function', () => {
         },
         'Carlos',
       ),
-    ).toContain('¡Listo, Carlos!')
+    ).toContain('¡Claro, Carlos!')
   })
 
   it('falls back to inicio when fecha/hora are missing from the JSON_RESULT', () => {
@@ -722,6 +749,6 @@ describe('buildBookingConfirmationMessage — pure function', () => {
       null,
     )
     expect(out).toContain('para el 2026-09-18 a las 14:00')
-    expect(out).toContain('¡Listo, Humberto!')
+    expect(out).toContain('¡Claro, Humberto!')
   })
 })
