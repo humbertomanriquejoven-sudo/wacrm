@@ -665,7 +665,7 @@ describe('agendar_cita — enlace del evento', () => {
     expect(out).toContain('"link":"https://meet.google.com/json-meet"')
   })
 
-  it('defaults the reason to "Reunión de valoración / Consulta" when omitted', async () => {
+  it('defaults the reason to "Consulta / Valoración" when omitted', async () => {
     h.insert.mockResolvedValue({ data: { id: 'evt-def' } })
     const supabase = db()
     await agendar_cita({
@@ -677,7 +677,7 @@ describe('agendar_cita — enlace del evento', () => {
     })
     const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
     expect((insert!.row as { motivo: string }).motivo).toBe(
-      'Reunión de valoración / Consulta',
+      'Consulta / Valoración',
     )
   })
 })

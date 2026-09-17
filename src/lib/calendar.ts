@@ -488,7 +488,7 @@ export async function agendar_cita(
   }
   // Motivo por defecto: el flujo nunca debe bloquearse preguntando por el
   // motivo cuando el usuario no lo mencionó.
-  const motivoFinal = motivo?.trim() || 'Reunión de valoración / Consulta'
+  const motivoFinal = motivo?.trim() || 'Consulta / Valoración'
 
   // La verificación de disponibilidad es best-effort y nunca debe bloquear
   // la cita: si freebusy falla o da timeout, pasamos directo a la creación

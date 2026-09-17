@@ -86,7 +86,7 @@ export const AGENDAR_CITA_TOOL: ToolDefinition = {
   description:
     'Schedule a 45-minute appointment for the customer in the business calendar. ' +
     'CALL IT IMMEDIATELY when the customer states a concrete date/time — do not ask again for the date/time or the reason. ' +
-    'motivo is optional and defaults to "Reunión de valoración / Consulta" when omitted. ' +
+    'motivo is optional and defaults to "Consulta / Valoración" when omitted. ' +
     'Google creates a Meet link (or returns the calendar event URL as fallback) and emails the customer an invitation. ' +
     'Pass the customer email when you know it, so they receive the invite with the link. ' +
     'On success the tool returns confirmado:true plus the exact link to share with the customer.',
@@ -105,7 +105,7 @@ export const AGENDAR_CITA_TOOL: ToolDefinition = {
       motivo: {
         type: 'string',
         description:
-          'Reason or topic of the appointment (e.g. "cotización de interiores"). Optional: defaults to "Reunión de valoración / Consulta", so never block the booking by asking for it.',
+          'Reason or topic of the appointment (e.g. "cotización de interiores"). Optional: defaults to "Consulta / Valoración", so never block the booking by asking for it.',
       },
       email: {
         type: 'string',
@@ -236,6 +236,45 @@ export const LEER_CORREOS_TOOL: ToolDefinition = {
       },
     },
   },
+}
+
+/**
+ * Structured result parsed out of agendar_cita's `JSON_RESULT` trailer.
+ * Auto-reply uses this to ground the confirmation in the REAL event:
+ * even if the model hallucinates a link, we can strip/inject the true one.
+ */
+export interface BookingToolResult {
+  confirmado: boolean
+  link: string | null
+  inicio: string | null
+  idCita: string | null
+}
+
+/**
+ * Parse the `JSON_RESULT` block that agendar_cita appends to its
+ * human-readable result. Returns null when there is no trailer (e.g. the
+ * tool errored, threw, or was an availability check), so the caller never
+ * mistakes a simulated success for a real one.
+ */
+export function extractBookingResult(output: string): BookingToolResult | null {
+  const marker = output.lastIndexOf('JSON_RESULT')
+  if (marker === -1) return null
+  const start = output.indexOf('{', marker)
+  if (start === -1) return null
+  try {
+    const parsed = JSON.parse(output.slice(start)) as Record<string, unknown>
+    return {
+      confirmado: parsed.confirmado === true,
+      link:
+        typeof parsed.link === 'string' && parsed.link.trim()
+          ? parsed.link.trim()
+          : null,
+      inicio: typeof parsed.inicio === 'string' ? parsed.inicio : null,
+      idCita: typeof parsed.idCita === 'string' ? parsed.idCita : null,
+    }
+  } catch {
+    return null
+  }
 }
 
 /** All tools available to the AI agent. */

@@ -75,6 +75,18 @@ describe('buildSystemPrompt', () => {
   it('forbids re-asking for the date range in the confirmation protocol', () => {
     const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' })
     expect(prompt).toContain('must NOT ask a customer who already confirmed a date/time for "rangos de fechas"')
-    expect(prompt).toContain('"Reunión de valoración / Consulta"')
+    expect(prompt).toContain('"Consulta / Valoración"')
+  })
+
+  it('forbids inventing Meet/calendar URLs and trusts the configured credentials', () => {
+    const prompt = buildSystemPrompt({
+      userPrompt: null,
+      mode: 'auto_reply',
+      calendarEnabled: true,
+    })
+    expect(prompt).toContain('PROHIBIDO inventar URLs')
+    expect(prompt).toContain('meet.google.com/xxx-yyyy-zzz')
+    expect(prompt).toContain('Confía plenamente en que las credenciales')
+    expect(prompt).toContain('ejecuta el tool_call directamente')
   })
 })

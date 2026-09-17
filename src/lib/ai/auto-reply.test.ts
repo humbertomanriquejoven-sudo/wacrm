@@ -29,6 +29,23 @@ vi.mock('./tools', () => ({
   AI_TOOLS: [{ name: 'agendar_cita', description: '', parameters: { type: 'object', properties: {} } }],
   executeToolCall: h.executeToolCall,
   loadContactContext: h.loadContactContext,
+  extractBookingResult: (output: string) => {
+    const marker = output.lastIndexOf('JSON_RESULT')
+    if (marker === -1) return null
+    const start = output.indexOf('{', marker)
+    if (start === -1) return null
+    try {
+      const parsed = JSON.parse(output.slice(start)) as Record<string, unknown>
+      return {
+        confirmado: parsed.confirmado === true,
+        link: typeof parsed.link === 'string' ? parsed.link : null,
+        inicio: typeof parsed.inicio === 'string' ? parsed.inicio : null,
+        idCita: typeof parsed.idCita === 'string' ? parsed.idCita : null,
+      }
+    } catch {
+      return null
+    }
+  },
 }))
 vi.mock('@/lib/flows/meta-send', () => ({
   engineSendText: h.engineSendText,
@@ -80,7 +97,12 @@ vi.mock('./admin-client', () => ({
   }),
 }))
 
-import { dispatchInboundToAiReply, AGENDAR_FALLBACK_MESSAGE } from './auto-reply'
+import {
+  dispatchInboundToAiReply,
+  AGENDAR_FALLBACK_MESSAGE,
+  AGENDAR_RETRY_MESSAGE,
+  guardBookingReply,
+} from './auto-reply'
 
 const ARGS = {
   accountId: 'acct-1',
@@ -119,7 +141,11 @@ beforeEach(() => {
   h.buildConversationContext.mockResolvedValue([{ role: 'user', content: 'hi' }])
   h.retrieveKnowledge.mockResolvedValue([])
   h.generateReply.mockResolvedValue({ text: 'Hello!', handoff: false })
-  h.executeToolCall.mockResolvedValue('Cita agendada: 2026-09-18T14:00:00 (45 minutos). Reunión Meet: https://meet.google.com/abc')
+  h.executeToolCall.mockResolvedValue(
+    'Cita agendada: 2026-09-18T14:00:00-05:00 (45 minutos) para Carlos. Reunión Meet: https://meet.google.com/abc.\n\n' +
+      'JSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ' +
+      '{"confirmado":true,"exito":true,"inicio":"2026-09-18T14:00:00-05:00","duracionMin":45,"idCita":"cita-1","link":"https://meet.google.com/abc","estado":"confirmada"}',
+  )
   h.loadContactContext.mockImplementation(async () => ({
     name: null,
     email: null,
@@ -321,7 +347,9 @@ describe('dispatchInboundToAiReply — tool-call lifecycle', () => {
     const forcedArgs = h.generateReply.mock.calls[4][0] as { tools?: unknown }
     expect(forcedArgs.tools).toBeUndefined()
     expect(h.engineSendAiReply).toHaveBeenCalledWith(
-      expect.objectContaining({ text: 'Confirmado para mañana a las 2:00 PM.' }),
+      expect.objectContaining({
+        text: expect.stringContaining('Confirmado para mañana a las 2:00 PM.'),
+      }),
     )
   })
 
@@ -353,5 +381,132 @@ describe('dispatchInboundToAiReply — tool-call lifecycle', () => {
     expect(h.engineSendAiReply).toHaveBeenCalledWith(
       expect.objectContaining({ text: AGENDAR_FALLBACK_MESSAGE }),
     )
+  })
+})
+
+describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
+  it('replaces a fake Meet URL invented by the model with the REAL link from the tool', async () => {
+    h.executeToolCall.mockResolvedValue(
+      'Cita agendada: 2026-09-18T14:00:00-05:00 (45 minutos) para Carlos. Reunión Meet: https://meet.google.com/real-link.\n\n' +
+        'JSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ' +
+        '{"confirmado":true,"exito":true,"inicio":"2026-09-18T14:00:00-05:00","duracionMin":45,"idCita":"cita-1","link":"https://meet.google.com/real-link","estado":"confirmada"}',
+    )
+    h.generateReply
+      .mockResolvedValueOnce({
+        text: '',
+        handoff: false,
+        toolCalls: [
+          {
+            id: 'call-1',
+            name: 'agendar_cita',
+            arguments: { inicio: '2026-09-18T14:00:00-05:00', nombre: 'Carlos' },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        text: '¡Listo! Agendada tu cita para el jueves a las 2:00 PM. Meet: https://meet.google.com/xxx-yyyy-zzz',
+        handoff: false,
+      })
+
+    await dispatchInboundToAiReply(ARGS)
+
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string
+    expect(sent).toContain('https://meet.google.com/real-link')
+    expect(sent).not.toContain('xxx-yyyy-zzz')
+  })
+
+  it('never sends a booking confirmation that has no real tool success', async () => {
+    h.generateReply.mockResolvedValue({
+      text: '¡Listo! Agendada tu cita para mañana a las 10:00 AM. Meet: https://meet.google.com/xxx-yyyy-zzz',
+      handoff: false,
+    })
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.generateReply).toHaveBeenCalledTimes(1)
+    expect(h.executeToolCall).not.toHaveBeenCalled()
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ text: AGENDAR_RETRY_MESSAGE }),
+    )
+  })
+
+  it('appends the real link when the model confirms the booking but omits the URL', async () => {
+    h.generateReply
+      .mockResolvedValueOnce({
+        text: '',
+        handoff: false,
+        toolCalls: [
+          {
+            id: 'call-1',
+            name: 'agendar_cita',
+            arguments: { inicio: '2026-09-18T14:00:00-05:00', nombre: 'Carlos' },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        text: 'Quedó agendada tu cita para el jueves a las 2:00 PM.',
+        handoff: false,
+      })
+
+    await dispatchInboundToAiReply(ARGS)
+
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string
+    expect(sent).toContain('Quedó agendada tu cita')
+    expect(sent).toContain('https://meet.google.com/abc')
+  })
+
+  it('strips a stray fake URL from an ordinary (non-booking) reply', async () => {
+    h.generateReply.mockResolvedValue({
+      text: 'Te comparto el enlace que pidió Juan: https://calendar.google.com/event?eid=abc',
+      handoff: false,
+    })
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: 'Te comparto el enlace que pidió Juan: ',
+      }),
+    )
+  })
+})
+
+describe('guardBookingReply — pure function', () => {
+  const confirmedLink: Parameters<typeof guardBookingReply>[1] = {
+    confirmado: true,
+    link: 'https://meet.google.com/real-link',
+    inicio: '2026-09-18T14:00:00-05:00',
+    idCita: 'cita-1',
+  }
+
+  it('keeps text untouched when it already quotes the real link', () => {
+    const text = 'Cita para jueves 14:00. Meet: https://meet.google.com/real-link'
+    expect(guardBookingReply(text, confirmedLink)).toBe(text)
+  })
+
+  it('replaces every fake link with the real one', () => {
+    const out = guardBookingReply(
+      'Meet: https://meet.google.com/fake-aaa y evento https://calendar.google.com/event?eid=zzz',
+      confirmedLink,
+    )
+    expect(out).toBe(
+      'Meet: https://meet.google.com/real-link y evento https://meet.google.com/real-link',
+    )
+  })
+
+  it('replaces a booking claim without real success with the retry message', () => {
+    const out = guardBookingReply(
+      '¡Listo! Agendada tu cita. Meet: https://meet.google.com/xxx-yyyy-zzz',
+      null,
+    )
+    expect(out).toBe(AGENDAR_RETRY_MESSAGE)
+  })
+
+  it('strips fake URLs but keeps the text when there is no booking claim', () => {
+    const out = guardBookingReply(
+      'Aquí tienes el enlace: https://meet.google.com/xxx',
+      null,
+    )
+    expect(out).toBe('Aquí tienes el enlace: ')
   })
 })
