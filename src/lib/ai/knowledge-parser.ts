@@ -1,6 +1,6 @@
 import * as XLSX from 'xlsx';
 import mammoth from 'mammoth';
-import pdfParse from 'pdf-parse';
+import { PDFParse } from 'pdf-parse';
 import WordExtractor from 'word-extractor';
 
 // ============================================================
@@ -258,8 +258,18 @@ async function legacyDocToText(buffer: Buffer): Promise<string> {
 // ------------------------------------------------------------
 
 async function pdfToText(buffer: Buffer): Promise<string> {
-  const parsed = await pdfParse(buffer);
-  const text = (parsed.text ?? '').replace(/\u0000/g, '').trim();
+  // pdf-parse 2.x: build a parser over the bytes, extract the text of all
+  // pages (pageJoiner '' omits the "– page N of M –" markers), then always
+  // release the worker/document in `finally`.
+  const parser = new PDFParse({ data: new Uint8Array(buffer) });
+  let raw = '';
+  try {
+    const result = await parser.getText({ pageJoiner: '' });
+    raw = result.text ?? '';
+  } finally {
+    await parser.destroy().catch(() => undefined);
+  }
+  const text = raw.replace(/\u0000/g, '').trim();
   if (!text) {
     throw new Error(
       'No readable text could be extracted from the PDF (it may be a scanned document with no text layer).'

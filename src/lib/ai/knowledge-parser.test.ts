@@ -23,7 +23,17 @@ vi.mock('mammoth', () => ({
   },
 }));
 
-vi.mock('pdf-parse', () => ({ default: h.pdfParse }));
+vi.mock('pdf-parse', () => {
+  class PDFParseMock {
+    getText(params: { pageJoiner?: string }) {
+      return h.pdfParse(params);
+    }
+    destroy() {
+      return Promise.resolve();
+    }
+  }
+  return { PDFParse: PDFParseMock };
+});
 
 vi.mock('word-extractor', () => {
   class WordExtractorMock {
