@@ -2,7 +2,7 @@ import { supabaseAdmin } from './admin-client';
 import { loadAiConfig } from './config';
 import { buildConversationContext } from './context';
 import { retrieveKnowledge } from './knowledge';
-import { generateReply } from './generate';
+import { generateReply, stripInternalReasoning } from './generate';
 import { buildSystemPrompt } from './defaults';
 import { logAiUsage } from './usage';
 import { latestUserMessage } from './query';
@@ -455,9 +455,17 @@ export async function dispatchInboundToAiReply(
     // permanently silent.
     if (finalText) {
       const raw = finalText;
-      finalText = guardBookingReply(finalText, realBooking, {
-        bookingContext: hasBookingIntent(messages),
-      });
+      // Chain-of-Thought / thinking blocks are NEVER part of the answer.
+      // Stripped again here (idempotent, defense-in-depth on top of
+      // parseGeneration) so no internal reasoning reaches WhatsApp even
+      // if the model leaks it into the final bubble.
+      finalText = guardBookingReply(
+        stripInternalReasoning(finalText),
+        realBooking,
+        {
+          bookingContext: hasBookingIntent(messages),
+        }
+      );
       const isWaitOnly =
         (INTERMEDIATE_ACK_RE.test(raw) || LINK_PROMISE_RE.test(raw)) &&
         !looksLikeBookingConfirmation(raw);
@@ -514,7 +522,7 @@ export async function dispatchInboundToAiReply(
       userId: configOwnerUserId,
       conversationId,
       contactId,
-      text: finalText,
+      text: stripInternalReasoning(finalText),
       aiGenerated: true,
       composeMessageId: args.composeMessageId,
       // La confirmación de una cita REAL va en UNA sola burbuja: se salta

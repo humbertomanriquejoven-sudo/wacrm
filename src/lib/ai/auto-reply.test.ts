@@ -31,7 +31,16 @@ vi.mock('./context', () => ({
   buildConversationContext: h.buildConversationContext,
 }));
 vi.mock('./knowledge', () => ({ retrieveKnowledge: h.retrieveKnowledge }));
-vi.mock('./generate', () => ({ generateReply: h.generateReply }));
+vi.mock('./generate', async () => {
+  const actual =
+    await vi.importActual<typeof import('./generate')>('./generate');
+  return {
+    generateReply: h.generateReply,
+    // Real implementation: deterministic CoT stripping applied before the
+    // WhatsApp send — keep it real so the guard tests exercise it.
+    stripInternalReasoning: actual.stripInternalReasoning,
+  };
+});
 vi.mock('./tools', () => ({
   AI_TOOLS: [
     {
@@ -696,9 +705,40 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
 
     expect(h.engineSendAiReply).toHaveBeenCalledWith(
       expect.objectContaining({
-        text: 'Te comparto el enlace que pidió Juan: ',
+        text: 'Te comparto el enlace que pidió Juan:',
       })
     );
+  });
+
+  it('never sends Chain-of-Thought / thinking blocks to WhatsApp', async () => {
+    h.generateReply.mockResolvedValue({
+      text:
+        '<thinking>El cliente pide el enlace de su cita del viernes.</thinking>\n' +
+        'Claro, con gusto te doy más información.',
+      handoff: false,
+    });
+
+    await dispatchInboundToAiReply(ARGS);
+
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string;
+    expect(sent).not.toContain('<thinking>');
+    expect(sent).not.toContain('El cliente pide el enlace');
+    expect(sent).toBe('Claro, con gusto te doy más información.');
+  });
+
+  it('strips label-prefixed monologue (Pensamiento:/Razonamiento:) before send', async () => {
+    h.generateReply.mockResolvedValue({
+      text:
+        'Pensamiento: podría responder en un solo mensaje.\n' +
+        'Razonamiento: mantenerlo profesional.\n' +
+        'Con gusto te ayudo con tu solicitud.',
+      handoff: false,
+    });
+
+    await dispatchInboundToAiReply(ARGS);
+
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string;
+    expect(sent).toBe('Con gusto te ayudo con tu solicitud.');
   });
 });
 
