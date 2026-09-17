@@ -268,10 +268,6 @@ export default async function CalendarioPage({ searchParams }: CalendarioPagePro
           <span className="size-2.5 rounded-sm border border-border bg-card" />
           Disponible
         </span>
-        <span className="flex items-center gap-1.5">
-          <span className="cal-stripes size-2.5 rounded-sm border border-border" />
-          Fuera de horario
-        </span>
       </div>
     </div>
   )

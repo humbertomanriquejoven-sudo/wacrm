@@ -159,6 +159,11 @@ interface SendAiReplyArgs extends SendTextEngineArgs {
    *  call without it still splits + sends, just skips the composing
    *  refresh. */
   composeMessageId?: string
+  /** Send the whole text as ONE bubble, skipping the paragraph splitter.
+   *  Used for the deterministic booking confirmation so fecha, hora and
+   *  the Google Meet link arrive together in a single message (a split
+   *  could leave the link in a separate bubble or cut it off). */
+  single?: boolean
 }
 
 /**
@@ -206,10 +211,15 @@ export async function engineSendAiReply(
   }
 
   const accessToken = decrypt(config.access_token)
-  const fragments = splitAiReply(cleanAiReplyText(args.text))
-  if (fragments.length === 0) {
+  const normalized = cleanAiReplyText(args.text)
+  if (!normalized) {
     throw new Error('empty reply text')
   }
+  // `single` bypasses the paragraph splitter: the whole text — including
+  // any blank line right before the Google Meet link — is delivered as
+  // one WhatsApp bubble so a mandatory URL can never be cut off or split
+  // into a separate message.
+  const fragments = args.single ? [normalized] : splitAiReply(normalized)
 
   let waMessageId = ''
   let workingPhone = sanitized

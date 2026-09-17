@@ -35,8 +35,9 @@ export const AGENDAR_FALLBACK_MESSAGE =
  * agendar_cita tool result (fecha/hora/link) — it does not depend on the
  * model echoing the link back. Dispatched by the backend the instant a
  * booking succeeds, so a booked appointment ALWAYS reaches the customer
- * in ONE bubble. The Google Meet URL is MANDATORY: it uses the real link
- * returned by the tool (hangoutLink/htmlLink) or the MEET_FALLBACK_LINK —
+ * in ONE bubble (the sender is told to skip its paragraph splitter). The
+ * Google Meet URL is MANDATORY: it uses the real link returned by the
+ * tool (hangoutLink/entryPoints/htmlLink) or the MEET_FALLBACK_LINK —
  * the message is never sent without a URL.
  * Returns null when the booking was not confirmed.
  */
@@ -49,7 +50,7 @@ export function buildBookingConfirmationMessage(
   const fecha = booking.fecha ?? (booking.inicio?.slice(0, 10) ?? '')
   const hora = booking.hora ?? (booking.inicio?.slice(11, 16) ?? '')
   const link = booking.link || MEET_FALLBACK_LINK
-  return `¡Claro, ${nombre}! Te confirmo que nuestra reunión ha sido agendada para el ${fecha} a las ${hora}.\nPuedes conectarte a través de este enlace de Google Meet: ${link}`
+  return `¡Listo, ${nombre}! Tu cita ha sido agendada con éxito para el ${fecha} a las ${hora}.\n\nPuedes unirte a la videollamada de Google Meet directamente desde este enlace:\n${link}`
 }
 
 /**
@@ -176,31 +177,15 @@ export async function dispatchInboundToAiReply(
 
     const { data: conv, error: convErr } = await db
       .from('conversations')
-      .select('assigned_agent_id, ai_autoreply_disabled, ai_reply_count')
+      .select('assigned_agent_id')
       .eq('id', conversationId)
       .maybeSingle()
     if (convErr || !conv) return
+    // Único criterio de silencio: un humano que tomó el control. No existe
+    // flag de pausa ni de handoff (ai_autoreply_disabled) ni límite de
+    // respuestas: mientras no haya agente asignado, la IA responde SIEMPRE
+    // cada mensaje entrante ("Hola", "?", etc.) sin dejar en visto.
     if (conv.assigned_agent_id) return
-
-    // Desbloqueo automático: si el chat quedó mudo por un handoff previo
-    // del flujo de agendamiento (ai_autoreply_disabled) y ningún humano lo
-    // tomó, un mensaje NUEVO del usuario (p. ej. "Hola") tiene que borrar
-    // ese estado de bloqueo y volver a ser respondido de inmediato. Nunca
-    // dejamos una conversación ignorada por un residuo de una ejecución
-    // anterior de herramientas.
-    if (conv.ai_autoreply_disabled) {
-      await db
-        .from('conversations')
-        .update({ ai_autoreply_disabled: false, ai_handoff_summary: null })
-        .eq('id', conversationId)
-      conv.ai_autoreply_disabled = false
-      console.log(
-        `[ai auto-reply] cleared stale mute on conversation ${conversationId} — new message re-enables the agent.`,
-      )
-    }
-    // Sin límite de auto-respuestas: si ningún humano está asignado, la IA
-    // responde SIEMPRE a cada mensaje entrante (no se compara ai_reply_count
-    // con ningún máximo).
 
     const messages = await buildConversationContext(db, conversationId)
     if (messages.length === 0) return
@@ -394,8 +379,8 @@ export async function dispatchInboundToAiReply(
     })
 
     // Si no hay texto final, no hay nada que enviar — pero JAMÁS se marca
-    // la conversación como muda (ai_autoreply_disabled) ni se la asigna a
-    // un humano automáticamente: el siguiente mensaje se responde normal.
+    // la conversación como muda ni se la asigna a un humano
+    // automáticamente: el siguiente mensaje se responde normal.
     if (!finalText) {
       console.log(
         '[ai auto-reply] no final text to send — skipping without muting.',
@@ -425,6 +410,11 @@ export async function dispatchInboundToAiReply(
       text: finalText,
       aiGenerated: true,
       composeMessageId: args.composeMessageId,
+      // La confirmación de una cita REAL va en UNA sola burbuja: se salta
+      // el split por párrafos para que el cliente reciba la fecha, la hora
+      // y el enlace de Meet juntos, sin cortes que puedan dejar el enlace
+      // fuera o dividido en varios mensajes.
+      single: realBooking?.confirmado === true,
     })
     console.log('[AUTO-REPLY] Mensaje enviado con éxito a WhatsApp:', enviado)
   } catch (err) {

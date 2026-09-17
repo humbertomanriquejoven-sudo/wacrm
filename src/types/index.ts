@@ -198,13 +198,12 @@ export interface Conversation {
   updated_at: string;
   contact?: Contact;
   /**
-   * AI auto-reply state for this thread (migration 029 + 033):
-   *  - `ai_autoreply_disabled` — the bot is paused here (a human took
-   *    over, or the model handed off). Sticky until re-enabled.
-   *  - `ai_reply_count` — how many times the bot has auto-replied,
-   *    checked against the account's per-conversation cap.
-   *  - `ai_handoff_summary` — short internal note the bot wrote when it
-   *    handed off, shown to whoever takes the thread over.
+   * Legacy AI auto-reply state for this thread (migrations 029 + 033).
+   * DEPRECATED: since the "siempre responde" refactor the bot is governed
+   * ONLY by `assigned_agent_id` — there is no pause flag and no
+   * per-conversation reply cap anymore (max 99999 = unlimited). These
+   * columns are kept for history; nothing writes or reads them in the
+   * auto-reply pipeline and new code must not rely on them.
    */
   ai_autoreply_disabled?: boolean;
   ai_reply_count?: number;

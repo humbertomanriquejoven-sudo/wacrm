@@ -65,6 +65,16 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('está estrictamente prohibido responder en inglés')
   })
 
+  it('never teaches an automatic handoff and demands a reply to every message', () => {
+    const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' })
+    // CERO handoff automático: el inline no instruye el sentinel y ninguna
+    // conversación puede quedar en visto.
+    expect(prompt).not.toContain('[[HANDOFF]]')
+    expect(prompt).not.toContain('responde exactamente con')
+    expect(prompt).toContain('ninguna conversación debe quedar en visto')
+    expect(prompt).toContain('responder SIEMPRE en español a cada mensaje')
+  })
+
   it('orders direct booking in the same turn once the customer gave a date', () => {
     const prompt = buildSystemPrompt({
       userPrompt: null,

@@ -118,8 +118,7 @@ export function todayContextLine(): string {
  * Build the system prompt shared by draft + auto-reply. The account's
  * own `system_prompt` (business context / persona / tone) is appended
  * to a fixed scaffold so behaviour stays predictable regardless of what
- * the user typed. Auto-reply mode additionally teaches the handoff
- * protocol.
+ * the user typed.
  *
  * The current date/time (business timezone) is always prepended as the
  * opening line — see `todayContextLine`.
@@ -236,7 +235,12 @@ export function buildSystemPrompt(args: {
 
   if (mode === 'auto_reply') {
     parts.push(
-      `Estás respondiendo automáticamente sin humano en el bucle. Si no puedes ayudar con seguridad y confianza — el cliente pide explícitamente un humano, está molesto o se queja, o la solicitud necesita información que no tienes — responde exactamente con ${HANDOFF_SENTINEL} y nada más, en español. Un agente humano lo retomará. Prefiere entregar el caso a adivinar.`,
+      'Estás respondiendo automáticamente sin humano en el bucle, los 7 días de la semana de 08:00 a 23:00. ' +
+        'Debes responder SIEMPRE en español a cada mensaje, por breve que sea («Hola», «?», un adjetivo). ' +
+        'No hay transferencia automática a un humano y ninguna conversación debe quedar en visto: si la solicitud supera ' +
+        'lo que las herramientas permiten, responde en español ofreciendo la siguiente mejor opción o pidiendo amablemente ' +
+        'los datos que faltan (p. ej. una fecha/hora para agendar), pero NUNCA te quedes en silencio ni emitas una ' +
+        'secuencia de transferencia.',
     )
   }
 
@@ -246,9 +250,7 @@ export function buildSystemPrompt(args: {
 
   if (knowledge && knowledge.length > 0) {
     const fallback =
-      mode === 'auto_reply'
-        ? `si no cubren la pregunta, no adivines — responde exactamente con ${HANDOFF_SENTINEL} para que un humano ayude`
-        : 'si no cubren la pregunta, no adivines — di que lo revisarás y harás seguimiento'
+      'si no cubren la pregunta, no adivines — responde en español que lo revisarás y harás seguimiento'
     parts.push(
       'Base de conocimiento — extractos de la documentación propia del negocio, recuperados para esta pregunta. ' +
         `Prefiere estos para cualquier detalle (precios, políticas, datos); ${fallback}. ` +

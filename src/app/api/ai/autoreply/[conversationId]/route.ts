@@ -7,19 +7,22 @@ type Params = { params: Promise<{ conversationId: string }> }
 /**
  * POST /api/ai/autoreply/[conversationId]  (agent+)
  *
- * Toggle the AI auto-reply bot for one conversation from the inbox — the
- * "Take over" / "Resume AI" banner.
+ * Hand control of one conversation back and forth between the inbox and
+ * the AI bot — the "Take over" / "Resume AI" banner.
  *
  * Body: { paused: boolean, assign_to_me?: boolean }
- *   - paused: true  → pause the bot here (a human is taking over). When
- *                     `assign_to_me` is set, also assign the thread to the
- *                     caller (the usual "Take over" flow). Assignment
+ *   - paused: true  → a human is taking over the thread. When
+ *                     `assign_to_me` is set (the usual "Take over" flow),
+ *                     the thread is assigned to the caller; assignment
  *                     fires the `on_conversation_assigned` trigger.
- *   - paused: false → hand the thread back to the bot: clear the pause,
- *                     reset the per-conversation reply count so it gets
- *                     fresh slots, and clear the handoff note. If the
- *                     caller currently owns the thread, unassign it too so
- *                     the bot isn't blocked by the "human owns this" gate.
+ *   - paused: false → hand the thread back to the bot: release ANY
+ *                     assignment so the AI resumes replying.
+ *
+ * There is NO pause/handoff flag anymore (ai_autoreply_disabled is
+ * legacy): the bot's only eligibility rule is "no human assigned", and
+ * a human accountable for the thread is expressed purely as
+ * `assigned_agent_id`. The request key is still called `paused` for
+ * backwards compatibility with the banner.
  *
  * Writes go through the RLS-scoped SSR client, so a conversation outside
  * the caller's account simply isn't found (404).
@@ -62,25 +65,19 @@ export async function POST(request: Request, { params }: Params) {
       return NextResponse.json({ error: 'Conversation not found' }, { status: 404 })
     }
 
-    const update: Record<string, unknown> = { ai_autoreply_disabled: paused }
+    const update: Record<string, unknown> = {}
 
     if (paused) {
+      // "Take over": el agente humano queda asignado — única condición que
+      // detiene el bot. Sin flag de pausa.
       if (assignToMe) update.assigned_agent_id = userId
     } else {
-      // Resuming hands the thread *back to the bot*. Clear the pause and
-      // the handoff note, and — crucially — release ANY assignment, not
-      // just the caller's own: the auto-reply eligibility gate stands
-      // down whenever a human is assigned, so leaving a stale assignee
-      // (e.g. the agent a prior handoff routed to) would silently keep
-      // the bot muted and make "Resume AI" a no-op. This is the explicit
-      // choice to let the bot own the thread again.
+      // "Resume AI": liberar CUALQUIER asignación (no solo la del caller)
+      // — la puerta de elegibilidad del auto-reply se detiene cuando hay
+      // un humano asignado, así que dejar un assignee viejo mantendría el
+      // bot mudo y haría "Resume AI" un no-op. Es la decisión explícita
+      // de devolverle el hilo al bot.
       update.assigned_agent_id = null
-      // Give the bot a fresh reply budget on this thread. This is a
-      // deliberate, manual, rate-limited action (not automatable), so it
-      // can't be used to bypass the per-conversation cap at scale — it's
-      // a human choosing to re-engage the assistant.
-      update.ai_reply_count = 0
-      update.ai_handoff_summary = null
     }
 
     const { error: upErr } = await supabase

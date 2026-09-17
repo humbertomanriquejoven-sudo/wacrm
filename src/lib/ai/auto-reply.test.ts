@@ -131,8 +131,6 @@ function aiConfig(overrides: Partial<AiConfig> = {}): AiConfig {
 beforeEach(() => {
   h.state.conv = {
     assigned_agent_id: null,
-    ai_autoreply_disabled: false,
-    ai_reply_count: 0,
   }
   h.state.autoResponders = []
   h.state.citas = []
@@ -229,25 +227,22 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
   it('skips when a human agent is assigned', async () => {
     h.state.conv = {
       assigned_agent_id: 'agent-9',
-      ai_autoreply_disabled: false,
-      ai_reply_count: 0,
     }
     await dispatchInboundToAiReply(ARGS)
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
-  it('clears a stale AI mute (no human agent) and replies to the new message', async () => {
+  it('ignores the legacy pause flag and replies anyway (no handoff flag gates the bot)', async () => {
+    // ai_autoreply_disabled is a legacy column: the bot must answer any
+    // new inbound when no human is assigned, and must NOT try to clear
+    // the column (it no longer reads or writes it).
     h.state.conv = {
       assigned_agent_id: null,
       ai_autoreply_disabled: true,
       ai_reply_count: 0,
     }
     await dispatchInboundToAiReply(ARGS)
-    // The stale mute from a previous run is wiped so the agent answers.
-    expect(h.state.updatePayload).toMatchObject({
-      ai_autoreply_disabled: false,
-      ai_handoff_summary: null,
-    })
+    expect(h.state.updatePayload).toBeNull()
     expect(h.engineSendAiReply).toHaveBeenCalledWith(
       expect.objectContaining({ text: 'Hello!' }),
     )
@@ -256,8 +251,6 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
   it('still skips when a HUMAN agent is assigned to the conversation', async () => {
     h.state.conv = {
       assigned_agent_id: 'agent-9',
-      ai_autoreply_disabled: true,
-      ai_reply_count: 0,
     }
     await dispatchInboundToAiReply(ARGS)
     expect(h.engineSendText).not.toHaveBeenCalled()
@@ -268,8 +261,6 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     h.loadAiConfig.mockResolvedValue(aiConfig({ autoReplyMaxPerConversation: 3 }))
     h.state.conv = {
       assigned_agent_id: null,
-      ai_autoreply_disabled: false,
-      ai_reply_count: 50,
     }
     await dispatchInboundToAiReply(ARGS)
     // The effective cap is 99999, so the AI still answers this inbound.
@@ -282,8 +273,6 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     h.loadAiConfig.mockResolvedValue(aiConfig({ autoReplyMaxPerConversation: 0 }))
     h.state.conv = {
       assigned_agent_id: null,
-      ai_autoreply_disabled: false,
-      ai_reply_count: 50,
     }
     await dispatchInboundToAiReply(ARGS)
     expect(h.engineSendAiReply).toHaveBeenCalledWith(
@@ -460,11 +449,10 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     await dispatchInboundToAiReply(ARGS)
 
     // The wait phrase is dropped for this turn, but the conversation stays
-    // enabled so the NEXT message is answered without a stale mute.
+    // enabled so the NEXT message is answered normally (no mute, no
+    // handoff flag is ever written).
     expect(h.engineSendAiReply).not.toHaveBeenCalled()
-    expect(h.state.updatePayload).not.toMatchObject({
-      ai_autoreply_disabled: true,
-    })
+    expect(h.state.updatePayload).toBeNull()
   })
 
   it('sends the mandated confirmation with the real link even when the model omits the URL', async () => {
@@ -488,8 +476,12 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     await dispatchInboundToAiReply(ARGS)
 
     const sent = h.engineSendAiReply.mock.calls[0][0].text as string
-    expect(sent).toContain('reunión ha sido agendada para el 2026-09-18 a las 14:00')
+    expect(sent).toContain('cita ha sido agendada con éxito para el 2026-09-18 a las 14:00')
     expect(sent).toContain('https://meet.google.com/abc')
+    // La confirmación de una cita REal viaja en UNA sola burbuja.
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ single: true }),
+    )
   })
 
   it('greets the contact by their CRM name when available', async () => {
@@ -516,7 +508,7 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     await dispatchInboundToAiReply(ARGS)
 
     const sent = h.engineSendAiReply.mock.calls[0][0].text as string
-    expect(sent).toContain('¡Claro, Carlos!')
+    expect(sent).toContain('¡Listo, Carlos!')
   })
 
   it('never sends a link-promise with a fake URL — drops the turn without muting', async () => {
@@ -550,8 +542,13 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
 
     const sent = h.engineSendAiReply.mock.calls[0][0].text as string
     expect(sent).toBe(
-      '¡Claro, Humberto! Te confirmo que nuestra reunión ha sido agendada para el 2026-09-18 a las 14:00.\n' +
-        'Puedes conectarte a través de este enlace de Google Meet: https://meet.google.com/abc',
+      '¡Listo, Humberto! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n' +
+        '\n' +
+        'Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n' +
+        'https://meet.google.com/abc',
+    )
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ single: true }),
     )
   })
 
@@ -579,9 +576,14 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     await dispatchInboundToAiReply(ARGS)
 
     const sent = h.engineSendAiReply.mock.calls[0][0].text as string
-    expect(sent).toContain('reunión ha sido agendada para el 2026-09-18 a las 14:00')
-    expect(sent).toContain('Puedes conectarte a través de este enlace de Google Meet: https://meet.google.com/new')
+    expect(sent).toContain('cita ha sido agendada con éxito para el 2026-09-18 a las 14:00')
+    expect(sent).toContain(
+      'Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\nhttps://meet.google.com/new',
+    )
     expect(sent).not.toContain('calendar.google.com')
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ single: true }),
+    )
   })
 
   it('strips a stray fake URL from an ordinary (non-booking) reply', async () => {
@@ -693,10 +695,12 @@ describe('buildBookingConfirmationMessage — pure function', () => {
     const out = buildBookingConfirmationMessage(
       { confirmado: true, link: null, inicio: null, idCita: null, fecha: '2026-09-18', hora: '14:00' },
     )
-    expect(out).toContain('reunión ha sido agendada para el 2026-09-18 a las 14:00')
+    expect(out).toContain('cita ha sido agendada con éxito para el 2026-09-18 a las 14:00')
     expect(out).toBe(
-      '¡Claro, Humberto! Te confirmo que nuestra reunión ha sido agendada para el 2026-09-18 a las 14:00.\n' +
-        'Puedes conectarte a través de este enlace de Google Meet: https://meet.google.com/new',
+      '¡Listo, Humberto! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n' +
+        '\n' +
+        'Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n' +
+        'https://meet.google.com/new',
     )
   })
 
@@ -714,8 +718,10 @@ describe('buildBookingConfirmationMessage — pure function', () => {
         null,
       ),
     ).toBe(
-      '¡Claro, Humberto! Te confirmo que nuestra reunión ha sido agendada para el 2026-09-18 a las 14:00.\n' +
-        'Puedes conectarte a través de este enlace de Google Meet: https://meet.google.com/real-link',
+      '¡Listo, Humberto! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n' +
+        '\n' +
+        'Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n' +
+        'https://meet.google.com/real-link',
     )
   })
 
@@ -732,7 +738,7 @@ describe('buildBookingConfirmationMessage — pure function', () => {
         },
         'Carlos',
       ),
-    ).toContain('¡Claro, Carlos!')
+    ).toContain('¡Listo, Carlos!')
   })
 
   it('falls back to inicio when fecha/hora are missing from the JSON_RESULT', () => {
@@ -748,6 +754,6 @@ describe('buildBookingConfirmationMessage — pure function', () => {
       null,
     )
     expect(out).toContain('para el 2026-09-18 a las 14:00')
-    expect(out).toContain('¡Claro, Humberto!')
+    expect(out).toContain('¡Listo, Humberto!')
   })
 })

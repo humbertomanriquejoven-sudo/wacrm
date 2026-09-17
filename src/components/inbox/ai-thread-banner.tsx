@@ -44,35 +44,31 @@ async function fetchAiAccountStatus(accountId: string): Promise<AiAccountStatus>
 
 interface AiThreadBannerProps {
   conversationId: string;
-  /** `conversations.ai_autoreply_disabled` — bot paused on this thread. */
-  disabled: boolean;
   /** `conversations.ai_handoff_summary` — note the bot left on handoff. */
   handoffSummary?: string | null;
   /** Current assignee; when a human owns the thread the bot won't run,
-   *  so the "AI active" banner is suppressed. */
+   *  so the "AI active" banner becomes a "handed to a human → Resume AI"
+   *  banner. There is no pause/handoff flag anymore — assignment is the
+   *  single source of truth. */
   assignedAgentId?: string | null;
   /** The acting agent — "Take over" assigns the thread to them. */
   currentUserId?: string | null;
   /** Called after a successful toggle so the parent can patch its local
    *  conversation state (the realtime UPDATE also arrives, but this keeps
    *  the banner instant). */
-  onChange?: (patch: {
-    ai_autoreply_disabled: boolean;
-    assigned_agent_id?: string | null;
-  }) => void;
+  onChange?: (patch: { assigned_agent_id?: string | null }) => void;
 }
 
 /**
  * Inbox banner that surfaces + controls the AI auto-reply bot per
  * conversation:
- *   - bot active here → "AI is replying automatically" + [Take over]
- *   - bot paused here → the handoff note (if any) + [Resume AI]
- * Renders nothing when the account has no auto-reply configured, or when
- * the bot is active but a human already owns the thread (nothing to do).
+ *   - no human assigned → "AI is replying automatically" + [Take over]
+ *   - a human owns the thread → muted banner (with the handoff note, if
+ *     any) + [Resume AI] to hand control back to the bot
+ * Renders nothing when the account has no auto-reply configured.
  */
 export function AiThreadBanner({
   conversationId,
-  disabled,
   handoffSummary,
   assignedAgentId,
   currentUserId,
@@ -82,11 +78,8 @@ export function AiThreadBanner({
   const { accountId } = useAuth();
   const [autoReplyOn, setAutoReplyOn] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
-  // Optimistic local mirror of the pause flag so the banner flips
-  // instantly on click; re-seeds whenever the thread (or its server
-  // state via realtime) changes.
-  const [paused, setPaused] = useState(disabled);
-  useEffect(() => setPaused(disabled), [conversationId, disabled]);
+  // A human owns the thread (assigned) ⇒ the bot is quiet here.
+  const paused = Boolean(assignedAgentId);
 
   useEffect(() => {
     if (!accountId) return;
@@ -98,33 +91,28 @@ export function AiThreadBanner({
   }, [accountId]);
 
   const toggle = useCallback(
-    async (paused: boolean) => {
+    async (takeOver: boolean) => {
       setBusy(true);
       try {
         const res = await fetch(`/api/ai/autoreply/${conversationId}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           // "Take over" also assigns the thread to the acting agent.
-          body: JSON.stringify({ paused, assign_to_me: paused }),
+          body: JSON.stringify({ paused: takeOver, assign_to_me: takeOver }),
         });
         if (!res.ok) {
           const j = await res.json().catch(() => ({}));
           toast.error(j?.error ?? t("updateError"));
           return;
         }
-        setPaused(paused);
         onChange?.({
-          ai_autoreply_disabled: paused,
-          // Take over assigns to the acting agent; resume releases only
-          // the caller's own assignment. The realtime UPDATE reconciles
-          // the exact value either way.
-          ...(paused
-            ? currentUserId
-              ? { assigned_agent_id: currentUserId }
-              : {}
-            : { assigned_agent_id: null }),
+          // Take over assigns to the acting agent; resume releases the
+          // assignment. The realtime UPDATE reconciles the exact value.
+          assigned_agent_id: takeOver
+            ? currentUserId ?? null
+            : null,
         });
-        toast.success(paused ? t("tookOver") : t("resumed"));
+        toast.success(takeOver ? t("tookOver") : t("resumed"));
       } catch {
         toast.error(t("networkError"));
       } finally {
@@ -137,7 +125,7 @@ export function AiThreadBanner({
   // Account has no auto-reply → nothing to show. (Still loading → nothing.)
   if (!autoReplyOn) return null;
 
-  // Paused here (a human took over, or the model handed off).
+  // A human owns the thread → hand it back to the bot.
   if (paused) {
     return (
       <Banner tone="muted">
@@ -156,10 +144,7 @@ export function AiThreadBanner({
     );
   }
 
-  // Active, but a human already owns it → the bot won't fire; no banner.
-  if (assignedAgentId) return null;
-
-  // Active on this thread.
+  // Active on this thread (no human assigned).
   return (
     <Banner tone="primary">
       <div className="flex min-w-0 flex-1 items-center gap-1.5">
