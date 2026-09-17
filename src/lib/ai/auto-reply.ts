@@ -73,9 +73,10 @@ function looksLikeBookingConfirmation(text: string): boolean {
  *    with that real link (append it if the model omitted it),
  *  - real success but no link         → strip every Meet/calendar URL,
  *  - no real success this turn: never promise a booking. When the text
- *    claims a booking OR is an intermediate "un momento…" wait message
- *    (and the customer was trying to schedule) return null so the caller
- *    hands off silently; anything else keeps its fake URLs stripped.
+ *    claims a booking (and the customer was trying to schedule) OR is an
+ *    intermediate "un momento…" wait message (always, booking or not)
+ *    return null so the caller hands off silently; anything else keeps
+ *    its fake URLs stripped.
  */
 export function guardBookingReply(
   text: string,
@@ -97,10 +98,9 @@ export function guardBookingReply(
     return text.replace(FAKE_LINK_RE, '')
   }
 
+  if (INTERMEDIATE_ACK_RE.test(text)) return null
   if (opts.bookingContext ?? false) {
-    if (looksLikeBookingConfirmation(text) || INTERMEDIATE_ACK_RE.test(text)) {
-      return null
-    }
+    if (looksLikeBookingConfirmation(text)) return null
   }
   return text.replace(FAKE_LINK_RE, '')
 }

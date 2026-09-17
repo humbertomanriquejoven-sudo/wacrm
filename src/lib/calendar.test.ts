@@ -202,7 +202,7 @@ describe('agendar_cita', () => {
           start: expect.objectContaining({ dateTime: expect.stringContaining('2026-09-14T10:00:00') }),
         }),
       }),
-      expect.objectContaining({ timeout: 8000 }),
+      expect.objectContaining({ timeout: 6000 }),
     )
     const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
     expect(insert).toMatchObject({
@@ -684,7 +684,7 @@ describe('agendar_cita — enlace del evento', () => {
     expect(out).toContain('"link":"https://meet.google.com/shape"')
   })
 
-  it('does not hang when Google never answers — 8s timeout, saves locally and returns success', async () => {
+  it('does not hang when Google never answers — 6s timeout, saves locally and returns success', async () => {
     vi.useFakeTimers()
     try {
       h.insert.mockReturnValue(new Promise(() => {}))
@@ -696,7 +696,7 @@ describe('agendar_cita — enlace del evento', () => {
         inicio: '2026-09-14T10:00:00-05:00',
         nombre: 'Ana',
       })
-      await vi.advanceTimersByTimeAsync(8000)
+      await vi.advanceTimersByTimeAsync(6000)
       const out = await p
       expect(h.insert).toHaveBeenCalledTimes(1)
       expect(out).toContain('Cita agendada')

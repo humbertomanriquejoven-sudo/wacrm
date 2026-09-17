@@ -528,6 +528,11 @@ describe('guardBookingReply — pure function', () => {
     expect(out).toBeNull()
   })
 
+  it('returns null for an intermediate wait message WITHOUT booking context', () => {
+    const out = guardBookingReply('Un momento, por favor, esto puede tardar un poco.', null)
+    expect(out).toBeNull()
+  })
+
   it('keeps a non-booking-context claim but still strips its fake URL', () => {
     const out = guardBookingReply(
       '¡Listo! Agendada tu cita. Meet: https://meet.google.com/xxx-yyyy-zzz',
