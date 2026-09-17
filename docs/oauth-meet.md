@@ -65,11 +65,16 @@ GOOGLE_REFRESH_TOKEN=1//04...
 ## 4. Configurar el consentimiento + scopes
 
 - OAuth consent screen (External/testing), scopes (`calendar`,
-  `calendar.events`), y el usuario Gmail dueño del calendario debe ser test
-  user hasta publicar.
-- Desde el código solo se usa `https://www.googleapis.com/auth/calendar`
-  (con OAuth2Client) y `conferenceDataVersion: 1` con
-  `conferenceSolutionKey: hangoutsMeet`.
+  `calendar.events`, `gmail.send`, `gmail.readonly`), y el usuario Gmail
+  dueño del calendario debe ser test user hasta publicar.
+- Desde el código se usa `https://www.googleapis.com/auth/calendar` (con
+  OAuth2Client) y `conferenceDataVersion: 1` con
+  `conferenceSolutionKey: hangoutsMeet`; Gmail (enviar/leer correos) usa
+  `gmail.send` + `gmail.readonly` desde el mismo refresh token.
+- Asegúrate de que la API *Gmail* esté habilitada en el proyecto de Google
+  Cloud (APIs & Services → Library → Gmail API → Enable); de lo contrario
+  `messages.send`/`messages.list` responden 403 "Gmail API has not been
+  used in project …".
 
 ---
 
@@ -93,6 +98,8 @@ const url = client.generateAuthUrl({
   scope: [
     'https://www.googleapis.com/auth/calendar',
     'https://www.googleapis.com/auth/calendar.events',
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/gmail.readonly',
   ],
 })
 console.log(url)

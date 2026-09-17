@@ -7,6 +7,8 @@ import { generateReply } from '@/lib/ai/generate'
 import { buildSystemPrompt } from '@/lib/ai/defaults'
 import { latestUserMessage } from '@/lib/ai/query'
 import { AiError, type ChatMessage } from '@/lib/ai/types'
+import { calendarConfigured } from '@/lib/calendar'
+import { gmailConfigured } from '@/lib/gmail'
 
 // Keep the tested transcript bounded, mirroring the live context window.
 const MAX_TURNS = 20
@@ -82,6 +84,8 @@ export async function POST(request: Request) {
       userPrompt: config.systemPrompt,
       mode: 'auto_reply',
       knowledge,
+      calendarEnabled: calendarConfigured(),
+      gmailEnabled: gmailConfigured(),
     })
 
     const { text, handoff } = await generateReply({ config, systemPrompt, messages })

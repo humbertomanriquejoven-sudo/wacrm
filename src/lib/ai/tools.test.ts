@@ -6,15 +6,23 @@ vi.mock('@/lib/calendar', () => ({
   agendar_cita: vi.fn(async () => 'Cita agendada'),
   reagendar_cita: vi.fn(async () => 'Cita reagendada'),
   cancelar_cita: vi.fn(async () => 'Cita cancelada'),
+  listar_eventos: vi.fn(async () => '- 2026-09-20T09:00:00-05:00 → 2026-09-20T09:45:00-05:00 | Cita'),
 }))
 
-import { executeToolCall, AI_TOOLS, VER_DISPONIBILIDAD_TOOL, AGENDAR_CITA_TOOL, REAGENDAR_CITA_TOOL, CANCELAR_CITA_TOOL } from './tools'
+vi.mock('@/lib/gmail', () => ({
+  gmailConfigured: vi.fn(() => true),
+  enviar_correo: vi.fn(async () => 'Correo enviado a ana@x.com (Gmail message id 1).'),
+  leer_correos: vi.fn(async () => '- De: ana@x.com\n  Asunto: Hola'),
+}))
+
+import { executeToolCall, AI_TOOLS, VER_DISPONIBILIDAD_TOOL, AGENDAR_CITA_TOOL, REAGENDAR_CITA_TOOL, CANCELAR_CITA_TOOL, LISTAR_EVENTOS_TOOL, ENVIAR_CORREO_TOOL, LEER_CORREOS_TOOL } from './tools'
 import * as cal from '@/lib/calendar'
+import * as gmailModule from '@/lib/gmail'
 
 const mockDb = {} as never
 
 describe('AI_TOOLS array', () => {
-  it('contains the 5 expected tools', () => {
+  it('contains the 8 expected tools', () => {
     expect(AI_TOOLS.map((t) => t.name)).toEqual(
       expect.arrayContaining([
         'update_client_profile',
@@ -22,9 +30,12 @@ describe('AI_TOOLS array', () => {
         'agendar_cita',
         'reagendar_cita',
         'cancelar_cita',
+        'listar_eventos',
+        'enviar_correo',
+        'leer_correos',
       ]),
     )
-    expect(AI_TOOLS).toHaveLength(5)
+    expect(AI_TOOLS).toHaveLength(8)
   })
 
   it('all have name, description and required parameters', () => {
@@ -48,6 +59,13 @@ describe('calendar tool definitions', () => {
   })
   it('cancelar_cita requires idCita', () => {
     expect(CANCELAR_CITA_TOOL.parameters.required).toEqual(['idCita'])
+  })
+  it('enviar_correo requires to, subject and body', () => {
+    expect(ENVIAR_CORREO_TOOL.parameters.required).toEqual(['to', 'subject', 'body'])
+  })
+  it('listar_eventos and leer_correos default to 100 items', () => {
+    expect(LISTAR_EVENTOS_TOOL.description).toContain('100')
+    expect(LEER_CORREOS_TOOL.description).toContain('100')
   })
 })
 
@@ -103,9 +121,41 @@ describe('executeToolCall — calendar dispatch', () => {
     expect(cal.cancelar_cita).toHaveBeenCalledWith({ db: mockDb, accountId: 'a', idCita: 'c-1' })
   })
 
+  it('calls listar_eventos with default maxResults', async () => {
+    const out = await executeToolCall(mockDb, 'a', 'c', {
+      id: '7', name: 'listar_eventos', arguments: { desde: '2026-09-20' },
+    })
+    expect(out).toContain('Cita')
+    expect(cal.listar_eventos).toHaveBeenCalledWith({ desde: '2026-09-20', hasta: undefined, maxResults: undefined })
+  })
+
+  it('calls enviar_correo with an HTML body', async () => {
+    const out = await executeToolCall(mockDb, 'a', 'c', {
+      id: '8', name: 'enviar_correo', arguments: { to: 'ana@x.com', subject: 'Confirmación', body: '<strong>Cita</strong>' },
+    })
+    expect(out).toContain('Correo enviado')
+    expect(gmailModule.enviar_correo).toHaveBeenCalledWith({ to: 'ana@x.com', subject: 'Confirmación', html: '<strong>Cita</strong>' })
+  })
+
+  it('returns error for enviar_correo when fields are missing', async () => {
+    const out = await executeToolCall(mockDb, 'a', 'c', {
+      id: '9', name: 'enviar_correo', arguments: { to: 'ana@x.com' },
+    })
+    expect(out).toContain('Error')
+    expect(gmailModule.enviar_correo).not.toHaveBeenCalled()
+  })
+
+  it('calls leer_correos', async () => {
+    const out = await executeToolCall(mockDb, 'a', 'c', {
+      id: '10', name: 'leer_correos', arguments: { maxResults: 100, query: 'is:unread' },
+    })
+    expect(out).toContain('De: ana@x.com')
+    expect(gmailModule.leer_correos).toHaveBeenCalledWith({ maxResults: 100, query: 'is:unread' })
+  })
+
   it('returns unknown tool for unrecognized name', async () => {
     const out = await executeToolCall(mockDb, 'a', 'c', {
-      id: '7', name: 'magic_wand', arguments: {},
+      id: '11', name: 'magic_wand', arguments: {},
     })
     expect(out).toContain('Unknown tool')
   })

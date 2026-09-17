@@ -10,6 +10,8 @@ import { latestUserMessage } from '@/lib/ai/query'
 import { logAiUsage } from '@/lib/ai/usage'
 import { supabaseAdmin } from '@/lib/ai/admin-client'
 import { AiError } from '@/lib/ai/types'
+import { calendarConfigured } from '@/lib/calendar'
+import { gmailConfigured } from '@/lib/gmail'
 
 /**
  * POST /api/ai/draft  (agent+)
@@ -102,6 +104,8 @@ export async function POST(request: Request) {
       userPrompt: config.systemPrompt,
       mode: 'draft',
       knowledge,
+      calendarEnabled: calendarConfigured(),
+      gmailEnabled: gmailConfigured(),
     })
 
     const { text, usage } = await generateReply({ config, systemPrompt, messages })

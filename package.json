@@ -46,6 +46,7 @@
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
     "@googleapis/calendar": "^19.0.0",
+    "@googleapis/gmail": "^22.0.0",
     "@supabase/ssr": "^0.12.0",
     "@supabase/supabase-js": "^2.107.0",
     "@xyflow/react": "^12.11.2",

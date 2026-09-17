@@ -3,9 +3,11 @@ import type { ToolDefinition, ToolCall } from './types'
 import {
   agendar_cita,
   cancelar_cita,
+  listar_eventos,
   reagendar_cita,
   ver_disponibilidad,
 } from '@/lib/calendar'
+import { enviar_correo, leer_correos, gmailConfigured } from '@/lib/gmail'
 
 // ============================================================
 // Tool definitions and handlers for the AI auto-reply agent.
@@ -155,6 +157,84 @@ export const CANCELAR_CITA_TOOL: ToolDefinition = {
   },
 }
 
+/** Google Calendar — list upcoming events (maxResults=100). */
+export const LISTAR_EVENTOS_TOOL: ToolDefinition = {
+  name: 'listar_eventos',
+  description:
+    'List upcoming/oncoming events in the business calendar (default fetch is 100 items, far above the API\'s built-in 5-result cap). ' +
+    'Use this when the customer asks "¿qué tengo esta semana?", "¿hay algo agendado?", or to see the full agenda. ' +
+    'Available only when Google Calendar is configured.',
+  parameters: {
+    type: 'object',
+    properties: {
+      desde: {
+        type: 'string',
+        description:
+          'Start of the window, ISO date or date-time in Bogota time (e.g. "2026-05-04" or "2026-05-04T00:00:00-05:00"). Default: now.',
+      },
+      hasta: {
+        type: 'string',
+        description:
+          'End of the window, ISO date or date-time in Bogota time. Default: no limit (from `desde` onwards).',
+      },
+      maxResults: {
+        type: 'integer',
+        description: 'Number of events to fetch (default 100, max 250)',
+      },
+    },
+  },
+}
+
+/** Gmail — send an HTML email from the business inbox. */
+export const ENVIAR_CORREO_TOOL: ToolDefinition = {
+  name: 'enviar_correo',
+  description:
+    'Send an email from the business Gmail account via the Gmail API. The body is HTML by default, so it renders nicely on phones. ' +
+    'Available only when the Gmail OAuth scope is configured.',
+  parameters: {
+    type: 'object',
+    properties: {
+      to: {
+        type: 'string',
+        description: 'Recipient email address',
+      },
+      subject: {
+        type: 'string',
+        description: 'Clear subject line that names the event/cita topic',
+      },
+      body: {
+        type: 'string',
+        description:
+          'HTML body of the email (e.g. with <strong> for the date/time and a link to the Google Meet room)',
+      },
+    },
+    required: ['to', 'subject', 'body'],
+  },
+}
+
+/** Gmail — read recent received messages. */
+export const LEER_CORREOS_TOOL: ToolDefinition = {
+  name: 'leer_correos',
+  description:
+    'Read recent received messages in the business Gmail inbox (from, subject, date and a snippet; fetches up to 100 messages by default). ' +
+    'Use this when the customer asks about incoming emails or confirmations. ' +
+    'Available only when the Gmail OAuth scope is configured.',
+  parameters: {
+    type: 'object',
+    properties: {
+      maxResults: {
+        type: 'integer',
+        description: 'Number of messages to fetch (default 100, max 100)',
+      },
+      query: {
+        type: 'string',
+        description:
+          'Optional Gmail search, e.g. "from:someone@x.com" or "is:unread"',
+      },
+    },
+  },
+}
+
 /** All tools available to the AI agent. */
 export const AI_TOOLS: ToolDefinition[] = [
   UPDATE_CLIENT_PROFILE_TOOL,
@@ -162,6 +242,9 @@ export const AI_TOOLS: ToolDefinition[] = [
   AGENDAR_CITA_TOOL,
   REAGENDAR_CITA_TOOL,
   CANCELAR_CITA_TOOL,
+  LISTAR_EVENTOS_TOOL,
+  ENVIAR_CORREO_TOOL,
+  LEER_CORREOS_TOOL,
 ]
 
 /**
@@ -214,6 +297,48 @@ export async function executeToolCall(
       return 'Error: cancelar_cita requiere "idCita".'
     }
     return cancelar_cita({ db, accountId, idCita })
+  }
+  if (toolCall.name === 'listar_eventos') {
+    const { desde, hasta, maxResults } = toolCall.arguments
+    if (desde !== undefined && typeof desde !== 'string') {
+      return 'Error: "desde" debe ser un texto de fecha en listar_eventos.'
+    }
+    if (hasta !== undefined && typeof hasta !== 'string') {
+      return 'Error: "hasta" debe ser un texto de fecha en listar_eventos.'
+    }
+    const parsedMax =
+      typeof maxResults === 'number' && Number.isFinite(maxResults)
+        ? Math.round(maxResults)
+        : undefined
+    return listar_eventos({
+      desde: typeof desde === 'string' ? desde : undefined,
+      hasta: typeof hasta === 'string' ? hasta : undefined,
+      maxResults: parsedMax,
+    })
+  }
+  if (toolCall.name === 'enviar_correo') {
+    const { to, subject, body } = toolCall.arguments
+    if (typeof to !== 'string' || typeof subject !== 'string' || typeof body !== 'string') {
+      return 'Error: enviar_correo requiere "to" (destinatario), "subject" (asunto) y "body" (mensaje HTML).'
+    }
+    if (!gmailConfigured()) {
+      return 'Error: Gmail no está configurado (faltan GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN con alcance de Gmail).'
+    }
+    return enviar_correo({ to: to.trim(), subject: subject.trim(), html: body })
+  }
+  if (toolCall.name === 'leer_correos') {
+    const { maxResults, query } = toolCall.arguments
+    if (!gmailConfigured()) {
+      return 'Error: Gmail no está configurado (faltan GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN con alcance de Gmail).'
+    }
+    const parsedMax =
+      typeof maxResults === 'number' && Number.isFinite(maxResults)
+        ? Math.round(maxResults)
+        : undefined
+    return leer_correos({
+      maxResults: parsedMax,
+      query: typeof query === 'string' && query.trim() ? query.trim() : undefined,
+    })
   }
   return `Unknown tool: ${toolCall.name}`
 }

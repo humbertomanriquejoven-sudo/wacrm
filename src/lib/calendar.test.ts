@@ -18,6 +18,7 @@ vi.hoisted(() => {
 
 const h = vi.hoisted(() => ({
   freebusy: vi.fn(),
+  list: vi.fn(),
   insert: vi.fn(),
   patch: vi.fn(),
   del: vi.fn(),
@@ -26,7 +27,7 @@ const h = vi.hoisted(() => ({
 vi.mock('@googleapis/calendar', () => ({
   calendar: vi.fn(() => ({
     freebusy: { query: h.freebusy },
-    events: { insert: h.insert, patch: h.patch, delete: h.del },
+    events: { list: h.list, insert: h.insert, patch: h.patch, delete: h.del },
   })),
 }))
 
@@ -42,6 +43,7 @@ import {
   cancelar_cita,
   reagendar_cita,
   ver_disponibilidad,
+  listar_eventos,
   parseBogotaInstant,
   APPOINTMENT_DURATION_MIN,
 } from '@/lib/calendar'
@@ -509,6 +511,43 @@ describe('reagendar_cita / cancelar_cita', () => {
       nuevoInicio: '2026-09-15T11:00:00-05:00',
     })
     expect(out).toContain('no se encontró la cita')
+  })
+})
+
+describe('listar_eventos', () => {
+  beforeEach(() => {
+    h.list.mockReset()
+    h.list.mockResolvedValue({ data: {} })
+  })
+
+  it('requests maxResults=100 by default (breaks the 5-result cap)', async () => {
+    await listar_eventos({})
+    const args = h.list.mock.calls[0][0] as { maxResults: number }
+    expect(args.maxResults).toBe(100)
+  })
+
+  it('formats items with their Meet links', async () => {
+    h.list.mockResolvedValue({
+      data: {
+        items: [
+          {
+            summary: 'Cita con Cliente - Ana',
+            start: { dateTime: '2026-09-20T09:00:00-05:00' },
+            end: { dateTime: '2026-09-20T09:45:00-05:00' },
+            hangoutLink: 'https://meet.google.com/abc',
+          },
+        ],
+      },
+    })
+    const out = await listar_eventos({})
+    expect(out).toContain('2026-09-20T09:00:00-05:00')
+    expect(out).toContain('https://meet.google.com/abc')
+  })
+
+  it('reports an invalid window date', async () => {
+    const out = await listar_eventos({ desde: 'no-es-fecha' })
+    expect(out).toContain('fecha inválida')
+    expect(h.list).not.toHaveBeenCalled()
   })
 })
 

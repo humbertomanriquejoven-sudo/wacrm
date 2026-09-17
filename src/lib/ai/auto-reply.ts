@@ -9,6 +9,7 @@ import { logAiUsage } from './usage'
 import { latestUserMessage } from './query'
 import { AI_TOOLS, executeToolCall, loadContactContext } from './tools'
 import { calendarConfigured } from '@/lib/calendar'
+import { gmailConfigured } from '@/lib/gmail'
 import { engineSendAiReply } from '@/lib/flows/meta-send'
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit'
 import type { ChatMessage } from './types'
@@ -111,6 +112,7 @@ export async function dispatchInboundToAiReply(
       contactEmail: contactCtx?.email,
       contactLocation: contactCtx?.location,
       calendarEnabled: calendarConfigured(),
+      gmailEnabled: gmailConfigured(),
       citas: contactCtx?.citas,
     })
 

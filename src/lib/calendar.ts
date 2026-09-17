@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { calendar as calendarV3 } from '@googleapis/calendar'
 import { JWT, OAuth2Client } from 'google-auth-library'
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { enviarConfirmacionCita } from '@/lib/gmail'
 
 // ============================================================
 // Google Calendar booking helpers.
@@ -359,6 +360,62 @@ export async function ver_disponibilidad(
   return lines.join('\n')
 }
 
+export interface ListarEventosArgs {
+  /** Window start (ISO "2026-09-17" or "2026-09-17T00:00:00-05:00"). Default: now. */
+  desde?: string
+  /** Window end. Default: none (Google returns from `desde` onwards). */
+  hasta?: string
+  /** Number of events to fetch. Default 100, ceiling 250. */
+  maxResults?: number
+}
+
+/**
+ * listar_eventos — list upcoming calendar events as RFC3339 strings for the
+ * model to relay ("¿qué tengo esta semana?"). Uses `maxResults: 100` by
+ * default to break the API's built-in 5-result cap.
+ */
+export async function listar_eventos(
+  args: ListarEventosArgs = {},
+): Promise<string> {
+  const maxResults = Math.min(Math.max(1, args.maxResults ?? 100), 250)
+  const from = args.desde ? parseBogotaInstant(args.desde) : new Date()
+  const to = args.hasta ? parseBogotaInstant(args.hasta) : null
+  if (!from || (args.hasta !== undefined && !to)) {
+    return 'Error: fecha inválida en listar_eventos. Usa formato ISO 8601 en hora de Bogotá (p. ej. 2026-09-17 o 2026-09-17T15:00:00-05:00).'
+  }
+
+  const cal = calendarClient()
+  try {
+    const res = await cal.events.list(
+      {
+        calendarId: CAL_ID,
+        timeMin: from.toISOString(),
+        ...(to ? { timeMax: to.toISOString() } : {}),
+        maxResults,
+        singleEvents: true,
+        orderBy: 'startTime',
+        timeZone: CAL_TIMEZONE,
+      },
+      { timeout: CALENDAR_TIMEOUT_MS },
+    )
+    const items = res.data.items ?? []
+    if (items.length === 0) {
+      return 'No hay eventos en el rango indicado.'
+    }
+    return items
+      .map((e) => {
+        const start = e.start?.dateTime ?? e.start?.date ?? '?'
+        const end = e.end?.dateTime ?? e.end?.date ?? ''
+        const label = e.summary?.trim() || '(sin título)'
+        return `- ${start} → ${end} | ${label}${e.hangoutLink ? ` | Meet: ${e.hangoutLink}` : ''}`
+      })
+      .join('\n')
+  } catch (err) {
+    console.error('[calendar] events.list failed:', err)
+    return 'Error: no se pudo consultar los eventos del calendario.'
+  }
+}
+
 // ------------------------------------------------------------
 // Lifecycle: create / reschedule / cancel
 // ------------------------------------------------------------
@@ -419,6 +476,7 @@ export async function agendar_cita(
   let event: { id?: string | null }
   let calendarSynced = true
   let meetUrl: string | null = null
+  let emailSent = false
   try {
     const baseBody = {
       summary: title,
@@ -507,11 +565,29 @@ export async function agendar_cita(
     return `Error: la cita se creó en Google Calendar pero no se pudo guardar en el CRM (${error.message}).`
   }
 
-return calendarSynced
+  // Confirmation email (Gmail API) — automatic and best-effort. A mail
+  // failure must not undo an already-booked calendar event; we only warn.
+  if (clientEmail) {
+    const mailConfirmation = await enviarConfirmacionCita({
+      to: clientEmail,
+      nombre: name.trim(),
+      motivo: motivo?.trim(),
+      inicioIso: start.toISOString(),
+      duracionMin: APPOINTMENT_DURATION_MIN,
+      meetUrl,
+    })
+    emailSent = mailConfirmation.startsWith('Correo enviado')
+    if (!emailSent && mailConfirmation) {
+      console.warn('[calendar] confirmation email failed:', mailConfirmation)
+    }
+  }
+
+return (calendarSynced
   ? meetUrl
     ? `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}. Reunión Meet: ${meetUrl}`
     : `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}.`
-  : `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}. (Google Calendar no disponible; la cita quedó guardada en el CRM sin enlace de Meet.)`
+  : `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}. (Google Calendar no disponible; la cita quedó guardada en el CRM sin enlace de Meet.)`)
+  + (emailSent ? ` Correo de confirmación enviado a ${clientEmail}.` : '')
 }
 
 export interface ReagendarCitaArgs {
