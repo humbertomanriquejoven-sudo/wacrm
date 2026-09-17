@@ -630,6 +630,56 @@ describe('agendar_cita — enlace del evento', () => {
     const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
     expect((insert!.row as { meet_link: string | null }).meet_link).toBeNull()
   })
+
+  it('books directly when the freebusy check fails (no blocking)', async () => {
+    h.freebusy.mockRejectedValue(new Error('freebusy down'))
+    h.insert.mockResolvedValue({
+      data: { id: 'evt-direct', htmlLink: 'https://calendar.google.com/event?eid=direct' },
+    })
+    const supabase = db()
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'Ana',
+    })
+    expect(out).toContain('Cita agendada')
+    expect(h.insert).toHaveBeenCalled()
+    expect(out).toContain('Enlace del evento: https://calendar.google.com/event?eid=direct')
+  })
+
+  it('returns confirmado:true plus the exact link in JSON_RESULT', async () => {
+    h.insert.mockResolvedValue({
+      data: { id: 'evt-json', hangoutLink: 'https://meet.google.com/json-meet' },
+    })
+    const supabase = db()
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'Ana',
+    })
+    expect(out).toContain('"confirmado":true')
+    expect(out).toContain('"link":"https://meet.google.com/json-meet"')
+  })
+
+  it('defaults the reason to "Reunión de valoración / Consulta" when omitted', async () => {
+    h.insert.mockResolvedValue({ data: { id: 'evt-def' } })
+    const supabase = db()
+    await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'Ana',
+    })
+    const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+    expect((insert!.row as { motivo: string }).motivo).toBe(
+      'Reunión de valoración / Consulta',
+    )
+  })
 })
 
 describe('consultarOcupados', () => {

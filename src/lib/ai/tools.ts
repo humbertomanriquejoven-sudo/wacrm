@@ -85,8 +85,11 @@ export const AGENDAR_CITA_TOOL: ToolDefinition = {
   name: 'agendar_cita',
   description:
     'Schedule a 45-minute appointment for the customer in the business calendar. ' +
-    'Google creates a Meet link and emails the customer an invitation. ' +
-    'Pass the customer email when you know it, so they receive the invite with the Meet link.',
+    'CALL IT IMMEDIATELY when the customer states a concrete date/time — do not ask again for the date/time or the reason. ' +
+    'motivo is optional and defaults to "Reunión de valoración / Consulta" when omitted. ' +
+    'Google creates a Meet link (or returns the calendar event URL as fallback) and emails the customer an invitation. ' +
+    'Pass the customer email when you know it, so they receive the invite with the link. ' +
+    'On success the tool returns confirmado:true plus the exact link to share with the customer.',
   parameters: {
     type: 'object',
     properties: {
@@ -102,12 +105,12 @@ export const AGENDAR_CITA_TOOL: ToolDefinition = {
       motivo: {
         type: 'string',
         description:
-          'Reason or topic of the appointment (e.g. "cotización de interiores")',
+          'Reason or topic of the appointment (e.g. "cotización de interiores"). Optional: defaults to "Reunión de valoración / Consulta", so never block the booking by asking for it.',
       },
       email: {
         type: 'string',
         description:
-          'Customer email, used to send the Google Calendar invitation with the Meet link',
+          'Customer email, used to send the Google Calendar invitation with the Meet link (optional — never block the booking if you do not have it)',
       },
     },
     required: ['inicio', 'nombre'],

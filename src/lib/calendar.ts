@@ -486,15 +486,20 @@ export async function agendar_cita(
   if (start === null) {
     return 'Error: "inicio" no es una fecha válida o cae fuera del horario de atención.'
   }
+  // Motivo por defecto: el flujo nunca debe bloquearse preguntando por el
+  // motivo cuando el usuario no lo mencionó.
+  const motivoFinal = motivo?.trim() || 'Reunión de valoración / Consulta'
 
+  // La verificación de disponibilidad es best-effort y nunca debe bloquear
+  // la cita: si freebusy falla o da timeout, pasamos directo a la creación
+  // del evento (la creación en Google Calendar sigue adelante igual).
   try {
     const busy = await fetchBusy(start, new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000))
     if (busy.length > 0) {
       return 'Error: ese horario ya está ocupado. Consulta ver_disponibilidad antes de agendar.'
     }
   } catch (err) {
-    console.error('[calendar] agendar freebusy failed:', err)
-    return 'Error: no se pudo confirmar el horario en el calendario.'
+    console.warn('[calendar] agendar freebusy failed — booking directly:', err)
   }
 
   const cal = calendarClient()
@@ -601,7 +606,7 @@ export async function agendar_cita(
     calendarSynced = false
   }
 
-  const { error } = await db
+  const { data: insertedRow, error } = await db
     .from('citas')
     .insert({
       account_id: accountId,
@@ -611,7 +616,7 @@ export async function agendar_cita(
       fecha_inicio: start.toISOString(),
       fecha_fin: new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000).toISOString(),
       estado: 'confirmada',
-      motivo: motivo?.trim() || null,
+      motivo: motivoFinal,
     })
     .select('id')
     .single()
@@ -620,6 +625,7 @@ export async function agendar_cita(
     console.error('[calendar] citas insert failed:', error)
     return `Error: la cita se creó en Google Calendar pero no se pudo guardar en el CRM (${error.message}).`
   }
+  const idCita = (insertedRow as { id?: string } | null)?.id ?? null
 
   // Confirmation email (Gmail API) — automatic and best-effort. A mail
   // failure must not undo an already-booked calendar event; we only warn.
@@ -627,7 +633,7 @@ export async function agendar_cita(
     const mailConfirmation = await enviarConfirmacionCita({
       to: clientEmail,
       nombre: name.trim(),
-      motivo: motivo?.trim(),
+      motivo: motivoFinal,
       inicioIso: start.toISOString(),
       duracionMin: APPOINTMENT_DURATION_MIN,
       meetUrl,
@@ -646,10 +652,25 @@ export async function agendar_cita(
         : ` Enlace del evento: ${meetUrl}`
       : ''
 
-  return (calendarSynced
+  const human = (calendarSynced
     ? `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}.${enlaceMsg}`
     : `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}. (Google Calendar no disponible; la cita quedó guardada en el CRM sin enlace.)`)
     + (emailSent ? ` Correo de confirmación enviado a ${clientEmail}.` : '')
+
+  // Respuesta estructurada para el agente: marca de éxito inequívoca y el
+  // enlace exacto (hangoutLink > htmlLink) que debe citar al cliente.
+  // Es un ámbito de la tool, no del mensaje al cliente.
+  const structured: Record<string, unknown> = {
+    confirmado: true,
+    exito: true,
+    inicio: bogotaIso(start),
+    duracionMin: APPOINTMENT_DURATION_MIN,
+    idCita,
+    link: meetUrl ?? null,
+    estado: 'confirmada',
+  }
+
+  return `${human}\n\nJSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ${JSON.stringify(structured)}`
 }
 
 export interface ReagendarCitaArgs {

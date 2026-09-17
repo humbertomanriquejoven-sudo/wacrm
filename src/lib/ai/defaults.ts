@@ -183,12 +183,20 @@ export function buildSystemPrompt(args: {
     parts.push(
       'Appointment booking is available. Business hours (America/Bogota, UTC-5): Monday to Friday 09:00-18:00, Saturday 09:00-13:00. ' +
         'Appointments last 45 minutes by default; send start times as ISO 8601 with the Bogota offset (e.g. 2026-09-17T15:00:00-05:00). ' +
-        'Every booking automatically requests Google to create a Google Meet link (conferenceData) so the customer can join by video call. ' +
-        'When the customer asks for an appointment, follow this flow: ' +
-        '1) Call ver_disponibilidad with the date(s) the customer wants to see available slots; ' +
-        '2) Show the customer the free times and ask which one they prefer; ' +
-'3) Booking is MANDATORY: the instant the customer confirms a date/time, immediately call agendar_cita with that start time and their name (and the reason if mentioned). NEVER simulate, pretend, or confirm a booking without actually invoking agendar_cita and waiting for its success return; ' +
-'4) Confirm the booked date/time in your reply, and include the exact Meet (hangoutLink) returned by agendar_cita VERBATIM in the WhatsApp message so the customer can join the call. Never invent a link: only quote the one the tool actually returned; ' +
+        'Every booking automatically requests Google to create a Google Meet link (conferenceData); when the account cannot create Meet, ' +
+        'the system returns the calendar event URL (htmlLink) instead — either one is the link to share. ' +
+        'BOOKING FLOW (STRICT): ' +
+        '1) DIRECT BOOKING IS MANDATORY: the instant the customer gives a concrete date/time (e.g. "mañana a las 2 pm", "el jueves a las 10"), ' +
+        'call agendar_cita in THIS SAME TURN with that exact start time and their name. DO NOT ask again for the date, ' +
+        'DO NOT ask "cuál horario prefiere", DO NOT ask for a date range, and DO NOT run ver_disponibilidad just to re-confirm a time they already chose. ' +
+        'Only call ver_disponibilidad when the customer has NOT picked any date/time yet and you need to show available slots. ' +
+        '2) If you are unsure the exact slot is free, call ver_disponibilidad ONCE for that single date, and if the requested time is listed book it immediately; if availability fails or times out, ' +
+        'still attempt agendar_cita directly — never abandon the booking because the availability check failed. ' +
+        '3) If the customer did not mention a specific reason for the appointment, book with motivo "Reunión de valoración / Consulta" — never stop the flow to ask for the reason. ' +
+        '4) NEVER simulate, pretend, or confirm a booking without actually invoking agendar_cita and waiting for its result. ' +
+        '5) agendar_cita returns a success marker (confirmado: true) plus the exact link (hangoutLink or htmlLink) in JSON_RESULT. The instant you see it, reply to the customer in THAT SAME message: ' +
+        'confirm the booked date/time AND include the returned link VERBATIM so they can join the call. Never invent a link: only quote the one the tool actually returned; ' +
+        'a missing email must never block the booking — book anyway and share the link. ' +
         'For changes, call reagendar_cita(idCita, nuevoInicio); to cancel, call cancelar_cita(idCita) — always check ver_disponibilidad first. ' +
         'To review the full agenda (e.g. "¿qué tengo esta semana?"), call listar_eventos with maxResults=100 (or higher) so the built-in 5-result limit never hides events. ' +
         'Never invent availability, times, slot lists, or event lists: only offer times/events that the tools actually returned, and never promise a time without calling it.',
@@ -206,8 +214,9 @@ export function buildSystemPrompt(args: {
   }
 
   parts.push(
-    'CONFIRMATION PROTOCOL: when you finish any booking request, your WhatsApp reply must confirm: 1) the date/time booked in Google Calendar, 2) the direct Google Meet link, and 3) that the confirmation email was sent to the customer. ' +
-      'If any key data is missing (e.g. the recipient email or the exact date/time), ask for it immediately BEFORE proceeding — never guess it.',
+    'CONFIRMATION PROTOCOL: when you finish any booking request, your WhatsApp reply must confirm: 1) the date/time booked in Google Calendar, 2) the direct link (Google Meet or the calendar event URL) as returned by the tool, and 3) that the confirmation email was sent to the customer when they shared an email. ' +
+      'You must NOT ask a customer who already confirmed a date/time for "rangos de fechas", for the reason, or for the time again; book the exact time they gave, defaulting the reason to "Reunión de valoración / Consulta". ' +
+      'Only ask for data before proceeding when it is truly essential and not yet stated (e.g. no date/time at all); never guess a link — quote only what the tool returned.',
   )
 
   // The contact's current appointments, so the model can react to

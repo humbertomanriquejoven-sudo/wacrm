@@ -58,4 +58,23 @@ describe('buildSystemPrompt', () => {
     )
     expect(prompt).toContain('You are a customer-messaging assistant for a business')
   })
+
+  it('orders direct booking in the same turn once the customer gave a date', () => {
+    const prompt = buildSystemPrompt({
+      userPrompt: null,
+      mode: 'auto_reply',
+      calendarEnabled: true,
+    })
+    expect(prompt).toContain('call agendar_cita in THIS SAME TURN')
+    expect(prompt).toContain('DO NOT ask again for the date')
+    expect(prompt).toContain('never stop the flow to ask for the reason')
+    expect(prompt).toContain('confirmado: true')
+    expect(prompt).toContain('a missing email must never block the booking')
+  })
+
+  it('forbids re-asking for the date range in the confirmation protocol', () => {
+    const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' })
+    expect(prompt).toContain('must NOT ask a customer who already confirmed a date/time for "rangos de fechas"')
+    expect(prompt).toContain('"Reunión de valoración / Consulta"')
+  })
 })
