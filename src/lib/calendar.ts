@@ -49,12 +49,11 @@ const BOGOTA_OFFSET = '-05:00'
 const CALENDAR_TIMEOUT_MS = 8_000
 
 /**
- * Techo duro para la CREACIÓN del evento en agendar_cita: 6 segundos.
- * Si Google tarda o falla, agendar_cita captura el error, guarda la cita
- * en la BD igual y retorna un objeto de éxito al agente — nunca se
- * queda colgada ni bloquea el webhook.
+ * Techo duro para la CREACIÓN del evento en agendar_cita: 5 segundos.
+ * Si Google no responde dentro de los 5 segundos, agendar_cita resuelve
+ * de inmediato con la confirmación basada en la BD (never más de 5s).
  */
-const AGENDAR_TIMEOUT_MS = 6_000
+const AGENDAR_TIMEOUT_MS = 5_000
 
 export const BUSINESS_HOURS: Record<
   number,
@@ -603,8 +602,8 @@ export async function agendar_cita(
       )
 
     // Toda la llamada a la API de Google (con el reintento Meet incluido)
-    // queda bajo un techo duro de 6s. Si Google tarda o falla por red, la
-    // excepción se captura abajo: NUNCA nos quedamos colgados, la cita se
+    // queda bajo un techo duro de 5s: si Google no responde, la excepción
+    // se captura abajo: NUNCA nos quedamos colgados, la cita se
     // guarda igual en la BD y se devuelve un objeto de éxito al agente.
     const created = await withTimeout(
       (async (): Promise<{ data: import('@googleapis/calendar').calendar_v3.Schema$Event }> => {

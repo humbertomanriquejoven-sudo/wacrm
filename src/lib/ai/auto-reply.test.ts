@@ -492,18 +492,18 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     const sent = h.engineSendAiReply.mock.calls[0][0].text as string
     expect(sent).toBe(
       '¡Listo! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n\n' +
-        'Te enviamos la confirmación a tu correo. Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n' +
+        'Te enviamos los detalles a tu correo. Puedes unirte a la reunión de Google Meet desde este enlace:\n' +
         'https://meet.google.com/abc',
     )
   })
 
-  it('greets the contact by name in the deterministic booking confirmation', async () => {
-    h.loadContactContext.mockImplementation(async () => ({
-      name: 'Carlos',
-      email: 'carlos@example.com',
-      location: null,
-      citas: [],
-    }))
+  it('dispatches a local confirmation when the booking succeeded but Google timed out (no link)', async () => {
+    h.executeToolCall.mockResolvedValue(
+      'Cita agendada: 2026-09-18T14:00:00-05:00 (45 minutos), cliente: Carlos. ' +
+        '(Google Calendar no disponible; la cita quedó guardada en el CRM sin enlace.)\n\n' +
+        'JSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ' +
+        '{"confirmado":true,"exito":true,"inicio":"2026-09-18T14:00:00-05:00","duracionMin":45,"idCita":"cita-1","link":null,"fecha":"2026-09-18","hora":"14:00","estado":"confirmada"}',
+    )
     h.generateReply
       .mockResolvedValueOnce({
         text: '',
@@ -521,7 +521,9 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     await dispatchInboundToAiReply(ARGS)
 
     const sent = h.engineSendAiReply.mock.calls[0][0].text as string
-    expect(sent).toContain('¡Listo, Carlos!')
+    expect(sent).toContain('agendada con éxito para el 2026-09-18 a las 14:00')
+    expect(sent).not.toContain('meet.google.com')
+    expect(sent).not.toContain('calendar.google.com')
   })
 
   it('strips a stray fake URL from an ordinary (non-booking) reply', async () => {
@@ -610,21 +612,19 @@ describe('buildBookingConfirmationMessage — pure function', () => {
     expect(
       buildBookingConfirmationMessage(
         { confirmado: false, link: null, inicio: null, idCita: null, fecha: null, hora: null },
-        'Carlos',
       ),
     ).toBeNull()
   })
 
-  it('returns null when there is no link to share', () => {
-    expect(
-      buildBookingConfirmationMessage(
-        { confirmado: true, link: null, inicio: null, idCita: null, fecha: null, hora: null },
-        'Carlos',
-      ),
-    ).toBeNull()
+  it('confirms the local booking when there is no link (Google timeout), without inventing a URL', () => {
+    const out = buildBookingConfirmationMessage(
+      { confirmado: true, link: null, inicio: null, idCita: null, fecha: '2026-09-18', hora: '14:00' },
+    )
+    expect(out).toContain('agendada con éxito para el 2026-09-18 a las 14:00')
+    expect(out).not.toContain('http')
   })
 
-  it('builds the mandated confirmation format with name, fecha, hora and link', () => {
+  it('builds the mandated confirmation format with fecha, hora and link', () => {
     expect(
       buildBookingConfirmationMessage(
         {
@@ -635,41 +635,26 @@ describe('buildBookingConfirmationMessage — pure function', () => {
           fecha: '2026-09-18',
           hora: '14:00',
         },
-        'Carlos',
       ),
     ).toBe(
-      '¡Listo, Carlos! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n\n' +
-        'Te enviamos la confirmación a tu correo. Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n' +
+      '¡Listo! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n\n' +
+        'Te enviamos los detalles a tu correo. Puedes unirte a la reunión de Google Meet desde este enlace:\n' +
         'https://meet.google.com/real-link',
     )
   })
 
   it('falls back to inicio when fecha/hora are missing from the JSON_RESULT', () => {
-    expect(
-      buildBookingConfirmationMessage(
-        {
-          confirmado: true,
-          link: 'https://meet.google.com/real-link',
-          inicio: '2026-09-18T14:00:00-05:00',
-          idCita: 'cita-1',
-          fecha: null,
-          hora: null,
-        },
-        null,
-      ),
-    ).toContain('para el 2026-09-18 a las 14:00')
-    expect(
-      buildBookingConfirmationMessage(
-        {
-          confirmado: true,
-          link: 'https://meet.google.com/real-link',
-          inicio: '2026-09-18T14:00:00-05:00',
-          idCita: 'cita-1',
-          fecha: null,
-          hora: null,
-        },
-        null,
-      ),
-    ).toContain('¡Listo!')
+    const out = buildBookingConfirmationMessage(
+      {
+        confirmado: true,
+        link: 'https://meet.google.com/real-link',
+        inicio: '2026-09-18T14:00:00-05:00',
+        idCita: 'cita-1',
+        fecha: null,
+        hora: null,
+      },
+    )
+    expect(out).toContain('para el 2026-09-18 a las 14:00')
+    expect(out).toContain('¡Listo!')
   })
 })

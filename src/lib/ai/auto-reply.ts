@@ -35,20 +35,25 @@ export const AGENDAR_FALLBACK_MESSAGE =
  * Deterministic, customer-facing booking confirmation built from the REAL
  * agendar_cita tool result (fecha/hora/link) — it does not depend on the
  * model echoing the link back. Dispatched by the backend the instant a
- * booking succeeds, so a booked appointment ALWAYS reaches the customer
- * with its meeting link. Returns null when the booking is not confirmed
- * or has no link to share.
+ * booking succeeds, so a booked appointment ALWAYS reaches the customer.
+ *
+ * Two variants:
+ *  - confirmed + link  → the mandated format with the Google Meet link.
+ *  - confirmed + no link (Google timed out; cita guarded en la BD) → a
+ *    confirmation of the LOCAL booking without inventing any URL.
+ * Returns null when the booking was not confirmed.
  */
 export function buildBookingConfirmationMessage(
   booking: BookingToolResult,
-  contactName?: string | null,
 ): string | null {
-  if (booking.confirmado !== true || !booking.link) return null
-  const nombre = contactName?.trim()
-  const saludo = nombre ? `¡Listo, ${nombre}!` : '¡Listo!'
+  if (booking.confirmado !== true) return null
   const fecha = booking.fecha ?? (booking.inicio?.slice(0, 10) ?? '')
   const hora = booking.hora ?? (booking.inicio?.slice(11, 16) ?? '')
-  return `${saludo} Tu cita ha sido agendada con éxito para el ${fecha} a las ${hora}.\n\nTe enviamos la confirmación a tu correo. Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n${booking.link}`
+  const header = `¡Listo! Tu cita ha sido agendada con éxito para el ${fecha} a las ${hora}.`
+  if (!booking.link) {
+    return `${header}\n\nTe enviamos los detalles a tu correo. El enlace de tu reunión de Google Meet se generó con una pequeña demora y lo recibirás en la confirmación; un asesor te contactará en breve.`
+  }
+  return `${header}\n\nTe enviamos los detalles a tu correo. Puedes unirte a la reunión de Google Meet desde este enlace:\n${booking.link}`
 }
 
 /**
@@ -290,16 +295,14 @@ export async function dispatchInboundToAiReply(
       break
     }
 
-    // The instant agendar_cita REALLY succeeded with a link, the backend
-    // composes and dispatches the confirmation itself — it must never
-    // depend on the model's final echo (which can be empty or a handoff,
-    // leaving a booked cita with NO WhatsApp message). The message goes
-    // out unconditionally with the exact link the tool returned.
-    if (realBooking?.confirmado && realBooking.link) {
-      const deterministic = buildBookingConfirmationMessage(
-        realBooking,
-        contactCtx?.name,
-      )
+    // The instant agendar_cita REALLY succeeded, the backend composes and
+    // dispatches the confirmation itself — it must never depend on the
+    // model's final echo (which can be empty or a handoff, leaving a
+    // booked cita with NO WhatsApp message). Covers both cases: with link
+    // (Google Meet) and — if the 5s timeout fired — the local-only
+    // confirmation of the appointment already saved in the CRM.
+    if (realBooking?.confirmado) {
+      const deterministic = buildBookingConfirmationMessage(realBooking)
       if (deterministic) {
         finalText = deterministic
         toolFallback = null
