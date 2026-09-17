@@ -177,7 +177,23 @@ export async function dispatchInboundToAiReply(
       .maybeSingle()
     if (convErr || !conv) return
     if (conv.assigned_agent_id) return
-    if (conv.ai_autoreply_disabled) return
+
+    // Desbloqueo automático: si el chat quedó mudo por un handoff previo
+    // del flujo de agendamiento (ai_autoreply_disabled) y ningún humano lo
+    // tomó, un mensaje NUEVO del usuario (p. ej. "Hola") tiene que borrar
+    // ese estado de bloqueo y volver a ser respondido de inmediato. Nunca
+    // dejamos una conversación ignorada por un residuo de una ejecución
+    // anterior de herramientas.
+    if (conv.ai_autoreply_disabled) {
+      await db
+        .from('conversations')
+        .update({ ai_autoreply_disabled: false, ai_handoff_summary: null })
+        .eq('id', conversationId)
+      conv.ai_autoreply_disabled = false
+      console.log(
+        `[ai auto-reply] cleared stale mute on conversation ${conversationId} — new message re-enables the agent.`,
+      )
+    }
     if (
       config.autoReplyMaxPerConversation > 0 &&
       conv.ai_reply_count >= config.autoReplyMaxPerConversation
@@ -343,12 +359,23 @@ export async function dispatchInboundToAiReply(
     // Anti-hallucination guard: the final message must be grounded in a
     // REAL tool result. Fake Meet/calendar URLs are replaced with the
     // returned link; a booking claim or an intermediate "un momento…"
-    // without a real success never goes out — it becomes a silent handoff
-    // (nobody receives a false promise or a wait message with no follow-up).
+    // without a real success never goes out. A wait-only phrase ("un
+    // momento…") only skips that turn WITHOUT muting the conversation —
+    // the next message is answered normally instead of leaving the chat
+    // permanently silent.
     if (finalText && !handoff) {
+      const raw = finalText
       finalText = guardBookingReply(finalText, realBooking, {
         bookingContext: hasBookingIntent(messages),
       })
+      const isWaitOnly =
+        INTERMEDIATE_ACK_RE.test(raw) && !looksLikeBookingConfirmation(raw)
+      if (finalText === null && isWaitOnly) {
+        console.log(
+          '[ai auto-reply] dropped a wait-only reply (no handoff, no mute).',
+        )
+        return
+      }
       if (finalText === null) handoff = true
     }
 
@@ -391,7 +418,7 @@ export async function dispatchInboundToAiReply(
     }
     if (claimed !== true) return
 
-    await engineSendAiReply({
+    const enviado = await engineSendAiReply({
       accountId,
       userId: configOwnerUserId,
       conversationId,
@@ -400,6 +427,7 @@ export async function dispatchInboundToAiReply(
       aiGenerated: true,
       composeMessageId: args.composeMessageId,
     })
+    console.log('[AUTO-REPLY] Mensaje enviado con éxito a WhatsApp:', enviado)
   } catch (err) {
     console.error('[ai auto-reply] dispatch failed:', err)
   }

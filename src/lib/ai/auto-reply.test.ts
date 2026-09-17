@@ -236,14 +236,32 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
-  it('skips when auto-reply was disabled on this conversation', async () => {
+  it('clears a stale AI mute (no human agent) and replies to the new message', async () => {
     h.state.conv = {
       assigned_agent_id: null,
       ai_autoreply_disabled: true,
       ai_reply_count: 0,
     }
     await dispatchInboundToAiReply(ARGS)
+    // The stale mute from a previous run is wiped so the agent answers.
+    expect(h.state.updatePayload).toMatchObject({
+      ai_autoreply_disabled: false,
+      ai_handoff_summary: null,
+    })
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'Hello!' }),
+    )
+  })
+
+  it('still skips when a HUMAN agent is assigned to the conversation', async () => {
+    h.state.conv = {
+      assigned_agent_id: 'agent-9',
+      ai_autoreply_disabled: true,
+      ai_reply_count: 0,
+    }
+    await dispatchInboundToAiReply(ARGS)
     expect(h.engineSendText).not.toHaveBeenCalled()
+    expect(h.engineSendAiReply).not.toHaveBeenCalled()
   })
 
   it('skips when the per-conversation cap is reached (max > 0)', async () => {
@@ -432,9 +450,9 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     expect(h.state.updatePayload).toMatchObject({ ai_autoreply_disabled: true })
   })
 
-  it('never sends an intermediate "un momento…" wait message — silent handoff', async () => {
+  it('never sends an intermediate "un momento…" wait message and does NOT mute the chat', async () => {
     h.buildConversationContext.mockResolvedValue([
-      { role: 'user', content: 'Quiero agendar una cita, Humberto, por favor' },
+      { role: 'user', content: 'Hola, ¿cómo estás?' },
     ])
     h.generateReply.mockResolvedValue({
       text: 'Un momento, por favor: estoy registrando tu cita.',
@@ -443,8 +461,12 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
 
     await dispatchInboundToAiReply(ARGS)
 
+    // The wait phrase is dropped for this turn, but the conversation stays
+    // enabled so the NEXT message is answered without a stale mute.
     expect(h.engineSendAiReply).not.toHaveBeenCalled()
-    expect(h.state.updatePayload).toMatchObject({ ai_autoreply_disabled: true })
+    expect(h.state.updatePayload).not.toMatchObject({
+      ai_autoreply_disabled: true,
+    })
   })
 
   it('sends the mandated confirmation with the real link even when the model omits the URL', async () => {
