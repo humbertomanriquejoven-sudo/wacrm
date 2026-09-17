@@ -56,6 +56,31 @@ export function buildBookingConfirmationMessage(
 }
 
 /**
+ * Notificación determinística cuando la cita se registró en el CRM pero la
+ * creación del evento en Google Calendar falló (timeout o error de API),
+ * de modo que NO existe un enlace real de Meet. Se envía al cliente en
+ * lugar de simular un éxito con un enlace inexistente, para que la
+ * conversación nunca quede en silencio. Devuelve null si la cita no
+ * quedó confirmada.
+ */
+export function buildBookingCalendarErrorMessage(
+  booking: BookingToolResult,
+  contactName?: string | null
+): string | null {
+  if (booking.confirmado !== true || booking.calendarSynced !== false) {
+    return null;
+  }
+  const nombre = contactName?.trim() || 'Humberto';
+  const fecha = booking.fecha ?? booking.inicio?.slice(0, 10) ?? '';
+  const hora = booking.hora ?? booking.inicio?.slice(11, 16) ?? '';
+  const cuando = fecha && hora ? ` para el ${fecha} a las ${hora}` : '';
+  return (
+    `¡Gracias, ${nombre}! Registramos tu cita${cuando}, pero en este momento no pudimos crear el evento en Google Calendar ni generar el enlace de Google Meet. ` +
+    'Un asesor te enviará el enlace de la videollamada en breve.'
+  );
+}
+
+/**
  * Deterministic reply for "mándame el link": the customer asked for the
  * Meet link of an ALREADY-booked cita. Built from the meet_link stored in
  * the `citas` table — never invented by the model.
@@ -383,13 +408,24 @@ export async function dispatchInboundToAiReply(
       break;
     }
 
-    // The instant agendar_cita REALLY succeeded, the backend composes and
-    // dispatches the confirmation itself — it must never depend on the
-    // model's final echo (which can be empty or a handoff, leaving a
-    // booked cita with NO WhatsApp message). Covers both cases: with link
-    // (Google Meet) and — if the 5s timeout fired — the local-only
-    // confirmation of the appointment already saved in the CRM.
-    if (realBooking?.confirmado) {
+    // La creación del evento en Google Calendar falló (timeout/error de
+    // API) pero la cita sí quedó registrada: se notifica al cliente con un
+    // mensaje determinístico en lugar de simular un enlace de Meet real.
+    const calendarFailed =
+      realBooking?.confirmado === true && realBooking.calendarSynced === false;
+
+    if (calendarFailed) {
+      finalText = buildBookingCalendarErrorMessage(
+        realBooking as BookingToolResult,
+        contactCtx?.name
+      );
+      toolFallback = null;
+    } else if (realBooking?.confirmado) {
+      // The instant agendar_cita REALLY succeeded, the backend composes and
+      // dispatches the confirmation itself — it must never depend on the
+      // model's final echo (which can be empty or a handoff, leaving a
+      // booked cita with NO WhatsApp message). Covers the case where Google
+      // generated the Meet link or the fallback link.
       const deterministic = buildBookingConfirmationMessage(
         realBooking,
         contactCtx?.name
@@ -471,7 +507,7 @@ export async function dispatchInboundToAiReply(
       // if the model leaks it into the final bubble.
       finalText = guardBookingReply(
         stripInternalReasoning(finalText),
-        realBooking,
+        calendarFailed ? null : realBooking,
         {
           bookingContext: hasBookingIntent(messages),
         }

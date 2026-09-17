@@ -1021,6 +1021,7 @@ describe('agendar_cita — enlace del evento', () => {
         'https://meet.google.com/new'
       );
       expect(out).toContain('"exito":true');
+      expect(out).toContain('"calendarSynced":false');
       expect(out).toContain('"link":"https://meet.google.com/new"');
     } finally {
       vi.useRealTimers();

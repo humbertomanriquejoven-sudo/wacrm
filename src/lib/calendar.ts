@@ -944,6 +944,11 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
     hora,
     link: meetUrl ?? null,
     confirmado: true,
+    // false cuando la creación del evento en Google Calendar falló (timeout
+    // o error de API) y la cita solo quedó guardada en el CRM. El motor de
+    // auto-respuesta lo usa para NOTIFICAR al cliente en vez de simular un
+    // enlace que Google nunca generó.
+    calendarSynced,
     inicio: bogotaIso(start),
     duracionMin: APPOINTMENT_DURATION_MIN,
     idCita,

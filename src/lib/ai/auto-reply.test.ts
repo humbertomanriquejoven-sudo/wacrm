@@ -65,6 +65,7 @@ vi.mock('./tools', () => ({
         idCita: typeof parsed.idCita === 'string' ? parsed.idCita : null,
         fecha: typeof parsed.fecha === 'string' ? parsed.fecha : null,
         hora: typeof parsed.hora === 'string' ? parsed.hora : null,
+        calendarSynced: parsed.calendarSynced !== false,
       };
     } catch {
       return null;
@@ -690,6 +691,41 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
       'Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\nhttps://meet.google.com/new'
     );
     expect(sent).not.toContain('calendar.google.com');
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ single: true })
+    );
+  });
+
+  it('notifica al cliente cuando Google Calendar falla al crear el evento (calendarSynced=false)', async () => {
+    h.executeToolCall.mockResolvedValue(
+      'Cita agendada: 2026-09-18T14:00:00-05:00 (45 minutos), cliente: Carlos. ' +
+        '(Google Calendar no disponible; la cita quedó guardada en el CRM con enlace provisional de Meet. Reunión Meet: https://meet.google.com/new)\n\n' +
+        'JSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ' +
+        '{"confirmado":true,"exito":true,"calendarSynced":false,"inicio":"2026-09-18T14:00:00-05:00","duracionMin":45,"idCita":"cita-1","link":null,"fecha":"2026-09-18","hora":"14:00","estado":"confirmada"}'
+    );
+    h.generateReply
+      .mockResolvedValueOnce({
+        text: '',
+        handoff: false,
+        toolCalls: [
+          {
+            id: 'call-1',
+            name: 'agendar_cita',
+            arguments: {
+              inicio: '2026-09-18T14:00:00-05:00',
+              nombre: 'Carlos',
+            },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ text: '', handoff: false });
+
+    await dispatchInboundToAiReply(ARGS);
+
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string;
+    expect(sent).toContain('no pudimos crear el evento en Google Calendar');
+    expect(sent).toContain('2026-09-18');
+    expect(sent).not.toContain('meet.google.com');
     expect(h.engineSendAiReply).toHaveBeenCalledWith(
       expect.objectContaining({ single: true })
     );

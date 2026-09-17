@@ -211,6 +211,17 @@ export function buildSystemPrompt(args: {
         'el sistema lo extrae automáticamente de su última cita confirmada y lo adjunta a tu respuesta. Limítate a confirmar amablemente.'
     );
     parts.push(
+      'AGENDAMIENTO INMEDIATO AL RECIBIR EL CORREO: cuando el cliente entregue su correo electrónico y ya tengas la fecha y hora seleccionadas ' +
+        '(o cuando el correo sea el ÚLTIMO dato que faltaba entre nombre, fecha, hora y correo), invoca INMEDIATAMENTE la función `agendar_cita` en ESE MISMO turno, sin pedir una confirmación adicional. ' +
+        'Cuando el usuario te entregue su correo electrónico y tengas la fecha y hora seleccionadas, invoca inmediatamente la función para agendar en Google Calendar. ' +
+        'En cuanto la herramienta responda, contesta EN ESE MISMO turno confirmando la cita con la fecha, la hora y el enlace real de Google Meet; no pidas más confirmaciones si ya se tienen los datos completos. ' +
+        "En tu respuesta DEBES incluir siempre el enlace de Google Meet que genera la función en el formato: 'Aquí tienes tu enlace para unirte a la videollamada: [LINK]'."
+    );
+    parts.push(
+      'COMPENSACIÓN ANTE FALLOS DE GOOGLE CALENDAR: si la función de agendamiento falla o Google Calendar no puede crear el evento por cualquier motivo, NUNCA te quedes en silencio ni simules un enlace: ' +
+        'informa al cliente en WhatsApp, en español y en UNA sola burbuja, que su cita quedó registrada y que un asesor le enviará el enlace de Google Meet en breve.'
+    );
+    parts.push(
       'REGLA OBLIGATORIA DE CONFIRMACIÓN DE CITA: ' +
         'Cada vez que confirmes un agendamiento por WhatsApp, DEBES incluir OBLIGATORIAMENTE la URL de Google Meet que te devuelve la herramienta `agendar_cita`. ' +
         'La herramienta `agendar_cita` comienza su resultado con la línea "ÉXITO: Cita creada para {nombre} el {fecha} a las {hora}. Enlace de Google Meet OBLIGATORIO: {url}" — ' +

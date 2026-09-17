@@ -94,6 +94,34 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('un correo faltante nunca debe bloquear la cita');
   });
 
+  it('forces immediate booking when the customer shares their email', () => {
+    const prompt = buildSystemPrompt({
+      userPrompt: null,
+      mode: 'auto_reply',
+      calendarEnabled: true,
+    });
+    expect(prompt).toContain('AGENDAMIENTO INMEDIATO AL RECIBIR EL CORREO');
+    expect(prompt).toContain(
+      'Cuando el usuario te entregue su correo electrónico y tengas la fecha y hora seleccionadas, invoca inmediatamente la función para agendar en Google Calendar.'
+    );
+    expect(prompt).toContain(
+      "Aquí tienes tu enlace para unirte a la videollamada: [LINK]"
+    );
+  });
+
+  it('instructs a WhatsApp notification when Google Calendar creation fails', () => {
+    const prompt = buildSystemPrompt({
+      userPrompt: null,
+      mode: 'auto_reply',
+      calendarEnabled: true,
+    });
+    expect(prompt).toContain('COMPENSACIÓN ANTE FALLOS DE GOOGLE CALENDAR');
+    expect(prompt).toContain('NUNCA te quedes en silencio');
+    expect(prompt).toContain(
+      'un asesor le enviará el enlace de Google Meet en breve'
+    );
+  });
+
   it('forbids re-asking for the date range in the confirmation protocol', () => {
     const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' });
     expect(prompt).toContain(

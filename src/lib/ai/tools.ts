@@ -255,6 +255,12 @@ export interface BookingToolResult {
   /** Fecha (YYYY-MM-DD) y hora (HH:MM) locales devueltas por agendar_cita. */
   fecha: string | null
   hora: string | null
+  /**
+   * false cuando Google Calendar no pudo crear el evento (timeout o error
+   * de API) y la cita solo quedó persistida en el CRM. Ausente o true
+   * significa que el evento quedó sincronizado.
+   */
+  calendarSynced?: boolean
 }
 
 /**
@@ -280,6 +286,9 @@ export function extractBookingResult(output: string): BookingToolResult | null {
       idCita: typeof parsed.idCita === 'string' ? parsed.idCita : null,
       fecha: typeof parsed.fecha === 'string' ? parsed.fecha : null,
       hora: typeof parsed.hora === 'string' ? parsed.hora : null,
+      // Ausente => se asume sincronizado (compatibilidad con trailers
+      // previos al flag).
+      calendarSynced: parsed.calendarSynced !== false,
     }
   } catch {
     return null
