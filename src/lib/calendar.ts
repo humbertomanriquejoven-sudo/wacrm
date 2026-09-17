@@ -477,6 +477,34 @@ export interface AgendarCitaArgs {
   correoCliente?: string
 }
 
+/**
+ * Rechaza una promesa pasados `ms` milisegundos si no resolvió antes.
+ * Frente a una API de Google lenta o colgada, agendar_cita no se queda
+ * esperando: falla rápido (máx 8s) y sigue con la persistencia local de
+ * la cita y el retorno de éxito al agente.
+ */
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`[calendar] ${label} timed out after ${ms}ms`))
+    }, ms)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
+}
+
 /** agendar_cita — create a 45-minute event and persist the CRM row. */
 export async function agendar_cita(
   args: AgendarCitaArgs,
@@ -542,12 +570,9 @@ export async function agendar_cita(
       ...(attendees ? { attendees } : {}),
     }
 
-    // Intentar crear un Google Meet (hangoutsMeet). Google lo rechaza (400
-    // "Invalid conference type value") cuando el emisor es una service account
-    // y el calendario pertenece a una cuenta personal (gmail.com, no
-    // Workspace): en ese caso reintentamos SIN conferencia para que el evento
-    // igual quede creado en el calendario (meetUrl queda null). Con OAuth2
-    // (GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN) el Meet se crea correctamente.
+    // Crear un Google Meet (hangoutsMeet) con reintento SIN conferencia si
+    // Google lo rechaza (400 "Invalid conference type value": service account
+    // sobre calendario gmail.com personal). Con OAuth2 el Meet se crea bien.
     const tryInsert = async (withConference: boolean): Promise<{ data: import('@googleapis/calendar').calendar_v3.Schema$Event }> =>
       cal.events.insert(
         withConference
@@ -569,25 +594,28 @@ export async function agendar_cita(
         { timeout: CALENDAR_TIMEOUT_MS },
       )
 
-    let created: { data: import('@googleapis/calendar').calendar_v3.Schema$Event } | null = null
-    try {
-      created = await tryInsert(true)
-    } catch (firstErr) {
-      const isConferenceError = /invalid conference|conference type value|conference data/i.test(
-        String((firstErr as Error)?.message ?? ''),
-      )
-      if (isConferenceError) {
-        // service account + cuenta personal => Meet no soportado, crear plano.
+    // Toda la llamada a la API de Google (con el reintento Meet incluido)
+    // queda bajo un techo duro de 8s. Si Google tarda o falla por red, la
+    // excepción se captura abajo: NUNCA nos quedamos colgados, la cita se
+    // guarda igual en la BD y se devuelve un objeto de éxito al agente.
+    const created = await withTimeout(
+      (async (): Promise<{ data: import('@googleapis/calendar').calendar_v3.Schema$Event }> => {
         try {
-          created = await tryInsert(false)
-        } catch {
-          created = null
+          return await tryInsert(true)
+        } catch (firstErr) {
+          const isConferenceError = /invalid conference|conference type value|conference data/i.test(
+            String((firstErr as Error)?.message ?? ''),
+          )
+          if (isConferenceError) {
+            // service account + cuenta personal => Meet no soportado, crear plano.
+            return tryInsert(false)
+          }
+          throw firstErr
         }
-      } else {
-        throw firstErr
-      }
-    }
-    if (!created) throw new Error('events.insert failed (Meet y reintento plano)')
+      })(),
+      CALENDAR_TIMEOUT_MS,
+      'agendar events.insert',
+    )
 
     // El evento creado puede tener un hangoutLink (Meet, con OAuth2) o, si
     // la cuenta no puede generar conferencias, solo un htmlLink (la URL
@@ -600,7 +628,7 @@ export async function agendar_cita(
     linkEsMeet = hangout !== null
     event = { id: created.data.id }
   } catch (err) {
-    console.warn('[calendar] events.insert failed:', err)
+    console.warn('[calendar] events.insert failed (timeout o error de API):', err)
     event = { id: 'local-' + randomUUID() }
     meetUrl = null
     calendarSynced = false
@@ -660,13 +688,31 @@ export async function agendar_cita(
   // Respuesta estructurada para el agente: marca de éxito inequívoca y el
   // enlace exacto (hangoutLink > htmlLink) que debe citar al cliente.
   // Es un ámbito de la tool, no del mensaje al cliente.
+  const fecha = new Intl.DateTimeFormat('en-CA', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    timeZone: CAL_TIMEZONE,
+  }).format(start)
+  const hora = new Intl.DateTimeFormat('es-CO', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+    timeZone: CAL_TIMEZONE,
+  })
+    .format(start)
+    .replace(/[^\d:]/g, '')
+
   const structured: Record<string, unknown> = {
-    confirmado: true,
     exito: true,
+    mensaje: 'Cita agendada correctamente',
+    fecha,
+    hora,
+    link: meetUrl ?? null,
+    confirmado: true,
     inicio: bogotaIso(start),
     duracionMin: APPOINTMENT_DURATION_MIN,
     idCita,
-    link: meetUrl ?? null,
     estado: 'confirmada',
   }
 

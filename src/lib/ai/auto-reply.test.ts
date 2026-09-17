@@ -100,7 +100,6 @@ vi.mock('./admin-client', () => ({
 import {
   dispatchInboundToAiReply,
   AGENDAR_FALLBACK_MESSAGE,
-  AGENDAR_RETRY_MESSAGE,
   guardBookingReply,
 } from './auto-reply'
 
@@ -415,7 +414,10 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     expect(sent).not.toContain('xxx-yyyy-zzz')
   })
 
-  it('never sends a booking confirmation that has no real tool success', async () => {
+  it('never sends a booking confirmation that has no real tool success — silent handoff', async () => {
+    h.buildConversationContext.mockResolvedValue([
+      { role: 'user', content: 'Hola, quiero agendar una cita para mañana a las 10 am' },
+    ])
     h.generateReply.mockResolvedValue({
       text: '¡Listo! Agendada tu cita para mañana a las 10:00 AM. Meet: https://meet.google.com/xxx-yyyy-zzz',
       handoff: false,
@@ -425,9 +427,23 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
 
     expect(h.generateReply).toHaveBeenCalledTimes(1)
     expect(h.executeToolCall).not.toHaveBeenCalled()
-    expect(h.engineSendAiReply).toHaveBeenCalledWith(
-      expect.objectContaining({ text: AGENDAR_RETRY_MESSAGE }),
-    )
+    expect(h.engineSendAiReply).not.toHaveBeenCalled()
+    expect(h.state.updatePayload).toMatchObject({ ai_autoreply_disabled: true })
+  })
+
+  it('never sends an intermediate "un momento…" wait message — silent handoff', async () => {
+    h.buildConversationContext.mockResolvedValue([
+      { role: 'user', content: 'Quiero agendar una cita, Humberto, por favor' },
+    ])
+    h.generateReply.mockResolvedValue({
+      text: 'Un momento, por favor: estoy registrando tu cita.',
+      handoff: false,
+    })
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.engineSendAiReply).not.toHaveBeenCalled()
+    expect(h.state.updatePayload).toMatchObject({ ai_autoreply_disabled: true })
   })
 
   it('appends the real link when the model confirms the booking but omits the URL', async () => {
@@ -494,12 +510,30 @@ describe('guardBookingReply — pure function', () => {
     )
   })
 
-  it('replaces a booking claim without real success with the retry message', () => {
+  it('replaces a booking claim without real success with null (handoff) under booking context', () => {
+    const out = guardBookingReply(
+      '¡Listo! Agendada tu cita. Meet: https://meet.google.com/xxx-yyyy-zzz',
+      null,
+      { bookingContext: true },
+    )
+    expect(out).toBeNull()
+  })
+
+  it('returns null for an intermediate wait message under booking context', () => {
+    const out = guardBookingReply(
+      'Un momento, por favor: estoy registrando tu cita.',
+      null,
+      { bookingContext: true },
+    )
+    expect(out).toBeNull()
+  })
+
+  it('keeps a non-booking-context claim but still strips its fake URL', () => {
     const out = guardBookingReply(
       '¡Listo! Agendada tu cita. Meet: https://meet.google.com/xxx-yyyy-zzz',
       null,
     )
-    expect(out).toBe(AGENDAR_RETRY_MESSAGE)
+    expect(out).toBe('¡Listo! Agendada tu cita. Meet: ')
   })
 
   it('strips fake URLs but keeps the text when there is no booking claim', () => {

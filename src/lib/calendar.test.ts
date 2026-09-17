@@ -665,6 +665,51 @@ describe('agendar_cita — enlace del evento', () => {
     expect(out).toContain('"link":"https://meet.google.com/json-meet"')
   })
 
+  it('returns the tool-shaped JSON (exito/mensaje/fecha/hora/link) resolved', async () => {
+    h.insert.mockResolvedValue({
+      data: { id: 'evt-shape', hangoutLink: 'https://meet.google.com/shape' },
+    })
+    const supabase = db()
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'Ana',
+    })
+    expect(out).toContain('"exito":true')
+    expect(out).toContain('"mensaje":"Cita agendada correctamente"')
+    expect(out).toContain('"fecha":"2026-09-14"')
+    expect(out).toContain('"hora":"10:00"')
+    expect(out).toContain('"link":"https://meet.google.com/shape"')
+  })
+
+  it('does not hang when Google never answers — 8s timeout, saves locally and returns success', async () => {
+    vi.useFakeTimers()
+    try {
+      h.insert.mockReturnValue(new Promise(() => {}))
+      const supabase = db()
+      const p = agendar_cita({
+        db: supabase as never,
+        accountId: 'acct-1',
+        contactoId: 'contact-1',
+        inicio: '2026-09-14T10:00:00-05:00',
+        nombre: 'Ana',
+      })
+      await vi.advanceTimersByTimeAsync(8000)
+      const out = await p
+      expect(h.insert).toHaveBeenCalledTimes(1)
+      expect(out).toContain('Cita agendada')
+      expect(out).toContain('Google Calendar no disponible')
+      const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+      expect((insert!.row as { meet_link: string | null }).meet_link).toBeNull()
+      expect(out).toContain('"exito":true')
+      expect(out).toContain('"link":null')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('defaults the reason to "Consulta / Valoración" when omitted', async () => {
     h.insert.mockResolvedValue({ data: { id: 'evt-def' } })
     const supabase = db()
