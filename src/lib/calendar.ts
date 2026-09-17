@@ -845,31 +845,44 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
     calendarSynced = false;
   }
 
-  const { data: insertedRow, error } = await db
-    .from('citas')
-    .insert({
-      account_id: accountId,
-      contact_id: contactoId,
-      google_event_id: event.id ?? '',
-      meet_link: meetUrl,
-      summary: title,
-      description: 'Reunión agendada automáticamente por el agente IA del CRM.',
-      attendees: eventAttendees,
-      fecha_inicio: start.toISOString(),
-      fecha_fin: new Date(
-        start.getTime() + APPOINTMENT_DURATION_MIN * 60_000
-      ).toISOString(),
-      estado: 'confirmada',
-      motivo: motivoFinal,
-    })
-    .select('id')
-    .single();
-
-  if (error) {
-    console.error('[calendar] citas insert failed:', error);
-    return `Error: la cita se creó en Google Calendar pero no se pudo guardar en el CRM (${error.message}).`;
+  // Persistencia en el CRM. La cita ya quedó confirmada (en Google
+  // Calendar o degradada a local). Un fallo de la BD NUNCA debe detener
+  // la respuesta del bot ni arruinar la confirmación: se intenta guardar,
+  // se registra el error y el flujo continúa con la confirmación completa
+  // (fecha, hora, enlace real). El JSON_RESULT de éxito se emite igual.
+  let idCita: string | null = null;
+  let crmSaved = true;
+  try {
+    const { data: insertedRow, error } = await db
+      .from('citas')
+      .insert({
+        account_id: accountId,
+        contact_id: contactoId,
+        google_event_id: event.id ?? '',
+        meet_link: meetUrl,
+        summary: title,
+        description:
+          'Reunión agendada automáticamente por el agente IA del CRM.',
+        attendees: eventAttendees,
+        fecha_inicio: start.toISOString(),
+        fecha_fin: new Date(
+          start.getTime() + APPOINTMENT_DURATION_MIN * 60_000
+        ).toISOString(),
+        estado: 'confirmada',
+        motivo: motivoFinal,
+      })
+      .select('id')
+      .single();
+    if (error) {
+      console.error('[calendar] citas insert failed:', error);
+      crmSaved = false;
+    } else {
+      idCita = (insertedRow as { id?: string } | null)?.id ?? null;
+    }
+  } catch (err) {
+    console.error('[calendar] citas insert threw:', err);
+    crmSaved = false;
   }
-  const idCita = (insertedRow as { id?: string } | null)?.id ?? null;
 
   // Confirmation email (Gmail API) — automatic and best-effort. A mail
   // failure must not undo an already-booked calendar event; we only warn.
@@ -899,6 +912,9 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
     (calendarSynced
       ? `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}.${enlaceMsg}`
       : `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}. (Google Calendar no disponible; la cita quedó guardada en el CRM con enlace provisional de Meet.${enlaceMsg})`) +
+    (crmSaved
+      ? ''
+      : ' (El CRM no pudo guardar la cita; quedó confirmada solo en Google Calendar.)') +
     (emailSent ? ` Correo de confirmación enviado a ${clientEmail}.` : '');
 
   // Respuesta estructurada para el agente: marca de éxito inequívoca y el

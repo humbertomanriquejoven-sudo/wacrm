@@ -1,26 +1,27 @@
-import { supabaseAdmin } from './admin-client'
-import { loadAiConfig } from './config'
-import { buildConversationContext } from './context'
-import { retrieveKnowledge } from './knowledge'
-import { generateReply } from './generate'
-import { buildSystemPrompt } from './defaults'
-import { logAiUsage } from './usage'
-import { latestUserMessage } from './query'
+import { supabaseAdmin } from './admin-client';
+import { loadAiConfig } from './config';
+import { buildConversationContext } from './context';
+import { retrieveKnowledge } from './knowledge';
+import { generateReply } from './generate';
+import { buildSystemPrompt } from './defaults';
+import { logAiUsage } from './usage';
+import { latestUserMessage } from './query';
 import {
   AI_TOOLS,
   executeToolCall,
   extractBookingResult,
   loadContactContext,
   type BookingToolResult,
-} from './tools'
-import { calendarConfigured, MEET_FALLBACK_LINK } from '@/lib/calendar'
-import { gmailConfigured } from '@/lib/gmail'
-import { engineSendAiReply } from '@/lib/flows/meta-send'
-import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit'
-import type { ChatMessage } from './types'
+} from './tools';
+import { calendarConfigured, MEET_FALLBACK_LINK } from '@/lib/calendar';
+import { gmailConfigured } from '@/lib/gmail';
+import { engineSendAiReply } from '@/lib/flows/meta-send';
+import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import type { ChatMessage } from './types';
 
 /** Maximum tool-call rounds per inbound to avoid infinite loops. */
-const MAX_TOOL_ROUNDS = 3
+const MAX_TOOL_ROUNDS = 3;
 
 /**
  * Customer-facing fallback when a scheduling tool ran but we could not
@@ -28,7 +29,7 @@ const MAX_TOOL_ROUNDS = 3
  * out of rounds). Sent instead of leaving the customer in silence.
  */
 export const AGENDAR_FALLBACK_MESSAGE =
-  'Tu cita ha sido procesada, pero tuvimos un inconveniente generando el enlace de Google Meet. Un asesor te contactará en breve.'
+  'Tu cita ha sido procesada, pero tuvimos un inconveniente generando el enlace de Google Meet. Un asesor te contactará en breve.';
 
 /**
  * Deterministic, customer-facing booking confirmation built from the REAL
@@ -43,14 +44,94 @@ export const AGENDAR_FALLBACK_MESSAGE =
  */
 export function buildBookingConfirmationMessage(
   booking: BookingToolResult,
-  contactName?: string | null,
+  contactName?: string | null
 ): string | null {
-  if (booking.confirmado !== true) return null
-  const nombre = contactName?.trim() || 'Humberto'
-  const fecha = booking.fecha ?? (booking.inicio?.slice(0, 10) ?? '')
-  const hora = booking.hora ?? (booking.inicio?.slice(11, 16) ?? '')
-  const link = booking.link || MEET_FALLBACK_LINK
-  return `¡Listo, ${nombre}! Tu cita ha sido agendada con éxito para el ${fecha} a las ${hora}.\n\nPuedes unirte a la videollamada de Google Meet directamente desde este enlace:\n${link}`
+  if (booking.confirmado !== true) return null;
+  const nombre = contactName?.trim() || 'Humberto';
+  const fecha = booking.fecha ?? booking.inicio?.slice(0, 10) ?? '';
+  const hora = booking.hora ?? booking.inicio?.slice(11, 16) ?? '';
+  const link = booking.link || MEET_FALLBACK_LINK;
+  return `¡Listo, ${nombre}! Tu cita ha sido agendada con éxito para el ${fecha} a las ${hora}.\n\nPuedes unirte a la videollamada de Google Meet directamente desde este enlace:\n${link}`;
+}
+
+/**
+ * Deterministic reply for "mándame el link": the customer asked for the
+ * Meet link of an ALREADY-booked cita. Built from the meet_link stored in
+ * the `citas` table — never invented by the model.
+ */
+export function buildMeetLinkResendMessage(
+  link: string,
+  citaInfo?: { fecha: string | null; hora: string | null } | null
+): string {
+  const base = `Aquí tienes el enlace de tu reunión de Google Meet:\n${link}`;
+  const fecha = citaInfo?.fecha || '';
+  const hora = citaInfo?.hora || '';
+  return fecha && hora
+    ? `${base}\n\nCorresponde a tu cita del ${fecha} a las ${hora}.`
+    : base;
+}
+
+/** Phrases where the customer is explicitly asking for their link. */
+const RESEND_LINK_RE =
+  /(?:m[aá]ndame|env[ií]a(?:me)?|p[aá]same|d[aá]me|comparte(?:me)?|r[eé]pite(?:me)?|quiero|necesito)\s+(?:el\s+|mi\s+|nuevamente\s+|otra\s+vez\s+|de\s+nuevo\s+)?(?:enlace|link|url)\b|(?:enlace|link|url)\s+(?:de|del)\s+(?:la\s+|mi\s+|tu\s+)?(?:cita|reuni[oó]n|meet|google\s*meet)\b|no\s+(?:me\s+)?(?:lleg[oó]|recib[ií]|veo)\s+(?:el\s+|mi\s+)?(?:enlace|link|url)\b/i;
+
+/** True when the user's latest message asks to be sent their link. */
+function wantsMeetLink(message: string | null | undefined): boolean {
+  return typeof message === 'string' && RESEND_LINK_RE.test(message);
+}
+
+/** Latest confirmed cita of the contact that still has a usable link. */
+interface StoredCitaConLink {
+  id: string;
+  fecha_inicio: string;
+  meet_link: string;
+}
+
+async function latestCitaConLink(
+  db: SupabaseClient,
+  contactId: string
+): Promise<StoredCitaConLink | null> {
+  try {
+    const { data, error } = await db
+      .from('citas')
+      .select('id, fecha_inicio, meet_link')
+      .eq('contact_id', contactId)
+      .eq('estado', 'confirmada')
+      .not('meet_link', 'is', null)
+      .order('fecha_inicio', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error || !data || typeof data.meet_link !== 'string') return null;
+    return {
+      id: data.id as string,
+      fecha_inicio: data.fecha_inicio as string,
+      meet_link: data.meet_link,
+    };
+  } catch (err) {
+    console.error('[ai auto-reply] latest cita link lookup failed:', err);
+    return null;
+  }
+}
+
+/** Bogota-local YYYY-MM-DD / HH:MM of an ISO instant (tool numeric style). */
+function fechaHoraBogota(inicioIso: string): { fecha: string; hora: string } {
+  const start = new Date(inicioIso);
+  if (Number.isNaN(start.getTime())) return { fecha: '', hora: '' };
+  const fecha = new Intl.DateTimeFormat('en-CA', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    timeZone: 'America/Bogota',
+  }).format(start);
+  const hora = new Intl.DateTimeFormat('es-CO', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+    timeZone: 'America/Bogota',
+  })
+    .format(start)
+    .replace(/[^\d:]/g, '');
+  return { fecha, hora };
 }
 
 /**
@@ -58,40 +139,39 @@ export function buildBookingConfirmationMessage(
  * output may contain. Any occurrence generated by the model is fake.
  */
 const FAKE_LINK_SRC =
-  'https?:\\/\\/(?:meet\\.google\\.com\\/[\\w-]+|calendar\\.google\\.com\\/event[^\\s"\\)]*)'
-const FAKE_LINK_RE = new RegExp(FAKE_LINK_SRC, 'gi')
-const FAKE_LINK_DETECT = new RegExp(FAKE_LINK_SRC, 'i')
+  'https?:\\/\\/(?:meet\\.google\\.com\\/[\\w-]+|calendar\\.google\\.com\\/event[^\\s"\\)]*)';
+const FAKE_LINK_RE = new RegExp(FAKE_LINK_SRC, 'gi');
+const FAKE_LINK_DETECT = new RegExp(FAKE_LINK_SRC, 'i');
 
 /** Phrases the model uses for a "wait, I'm on it" message WHILE NO tool
  *  has actually run. Under the no-repetitive-intermediate rule these are
  *  not acceptable as the final WhatsApp message for a booking request. */
 const INTERMEDIATE_ACK_RE =
-  /un momento|en un momento|un instante|enseguida|estoy registrando|estoy agendando|estoy confirmando|estoy revisando|estoy verificando|d[eé]jame (?:revisar|verificar|ver|consultar|agendar)|ya te (?:confirmo|aviso|digo)|ya mismo|por favor espera|espera un moment|perm[ií]teme|un segundo/i
+  /un momento|en un momento|un instante|enseguida|estoy registrando|estoy agendando|estoy confirmando|estoy revisando|estoy verificando|d[eé]jame (?:revisar|verificar|ver|consultar|agendar)|ya te (?:confirmo|aviso|digo)|ya mismo|por favor espera|espera un moment|perm[ií]teme|un segundo/i;
 
 /** Phrases that PROMISE a Meet/meeting link. A final WhatsApp message
  *  containing one of these but no REAL link (from the tool result) would
  *  go out as a dangling "aquí está el enlace:" — never send that. */
 const LINK_PROMISE_RE =
-  /este es el enlace|aqu[ií] tienes el enlace|a trav[eé]s de este enlace|para que te conectes|para acceder a (?:la|tu) (?:videollamada|reuni[oó]n|llamada)|[uú]nete a (?:la|tu) (?:videollamada|reuni[oó]n|llamada)|(?:el|este) enlace de (?:Google )?Meet\s*:/i
+  /este es el enlace|aqu[ií] tienes el enlace|a trav[eé]s de este enlace|para que te conectes|para acceder a (?:la|tu) (?:videollamada|reuni[oó]n|llamada)|[uú]nete a (?:la|tu) (?:videollamada|reuni[oó]n|llamada)|(?:el|este) enlace de (?:Google )?Meet\s*:/i;
 
 /** Booking signals in the conversation: an ack/claim is only intercepted
  *  when the customer is actually trying to schedule. */
 const BOOKING_INTENT_RE =
-  /\bcita\b|agendar|reagendar|reuni[oó]n|horario|disponible|disponibilidad|a qu[eé] hora|qu[eé] horario|consult(?:a|ar|aci[oó]n)|valoraci[oó]n|ma[nñ]ana a las|hoy a las|semana que viene/i
+  /\bcita\b|agendar|reagendar|reuni[oó]n|horario|disponible|disponibilidad|a qu[eé] hora|qu[eé] horario|consult(?:a|ar|aci[oó]n)|valoraci[oó]n|ma[nñ]ana a las|hoy a las|semana que viene/i;
 
 function hasBookingIntent(messages: ChatMessage[]): boolean {
   return messages.some(
-    (m) =>
-      typeof m.content === 'string' && BOOKING_INTENT_RE.test(m.content),
-  )
+    (m) => typeof m.content === 'string' && BOOKING_INTENT_RE.test(m.content)
+  );
 }
 
 function looksLikeBookingConfirmation(text: string): boolean {
-  if (!/\bcita\b/i.test(text)) return false
-  if (FAKE_LINK_DETECT.test(text)) return true
+  if (!/\bcita\b/i.test(text)) return false;
+  if (FAKE_LINK_DETECT.test(text)) return true;
   return /agend(?:ad[oa]|é|amos)|confirm(?:ad[oa]|ada)|qued(?:ó|o)\s+/i.test(
-    text,
-  )
+    text
+  );
 }
 
 /**
@@ -110,41 +190,41 @@ function looksLikeBookingConfirmation(text: string): boolean {
 export function guardBookingReply(
   text: string,
   booking: BookingToolResult | null,
-  opts: { bookingContext?: boolean } = {},
+  opts: { bookingContext?: boolean } = {}
 ): string | null {
-  if (!text) return text
+  if (!text) return text;
 
-  const confirmed = booking?.confirmado === true
+  const confirmed = booking?.confirmado === true;
   // Un mensaje de confirmación NUNCA queda sin URL: el link real si la
   // tool lo devolvió, si no el fallback de Meet.
-  const resolvedLink: string = booking?.link || MEET_FALLBACK_LINK
+  const resolvedLink: string = booking?.link || MEET_FALLBACK_LINK;
 
   if (confirmed) {
-    const replaced = text.replace(FAKE_LINK_RE, resolvedLink)
+    const replaced = text.replace(FAKE_LINK_RE, resolvedLink);
     return replaced.includes(resolvedLink)
       ? replaced
-      : `${replaced}\nAquí tienes el enlace de tu reunión: ${resolvedLink}`
+      : `${replaced}\nAquí tienes el enlace de tu reunión: ${resolvedLink}`;
   }
 
   // NUNCA enviar un texto que prometa un enlace de Meet/meeting sin que la
   // tool lo haya devuelto: "Este es el enlace de Google Meet para que te
   // conectes:" sin URL sería una burbuja vacía.
-  if (LINK_PROMISE_RE.test(text)) return null
-  if (INTERMEDIATE_ACK_RE.test(text)) return null
+  if (LINK_PROMISE_RE.test(text)) return null;
+  if (INTERMEDIATE_ACK_RE.test(text)) return null;
   if (opts.bookingContext ?? false) {
-    if (looksLikeBookingConfirmation(text)) return null
+    if (looksLikeBookingConfirmation(text)) return null;
   }
-  return text.replace(FAKE_LINK_RE, '')
+  return text.replace(FAKE_LINK_RE, '');
 }
 
 interface DispatchArgs {
-  accountId: string
-  conversationId: string
-  contactId: string
-  configOwnerUserId: string
+  accountId: string;
+  conversationId: string;
+  contactId: string;
+  configOwnerUserId: string;
   /** Meta id (wamid) of the inbound message being answered — used to
    *  keep WhatsApp's typing indicator alive across the multi-part reply. */
-  composeMessageId?: string
+  composeMessageId?: string;
 }
 
 /**
@@ -156,15 +236,15 @@ interface DispatchArgs {
  * or slow LLM call must not affect the webhook's 200 to Meta.
  */
 export async function dispatchInboundToAiReply(
-  args: DispatchArgs,
+  args: DispatchArgs
 ): Promise<void> {
-  const { accountId, conversationId, contactId, configOwnerUserId } = args
+  const { accountId, conversationId, contactId, configOwnerUserId } = args;
 
   try {
-    const db = supabaseAdmin()
+    const db = supabaseAdmin();
 
-    const config = await loadAiConfig(db, accountId)
-    if (!config || !config.autoReplyEnabled) return
+    const config = await loadAiConfig(db, accountId);
+    if (!config || !config.autoReplyEnabled) return;
 
     const { data: autoResponders } = await db
       .from('automations')
@@ -172,47 +252,42 @@ export async function dispatchInboundToAiReply(
       .eq('account_id', accountId)
       .eq('is_active', true)
       .in('trigger_type', ['new_message_received', 'keyword_match'])
-      .limit(1)
-    if (autoResponders && autoResponders.length > 0) return
+      .limit(1);
+    if (autoResponders && autoResponders.length > 0) return;
 
     const { data: conv, error: convErr } = await db
       .from('conversations')
       .select('assigned_agent_id')
       .eq('id', conversationId)
-      .maybeSingle()
-    if (convErr || !conv) return
+      .maybeSingle();
+    if (convErr || !conv) return;
     // Único criterio de silencio: un humano que tomó el control. No existe
     // flag de pausa ni de handoff (ai_autoreply_disabled) ni límite de
     // respuestas: mientras no haya agente asignado, la IA responde SIEMPRE
     // cada mensaje entrante ("Hola", "?", etc.) sin dejar en visto.
-    if (conv.assigned_agent_id) return
+    if (conv.assigned_agent_id) return;
 
-    const messages = await buildConversationContext(db, conversationId)
-    if (messages.length === 0) return
+    const messages = await buildConversationContext(db, conversationId);
+    if (messages.length === 0) return;
 
     const acctLimit = checkRateLimit(
       `ai-autoreply:${accountId}`,
-      RATE_LIMITS.aiAutoReplyAccount,
-    )
+      RATE_LIMITS.aiAutoReplyAccount
+    );
     if (!acctLimit.success) {
       console.warn(
-        `[ai auto-reply] account ${accountId} hit the per-account rate limit — skipping this inbound.`,
-      )
-      return
+        `[ai auto-reply] account ${accountId} hit the per-account rate limit — skipping this inbound.`
+      );
+      return;
     }
 
     // Pre-LLM context is fetched in parallel (knowledge retrieval and
     // the contact profile/citas are independent) so the reply isn't held
     // for two sequential DB + embedding round trips.
     const [knowledge, contactCtx] = await Promise.all([
-      retrieveKnowledge(
-        db,
-        accountId,
-        config,
-        latestUserMessage(messages),
-      ),
+      retrieveKnowledge(db, accountId, config, latestUserMessage(messages)),
       loadContactContext(db, contactId),
-    ])
+    ]);
 
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,
@@ -224,18 +299,18 @@ export async function dispatchInboundToAiReply(
       calendarEnabled: calendarConfigured(),
       gmailEnabled: gmailConfigured(),
       citas: contactCtx?.citas,
-    })
+    });
 
     // Tool execution loop: the model may request tool calls before
     // producing a final text reply. We feed tool results back and
     // re-generate up to MAX_TOOL_ROUNDS times.
-    let finalText: string | null = ''
-    let finalUsage = null
-    let toolFallback: string | null = null
+    let finalText: string | null = '';
+    let finalUsage = null;
+    let toolFallback: string | null = null;
     // Latest REAL successful booking from agendar_cita's JSON_RESULT.
     // Everything else that looks like a confirmation is hallucination.
-    let realBooking: BookingToolResult | null = null
-    const conversationMessages: ChatMessage[] = [...messages]
+    let realBooking: BookingToolResult | null = null;
+    const conversationMessages: ChatMessage[] = [...messages];
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
       const result = await generateReply({
@@ -243,43 +318,43 @@ export async function dispatchInboundToAiReply(
         systemPrompt,
         messages: conversationMessages,
         tools: AI_TOOLS,
-      })
+      });
 
-      finalUsage = result.usage
+      finalUsage = result.usage;
 
       // If the model returned tool calls, execute them and continue.
       if (result.toolCalls && result.toolCalls.length > 0) {
-        const toolResults: ChatMessage[] = []
+        const toolResults: ChatMessage[] = [];
         for (const tc of result.toolCalls) {
-          let output: string
+          let output: string;
           try {
-            output = await executeToolCall(db, accountId, contactId, tc)
+            output = await executeToolCall(db, accountId, contactId, tc);
           } catch (err) {
             // A thrown tool must never abort the whole turn — that would
             // leave the customer with no message at all. Turn the failure
             // into a tool result the model can relay, and remember a
             // deterministic fallback for the scheduling case.
-            console.error(`[ai auto-reply] tool "${tc.name}" threw:`, err)
+            console.error(`[ai auto-reply] tool "${tc.name}" threw:`, err);
             if (tc.name === 'agendar_cita') {
-              toolFallback = AGENDAR_FALLBACK_MESSAGE
+              toolFallback = AGENDAR_FALLBACK_MESSAGE;
             }
             output =
               tc.name === 'agendar_cita'
                 ? AGENDAR_FALLBACK_MESSAGE
-                : `Error: la herramienta ${tc.name} no pudo completarse.`
+                : `Error: la herramienta ${tc.name} no pudo completarse.`;
           }
           // Grounding: remember the LAST confirmed booking's real link so
           // the outgoing message can never carry a link the tool didn't
           // return. Ignore tool results that announced an error.
           if (tc.name === 'agendar_cita') {
-            const parsed = extractBookingResult(output)
-            if (parsed?.confirmado) realBooking = parsed
+            const parsed = extractBookingResult(output);
+            if (parsed?.confirmado) realBooking = parsed;
           }
           toolResults.push({
             role: 'tool',
             content: output,
             toolCallId: tc.id,
-          })
+          });
         }
         // Append the assistant message carrying the requested tool_calls
         // plus the results so the model can reason over them on the next
@@ -288,14 +363,14 @@ export async function dispatchInboundToAiReply(
           role: 'assistant',
           content: result.text || '',
           toolCalls: result.toolCalls,
-        })
-        conversationMessages.push(...toolResults)
-        continue
+        });
+        conversationMessages.push(...toolResults);
+        continue;
       }
 
       // No tool calls — this is the final text reply.
-      finalText = result.text
-      break
+      finalText = result.text;
+      break;
     }
 
     // The instant agendar_cita REALLY succeeded, the backend composes and
@@ -307,11 +382,43 @@ export async function dispatchInboundToAiReply(
     if (realBooking?.confirmado) {
       const deterministic = buildBookingConfirmationMessage(
         realBooking,
-        contactCtx?.name,
-      )
+        contactCtx?.name
+      );
       if (deterministic) {
-        finalText = deterministic
-        toolFallback = null
+        finalText = deterministic;
+        toolFallback = null;
+      }
+    }
+
+    // "Mándame el link": el cliente pide (de nuevo) el enlace de su cita.
+    // Garantía determinística — se lee la última cita confirmada del
+    // contacto directamente de la BD y se responde con su meet_link real.
+    // Solo aplica cuando NO se agendó en este turno: si agendar_cita acaba
+    // de correr, el enlace recién creado gana.
+    if (
+      !realBooking?.confirmado &&
+      wantsMeetLink(latestUserMessage(messages))
+    ) {
+      const stored = await latestCitaConLink(db, contactId);
+      if (
+        stored &&
+        stored.meet_link &&
+        stored.meet_link !== MEET_FALLBACK_LINK
+      ) {
+        const { fecha, hora } = fechaHoraBogota(stored.fecha_inicio);
+        realBooking = {
+          confirmado: true,
+          link: stored.meet_link,
+          inicio: stored.fecha_inicio,
+          idCita: stored.id,
+          fecha,
+          hora,
+        };
+        finalText = buildMeetLinkResendMessage(stored.meet_link, {
+          fecha,
+          hora,
+        });
+        toolFallback = null;
       }
     }
 
@@ -325,18 +432,18 @@ export async function dispatchInboundToAiReply(
           config,
           systemPrompt,
           messages: conversationMessages,
-        })
-        finalUsage = final.usage ?? finalUsage
-        finalText = final.text
+        });
+        finalUsage = final.usage ?? finalUsage;
+        finalText = final.text;
       } catch (err) {
-        console.error('[ai auto-reply] final confirmation pass failed:', err)
+        console.error('[ai auto-reply] final confirmation pass failed:', err);
       }
     }
 
     // Last resort: if a scheduling tool failed and the model still said
     // nothing, send the fallback rather than going silent.
     if (!finalText && toolFallback) {
-      finalText = toolFallback
+      finalText = toolFallback;
     }
 
     // Anti-hallucination guard: the final message must be grounded in a
@@ -347,24 +454,24 @@ export async function dispatchInboundToAiReply(
     // the next message is answered normally instead of leaving the chat
     // permanently silent.
     if (finalText) {
-      const raw = finalText
+      const raw = finalText;
       finalText = guardBookingReply(finalText, realBooking, {
         bookingContext: hasBookingIntent(messages),
-      })
+      });
       const isWaitOnly =
         (INTERMEDIATE_ACK_RE.test(raw) || LINK_PROMISE_RE.test(raw)) &&
-        !looksLikeBookingConfirmation(raw)
+        !looksLikeBookingConfirmation(raw);
       if (finalText === null && isWaitOnly) {
         console.log(
-          '[ai auto-reply] dropped an empty reply without a link (no handoff, no mute).',
-        )
-        return
+          '[ai auto-reply] dropped an empty reply without a link (no handoff, no mute).'
+        );
+        return;
       }
       if (finalText === null) {
         console.log(
-          '[ai auto-reply] dropped an ungrounded text (no mute, no handoff).',
-        )
-        return
+          '[ai auto-reply] dropped an ungrounded text (no mute, no handoff).'
+        );
+        return;
       }
     }
 
@@ -376,16 +483,16 @@ export async function dispatchInboundToAiReply(
       provider: config.provider,
       model: config.model,
       usage: finalUsage,
-    })
+    });
 
     // Si no hay texto final, no hay nada que enviar — pero JAMÁS se marca
     // la conversación como muda ni se la asigna a un humano
     // automáticamente: el siguiente mensaje se responde normal.
     if (!finalText) {
       console.log(
-        '[ai auto-reply] no final text to send — skipping without muting.',
-      )
-      return
+        '[ai auto-reply] no final text to send — skipping without muting.'
+      );
+      return;
     }
 
     const { data: claimed, error: claimErr } = await db.rpc(
@@ -394,13 +501,13 @@ export async function dispatchInboundToAiReply(
         conversation_id: conversationId,
         // 0 = ilimitado: el RPC claim_ai_reply_slot siempre otorga el slot.
         max_replies: 0,
-      },
-    )
+      }
+    );
     if (claimErr) {
-      console.error('[ai auto-reply] claim_ai_reply_slot failed:', claimErr)
-      return
+      console.error('[ai auto-reply] claim_ai_reply_slot failed:', claimErr);
+      return;
     }
-    if (claimed !== true) return
+    if (claimed !== true) return;
 
     const enviado = await engineSendAiReply({
       accountId,
@@ -415,9 +522,9 @@ export async function dispatchInboundToAiReply(
       // y el enlace de Meet juntos, sin cortes que puedan dejar el enlace
       // fuera o dividido en varios mensajes.
       single: realBooking?.confirmado === true,
-    })
-    console.log('[AUTO-REPLY] Mensaje enviado con éxito a WhatsApp:', enviado)
+    });
+    console.log('[AUTO-REPLY] Mensaje enviado con éxito a WhatsApp:', enviado);
   } catch (err) {
-    console.error('[ai auto-reply] dispatch failed:', err)
+    console.error('[ai auto-reply] dispatch failed:', err);
   }
 }

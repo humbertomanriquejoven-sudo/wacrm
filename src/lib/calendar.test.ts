@@ -360,6 +360,45 @@ describe('agendar_cita', () => {
     expect(out).toContain('ya está ocupado');
     expect(h.insert).not.toHaveBeenCalled();
   });
+
+  it('never aborts when the CRM insert throws — the booking confirmation still ships', async () => {
+    const supabase = db();
+    const throwingDb = {
+      ...supabase,
+      from: (table: string) =>
+        table === 'citas'
+          ? {
+              insert: () => {
+                throw new Error('connection reset');
+              },
+            }
+          : supabase.from(table),
+    };
+    const out = await agendar_cita({
+      db: throwingDb as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'María Pérez',
+    });
+    // The bot still gets a full confirmation (date, hour, real Meet link)
+    // with an honest note that the CRM row could not be saved.
+    expect(out).toContain('Cita agendada');
+    expect(out).toContain('2026-09-14T10:00:00-05:00');
+    expect(out).toContain('no pudo guardar la cita');
+    expect(out).toContain('https://meet.google.com/');
+    // The success marker survives the DB failure — never an "Error:".
+    const json = out.split(
+      'JSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): '
+    )[1];
+    expect(JSON.parse(json)).toMatchObject({
+      exito: true,
+      confirmado: true,
+      link: expect.any(String),
+      idCita: null,
+    });
+    expect(h.insert).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('reagendar_cita / cancelar_cita', () => {
