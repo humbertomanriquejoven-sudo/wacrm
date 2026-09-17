@@ -44,6 +44,7 @@ import {
   reagendar_cita,
   ver_disponibilidad,
   listar_eventos,
+  consultarOcupados,
   parseBogotaInstant,
   APPOINTMENT_DURATION_MIN,
 } from '@/lib/calendar'
@@ -544,10 +545,135 @@ describe('listar_eventos', () => {
     expect(out).toContain('https://meet.google.com/abc')
   })
 
+  it('falls back to htmlLink when the event has no Meet link', async () => {
+    h.list.mockResolvedValue({
+      data: {
+        items: [
+          {
+            summary: 'Cita con Cliente - Ana',
+            start: { dateTime: '2026-09-20T09:00:00-05:00' },
+            end: { dateTime: '2026-09-20T09:45:00-05:00' },
+            htmlLink: 'https://calendar.google.com/event?eid=abc',
+          },
+        ],
+      },
+    })
+    const out = await listar_eventos({})
+    expect(out).toContain('https://calendar.google.com/event?eid=abc')
+  })
+
   it('reports an invalid window date', async () => {
     const out = await listar_eventos({ desde: 'no-es-fecha' })
     expect(out).toContain('fecha inválida')
     expect(h.list).not.toHaveBeenCalled()
+  })
+})
+
+describe('agendar_cita — enlace del evento', () => {
+  beforeEach(() => {
+    h.freebusy.mockReset()
+    h.freebusy.mockResolvedValue(freebusyEmpty())
+    h.insert.mockReset()
+  })
+
+  it('persists the Meet hangoutLink in meet_link', async () => {
+    h.insert.mockResolvedValue({
+      data: { id: 'evt-meet', hangoutLink: 'https://meet.google.com/abc-defg-hij' },
+    })
+    const supabase = db()
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'Ana',
+    })
+    expect(out).toContain('Reunión Meet: https://meet.google.com/abc-defg-hij')
+    const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+    expect((insert!.row as { meet_link: string | null }).meet_link).toBe(
+      'https://meet.google.com/abc-defg-hij',
+    )
+  })
+
+  it('falls back to htmlLink and does NOT report a system error', async () => {
+    h.insert.mockResolvedValue({
+      data: { id: 'evt-html', htmlLink: 'https://calendar.google.com/event?eid=xyz' },
+    })
+    const supabase = db()
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'Ana',
+    })
+    expect(out).toContain('Cita agendada')
+    expect(out).toContain('Enlace del evento: https://calendar.google.com/event?eid=xyz')
+    expect(out).not.toContain('no disponible')
+    const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+    expect((insert!.row as { meet_link: string | null }).meet_link).toBe(
+      'https://calendar.google.com/event?eid=xyz',
+    )
+  })
+
+  it('confirms the appointment even with no link at all', async () => {
+    h.insert.mockResolvedValue({ data: { id: 'evt-plain' } })
+    const supabase = db()
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T10:00:00-05:00',
+      nombre: 'Ana',
+    })
+    expect(out).toContain('Cita agendada')
+    const insert = supabase.callLog.find((c) => c.op === 'insert' && c.table === 'citas')
+    expect((insert!.row as { meet_link: string | null }).meet_link).toBeNull()
+  })
+})
+
+describe('consultarOcupados', () => {
+  beforeEach(() => {
+    h.freebusy.mockReset()
+  })
+
+  it('returns busy intervals as ISO strings on success', async () => {
+    h.freebusy.mockResolvedValue({
+      data: {
+        calendars: {
+          [process.env.GOOGLE_CALENDAR_ID!]: {
+            busy: [
+              { start: '2026-09-14T15:00:00-05:00', end: '2026-09-14T16:00:00-05:00' },
+            ],
+          },
+        },
+      },
+    })
+    const res = await consultarOcupados(
+      '2026-09-14T00:00:00-05:00',
+      '2026-09-15T00:00:00-05:00',
+    )
+    expect(res.ok).toBe(true)
+    expect(res.ocupados).toHaveLength(1)
+    expect(res.ocupados[0].start).toBe('2026-09-14T20:00:00.000Z')
+    expect(res.ocupados[0].end).toBe('2026-09-14T21:00:00.000Z')
+  })
+
+  it('degrades to ok:false with an empty list when freebusy fails', async () => {
+    h.freebusy.mockRejectedValue(new Error('freebusy down'))
+    const res = await consultarOcupados(
+      '2026-09-14T00:00:00-05:00',
+      '2026-09-15T00:00:00-05:00',
+    )
+    expect(res.ok).toBe(false)
+    expect(res.ocupados).toEqual([])
+  })
+
+  it('rejects invalid bounds without calling freebusy', async () => {
+    const res = await consultarOcupados('no-es-fecha', 'tampoco')
+    expect(res.ok).toBe(false)
+    expect(res.ocupados).toEqual([])
+    expect(h.freebusy).not.toHaveBeenCalled()
   })
 })
 

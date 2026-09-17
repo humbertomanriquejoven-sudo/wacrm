@@ -234,12 +234,18 @@ export interface CitaEmailArgs {
   inicioIso: string
   duracionMin: number
   meetUrl?: string | null
+  /**
+   * true when `meetUrl` is a Google Meet hangout (default wording),
+   * false when it's the plain Google Calendar htmlLink fallback.
+   */
+  esMeet?: boolean
 }
 
 /**
  * Send the HTML confirmation email for a booked appointment (date, exact
- * time and direct Google Meet link). Never throws — Gmail failure must not
- * undo an already-created calendar event.
+ * time and a direct link — Google Meet or the calendar event when Meet is
+ * unavailable). Never throws — Gmail failure must not undo an
+ * already-created calendar event.
  */
 export async function enviarConfirmacionCita(
   args: CitaEmailArgs,
@@ -248,16 +254,17 @@ export async function enviarConfirmacionCita(
     console.warn('[gmail] no config — confirmation email skipped.')
     return ''
   }
-  const { to, nombre, motivo, inicioIso, duracionMin, meetUrl } = args
+  const { to, nombre, motivo, inicioIso, duracionMin, meetUrl, esMeet = true } = args
   const when = formatBogota(inicioIso)
   const topic = motivo?.trim() || nombre?.trim() || 'reunión'
+  const enlaceTitulo = esMeet ? 'Enlace directo de Google Meet' : 'Enlace del evento de Google Calendar'
 
   const text = [
     'Hola,',
     '',
     `Te confirmamos tu ${topic} con nosotros el día ${when}.`,
     duracionMin ? `Duración estimada: ${duracionMin} minutos.` : '',
-    meetUrl ? `Enlace directo de Google Meet: ${meetUrl}` : '',
+    meetUrl ? `${enlaceTitulo}: ${meetUrl}` : '',
     '',
     'Cualquier cambio, escríbenos por WhatsApp.',
   ].join('\n')
@@ -269,7 +276,7 @@ export async function enviarConfirmacionCita(
     `<p>Te confirmamos tu <strong>${escapeHtml(topic)}</strong> el día <strong>${escapeHtml(when)}</strong>.</p>`,
     duracionMin ? `<p>Duración estimada: <strong>${duracionMin} minutos</strong>.</p>` : '',
     meetUrl
-      ? `<p>Enlace directo de tu reunión de <strong>Google Meet</strong>:<br/><a href="${escapeAttr(meetUrl)}">${escapeHtml(meetUrl)}</a></p>`
+      ? `<p>${enlaceTitulo}:<br/><a href="${escapeAttr(meetUrl)}">${escapeHtml(meetUrl)}</a></p>`
       : '',
     '<p style="margin-top:20px;color:#666;">Cualquier cambio, escríbenos por WhatsApp. ¡Te esperamos!</p>',
     '</div>',

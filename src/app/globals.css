@@ -228,3 +228,103 @@ html[data-theme="rose"] {
     @apply font-sans;
   }
 }
+
+/* ============================================================
+ * Calendario semanal (/calendario)
+ *
+ * Shared primitives for the weekly grid: the RSC page draws the
+ * background (hour lines, out-of-hours shading, current-time line)
+ * and the client overlay draws the blocks with the same geometry
+ * (1 grid pixel = 1 Bogota minute, column = 540px for 09:00-18:00).
+ * ============================================================ */
+
+.cal-cita {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 1px;
+  overflow: hidden;
+  border-radius: 6px;
+  border: 1px solid oklch(0.52 0.13 162);
+  padding: 3px 5px;
+  font-size: 11px;
+  line-height: 1.15;
+  text-align: left;
+  color: oklch(0.985 0 0);
+  background: oklch(0.42 0.12 162);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.35);
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.cal-cita:hover {
+  background: oklch(0.48 0.13 162);
+}
+.cal-cita--cancelada {
+  background: var(--muted);
+  border-color: var(--border);
+  color: var(--muted-foreground);
+  cursor: default;
+  text-decoration: line-through;
+  box-shadow: none;
+}
+.cal-cita__hora {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.cal-busy {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  z-index: 1;
+  border-radius: 4px;
+  background: oklch(0.78 0.16 70 / 0.28);
+  border: 1px dashed oklch(0.82 0.14 70 / 0.55);
+}
+
+.cal-linea-ahora {
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: 5;
+  height: 2px;
+  background: oklch(0.78 0.16 162);
+}
+.cal-linea-ahora::before {
+  content: "";
+  position: absolute;
+  left: -3px;
+  top: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background: inherit;
+}
+
+/* Diagonal stripes marking out-of-business-hours cells. */
+.cal-stripes {
+  background-image: repeating-linear-gradient(
+    45deg,
+    oklch(0.55 0.01 260 / 0.18) 0,
+    oklch(0.55 0.01 260 / 0.18) 6px,
+    transparent 6px,
+    transparent 14px
+  );
+}
+
+/* Hour separators inside a day column (60px pitch; body is 9 rows = 540px). */
+.cal-horas {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent 59px,
+    var(--border) 59px,
+    var(--border) 60px
+  );
+}

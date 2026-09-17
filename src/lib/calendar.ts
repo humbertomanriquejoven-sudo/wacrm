@@ -360,6 +360,50 @@ export async function ver_disponibilidad(
   return lines.join('\n')
 }
 
+export interface OcupadoIntervalo {
+  /** ISO instant (ms-precision UTC) of the busy block start. */
+  start: string
+  /** ISO instant (ms-precision UTC) of the busy block end. */
+  end: string
+}
+
+export interface ConsultaOcupados {
+  /** false when freebusy failed (timeout, unconfigured, etc.). */
+  ok: boolean
+  ocupados: OcupadoIntervalo[]
+}
+
+/**
+ * consultar_ocupados(desde, hasta) — busy intervals for the weekly-view
+ * grid on /calendario. Wraps the internal freeBusy call so the page can
+ * render the DB citas as a fallback and show a subtle notice when Google
+ * is unavailable: a failure returns `ok: false` with an empty list
+ * instead of throwing.
+ */
+export async function consultarOcupados(
+  desdeIso: string,
+  hastaIso: string,
+): Promise<ConsultaOcupados> {
+  const from = new Date(desdeIso)
+  const to = new Date(hastaIso)
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
+    return { ok: false, ocupados: [] }
+  }
+  try {
+    const busy = await fetchBusy(from, to)
+    return {
+      ok: true,
+      ocupados: busy.map((b) => ({
+        start: b.start.toISOString(),
+        end: b.end.toISOString(),
+      })),
+    }
+  } catch (err) {
+    console.error('[calendar] consultarOcupados failed:', err)
+    return { ok: false, ocupados: [] }
+  }
+}
+
 export interface ListarEventosArgs {
   /** Window start (ISO "2026-09-17" or "2026-09-17T00:00:00-05:00"). Default: now. */
   desde?: string
@@ -407,7 +451,9 @@ export async function listar_eventos(
         const start = e.start?.dateTime ?? e.start?.date ?? '?'
         const end = e.end?.dateTime ?? e.end?.date ?? ''
         const label = e.summary?.trim() || '(sin título)'
-        return `- ${start} → ${end} | ${label}${e.hangoutLink ? ` | Meet: ${e.hangoutLink}` : ''}`
+        // Meet primero, htmlLink (URL del evento) como respaldo.
+        const link = e.hangoutLink ?? e.htmlLink ?? ''
+        return `- ${start} → ${end} | ${label}${link ? ` | Enlace: ${link}` : ''}`
       })
       .join('\n')
   } catch (err) {
@@ -476,6 +522,8 @@ export async function agendar_cita(
   let event: { id?: string | null }
   let calendarSynced = true
   let meetUrl: string | null = null
+  /** Whether `meetUrl` is a Meet hangout (true) or the plain htmlLink (false). */
+  let linkEsMeet = false
   let emailSent = false
   try {
     const baseBody = {
@@ -536,7 +584,15 @@ export async function agendar_cita(
     }
     if (!created) throw new Error('events.insert failed (Meet y reintento plano)')
 
-    meetUrl = created.data.hangoutLink ?? null
+    // El evento creado puede tener un hangoutLink (Meet, con OAuth2) o, si
+    // la cuenta no puede generar conferencias, solo un htmlLink (la URL
+    // pública de Google Calendar del evento). Guardamos el mejor enlace
+    // disponible: Meet primero, htmlLink como respaldo. La cita se confirma
+    // igual con cualquiera de los dos, sin marcar error de sistema.
+    const hangout = created.data.hangoutLink ?? null
+    const html = created.data.htmlLink ?? null
+    meetUrl = hangout ?? html
+    linkEsMeet = hangout !== null
     event = { id: created.data.id }
   } catch (err) {
     console.warn('[calendar] events.insert failed:', err)
@@ -575,6 +631,7 @@ export async function agendar_cita(
       inicioIso: start.toISOString(),
       duracionMin: APPOINTMENT_DURATION_MIN,
       meetUrl,
+      esMeet: linkEsMeet,
     })
     emailSent = mailConfirmation.startsWith('Correo enviado')
     if (!emailSent && mailConfirmation) {
@@ -582,12 +639,17 @@ export async function agendar_cita(
     }
   }
 
-return (calendarSynced
-  ? meetUrl
-    ? `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}. Reunión Meet: ${meetUrl}`
-    : `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}.`
-  : `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}. (Google Calendar no disponible; la cita quedó guardada en el CRM sin enlace de Meet.)`)
-  + (emailSent ? ` Correo de confirmación enviado a ${clientEmail}.` : '')
+  const enlaceMsg =
+    meetUrl
+      ? linkEsMeet
+        ? ` Reunión Meet: ${meetUrl}`
+        : ` Enlace del evento: ${meetUrl}`
+      : ''
+
+  return (calendarSynced
+    ? `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}.${enlaceMsg}`
+    : `Cita agendada: ${bogotaIso(start)} (45 minutos), cliente: ${name}. (Google Calendar no disponible; la cita quedó guardada en el CRM sin enlace.)`)
+    + (emailSent ? ` Correo de confirmación enviado a ${clientEmail}.` : '')
 }
 
 export interface ReagendarCitaArgs {
