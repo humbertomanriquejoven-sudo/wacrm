@@ -73,7 +73,9 @@ export function AiConfig() {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [isActive, setIsActive] = useState(false);
   const [autoReplyEnabled, setAutoReplyEnabled] = useState(false);
-  const [maxPerConversation, setMaxPerConversation] = useState(0);
+  // 99999 = sin tope efectivo: el bot responde siempre mientras no haya un
+  // humano asignado. El valor sólo se usa como referencia para el despacho.
+  const [maxPerConversation, setMaxPerConversation] = useState(99999);
   // Empty string = leave unassigned (shared queue).
   const [handoffAgentId, setHandoffAgentId] = useState('');
   const [members, setMembers] = useState<AccountMember[]>([]);

@@ -25,6 +25,57 @@ import type { ChatMessage } from './types';
 const MAX_TOOL_ROUNDS = 3;
 
 /**
+ * Tope de auto-respuestas a partir del cual NO hay tope: cualquier valor
+ * configurado mayor o igual a este se envía al RPC como 0 (ilimitado), de
+ * modo que el bot conteste siempre a cada mensaje entrante mientras no haya
+ * un humano asignado, sin exigir un "Take over" manual para desbloquear.
+ * 99999 es el valor por defecto del panel desde la migración 044.
+ */
+const UNLIMITED_AUTO_REPLIES = 99999;
+
+/**
+ * Traduce el tope configurado en el panel al parámetro `max_replies` del RPC
+ * `claim_ai_reply_slot`, que interpreta 0 como "otorga el slot siempre".
+ * Valores >= UNLIMITED_AUTO_REPLIES se colapsan a 0 para que un tope alto
+ * configurado nunca sea interpretado como un límite real, y un valor
+ * inválido (NaN / negativo) cae a 0 en vez de bloquear el hilo.
+ */
+function effectiveMaxReplies(configured: number): number {
+  if (!Number.isFinite(configured) || configured <= 0) return 0;
+  return configured >= UNLIMITED_AUTO_REPLIES ? 0 : Math.floor(configured);
+}
+
+/**
+ * Reinicia el contador de auto-respuestas de una conversación al entrar un
+ * mensaje nuevo y limpia el flag legacy `ai_autoreply_disabled`.
+ *
+ * Sin esto, un `ai_reply_count` acumulado por una versión anterior del bot
+ * (o un flag de pausa heredado) podía dejar el hilo mudo de forma
+ * permanente sin que nadie lo hubiera decidido: era el bug clásico de
+ * "el bot dejó de responder y tocaba tomar el control a mano". Como el
+ * tope vigente es ilimitado, el contador solo sirve como métrica, así que
+ * reiniciarlo en cada mensaje entrante es seguro y no afecta el reporte de
+ * uso (que viene de `ai_usage_log`, no de esta columna).
+ *
+ * Nunca propaga el error: un fallo al resetear no debe impedir responder.
+ */
+async function resetAutoReplyCounter(
+  db: SupabaseClient,
+  conversationId: string
+): Promise<void> {
+  const { error } = await db
+    .from('conversations')
+    .update({ ai_reply_count: 0, ai_autoreply_disabled: false })
+    .eq('id', conversationId);
+  if (error) {
+    console.warn(
+      `[ai auto-reply] could not reset the reply counter for ${conversationId}:`,
+      error.message
+    );
+  }
+}
+
+/**
  * Customer-facing fallback when a scheduling tool ran but we could not
  * produce a confirmation with a Meet link (tool threw, or the model ran
  * out of rounds). Sent instead of leaving the customer in silence.
@@ -302,6 +353,12 @@ export async function dispatchInboundToAiReply(
     // cada mensaje entrante ("Hola", "?", etc.) sin dejar en visto.
     if (conv.assigned_agent_id) return;
 
+    // Cada mensaje entrante arranca con el contador en cero y sin flags
+    // legacy: un hilo que quedó con el contador en el límite de una versión
+    // anterior se desbloquea solo al llegarle un mensaje nuevo, sin que un
+    // agente tenga que hacer un "Take over" manual.
+    await resetAutoReplyCounter(db, conversationId);
+
     const messages = await buildConversationContext(db, conversationId);
     if (messages.length === 0) return;
 
@@ -559,8 +616,13 @@ export async function dispatchInboundToAiReply(
       'claim_ai_reply_slot',
       {
         conversation_id: conversationId,
-        // 0 = ilimitado: el RPC claim_ai_reply_slot siempre otorga el slot.
-        max_replies: 0,
+        // El tope sale de la configuración real de la cuenta en vez de un 0
+        // fijo: 99999 (o cualquier valor >= UNLIMITED_AUTO_REPLIES) se
+        // colapsa a 0, que el RPC trata como ilimitado. Así un panel con el
+        // máximo alto nunca vuelve a dejar el hilo mudo, y el RPC sigue
+        // funcionando aunque se haya creado desde una versión anterior que
+        // no entendía el 0 como "sin tope".
+        max_replies: effectiveMaxReplies(config.autoReplyMaxPerConversation),
       }
     );
     if (claimErr) {

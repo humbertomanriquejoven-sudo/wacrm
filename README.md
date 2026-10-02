@@ -36,7 +36,8 @@ clone or fork it to run your own CRM.
 - **AI reply assistant** — bring your own OpenAI or Anthropic key
   (stored encrypted; no per-seat AI fee, your data stays yours).
   One-click AI-drafted replies in the inbox, plus an optional
-  auto-reply bot with a per-conversation cap and clean human handoff.
+  always-on auto-reply bot with clean human handoff (it answers every inbound
+while no human owns the thread).
   Add a **knowledge base** (FAQs, policies, product docs) and it
   answers from your own content — hybrid retrieval (Postgres full-text,
   or semantic pgvector when an embeddings key is set).

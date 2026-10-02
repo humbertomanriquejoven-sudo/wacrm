@@ -21,7 +21,8 @@ const h = vi.hoisted(() => ({
       meet_link?: string | null;
     }[],
     claim: true as boolean,
-    updatePayload: null as Record<string, unknown> | null,
+    rateLimit: true,
+    updatePayloads: [] as Record<string, unknown>[],
     rpcCalls: [] as { name: string; args: unknown }[],
   },
 }));
@@ -76,6 +77,18 @@ vi.mock('@/lib/flows/meta-send', () => ({
   engineSendText: h.engineSendText,
   engineSendAiReply: h.engineSendAiReply,
 }));
+// The real limiter is a module-level singleton with a 30/min budget, so a
+// suite that dispatches more than 30 inbounds would start failing purely on
+// test count. These tests are about dispatch behaviour, not throttling, and
+// `rateLimit:false` re-enables the limiter for the one test that covers it.
+vi.mock('@/lib/rate-limit', () => ({
+  checkRateLimit: () =>
+    h.state.rateLimit
+      ? { success: true, remaining: 999, limit: 999, reset: Date.now() }
+      : { success: false, remaining: 0, limit: 0, reset: Date.now() },
+  rateLimitResponse: () => new Response(null, { status: 429 }),
+  RATE_LIMITS: { aiAutoReplyAccount: { limit: 30, windowMs: 60_000 } },
+}));
 vi.mock('./admin-client', () => ({
   supabaseAdmin: () => ({
     from: (table: string) => {
@@ -120,7 +133,7 @@ vi.mock('./admin-client', () => ({
           }),
         }),
         update: (payload: Record<string, unknown>) => {
-          h.state.updatePayload = payload;
+          h.state.updatePayloads.push(payload);
           return { eq: () => Promise.resolve({ error: null }) };
         },
       };
@@ -161,6 +174,20 @@ function aiConfig(overrides: Partial<AiConfig> = {}): AiConfig {
   };
 }
 
+/**
+ * The bot must never silence a thread or hand it to a human on its own —
+ * not even when it drops a turn. An inbound MAY reset the legacy counter
+ * (`ai_reply_count = 0`) and clear the legacy pause flag
+ * (`ai_autoreply_disabled = false`), which is what unblocks a thread stuck
+ * at an old cap; what it must never do is mute or assign.
+ */
+function expectNeverMuted() {
+  for (const payload of h.state.updatePayloads) {
+    expect(payload.ai_autoreply_disabled ?? false).toBe(false);
+    expect(payload.assigned_agent_id ?? null).toBeNull();
+  }
+}
+
 beforeEach(() => {
   h.state.conv = {
     assigned_agent_id: null,
@@ -168,7 +195,8 @@ beforeEach(() => {
   h.state.autoResponders = [];
   h.state.citas = [];
   h.state.claim = true;
-  h.state.updatePayload = null;
+  h.state.rateLimit = true;
+  h.state.updatePayloads = [];
   h.state.rpcCalls = [];
   h.loadAiConfig.mockResolvedValue(aiConfig());
   h.buildConversationContext.mockResolvedValue([
@@ -194,15 +222,43 @@ beforeEach(() => {
 describe('dispatchInboundToAiReply — eligibility gates', () => {
   it('claims a slot and sends on the happy path', async () => {
     await dispatchInboundToAiReply(ARGS);
+    // The configured cap is forwarded verbatim when it is a real number.
+    expect(h.state.rpcCalls).toEqual([
+      {
+        name: 'claim_ai_reply_slot',
+        args: { conversation_id: 'conv-1', max_replies: 3 },
+      },
+    ]);
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ conversationId: 'conv-1', text: 'Hello!' })
+    );
+  });
+
+  it('sends no cap (0) when the configured max is 99999 or more', async () => {
+    h.loadAiConfig.mockResolvedValue(
+      aiConfig({ autoReplyMaxPerConversation: 99999 })
+    );
+    await dispatchInboundToAiReply(ARGS);
     expect(h.state.rpcCalls).toEqual([
       {
         name: 'claim_ai_reply_slot',
         args: { conversation_id: 'conv-1', max_replies: 0 },
       },
     ]);
-    expect(h.engineSendAiReply).toHaveBeenCalledWith(
-      expect.objectContaining({ conversationId: 'conv-1', text: 'Hello!' })
-    );
+    expect(h.engineSendAiReply).toHaveBeenCalled();
+  });
+
+  it('resets the legacy reply counter and pause flag on every inbound', async () => {
+    h.state.conv = {
+      assigned_agent_id: null,
+      ai_autoreply_disabled: true,
+      ai_reply_count: 17,
+    };
+    await dispatchInboundToAiReply(ARGS);
+    expect(h.state.updatePayloads).toContainEqual({
+      ai_reply_count: 0,
+      ai_autoreply_disabled: false,
+    });
   });
 
   it('forwards the inbound composeMessageId to the fragment sender', async () => {
@@ -273,17 +329,18 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.engineSendText).not.toHaveBeenCalled();
   });
 
-  it('ignores the legacy pause flag and replies anyway (no handoff flag gates the bot)', async () => {
-    // ai_autoreply_disabled is a legacy column: the bot must answer any
-    // new inbound when no human is assigned, and must NOT try to clear
-    // the column (it no longer reads or writes it).
+  it('ignores the legacy pause flag, clears it and replies anyway', async () => {
+    // ai_autoreply_disabled is a legacy column and no longer GATES the
+    // bot: it must answer any new inbound when no human is assigned, and
+    // it clears the stale flag on the way so a thread muted by an older
+    // version unblocks itself on the next message.
     h.state.conv = {
       assigned_agent_id: null,
       ai_autoreply_disabled: true,
       ai_reply_count: 0,
     };
     await dispatchInboundToAiReply(ARGS);
-    expect(h.state.updatePayload).toBeNull();
+    expectNeverMuted();
     expect(h.engineSendAiReply).toHaveBeenCalledWith(
       expect.objectContaining({ text: 'Hello!' })
     );
@@ -331,6 +388,14 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.generateReply).not.toHaveBeenCalled();
     expect(h.engineSendText).not.toHaveBeenCalled();
   });
+
+  it('skips without muting when the account is over its rate limit', async () => {
+    h.state.rateLimit = false;
+    await dispatchInboundToAiReply(ARGS);
+    expect(h.generateReply).not.toHaveBeenCalled();
+    expect(h.engineSendAiReply).not.toHaveBeenCalled();
+    expectNeverMuted();
+  });
 });
 
 describe('dispatchInboundToAiReply — handoff', () => {
@@ -340,7 +405,7 @@ describe('dispatchInboundToAiReply — handoff', () => {
     expect(h.engineSendText).not.toHaveBeenCalled();
     expect(h.state.rpcCalls).toHaveLength(0);
     // The conversation is NOT silenced and NOT auto-assigned to a human.
-    expect(h.state.updatePayload).toBeNull();
+    expectNeverMuted();
   });
 
   it('never auto-assigns to the handoff agent when the model yields nothing', async () => {
@@ -348,7 +413,7 @@ describe('dispatchInboundToAiReply — handoff', () => {
     h.generateReply.mockResolvedValue({ text: '', handoff: true });
     await dispatchInboundToAiReply(ARGS);
     expect(h.engineSendText).not.toHaveBeenCalled();
-    expect(h.state.updatePayload).toBeNull();
+    expectNeverMuted();
   });
 });
 
@@ -453,7 +518,7 @@ describe('dispatchInboundToAiReply — tool-call lifecycle', () => {
     expect(h.engineSendAiReply).toHaveBeenCalledWith(
       expect.objectContaining({ text: AGENDAR_FALLBACK_MESSAGE })
     );
-    expect(h.state.updatePayload).toBeNull();
+    expectNeverMuted();
   });
 
   it('relays the tool fallback message through the model on the next pass', async () => {
@@ -546,7 +611,7 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     expect(h.generateReply).toHaveBeenCalledTimes(1);
     expect(h.executeToolCall).not.toHaveBeenCalled();
     expect(h.engineSendAiReply).not.toHaveBeenCalled();
-    expect(h.state.updatePayload).toBeNull();
+    expectNeverMuted();
   });
 
   it('never sends an intermediate "un momento…" wait message and does NOT mute the chat', async () => {
@@ -564,7 +629,7 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     // enabled so the NEXT message is answered normally (no mute, no
     // handoff flag is ever written).
     expect(h.engineSendAiReply).not.toHaveBeenCalled();
-    expect(h.state.updatePayload).toBeNull();
+    expectNeverMuted();
   });
 
   it('sends the mandated confirmation with the real link even when the model omits the URL', async () => {
@@ -640,7 +705,7 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     await dispatchInboundToAiReply(ARGS);
 
     expect(h.engineSendAiReply).not.toHaveBeenCalled();
-    expect(h.state.updatePayload).toBeNull();
+    expectNeverMuted();
   });
 
   it('dispatches the confirmation with the REAL link even if the final LLM pass returns empty text', async () => {

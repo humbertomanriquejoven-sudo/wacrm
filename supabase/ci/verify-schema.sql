@@ -42,6 +42,23 @@ BEGIN
     RAISE EXCEPTION 'public.accounts is missing — migration 017 did not apply';
   END IF;
 
+  -- The auto-reply slot claim (029/031/046). Both halves have shipped
+  -- silent "the bot just never answers" bugs: a missing function, and a
+  -- SECURITY DEFINER function that exists but that service_role may not
+  -- CALL (EXECUTE was never granted — issue #345). The webhook runs under
+  -- service_role, so a missing grant is invisible to every other check here.
+  IF to_regprocedure('public.claim_ai_reply_slot(uuid, integer)') IS NULL THEN
+    RAISE EXCEPTION 'public.claim_ai_reply_slot(uuid, integer) is missing';
+  END IF;
+  IF NOT has_function_privilege(
+       'service_role',
+       'public.claim_ai_reply_slot(uuid, integer)',
+       'EXECUTE'
+     ) THEN
+    RAISE EXCEPTION
+      'service_role may not EXECUTE claim_ai_reply_slot — the auto-reply will silently never send (issue #345)';
+  END IF;
+
   RAISE NOTICE 'schema verification passed';
 END
 $$;
