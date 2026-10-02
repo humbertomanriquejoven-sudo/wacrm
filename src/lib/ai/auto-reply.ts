@@ -489,6 +489,18 @@ export async function dispatchInboundToAiReply(
         systemPrompt,
         messages: conversationMessages,
         tools: AI_TOOLS,
+      }).catch((err: unknown) => {
+        // Never let a provider failure abort the turn quietly. Log the
+        // full error (AiError carries provider + code + status, which is
+        // what distinguishes 401 bad key / 429 rate limit / 404 wrong
+        // model / timeout), then rethrow so the outer catch records it.
+        console.error(
+          `[ai auto-reply] provider call FAILED (${config.provider}/${config.model}, round ${round + 1}) for conversation ${conversationId}:`,
+          err instanceof Error
+            ? { message: err.message, stack: err.stack, ...(err as object) }
+            : err
+        );
+        throw err;
       });
 
       console.log(
@@ -742,17 +754,31 @@ export async function dispatchInboundToAiReply(
       // y el enlace de Meet juntos, sin cortes que puedan dejar el enlace
       // fuera o dividido en varios mensajes.
       single: realBooking?.confirmado === true,
+    }).catch((err: unknown) => {
+      // The model already produced an answer, so a send failure is the
+      // one error the operator most needs verbatim: "contact phone
+      // invalid", "WhatsApp not configured for this account", a bad
+      // access_token, or Meta rejecting every number variant (131030 =
+      // outside the 24h window).
+      console.error(
+        `[ai auto-reply] SEND to WhatsApp FAILED for conversation ${conversationId} (contact ${contactId}, account ${accountId}). The reply text was generated but never delivered:`,
+        err instanceof Error
+          ? { message: err.message, stack: err.stack, ...(err as object) }
+          : err
+      );
+      throw err;
     });
     console.log('[AUTO-REPLY] Mensaje enviado con éxito a WhatsApp:', enviado);
   } catch (err) {
-    // The safety net. `engineSendAiReply` throws for the failures that
-    // used to be invisible end to end: invalid contact phone, WhatsApp
-    // not configured for this account, a bad access_token, or Meta
-    // rejecting every number variant (e.g. 131030, outside the 24h
-    // window). Name the conversation so the failure is traceable.
+    // The safety net for everything above. Never throws, so the webhook's
+    // 200 to Meta is unaffected — but it is now impossible for a turn to
+    // die without a line naming the conversation, the account and the
+    // error.
     console.error(
       `[ai auto-reply] dispatch failed for conversation ${conversationId} (contact ${contactId}, account ${accountId}):`,
-      err
+      err instanceof Error
+        ? { message: err.message, stack: err.stack, ...(err as object) }
+        : err
     );
   }
 }
