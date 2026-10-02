@@ -256,6 +256,7 @@ export async function sendTextMessage(
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
   const data = await response.json()
+  console.log('[OUTBOUND WHATSAPP]', data)
   return { messageId: data.messages[0].id }
 }
 
@@ -322,6 +323,7 @@ export async function sendMediaMessage(
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
   const data = await response.json()
+  console.log('[OUTBOUND WHATSAPP]', data)
   return { messageId: data.messages[0].id }
 }
 
@@ -440,6 +442,7 @@ export async function sendTemplateMessage(
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
   const data = await response.json()
+  console.log('[OUTBOUND WHATSAPP]', data)
   return { messageId: data.messages[0].id }
 }
 
@@ -754,6 +757,7 @@ export async function sendReactionMessage(
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
   const data = await response.json()
+  console.log('[OUTBOUND WHATSAPP]', data)
   return { messageId: data.messages[0].id }
 }
 
@@ -884,6 +888,7 @@ export async function sendInteractiveButtons(
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
   const data = await response.json()
+  console.log('[OUTBOUND WHATSAPP]', data)
   return { messageId: data.messages[0].id }
 }
 
@@ -1016,6 +1021,7 @@ export async function sendInteractiveList(
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
   const data = await response.json()
+  console.log('[OUTBOUND WHATSAPP]', data)
   return { messageId: data.messages[0].id }
 }
 
