@@ -402,6 +402,49 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.engineSendAiReply).not.toHaveBeenCalled();
   });
 
+  it('BYPASS: answers anyway when a human is assigned and the flag is on', async () => {
+    // AI_AUTOREPLY_BYPASS is the temporary diagnostic switch: it must
+    // override the human-handoff gate so we can prove the rest of the
+    // pipeline (provider + WhatsApp outbound) is reachable. Off by
+    // default so production behaviour is unchanged.
+    process.env.AI_AUTOREPLY_BYPASS = 'true';
+    try {
+      h.state.conv = { assigned_agent_id: 'agent-9' };
+      await dispatchInboundToAiReply(ARGS);
+      expect(h.engineSendAiReply).toHaveBeenCalledWith(
+        expect.objectContaining({ conversationId: 'conv-1' })
+      );
+    } finally {
+      delete process.env.AI_AUTOREPLY_BYPASS;
+    }
+  });
+
+  it('BYPASS: falls back to an outbound probe when the provider throws', async () => {
+    // Separates "the AI provider is broken" from "WhatsApp outbound is
+    // broken" — the two look identical from the customer's side.
+    process.env.AI_AUTOREPLY_BYPASS = 'true';
+    try {
+      h.generateReply.mockRejectedValue(
+        new Error('401 invalid_api_key from provider')
+      );
+      await dispatchInboundToAiReply(ARGS);
+      expect(h.engineSendAiReply).not.toHaveBeenCalled();
+      expect(h.engineSendText).toHaveBeenCalledWith(
+        expect.objectContaining({ text: 'Test de respuesta automática' })
+      );
+    } finally {
+      delete process.env.AI_AUTOREPLY_BYPASS;
+    }
+  });
+
+  it('BYPASS off by default: a provider failure sends nothing', async () => {
+    delete process.env.AI_AUTOREPLY_BYPASS;
+    h.generateReply.mockRejectedValue(new Error('401 invalid_api_key'));
+    await dispatchInboundToAiReply(ARGS);
+    expect(h.engineSendText).not.toHaveBeenCalled();
+    expect(h.engineSendAiReply).not.toHaveBeenCalled();
+  });
+
   it('skips when the per-conversation cap is reached (a low stored value never blocks)', async () => {
     h.loadAiConfig.mockResolvedValue(
       aiConfig({ autoReplyMaxPerConversation: 3 })

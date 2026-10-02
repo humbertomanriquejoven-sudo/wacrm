@@ -16,13 +16,108 @@ import {
 import { calendarConfigured, MEET_FALLBACK_LINK } from '@/lib/calendar';
 import { gmailConfigured } from '@/lib/gmail';
 import { stripRawTimestamps } from '@/lib/whatsapp/clean-ai-text';
-import { engineSendAiReply } from '@/lib/flows/meta-send';
+import { engineSendAiReply, engineSendText } from '@/lib/flows/meta-send';
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { ChatMessage } from './types';
 
 /** Maximum tool-call rounds per inbound to avoid infinite loops. */
 const MAX_TOOL_ROUNDS = 3;
+
+/**
+ * ============================================================
+ * DIAGNOSTIC BYPASS — TEMPORAL. QUÍTALO AL TERMINAR LA PRUEBA.
+ * ============================================================
+ * Activar con `AI_AUTOREPLY_BYPASS=true` en el entorno.
+ *
+ * Qué hace:
+ *   1. Salta `is_active` / `auto_reply_enabled` y, si falta la fila de
+ *      `ai_configs` o la key no se puede descifrar, usa una config de
+ *      emergencia para poder llamar al proveedor y ver su error real.
+ *   2. Salta el gate de automatizaciones activas.
+ *   3. Salta `assigned_agent_id` (el "pause" real; no existe is_paused).
+ *   4. Si el proveedor de IA falla o devuelve texto vacío, envía un texto
+ *      plano de prueba para separar "falla la IA" de "falla WhatsApp".
+ *
+ * Por qué está detrás de una bandera en vez de eliminado: la pausa por
+ * agente y el override de automatizaciones son comportamiento del
+ * producto. Borrarlos Would deja al bot respondiendo sobre hilos que un
+ * humano tomó a propósito. Con la variable el bypass es explícito,
+ * reversible y no se activa por accidente en producción.
+ * ============================================================
+ */
+function bypassEnabled(): boolean {
+  return process.env.AI_AUTOREPLY_BYPASS === 'true';
+}
+
+/**
+ * Config mínima para que el bypass todavía pueda llamar al proveedor y
+ * reportar su error real. Se combina sobre la config real cuando ésta
+ * existe, así que una key válida nunca se descarta.
+ */
+function emergencyConfig(base: AiConfigLike | null): AiConfigLike {
+  const fallback: AiConfigLike = {
+    provider: 'openrouter',
+    model: 'openai/gpt-4o-mini',
+    apiKey: process.env.AI_AUTOREPLY_BYPASS_KEY ?? '',
+    systemPrompt:
+      'You are a WhatsApp assistant. Reply in one short sentence.',
+    isActive: true,
+    autoReplyEnabled: true,
+    autoReplyMaxPerConversation: 99999,
+    handoffAgentId: null,
+    embeddingsApiKey: null,
+  };
+  return base ? { ...fallback, ...base, isActive: true, autoReplyEnabled: true } : fallback;
+}
+
+/** Structural alias so this file doesn't need a circular import for one type. */
+interface AiConfigLike {
+  provider: 'openai' | 'anthropic' | 'openrouter';
+  model: string;
+  apiKey: string;
+  systemPrompt: string | null;
+  isActive: boolean;
+  autoReplyEnabled: boolean;
+  autoReplyMaxPerConversation: number;
+  handoffAgentId: string | null;
+  embeddingsApiKey: string | null;
+}
+
+/**
+ * Connectivity probe. Sends a fixed plain-text message so the operator can
+ * tell, from the customer's side, whether the WhatsApp OUTBOUND path works
+ * at all — independent of the AI provider. If this arrives but the AI
+ * reply doesn't, the fault is the provider/key/config, not Meta.
+ *
+ * Deliberately does NOT reuse the model's voice: a fixed string means its
+ * arrival is unambiguous evidence.
+ */
+async function sendOutboundProbe(
+  args: DispatchArgs,
+  reason: string
+): Promise<void> {
+  console.warn(
+    `[ai auto-reply] BYPASS: sending outbound connectivity probe to conversation ${args.conversationId} (reason: ${reason})`
+  );
+  try {
+    const result = await engineSendText({
+      accountId: args.accountId,
+      userId: args.configOwnerUserId,
+      conversationId: args.conversationId,
+      contactId: args.contactId,
+      text: 'Test de respuesta automática',
+    });
+    console.warn(
+      `[ai auto-reply] BYPASS: outbound probe DELIVERED (${result.whatsapp_message_id}) — WhatsApp outbound works; the fault is the AI provider/config.`
+    );
+  } catch (err) {
+    console.error(
+      '[ai auto-reply] BYPASS: outbound probe FAILED — WhatsApp outbound is broken too:',
+      err
+    );
+  }
+}
 
 /**
  * Tope de auto-respuestas a partir del cual NO hay tope: cualquier valor
@@ -355,10 +450,17 @@ export async function dispatchInboundToAiReply(
     `[ai auto-reply] dispatch requested — conversation ${conversationId}, contact ${contactId}, account ${accountId}`
   );
 
+  const bypass = bypassEnabled();
+  if (bypass) {
+    console.warn(
+      `[ai auto-reply] ===== BYPASS MODE ACTIVE (AI_AUTOREPLY_BYPASS=true) — ignoring assignment, pause, automation override and the on/off toggles. REMOVE THIS VARIABLE WHEN DONE. =====`
+    );
+  }
+
   try {
     const db = supabaseAdmin();
 
-    const config = await loadAiConfig(db, accountId);
+    let config = await loadAiConfig(db, accountId);
     if (!config || !config.autoReplyEnabled) {
       // loadAiConfig returns null for a missing row, is_active=false, an
       // empty api_key — three very different operator mistakes that all
@@ -367,7 +469,21 @@ export async function dispatchInboundToAiReply(
         `[ai auto-reply] not enabled for account ${accountId} — skipping. ` +
           `Check ai_configs: row exists?, is_active=true?, auto_reply_enabled=true?, and a non-empty API key.`
       );
-      return;
+      if (bypass) {
+        config = emergencyConfig(config);
+        console.warn(
+          `[ai auto-reply] BYPASS: continuing with an emergency config — provider=${config.provider} model=${config.model} keyPresent=${Boolean(config.apiKey)}`
+        );
+        if (!config.apiKey) {
+          console.error(
+            '[ai auto-reply] BYPASS: no API key available at all (set AI_AUTOREPLY_BYPASS_KEY). Sending an outbound probe instead.'
+          );
+          await sendOutboundProbe(args, 'no AI key available under bypass');
+          return;
+        }
+      } else {
+        return;
+      }
     }
 
     console.log(
@@ -391,7 +507,8 @@ export async function dispatchInboundToAiReply(
       console.warn(
         `[ai auto-reply] an active automation (id ${autoResponders[0].id}) already answers "new_message_received"/"keyword_match" for account ${accountId} — the bot stands down to avoid double replies. Disable that automation to let the AI answer.`
       );
-      return;
+      if (!bypass) return;
+      console.warn('[ai auto-reply] BYPASS: ignoring the automation override.');
     }
 
     const { data: conv, error: convErr } = await db
@@ -404,6 +521,9 @@ export async function dispatchInboundToAiReply(
         `[ai auto-reply] could not load conversation ${conversationId} — skipping:`,
         convErr?.message ?? 'row not found'
       );
+      if (bypass) {
+        await sendOutboundProbe(args, 'conversation could not be loaded');
+      }
       return;
     }
     // Único criterio de silencio: un humano que tomó el control. No existe
@@ -414,7 +534,13 @@ export async function dispatchInboundToAiReply(
       console.warn(
         `[ai auto-reply] conversation ${conversationId} is assigned to agent ${conv.assigned_agent_id} (human took over) — skipping. Unassign it to hand the thread back to the bot.`
       );
-      return;
+      if (bypass) {
+        console.warn(
+          '[ai auto-reply] BYPASS: ignoring assigned_agent_id and answering anyway.'
+        );
+      } else {
+        return;
+      }
     }
 
     // Cada mensaje entrante arranca con el contador en cero y sin flags
@@ -428,6 +554,9 @@ export async function dispatchInboundToAiReply(
       console.error(
         `[ai auto-reply] conversation context for ${conversationId} came back empty — nothing to answer.`
       );
+      if (bypass) {
+        await sendOutboundProbe(args, 'conversation context was empty');
+      }
       return;
     }
 
@@ -439,7 +568,13 @@ export async function dispatchInboundToAiReply(
       console.warn(
         `[ai auto-reply] account ${accountId} hit the per-account rate limit — skipping this inbound.`
       );
-      return;
+      if (bypass) {
+        console.warn(
+          '[ai auto-reply] BYPASS: ignoring the per-account rate limit (30/min).'
+        );
+      } else {
+        return;
+      }
     }
 
     // Pre-LLM context is fetched in parallel (knowledge retrieval and
@@ -673,12 +808,18 @@ export async function dispatchInboundToAiReply(
         console.log(
           '[ai auto-reply] dropped an empty reply without a link (no handoff, no mute).'
         );
+        if (bypass) {
+          await sendOutboundProbe(args, 'model produced only a link promise');
+        }
         return;
       }
       if (finalText === null) {
         console.log(
           '[ai auto-reply] dropped an ungrounded text (no mute, no handoff).'
         );
+        if (bypass) {
+          await sendOutboundProbe(args, 'model text failed the grounding guard');
+        }
         return;
       }
     }
@@ -700,6 +841,9 @@ export async function dispatchInboundToAiReply(
       console.log(
         '[ai auto-reply] no final text to send — skipping without muting.'
       );
+      if (bypass) {
+        await sendOutboundProbe(args, 'the model returned empty text');
+      }
       return;
     }
 
@@ -769,16 +913,31 @@ export async function dispatchInboundToAiReply(
       throw err;
     });
     console.log('[AUTO-REPLY] Mensaje enviado con éxito a WhatsApp:', enviado);
-  } catch (err) {
-    // The safety net for everything above. Never throws, so the webhook's
-    // 200 to Meta is unaffected — but it is now impossible for a turn to
-    // die without a line naming the conversation, the account and the
-    // error.
+  } catch (error) {
+    // Global safety net around the ENTIRE reply block. Never throws, so the
+    // webhook's 200 to Meta is unaffected — but a turn can no longer die
+    // without a line naming the conversation and the full provider / Meta
+    // error (message, stack, and AiError's code/status when present).
     console.error(
-      `[ai auto-reply] dispatch failed for conversation ${conversationId} (contact ${contactId}, account ${accountId}):`,
-      err instanceof Error
-        ? { message: err.message, stack: err.stack, ...(err as object) }
-        : err
+      '[AUTOREPLY ERROR CRÍTICO]',
+      error,
+      error instanceof Error
+        ? {
+            conversationId,
+            contactId,
+            accountId,
+            message: error.message,
+            stack: error.stack,
+            ...(error as object),
+          }
+        : { conversationId, contactId, accountId }
     );
+
+    // Under bypass, an outbound probe distinguishes "the AI provider is
+    // broken" from "WhatsApp outbound is broken" — the two failure modes
+    // that look identical from the customer's side.
+    if (bypassEnabled()) {
+      await sendOutboundProbe(args, 'dispatch threw');
+    }
   }
 }
