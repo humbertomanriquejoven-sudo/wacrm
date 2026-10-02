@@ -326,32 +326,74 @@ export async function dispatchInboundToAiReply(
 ): Promise<void> {
   const { accountId, conversationId, contactId, configOwnerUserId } = args;
 
+  // Every early return below logs the reason. A gate that returns quietly
+  // is indistinguishable from a hung LLM call, which is exactly why
+  // "the bot just doesn't answer" was undiagnosable.
+  console.log(
+    `[ai auto-reply] dispatch requested — conversation ${conversationId}, contact ${contactId}, account ${accountId}`
+  );
+
   try {
     const db = supabaseAdmin();
 
     const config = await loadAiConfig(db, accountId);
-    if (!config || !config.autoReplyEnabled) return;
+    if (!config || !config.autoReplyEnabled) {
+      // loadAiConfig returns null for a missing row, is_active=false, an
+      // empty api_key — three very different operator mistakes that all
+      // used to collapse into one invisible no-op.
+      console.warn(
+        `[ai auto-reply] not enabled for account ${accountId} — skipping. ` +
+          `Check ai_configs: row exists?, is_active=true?, auto_reply_enabled=true?, and a non-empty API key.`
+      );
+      return;
+    }
 
-    const { data: autoResponders } = await db
+    console.log(
+      `[ai auto-reply] config OK — provider=${config.provider} model=${config.model}`
+    );
+
+    const { data: autoResponders, error: autoResponderErr } = await db
       .from('automations')
       .select('id')
       .eq('account_id', accountId)
       .eq('is_active', true)
       .in('trigger_type', ['new_message_received', 'keyword_match'])
       .limit(1);
-    if (autoResponders && autoResponders.length > 0) return;
+    if (autoResponderErr) {
+      console.error(
+        '[ai auto-reply] could not read the automations table; proceeding without the override check:',
+        autoResponderErr.message
+      );
+    }
+    if (autoResponders && autoResponders.length > 0) {
+      console.warn(
+        `[ai auto-reply] an active automation (id ${autoResponders[0].id}) already answers "new_message_received"/"keyword_match" for account ${accountId} — the bot stands down to avoid double replies. Disable that automation to let the AI answer.`
+      );
+      return;
+    }
 
     const { data: conv, error: convErr } = await db
       .from('conversations')
       .select('assigned_agent_id')
       .eq('id', conversationId)
       .maybeSingle();
-    if (convErr || !conv) return;
+    if (convErr || !conv) {
+      console.error(
+        `[ai auto-reply] could not load conversation ${conversationId} — skipping:`,
+        convErr?.message ?? 'row not found'
+      );
+      return;
+    }
     // Único criterio de silencio: un humano que tomó el control. No existe
     // flag de pausa ni de handoff (ai_autoreply_disabled) ni límite de
     // respuestas: mientras no haya agente asignado, la IA responde SIEMPRE
     // cada mensaje entrante ("Hola", "?", etc.) sin dejar en visto.
-    if (conv.assigned_agent_id) return;
+    if (conv.assigned_agent_id) {
+      console.warn(
+        `[ai auto-reply] conversation ${conversationId} is assigned to agent ${conv.assigned_agent_id} (human took over) — skipping. Unassign it to hand the thread back to the bot.`
+      );
+      return;
+    }
 
     // Cada mensaje entrante arranca con el contador en cero y sin flags
     // legacy: un hilo que quedó con el contador en el límite de una versión
@@ -360,7 +402,12 @@ export async function dispatchInboundToAiReply(
     await resetAutoReplyCounter(db, conversationId);
 
     const messages = await buildConversationContext(db, conversationId);
-    if (messages.length === 0) return;
+    if (messages.length === 0) {
+      console.error(
+        `[ai auto-reply] conversation context for ${conversationId} came back empty — nothing to answer.`
+      );
+      return;
+    }
 
     const acctLimit = checkRateLimit(
       `ai-autoreply:${accountId}`,
@@ -409,12 +456,22 @@ export async function dispatchInboundToAiReply(
     const conversationMessages: ChatMessage[] = [...messages];
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+      // Logged immediately before the network call: if the provider hangs
+      // or rejects, this line is the last thing in the logs and tells you
+      // the request left the app (vs. never being attempted).
+      console.log(
+        `[ai auto-reply] calling ${config.provider}/${config.model} — round ${round + 1}/${MAX_TOOL_ROUNDS + 1}, ${conversationMessages.length} message(s) in context`
+      );
       const result = await generateReply({
         config,
         systemPrompt,
         messages: conversationMessages,
         tools: AI_TOOLS,
       });
+
+      console.log(
+        `[ai auto-reply] provider replied — text=${result.text?.length ?? 0} chars, toolCalls=${result.toolCalls?.length ?? 0}`
+      );
 
       finalUsage = result.usage;
 
@@ -629,7 +686,15 @@ export async function dispatchInboundToAiReply(
       console.error('[ai auto-reply] claim_ai_reply_slot failed:', claimErr);
       return;
     }
-    if (claimed !== true) return;
+    if (claimed !== true) {
+      // The RPC refused the slot. With an unlimited cap this should be
+      // unreachable; if it fires, the installed claim_ai_reply_slot is
+      // from a migration that predates 046.
+      console.warn(
+        `[ai auto-reply] claim_ai_reply_slot returned false for conversation ${conversationId} — nothing sent. The DB function likely predates migration 046.`
+      );
+      return;
+    }
 
     const enviado = await engineSendAiReply({
       accountId,
@@ -647,6 +712,14 @@ export async function dispatchInboundToAiReply(
     });
     console.log('[AUTO-REPLY] Mensaje enviado con éxito a WhatsApp:', enviado);
   } catch (err) {
-    console.error('[ai auto-reply] dispatch failed:', err);
+    // The safety net. `engineSendAiReply` throws for the failures that
+    // used to be invisible end to end: invalid contact phone, WhatsApp
+    // not configured for this account, a bad access_token, or Meta
+    // rejecting every number variant (e.g. 131030, outside the 24h
+    // window). Name the conversation so the failure is traceable.
+    console.error(
+      `[ai auto-reply] dispatch failed for conversation ${conversationId} (contact ${contactId}, account ${accountId}):`,
+      err
+    );
   }
 }

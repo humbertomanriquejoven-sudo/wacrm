@@ -209,9 +209,32 @@ export async function POST(request: Request) {
   let body: { entry?: WhatsAppWebhookEntry[] }
   try {
     body = JSON.parse(rawBody)
-  } catch {
+  } catch (err) {
+    console.error(
+      '[webhook] POST body is not valid JSON — payload dropped:',
+      err instanceof Error ? err.message : err
+    )
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
   }
+
+  // Inbound breadcrumb. Everything downstream is asynchronous (after()
+  // below), so this is the only record that Meta's delivery even reached
+  // us — without it a dead bot and a webhook Meta never called look
+  // identical in the logs.
+  const inboundMessageCount = (body.entry ?? []).reduce(
+    (total, entry) =>
+      total +
+      (entry.changes ?? []).reduce(
+        (n, change) => n + (change.value?.messages?.length ?? 0),
+        0
+      ),
+    0
+  )
+  console.log(
+    `[webhook] POST received — signature ok, ${body.entry?.length ?? 0} entr${
+      (body.entry?.length ?? 0) === 1 ? 'y' : 'ies'
+    }, ${inboundMessageCount} inbound message(s)`
+  )
 
   // Process AFTER the response so we ack Meta within their ~20s timeout
   // (a slow ack triggers Meta retries + duplicate inserts), while still
@@ -228,10 +251,17 @@ export async function POST(request: Request) {
   // keeps the function alive until it resolves (within the route's
   // maxDuration).
   after(async () => {
+    const startedAt = Date.now()
     try {
       await processWebhook(body)
+      console.log(
+        `[webhook] delivery processed in ${Date.now() - startedAt}ms`
+      )
     } catch (error) {
-      console.error('Error processing webhook:', error)
+      console.error(
+        `[webhook] processWebhook threw after ${Date.now() - startedAt}ms — remaining messages in this delivery were dropped:`,
+        error
+      )
     }
   })
 
@@ -239,7 +269,12 @@ export async function POST(request: Request) {
 }
 
 async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
-  if (!body.entry) return
+  if (!body.entry) {
+    console.warn(
+      '[webhook] payload has no entry[] — nothing to process (not a Meta message delivery?)'
+    )
+    return
+  }
 
   for (const entry of body.entry) {
     for (const change of entry.changes) {
@@ -265,8 +300,16 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
         }
       }
 
-      // Handle incoming messages
-      if (!value.messages || !value.contacts) continue
+      // Handle incoming messages. `value.contacts` missing/empty used to
+      // skip the whole change with zero output, which is indistinguishable
+      // from "Meta never sent it" in the logs — say which half was absent.
+      if (!value.messages) continue
+      if (!value.contacts || value.contacts.length === 0) {
+        console.warn(
+          `[webhook] ${value.messages.length} inbound message(s) arrived with no contacts[] — skipping change (Meta normally always sends it)`
+        )
+        continue
+      }
 
       const phoneNumberId = value.metadata.phone_number_id
 
@@ -307,11 +350,33 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       const config = configRows[0]
 
-      const decryptedAccessToken = decrypt(config.access_token)
+// Decrypting outside a try/catch meant a wrong ENCRYPTION_KEY threw
+// straight out of processWebhook and killed every remaining message in
+// the delivery, surfacing only as one generic "Error processing webhook".
+// Scope the failure to this change so the rest still lands.
+let decryptedAccessToken: string
+try {
+      decryptedAccessToken = decrypt(config.access_token)
+    } catch (err) {
+      console.error(
+        `[webhook] could not decrypt access_token for phone_number_id ${phoneNumberId} (account ${config.account_id}) — check ENCRYPTION_KEY matches the value stored in whatsapp_config. All messages for this number are dropped:`,
+        err instanceof Error ? err.message : err
+      )
+      continue
+    }
 
-      for (let i = 0; i < value.messages.length; i++) {
-        const message = value.messages[i]
-        const contact = value.contacts[i] || value.contacts[0]
+    for (let i = 0; i < value.messages.length; i++) {
+      const message = value.messages[i]
+      // An empty contacts[] is filtered above, but a short array can still
+      // leave `contact` undefined. Dereferencing `contact.profile.name`
+      // used to throw and abort the whole delivery, so coerce it.
+      const contact = value.contacts[i] ?? value.contacts[0]
+      if (!contact) {
+        console.error(
+          `[webhook] no contact object for message ${message.id} — skipping it (contacts[] had ${value.contacts.length} entr${value.contacts.length === 1 ? 'y' : 'ies'} for ${value.messages.length} message(s))`
+        )
+        continue
+      }
 
         await processMessage(
           message,
@@ -609,6 +674,12 @@ async function processMessage(
   const senderPhone = normalizePhone(message.from)
   const contactName = contact.profile.name
 
+  // Per-message breadcrumb: this is where you confirm the inbound reached
+  // processing at all, and the steps below all reference this id.
+  console.log(
+    `[webhook] processing ${message.type} message ${message.id} from ${senderPhone || message.from} (account ${accountId})`
+  )
+
   // Show the WhatsApp typing indicator IMMEDIATELY so the customer sees
   // the bot "is typing" while we process text / voice notes. Fire-and-
   // forget and strictly best-effort: a failed indicator must never break
@@ -638,7 +709,12 @@ async function processMessage(
     senderPhone,
     contactName
   )
-  if (!contactOutcome) return
+  if (!contactOutcome) {
+    console.error(
+      `[webhook] could not resolve or create a contact for ${senderPhone} — dropping message ${message.id} before it reaches the AI.`
+    )
+    return
+  }
   const contactRecord = contactOutcome.contact
 
   // Find or create conversation
@@ -647,8 +723,17 @@ async function processMessage(
     configOwnerUserId,
     contactRecord.id
   )
-  if (!convResult) return
+  if (!convResult) {
+    console.error(
+      `[webhook] could not resolve or create a conversation for contact ${contactRecord.id} — dropping message ${message.id} before it reaches the AI.`
+    )
+    return
+  }
   const conversation = convResult.conversation
+
+  console.log(
+    `[webhook] thread ${conversation.id} (contact ${contactRecord.id}, assigned_agent_id=${(conversation as { assigned_agent_id?: string | null }).assigned_agent_id ?? 'null'}${convResult.created ? ', newly created' : ''})`
+  )
 
   // Emit conversation.created as soon as the thread is opened — BEFORE
   // the reaction short-circuit below — so a conversation first opened by
@@ -990,7 +1075,27 @@ async function processMessage(
   // the account has enabled it. Awaited inside `after()` (same reason as
   // the webhook dispatch below); `dispatchInboundToAiReply` owns its
   // eligibility gates + try/catch and never throws.
-  if (!flowConsumed && !interactiveReplyId && inboundText.trim()) {
+  //
+  // Every reason this block is skipped is logged explicitly: this gate
+  // used to be the largest silent hole in the pipeline, where a message
+  // would arrive, land in the inbox, and simply never reach the LLM with
+  // nothing in the logs to say why.
+  if (flowConsumed) {
+    console.log(
+      `[webhook] message ${message.id}: a Flow consumed it — AI auto-reply skipped by design.`
+    )
+  } else if (interactiveReplyId) {
+    console.log(
+      `[webhook] message ${message.id}: interactive reply ${interactiveReplyId} — AI auto-reply skipped by design (buttons/lists are answered by their own flow).`
+    )
+  } else if (!inboundText.trim()) {
+    console.log(
+      `[webhook] message ${message.id}: no text content after parsing (type=${message.type}) — AI auto-reply skipped (nothing to answer).`
+    )
+  } else {
+    console.log(
+      `[webhook] message ${message.id}: dispatching to AI auto-reply (${inboundText.trim().slice(0, 80)})`
+    )
     await dispatchInboundToAiReply({
       accountId,
       conversationId: conversation.id,
