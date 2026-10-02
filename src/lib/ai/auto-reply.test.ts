@@ -21,6 +21,7 @@ const h = vi.hoisted(() => ({
       meet_link?: string | null;
     }[],
     claim: true as boolean,
+    rpcError: null as Error | null,
     rateLimit: true,
     updatePayloads: [] as Record<string, unknown>[],
     rpcCalls: [] as { name: string; args: unknown }[],
@@ -140,6 +141,9 @@ vi.mock('./admin-client', () => ({
     },
     rpc: (name: string, args: unknown) => {
       h.state.rpcCalls.push({ name, args });
+      if (h.state.rpcError) {
+        return Promise.resolve({ data: null, error: h.state.rpcError });
+      }
       return Promise.resolve({ data: h.state.claim, error: null });
     },
   }),
@@ -195,6 +199,7 @@ beforeEach(() => {
   h.state.autoResponders = [];
   h.state.citas = [];
   h.state.claim = true;
+  h.state.rpcError = null;
   h.state.rateLimit = true;
   h.state.updatePayloads = [];
   h.state.rpcCalls = [];
@@ -234,7 +239,13 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     );
   });
 
-  it('sends no cap (0) when the configured max is 99999 or more', async () => {
+  it('sends 99999 (not 0) when the configured max is 99999 or more', async () => {
+    // Regression guard for the permanent-silence bug: the "unlimited"
+    // sentinel must NOT be 0. The original claim_ai_reply_slot from
+    // migration 029 tests `ai_reply_count < max_replies`, and the counter
+    // is reset to 0 on every inbound, so `0 < 0` is false — the RPC
+    // refuses the slot and the bot never answers anyone. 99999 passes on
+    // the 029, 041 and 046 versions of the function alike.
     h.loadAiConfig.mockResolvedValue(
       aiConfig({ autoReplyMaxPerConversation: 99999 })
     );
@@ -242,10 +253,31 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.state.rpcCalls).toEqual([
       {
         name: 'claim_ai_reply_slot',
-        args: { conversation_id: 'conv-1', max_replies: 0 },
+        args: { conversation_id: 'conv-1', max_replies: 99999 },
       },
     ]);
     expect(h.engineSendAiReply).toHaveBeenCalled();
+  });
+
+  it('never sends max_replies 0, which would mute the thread on the 029 RPC', async () => {
+    // Whatever the panel holds — including an empty/invalid value — the
+    // RPC must receive a positive cap.
+    for (const configured of [0, -5, Number.NaN, 1, 20, 500, 200000]) {
+      h.state.rpcCalls.length = 0;
+      h.loadAiConfig.mockResolvedValue(
+        aiConfig({ autoReplyMaxPerConversation: configured })
+      );
+      await dispatchInboundToAiReply(ARGS);
+      expect(h.state.rpcCalls).toHaveLength(1);
+      expect(h.state.rpcCalls[0].args).toMatchObject({
+        max_replies: expect.any(Number),
+      });
+      const sent = (h.state.rpcCalls[0].args as { max_replies: number })
+        .max_replies;
+      expect(Number.isFinite(sent)).toBe(true);
+      expect(sent).toBeGreaterThan(0);
+      expect(sent).toBeLessThanOrEqual(99999);
+    }
   });
 
   it('resets the legacy reply counter and pause flag on every inbound', async () => {
@@ -300,12 +332,27 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.engineSendText).not.toHaveBeenCalled();
   });
 
-  it('does not send when the atomic slot claim loses the race', async () => {
+  it('still sends when the slot claim refuses the slot', async () => {
+    // The claim is advisory, not a gate. `ai_reply_count` is reset to 0 on
+    // every inbound so no cap can ever be reached, and a stale/missing
+    // RPC used to silence the bot for every customer. Losing the claim
+    // must never cost the customer their reply.
     h.state.claim = false;
     await dispatchInboundToAiReply(ARGS);
-    // It still attempts the claim, but the send is skipped.
     expect(h.state.rpcCalls).toHaveLength(1);
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ conversationId: 'conv-1', text: 'Hello!' })
+    );
     expect(h.engineSendText).not.toHaveBeenCalled();
+  });
+
+  it('still sends when the slot claim RPC errors', async () => {
+    // e.g. the function is missing or service_role lacks EXECUTE.
+    h.state.rpcError = new Error('permission denied for function claim_ai_reply_slot');
+    await dispatchInboundToAiReply(ARGS);
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ conversationId: 'conv-1', text: 'Hello!' })
+    );
   });
 
   it('skips when AI is off / not configured', async () => {

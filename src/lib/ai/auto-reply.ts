@@ -26,23 +26,45 @@ const MAX_TOOL_ROUNDS = 3;
 
 /**
  * Tope de auto-respuestas a partir del cual NO hay tope: cualquier valor
- * configurado mayor o igual a este se envía al RPC como 0 (ilimitado), de
- * modo que el bot conteste siempre a cada mensaje entrante mientras no haya
- * un humano asignado, sin exigir un "Take over" manual para desbloquear.
+ * configurado mayor o igual a este se envía al RPC como este mismo número
+ * (un límite alto pero real), de modo que el bot conteste siempre a cada
+ * mensaje entrante mientras no haya un humano asignado, sin exigir un
+ * "Take over" manual para desbloquear.
  * 99999 es el valor por defecto del panel desde la migración 044.
  */
 const UNLIMITED_AUTO_REPLIES = 99999;
 
 /**
  * Traduce el tope configurado en el panel al parámetro `max_replies` del RPC
- * `claim_ai_reply_slot`, que interpreta 0 como "otorga el slot siempre".
- * Valores >= UNLIMITED_AUTO_REPLIES se colapsan a 0 para que un tope alto
- * configurado nunca sea interpretado como un límite real, y un valor
- * inválido (NaN / negativo) cae a 0 en vez de bloquear el hilo.
+ * `claim_ai_reply_slot`.
+ *
+ * CRÍTICO: el valor "sin tope" que se envía es UNLIMITED_AUTO_REPLIES, NO 0.
+ *
+ * Cada versión del RPC interpreta `max_replies` de forma distinta:
+ *
+ *   * 029 (original):  `ai_reply_count < max_replies`
+ *   * 041 / 046:        `max_replies = 0 OR ...` / `max_replies >= 99999 OR ...`
+ *
+ * Enviar 0 sólo funciona con 041 en adelante. Con la función de la 029,
+ * el predicado queda `ai_reply_count (0, recién reiniciado) < 0` → FALSE →
+ * el UPDATE no hace match → el RPC devuelve false → el despacho hace
+ * `return` y NO ENVÍA NADA. Como el contador se reinicia a cero en cada
+ * mensaje entrante (ver `resetAutoReplyCounter`), 0 es justamente el valor
+ * que garantiza el silencio permanente: el bot nunca responde, para ningún
+ * contacto, hasta que se apliquen las migraciones 041/046.
+ *
+ * Mandar 99999 hace que el claim tenga éxito en las TRES versiones:
+ *   029 → `0 < 99999` ✓   041 → `0 < 99999` ✓   046 → `>= 99999` ✓
+ *
+ * Y como el contador se reinicia a 0 en cada mensaje entrante, el tope nunca
+ * llega a alcanzarse: el claim conserva su atomicidad (el lock de fila sigue
+ * serializando dos despachos concurrentes) sin poder silenciar el hilo.
  */
 function effectiveMaxReplies(configured: number): number {
-  if (!Number.isFinite(configured) || configured <= 0) return 0;
-  return configured >= UNLIMITED_AUTO_REPLIES ? 0 : Math.floor(configured);
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return UNLIMITED_AUTO_REPLIES;
+  }
+  return Math.min(Math.floor(configured), UNLIMITED_AUTO_REPLIES);
 }
 
 /**
@@ -669,31 +691,42 @@ export async function dispatchInboundToAiReply(
       return;
     }
 
+    // The per-conversation slot claim. It exists to keep the row-level lock
+    // that serialises two concurrent dispatches on the same thread, and it
+    // is NO LONGER allowed to gate the send:
+    //
+    //   * `resetAutoReplyCounter` zeroes `ai_reply_count` on every inbound,
+    //     so no stored cap can ever be reached — the cap is meaningless.
+    //   * A missing function, a missing `service_role` EXECUTE grant, or a
+    //     stale definition from an older migration all made this RPC fail
+    //     or refuse the slot, which silenced the bot for EVERY inbound
+    //     while looking like a healthy run. That is exactly the class of
+    //     silent failure this whole path is meant to stop having.
+    //
+    // So a failure here is logged loudly and the reply still goes out.
+    // Duplicate deliveries of the same Meta message are already filtered
+    // upstream by the `messages` upsert (ignoreDuplicates), so honouring
+    // the claim is not what protects against double-sends.
     const { data: claimed, error: claimErr } = await db.rpc(
       'claim_ai_reply_slot',
       {
         conversation_id: conversationId,
-        // El tope sale de la configuración real de la cuenta en vez de un 0
-        // fijo: 99999 (o cualquier valor >= UNLIMITED_AUTO_REPLIES) se
-        // colapsa a 0, que el RPC trata como ilimitado. Así un panel con el
-        // máximo alto nunca vuelve a dejar el hilo mudo, y el RPC sigue
-        // funcionando aunque se haya creado desde una versión anterior que
-        // no entendía el 0 como "sin tope".
+        // El tope sale de la configuración real de la cuenta. El valor
+        // "sin tope" se envía como 99999 (NO como 0): ver effectiveMaxReplies
+        // — mandar 0 deja al bot mudo de forma permanente si la función
+        // claim_ai_reply_slot instalada es la de la migración 029.
         max_replies: effectiveMaxReplies(config.autoReplyMaxPerConversation),
       }
     );
     if (claimErr) {
-      console.error('[ai auto-reply] claim_ai_reply_slot failed:', claimErr);
-      return;
-    }
-    if (claimed !== true) {
-      // The RPC refused the slot. With an unlimited cap this should be
-      // unreachable; if it fires, the installed claim_ai_reply_slot is
-      // from a migration that predates 046.
-      console.warn(
-        `[ai auto-reply] claim_ai_reply_slot returned false for conversation ${conversationId} — nothing sent. The DB function likely predates migration 046.`
+      console.error(
+        '[ai auto-reply] claim_ai_reply_slot failed; sending anyway. Check that the function exists and that service_role has EXECUTE on it (supabase/ci/verify-schema.sql asserts both):',
+        claimErr
       );
-      return;
+    } else if (claimed !== true) {
+      console.warn(
+        `[ai auto-reply] claim_ai_reply_slot returned false for conversation ${conversationId}; sending anyway. The installed DB function may predate migration 046.`
+      );
     }
 
     const enviado = await engineSendAiReply({
