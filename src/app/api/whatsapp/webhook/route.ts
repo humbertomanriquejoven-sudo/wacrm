@@ -15,6 +15,11 @@ import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
 import { engineSendText } from '@/lib/flows/meta-send'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
+import {
+  autoUnblockConversation,
+  autoUnblockEnabled,
+  clearStaleFlowRuns,
+} from '@/lib/ai/unblock'
 import { transcribeAudio } from '@/lib/ai/transcribe'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
 import {
@@ -734,6 +739,17 @@ async function processMessage(
   console.log(
     `[webhook] thread ${conversation.id} (contact ${contactRecord.id}, assigned_agent_id=${(conversation as { assigned_agent_id?: string | null }).assigned_agent_id ?? 'null'}${convResult.created ? ', newly created' : ''})`
   )
+
+  // Auto-unblock BEFORE the flow runner. Threads that already interacted
+  // with a Flow can hold a stranded `active` run, and `dispatchInboundToFlows`
+  // reports `consumed: true` for every inbound while one exists — which is
+  // why the bot answered new numbers but went silent on old ones. Runs must
+  // be cleared before the flow dispatch, and the assignment flag before the
+  // AI gate, so this runs first and never throws.
+  if (autoUnblockEnabled() && !convResult.created) {
+    await autoUnblockConversation(supabaseAdmin(), conversation.id, senderPhone)
+    await clearStaleFlowRuns(supabaseAdmin(), conversation.id)
+  }
 
   // Emit conversation.created as soon as the thread is opened — BEFORE
   // the reaction short-circuit below — so a conversation first opened by

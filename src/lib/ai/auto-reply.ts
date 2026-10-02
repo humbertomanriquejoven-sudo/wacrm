@@ -17,6 +17,10 @@ import { calendarConfigured, MEET_FALLBACK_LINK } from '@/lib/calendar';
 import { gmailConfigured } from '@/lib/gmail';
 import { stripRawTimestamps } from '@/lib/whatsapp/clean-ai-text';
 import { engineSendAiReply, engineSendText } from '@/lib/flows/meta-send';
+import {
+  autoUnblockConversation,
+  autoUnblockEnabled,
+} from './unblock';
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { ChatMessage } from './types';
@@ -430,6 +434,23 @@ interface DispatchArgs {
   composeMessageId?: string;
 }
 
+/** Best-effort phone lookup so every skip diagnostic can name the contact. */
+async function contactPhoneFor(
+  db: SupabaseClient,
+  contactId: string
+): Promise<string | null> {
+  try {
+    const { data } = await db
+      .from('contacts')
+      .select('phone')
+      .eq('id', contactId)
+      .maybeSingle();
+    return (data as { phone?: string | null } | null)?.phone ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * AI auto-reply for a freshly-arrived inbound message.
  *
@@ -531,14 +552,31 @@ export async function dispatchInboundToAiReply(
     // respuestas: mientras no haya agente asignado, la IA responde SIEMPRE
     // cada mensaje entrante ("Hola", "?", etc.) sin dejar en visto.
     if (conv.assigned_agent_id) {
-      console.warn(
-        `[ai auto-reply] conversation ${conversationId} is assigned to agent ${conv.assigned_agent_id} (human took over) — skipping. Unassign it to hand the thread back to the bot.`
-      );
-      if (bypass) {
-        console.warn(
-          '[ai auto-reply] BYPASS: ignoring assigned_agent_id and answering anyway.'
+      // Last-chance auto-unlock. The webhook already clears this on inbound
+      // (see autoUnblockConversation), so reaching this point with an
+      // assignment still set means the thread was taken over BETWEEN the
+      // webhook's unblock and this gate — or the webhook unblock was
+      // disabled. Diagnostic names the contact so the operator can act.
+      const phone = await contactPhoneFor(db, contactId);
+      if (autoUnblockEnabled()) {
+        const unblocked = await autoUnblockConversation(
+          db,
+          conversationId,
+          phone
         );
+        if (unblocked.changed) {
+          console.warn(
+            `[ai auto-reply] phone ${phone ?? 'unknown'}: took over a thread that was assigned and is now answering it (cleared: ${unblocked.reasons.join(', ')})`
+          );
+        } else {
+          console.warn(
+            `[ai auto-reply] phone ${phone ?? 'unknown'}: auto-unblock did not clear the assignment; answering anyway under auto-unblock.`
+          );
+        }
       } else {
+        console.warn(
+          `[ai auto-reply] SKIPPED — phone ${phone ?? 'unknown'} (conversation ${conversationId}) is assigned to agent ${conv.assigned_agent_id}: a human took this thread over. Unassign it, or set AI_AUTOREPLY_AUTO_UNBLOCK=false/undefined to keep this behaviour.`
+        );
         return;
       }
     }

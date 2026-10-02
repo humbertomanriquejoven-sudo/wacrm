@@ -393,13 +393,37 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     );
   });
 
-  it('still skips when a HUMAN agent is assigned to the conversation', async () => {
+  it('auto-unblocks an assigned thread by DEFAULT and answers it', async () => {
+    // Requested behaviour: a thread left muted by an earlier session must
+    // not stay muted when the contact writes again. Only contacts with
+    // prior history can be stuck this way, which is why new numbers always
+    // worked.
+    delete process.env.AI_AUTOREPLY_AUTO_UNBLOCK;
     h.state.conv = {
       assigned_agent_id: 'agent-9',
     };
     await dispatchInboundToAiReply(ARGS);
-    expect(h.engineSendText).not.toHaveBeenCalled();
-    expect(h.engineSendAiReply).not.toHaveBeenCalled();
+    expect(h.state.updatePayloads).toContainEqual(
+      expect.objectContaining({ assigned_agent_id: null })
+    );
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ conversationId: 'conv-1' })
+    );
+  });
+
+  it('keeps human takeover sticky when AI_AUTOREPLY_AUTO_UNBLOCK=false', async () => {
+    // The opt-out preserves the original human-wins semantics.
+    process.env.AI_AUTOREPLY_AUTO_UNBLOCK = 'false';
+    try {
+      h.state.conv = {
+        assigned_agent_id: 'agent-9',
+      };
+      await dispatchInboundToAiReply(ARGS);
+      expect(h.engineSendText).not.toHaveBeenCalled();
+      expect(h.engineSendAiReply).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.AI_AUTOREPLY_AUTO_UNBLOCK;
+    }
   });
 
   it('BYPASS: answers anyway when a human is assigned and the flag is on', async () => {
