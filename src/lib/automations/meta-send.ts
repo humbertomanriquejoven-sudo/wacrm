@@ -133,39 +133,17 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
 
   // Resolve the best recipient for this contact (phone, BSUID, or username).
   const recipient = await resolveRecipient(contact, input.accountId, input.conversationId)
-  if (!recipient.to && !recipient.recipient) throw new Error('contact not found for this account')
+  if (!recipient.to) throw new Error('contact not found for this account')
 
   // Use metaRecipientFields to route the address to the correct Meta field.
   // - Phone numbers go in `to`.
   // - BSUID / username go in `recipient`.
-  // - If neither is present, fall back to the raw resolved address.
-  const { to, recipient: recipientField } = metaRecipientFields(recipient.to ?? recipient.recipient ?? '')
+  // - The recipientResolution type only exposes `to` and `isPhone`; when
+  //   `isPhone` is false the address in `to` should be sent via `recipient`.
+  const { to: toField, recipient: recipientField } = metaRecipientFields(recipient.to!)
 
   // Build the body based on whether this is a phone or an opaque identifier.
   const isPhone = recipient.isPhone
-
-  const attempt = async (address: string): Promise<string> => {
-    if (input.kind === 'template') {
-      const r = await sendTemplateMessage({
-        phoneNumberId: config?.phone_number_id, // will be fetched below
-        accessToken: config?.access_token ? decrypt(config.access_token) : '',
-        to: isPhone ? address : '',
-        recipient: isPhone ? '' : recipientField,
-        templateName: input.templateName,
-        language: input.language,
-        params: input.params,
-      })
-      return r.messageId
-    }
-    const r = await sendTextMessage({
-      phoneNumberId: config?.phone_number_id,
-      accessToken: config?.access_token ? decrypt(config.access_token) : '',
-      to: isPhone ? address : '',
-      recipient: isPhone ? '' : recipientField,
-      text: input.text,
-    })
-    return r.messageId
-  }
 
   // Fetch config after we know what we're sending, to avoid unnecessary decryption.
   const { data: config, error: configErr } = await db
@@ -191,14 +169,19 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   let waMessageId = ''
   let workingPhone = ''
 
-  if (recipient.isPhone) {
+  if (isPhone) {
     // Phone number: use variants + retry logic as before.
-    const sanitized = isDialablePhone(recipient.to) ? sanitizePhoneForMeta(recipient.to) : recipient.to
+    const sanitized = isDialablePhone(recipient.to!) ? sanitizePhoneForMeta(recipient.to!) : recipient.to!
     const variants = phoneVariants(sanitized)
     let lastError: unknown = null
     for (const v of variants) {
       try {
-        waMessageId = await attempt(v)
+        waMessageId = await sendTextMessage({
+          phoneNumberId: config.phone_number_id,
+          accessToken,
+          to: v,
+          text: input.text,
+        })
         workingPhone = v
         lastError = null
         break
@@ -210,10 +193,16 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
     }
     if (lastError) throw lastError
   } else {
-    // BSUID / username: send directly, no variants needed.
-    workingPhone = recipient.to ?? recipient.recipient ?? ''
+    // BSUID / username: send directly via recipient field, no variants needed.
+    workingPhone = recipient.to!
     try {
-      waMessageId = await attempt(workingPhone)
+      waMessageId = await sendTextMessage({
+        phoneNumberId: config.phone_number_id,
+        accessToken,
+        to: '',
+        recipient: recipient.to!,
+        text: input.text,
+      })
     } catch (err) {
       if (!isRecipientNotAllowedError(err instanceof Error ? err.message : String(err))) throw err
       throw err
@@ -227,10 +216,19 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   // Templates persist the substituted body, same as the manual and
   // public-API send paths. This was unconditionally null, so every
   // automation template send rendered as an empty bubble (issue #483).
+  const templateRow =
+    input.kind === 'template'
+      ? await resolveTemplateRow(
+          db,
+          input.accountId,
+          input.templateName,
+          input.language,
+        ).row
+      : null
   const content_text =
     input.kind === 'text'
       ? input.text
-      : templateContentText(resolveTemplateRow(db, input.accountId, input.templateName, input.language)?.row, input.params ?? [])
+      : templateContentText(templateRow, input.params ?? [])
   const template_name = input.kind === 'template' ? input.templateName : null
 
   const { error: msgErr } = await db.from('messages').insert({
