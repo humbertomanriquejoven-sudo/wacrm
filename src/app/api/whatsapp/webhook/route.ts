@@ -282,6 +282,9 @@ export async function POST(request: Request) {
   after(async () => {
     const startedAt = Date.now()
     try {
+      // Move any identifier that landed in `phone` to `wa_user_id` and
+      // adopt a real number where a sibling contact has one.
+      await repairBsuidPhoneContacts()
       // Remove orphan contacts left by pre-BSUID versions of this handler,
       // which could insert a row with no usable `phone`. Those rows are
       // undeliverable and they also break `findExistingContact`'s
@@ -712,36 +715,51 @@ async function processMessage(
   mirrorMedia: boolean
 ) {
   // ============================================================
-  // Sender identity — Meta can identify the same person three ways,
-  // and does NOT always send all three.
+  // Sender identity — Meta can identify the same person three ways, and
+  // does NOT always send all three:
   //
-  //   * `wa_id` / `messages[].from` — the phone number. Present for any
-  //     sender on a registered number.
-  //   * `contacts[].user_id` / `messages[].from_user_id` — the BSUID, an
-  //     opaque per-WABA id. Sent for senders on numbers NOT registered
-  //     on WhatsApp, INSTEAD of a usable number.
-  //   * `contacts[].profile.username` / `.name` — the public @username.
+  //   * `wa_id` / `messages[].from`   — the phone number, E.164 digits.
+  //   * `contacts[].user_id` / `messages[].from_user_id` — the BSUID. Meta
+  //     prefixes these with a namespace marker: `'CO.<digits>'` is a
+  //     contact-scoped id, `'WAID.<digits>'` a phone-scoped one. They are
+  //     OPAQUE identifiers, never phone numbers and never usernames.
+  //   * `contacts[].profile.username` — the public @username.
   //
-  // The BSUID case is the one that broke outbound delivery: we only had
-  // `phone` to store the identifier, so a BSUID-only sender produced a
-  // contact whose `phone` was either empty or an opaque id that
-  // `sanitizePhoneForMeta` rejects — the webhook worked (typing
-  // indicator fired) but every send failed. Collect all three, prefer
-  // the number, and never let the stored `phone` end up blank.
+  // The BSUID case is what broke outbound delivery: we only had `phone` to
+  // store an identifier, so a BSUID-only sender produced a contact whose
+  // `phone` held something like 'CO.1008477715690681' — not a number, so
+  // `sanitizePhoneForMeta` rejected it and every send failed while the
+  // typing indicator still fired. Classify first, then store each value
+  // in the column it actually belongs to.
   // ============================================================
-  const rawPhone = normalizePhone(message.from) || normalizePhone(contact.wa_id)
-  const senderUserId =
-    contact.user_id?.trim() || message.from_user_id?.trim() || null
-  const senderUsername =
-    contact.profile.username?.trim().replace(/^@/, '') || null
+  const waIdRaw = message.from || contact.wa_id || ''
+
+  // A real phone number is digits only. Anything with letters, a dot, or
+  // any other character is an identifier we must NOT treat as a number.
+  const rawPhone = isPhoneLike(waIdRaw) ? normalizePhone(waIdRaw) : ''
+
+  // BSUID, including its `'CO.'` / `'WAID.'` namespace prefix. Stripped of
+  // the prefix for storage so the value is comparable across payloads,
+  // but only ever written to `wa_user_id` — never to `phone`/`username`.
+  const senderUserId = firstOpaqueId(
+    contact.user_id,
+    message.from_user_id,
+    waIdRaw,
+  )
+
+  // Username, stored WITH the leading '@' so it renders the way WhatsApp
+  // shows it. Strip-then-re-add rather than check-startsWith, so
+  // '@@humberto' also normalizes to '@humberto'.
+  const senderUsername = withAtSign(
+    contact.profile.username || (contact as { username?: string }).username,
+  )
   const senderName = contact.profile.name?.trim() || null
 
-  // The `phone` we persist. Falls back through BSUID → username so the
-  // NOT NULL column always has something the sender can be reached at;
-  // `resolveSenderContact` promotes a BSUID into `phone` on insert for
-  // exactly this reason.
-  const senderPhone =
-    rawPhone || senderUserId || senderUsername || senderName || 'unknown'
+  // The `phone` we persist. Only ever a real number — if Meta gave us
+  // none, we fall back to the BSUID so the NOT NULL column holds something
+  // the sender can be addressed by (Meta accepts a BSUID as `to`), but we
+  // never invent a number from a username or a display name.
+  const senderPhone = rawPhone || senderUserId || 'unknown'
 
   // Human-facing label. The @username is more stable than the profile
   // name (people rename themselves), so it wins when present. Stored on
@@ -1490,6 +1508,190 @@ async function parseMessageContent(
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ContactRow = any
+
+/** Meta's namespace prefixes on a BSUID. Both mark an OPAQUE id. */
+const BSUID_PREFIX_RE = /^(CO|WAID)\./i
+
+/**
+ * True when `value` is usable as a phone number: at least 7 digits and
+ * nothing but digits / a leading `+` / separators.
+ *
+ * The point is to reject BSUIDs. `normalizePhone('CO.1008477715690681')`
+ * returns `'1008477715690681'` — pure digits, 16 of them — so a naive
+ * digits-only check happily promotes an identifier into the `phone`
+ * column, which is exactly how 'CO.…' ended up stored as a phone. Testing
+ * for the `CO.` / `WAID.` marker (and for any non-numeric character)
+ * before normalizing is what actually separates the two.
+ */
+function isPhoneLike(value: string | null | undefined): boolean {
+  if (!value) return false
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  if (BSUID_PREFIX_RE.test(trimmed)) return false
+  // Only digits, an optional leading '+', and the usual separators.
+  if (!/^\+?[\d\s().-]+$/.test(trimmed)) return false
+  return normalizePhone(trimmed).length >= 7
+}
+
+/**
+ * Extract a BSUID from whichever field carries it, returning the id with
+ * its namespace prefix stripped, or null when the value isn't one.
+ *
+ * Candidates are checked in order and each is classified: a real phone
+ * number is NOT returned as a BSUID. `wa_id` is included as a last resort
+ * because for unregistered senders Meta sometimes puts the 'CO.…' id there
+ * instead of a number.
+ */
+function firstOpaqueId(...candidates: Array<string | null | undefined>): string | null {
+  for (const candidate of candidates) {
+    const trimmed = candidate?.trim()
+    if (!trimmed) continue
+    if (BSUID_PREFIX_RE.test(trimmed)) {
+      return trimmed.replace(BSUID_PREFIX_RE, '').trim() || null
+    }
+  }
+  return null
+}
+
+/**
+ * Normalize a WhatsApp handle to its display form, leading '@' included:
+ * `'humberto'` → `'@humberto'`, `'@humberto'` → `'@humberto'`,
+ * `'@@humberto'` → `'@humberto'`.
+ *
+ * Returns null for anything that isn't a plausible handle. This is the
+ * guard that keeps a BSUID from being stored as a username: 'CO.1008…'
+ * contains a dot and digits but no handle characters, so it's rejected
+ * outright rather than becoming '@CO.1008…'.
+ */
+function withAtSign(raw: string | null | undefined): string | null {
+  const trimmed = raw?.trim().replace(/^@+/, '')
+  if (!trimmed) return null
+  if (BSUID_PREFIX_RE.test(trimmed)) return null
+  // Handles are letters, digits, dot, underscore, hyphen. No spaces, no
+  // digits-only values (that's a phone number in disguise).
+  if (!/^[A-Za-z0-9._-]+$/.test(trimmed)) return null
+  // All digits with no dot/underscore/hyphen is a phone number, not a
+  // handle — reject so we never write a number into `username`.
+  if (/^\d+$/.test(trimmed)) return null
+  return `@${trimmed}`
+}
+
+/**
+ * Repair contacts whose `phone` holds a BSUID instead of a number.
+ *
+ * Earlier versions of this handler stored the sender's identifier in
+ * `phone`, so rows like `'CO.1008477715690681'` ended up there. Those are
+ * undeliverable (Meta rejects a 'CO.…' as `to`) and they also poison the
+ * phone-suffix dedupe pre-filter, which is why such a contact never merged
+ * with the real '573122182949' row for the same person.
+ *
+ * The fix is a lookup by the identity fields we DO trust (`wa_user_id`
+ * first, then `username`, then `name`) among that contact's siblings in
+ * the same account:
+ *   - a sibling with a real number  → adopt that number;
+ *   - a sibling with a username     → adopt the @-prefixed handle.
+ * Rows with no recoverable number are left alone rather than deleted: the
+ * conversation history is worth more than an undeliverable `phone`, and
+ * the next inbound from that person can still supply a real number.
+ *
+ * Best-effort and self-limiting: once repaired the row no longer matches
+ * the `like` filter below, so repeat deliveries are a cheap no-op.
+ */
+async function repairBsuidPhoneContacts(): Promise<void> {
+  try {
+    const db = supabaseAdmin()
+
+    // PostgREST `like` needs the wildcard in the value. 'CO.%' / 'WAID.%'
+    // covers both namespace markers Meta emits.
+    const { data: coBroken, error } = await db
+      .from('contacts')
+      .select('id, account_id, phone, name, username, wa_user_id')
+      .like('phone', 'CO.%')
+
+    // WAID. ids are rarer; check them too but stay quiet if neither matches.
+    const { data: waidBroken } = await db
+      .from('contacts')
+      .select('id, account_id, phone, name, username, wa_user_id')
+      .like('phone', 'WAID.%')
+
+    const broken = [...(coBroken ?? []), ...(waidBroken ?? [])]
+    if (error && (!coBroken || coBroken.length === 0) && broken.length === 0) return
+    if (broken.length === 0) return
+
+    for (const row of broken as Array<{
+      id: string
+      account_id: string
+      phone: string
+      name?: string | null
+      username?: string | null
+      wa_user_id?: string | null
+    }>) {
+      const patch: Record<string, unknown> = {}
+
+      // The BSUID is the row's real identity — record it properly so the
+      // next inbound resolves by `wa_user_id` instead of by phone.
+      const bsuid = firstOpaqueId(row.phone, row.wa_user_id)
+      if (bsuid && !row.wa_user_id) patch.wa_user_id = bsuid
+
+      // Derive the @-prefixed handle from the stored name when we can.
+      // `withAtSign` rejects anything that isn't handle-shaped, so a
+      // display name like 'Humberto Manrique' is skipped rather than
+      // turned into '@Humberto Manrique'.
+      const handle = withAtSign(row.username) ?? null
+      if (handle && handle !== row.username) patch.username = handle
+
+      // Look for a sibling in the same account that has a real number and
+      // shares an identity field with this row.
+      const realPhone = await findRealNumberForIdentity(db, row)
+      if (realPhone) patch.phone = realPhone
+
+      if (Object.keys(patch).length === 0) continue
+
+      await db
+        .from('contacts')
+        .update({ ...patch, updated_at: new Date().toISOString() })
+        .eq('id', row.id)
+        .eq('account_id', row.account_id)
+
+      console.log(
+        `[webhook] repaired contact ${row.id}: phone ${row.phone} → ${(patch.phone as string) ?? '(kept)'} (identity: ${Object.keys(patch).join(', ')})`,
+      )
+    }
+  } catch (err) {
+    console.warn(
+      '[webhook] repair: BSUID-as-phone cleanup failed (non-fatal):',
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
+/**
+ * Find a real phone number among a contact's siblings, matching on the
+ * identity fields we trust. Returns null when nobody has one yet.
+ */
+async function findRealNumberForIdentity(
+  db: ReturnType<typeof supabaseAdmin>,
+  row: { account_id: string; name?: string | null; username?: string | null; wa_user_id?: string | null },
+): Promise<string | null> {
+  const clauses: string[] = []
+  if (row.wa_user_id) clauses.push(`wa_user_id.eq.${row.wa_user_id}`)
+  const handle = withAtSign(row.username)
+  if (handle) clauses.push(`username.eq.${handle}`)
+  if (row.name) clauses.push(`name.eq.${row.name}`)
+  if (clauses.length === 0) return null
+
+  const { data } = await db
+    .from('contacts')
+    .select('phone')
+    .eq('account_id', row.account_id)
+    .or(clauses.join(','))
+    .limit(25)
+
+  for (const candidate of (data ?? []) as Array<{ phone: string }>) {
+    if (isPhoneLike(candidate.phone)) return normalizePhone(candidate.phone)
+  }
+  return null
+}
 
 /**
  * Delete contacts with no usable `phone`, together with their

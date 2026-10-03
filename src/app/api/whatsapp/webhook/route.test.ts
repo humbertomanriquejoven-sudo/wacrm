@@ -49,6 +49,10 @@ const h = vi.hoisted(() => ({
     contactsInsertResponse: null as Record<string, unknown> | null,
     /** Row returned by the BSUID / username exact-match lookups. */
     bsuidLookupResponse: null as Record<string, unknown> | null,
+    /** Rows whose `phone` wrongly holds a 'CO.'-prefixed BSUID. */
+    bsuidPhoneContacts: [] as Array<Record<string, unknown>>,
+    /** Rows returned by the sibling-identity phone lookup. */
+    siblingPhoneCandidates: [] as Array<Record<string, unknown>>,
     /** Rows purgeEmptyPhoneContacts() considers orphaned. */
     emptyPhoneContacts: [] as Record<string, unknown>[],
     /** Transcripts written back onto messages rows ('id' → patch). */
@@ -158,13 +162,38 @@ vi.mock('@supabase/supabase-js', () => ({
                   }).then(resolve, reject),
               }
               return {
-                eq: () => ({ eq: () => secondEqResult }),
+                // repairBsuidPhoneContacts: select(...).like('phone', 'CO.%')
+                like: (column: string, pattern: string) =>
+                  Promise.resolve({
+                    data: (h.state.bsuidPhoneContacts ?? []).filter((row) =>
+                      pattern.endsWith('%')
+                        ? String(row[column] ?? '').startsWith(
+                            pattern.slice(0, -1),
+                          )
+                        : true,
+                    ),
+                    error: null,
+                  }),
                 // purgeEmptyPhoneContacts: select(...).or('phone.is.null,phone.eq.')
                 or: () =>
                   Promise.resolve({
                     data: h.state.emptyPhoneContacts ?? [],
                     error: null,
                   }),
+                // `eq` has two consumers with different tails: the BSUID /
+                // username exact lookups chain `.eq().eq()` (resolves via
+                // `then`), while findRealNumberForIdentity does
+                // `.eq(account_id).or(clauses).limit(n)`. Support both.
+                eq: () => ({
+                  eq: () => secondEqResult,
+                  or: () => ({
+                    limit: (n: number) =>
+                      Promise.resolve({
+                        data: (h.state.siblingPhoneCandidates ?? []).slice(0, n),
+                        error: null,
+                      }),
+                  }),
+                }),
               }
             },
             update: (patch: Record<string, unknown>) => ({
@@ -381,15 +410,15 @@ function bsuidInboundRequest() {
               contacts: [
                 {
                   wa_id: '',
-                  user_id: 'bsuid-abc',
-                  profile: { name: 'Humberto', username: 'humberto' },
+                  user_id: 'CO.1008477715690681',
+                  profile: { name: 'Humberto Manrique', username: 'humbertomanrique' },
                 },
               ],
               messages: [
                 {
                   id: 'wamid.BSUID1',
                   from: '',
-                  from_user_id: 'bsuid-abc',
+                  from_user_id: 'CO.1008477715690681',
                   timestamp: '1700000000',
                   type: 'text',
                   text: { body: 'hola' },
@@ -432,6 +461,8 @@ beforeEach(() => {
   h.state.contactByNameResult = null
   h.state.contactsInsertResponse = null
   h.state.bsuidLookupResponse = null
+  h.state.bsuidPhoneContacts = []
+  h.state.siblingPhoneCandidates = []
   h.state.emptyPhoneContacts = []
   h.state.contactUpdateCalls = []
   h.state.contactInsertCalls = []
@@ -976,24 +1007,73 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     })
   })
 
-  it('stores a BSUID sender in phone so outbound never sees an empty recipient', async () => {
-    // Senders on numbers NOT registered on WhatsApp arrive with a BSUID
-    // instead of `wa_id`. Previously the contact got an empty `phone`, which
-    // made engineSend* throw "contact not found" — the typing indicator
-    // fired but nothing was ever delivered.
+  it('stores a BSUID sender in phone and keeps the handle @-prefixed', async () => {
+    // Senders on numbers NOT registered on WhatsApp arrive with a
+    // namespaced BSUID ('CO.…') instead of `wa_id`. Previously the contact
+    // got an empty `phone`, which made engineSend* throw "contact not
+    // found" — the typing indicator fired but nothing was ever delivered.
     mockFindExistingContact.mockResolvedValue(null)
     mockFindContactByNameWithoutPhone.mockResolvedValue(null)
 
-    const res = await POST(bsuidInboundRequest())
+    await POST(bsuidInboundRequest())
     for (const cb of h.state.afterCallbacks) await cb()
-    expect(res).toBeDefined()
 
     expect(h.state.contactInsertCalls).toHaveLength(1)
     expect(h.state.contactInsertCalls[0]).toMatchObject({
-      phone: 'bsuid-abc',
-      wa_user_id: 'bsuid-abc',
-      username: 'humberto',
+      // The BSUID lands in `phone` (with its 'CO.' prefix stripped) so the
+      // NOT NULL column is usable, AND in its own column as the canonical id.
+      phone: '1008477715690681',
+      wa_user_id: '1008477715690681',
+      // Username keeps the '@' so it renders as WhatsApp shows it.
+      username: '@humbertomanrique',
     })
+    // The BSUID must never be stored as the username.
+    expect(h.state.contactInsertCalls[0].username).not.toMatch(/^@?CO\./)
+  })
+
+  it('never stores a BSUID as the username', async () => {
+    // A payload with no usable handle must not end up writing '@CO.…'.
+    mockFindExistingContact.mockResolvedValue(null)
+    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
+
+    const body = {
+      entry: [
+        {
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                metadata: { phone_number_id: 'pn-1' },
+                contacts: [
+                  { wa_id: '', user_id: 'CO.999', profile: { name: 'Humberto' } },
+                ],
+                messages: [
+                  {
+                    id: 'wamid.BSUID2',
+                    from: '',
+                    from_user_id: 'CO.999',
+                    timestamp: '1700000000',
+                    type: 'text',
+                    text: { body: 'hola' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    }
+
+    await POST({
+      text: async () => JSON.stringify(body),
+      headers: { get: () => 'sha256=stub' },
+    } as unknown as Request)
+    for (const cb of h.state.afterCallbacks) await cb()
+
+    const row = h.state.contactInsertCalls[0]
+    expect(row.username).toBeUndefined()
+    expect(row.phone).toBe('999')
+    expect(row.wa_user_id).toBe('999')
   })
 
   it('reuses the contact matched by BSUID instead of inserting a duplicate', async () => {
@@ -1006,14 +1086,69 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
       id: 'contact-existing',
       account_id: 'acc-1',
       user_id: 'user-1',
-      phone: '15551230000',
-      name: 'Humberto',
-      wa_user_id: 'bsuid-abc',
+      phone: '573122182949',
+      name: 'Humberto Manrique',
+      username: '@humbertomanrique',
+      wa_user_id: '1008477715690681',
     }
 
     await POST(bsuidInboundRequest())
     for (const cb of h.state.afterCallbacks) await cb()
 
     expect(h.state.contactInsertCalls).toHaveLength(0)
+  })
+
+  it('repairs a contact whose phone holds a CO.-prefixed BSUID', async () => {
+    // Rows written by the pre-fix handler. repairBsuidPhoneContacts() moves
+    // the identifier into wa_user_id and normalizes the handle so the
+    // dedupe pre-filter can finally match the real number.
+    mockFindExistingContact.mockResolvedValue(null)
+    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
+    h.state.bsuidPhoneContacts = [
+      {
+        id: 'contact-broken',
+        account_id: 'acc-1',
+        phone: 'CO.1008477715690681',
+        name: 'Humberto Manrique',
+        username: 'humbertomanrique',
+      },
+    ]
+
+    await runWebhook()
+
+    expect(h.state.contactUpdateCalls.length).toBeGreaterThan(0)
+    const patch = h.state.contactUpdateCalls[0].patch
+    expect(patch.wa_user_id).toBe('1008477715690681')
+    expect(patch.username).toBe('@humbertomanrique')
+    // No sibling had a real number, so `phone` must NOT be overwritten with
+    // a fabricated one — the row is left for a later inbound to repair.
+    expect(patch.phone).toBeUndefined()
+  })
+
+  it('adopts a sibling contact number when repairing a CO.-prefixed phone', async () => {
+    // 'Humberto Manrique' has two rows: the good one with his real number,
+    // and the broken one holding the BSUID. The repair should adopt the
+    // real number from the sibling rather than inventing one.
+    mockFindExistingContact.mockResolvedValue(null)
+    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
+    h.state.bsuidPhoneContacts = [
+      {
+        id: 'contact-broken',
+        account_id: 'acc-1',
+        phone: 'CO.1008477715690681',
+        name: 'Humberto Manrique',
+        username: 'humbertomanrique',
+      },
+    ]
+    h.state.siblingPhoneCandidates = [{ phone: '573122182949' }]
+
+    await runWebhook()
+
+    expect(h.state.contactUpdateCalls.length).toBeGreaterThan(0)
+    expect(h.state.contactUpdateCalls[0].patch).toMatchObject({
+      phone: '573122182949',
+      wa_user_id: '1008477715690681',
+      username: '@humbertomanrique',
+    })
   })
 })
