@@ -4,10 +4,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { requireRole, toErrorResponse } from '@/lib/auth/account';
 import { isUniqueViolation } from '@/lib/contacts/dedupe';
 import { findMergeableOrphan, mergeContactInto } from '@/lib/contacts/merge';
-import {
-  AWAITING_PHONE_NOTICE,
-  flushPendingReplies,
-} from '@/lib/whatsapp/pending-reply';
+import { flushPendingReplies } from '@/lib/whatsapp/pending-reply';
 import { toDialable } from '@/lib/whatsapp/recipient-resolver';
 import { sendMessageToConversation } from '@/lib/whatsapp/send-message';
 
@@ -215,6 +212,5 @@ async function deliverParkedReplies(
     pending_replies_sent: result.sent,
     pending_replies_failed: result.failed,
     pending_conversations: result.conversations,
-    notice: AWAITING_PHONE_NOTICE,
   };
 }

@@ -1,18 +1,16 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 import {
-  AWAITING_PHONE_NOTICE,
   clearParkedReply,
   flushPendingReplies,
   listPendingReplies,
-  parkReplyAwaitingValidPhone,
 } from '@/lib/whatsapp/pending-reply';
 
 /**
- * The promise this module makes to a customer is narrow and worth stating
- * in tests: a reply Meta rejected is kept verbatim, and it is released the
- * moment a valid number exists — and NOT before, so nothing is sent to an
- * address Meta will just reject again.
+ * The promise this module makes to a customer: a reply Meta rejected is
+ * kept verbatim, and it is released the moment the contact has ANY
+ * addressable identifier — a real number, a BSUID, or a handle — never
+ * before, so nothing is sent to an address that cannot exist.
  */
 
 // ---------------------------------------------------------------
@@ -45,53 +43,6 @@ function makeDb(conversationRows: Array<Record<string, unknown>>) {
 
 beforeEach(() => {
   vi.clearAllMocks();
-});
-
-describe('AWAITING_PHONE_NOTICE', () => {
-  it('is the exact wording the operator sees', () => {
-    expect(AWAITING_PHONE_NOTICE).toBe(
-      'Esperando número de teléfono válido para enviar respuesta'
-    );
-  });
-});
-
-describe('parkReplyAwaitingValidPhone', () => {
-  it('stores the reply and raises the flag on the conversation', async () => {
-    const { db, updates } = makeDb([]);
-    const ok = await parkReplyAwaitingValidPhone({
-      db,
-      accountId: 'acct-1',
-      conversationId: 'conv-1',
-      contactId: 'contact-1',
-      text: 'Hola, ¿en qué te ayudo?',
-      reason: 'recipient invalid',
-    });
-
-    expect(ok).toBe(true);
-    expect(updates).toHaveLength(1);
-    expect(updates[0].payload).toMatchObject({
-      awaiting_valid_phone: true,
-      pending_reply_text: 'Hola, ¿en qué te ayudo?',
-    });
-    expect(updates[0].payload.pending_reply_at).toBeTruthy();
-  });
-
-  it('refuses to park an empty reply', async () => {
-    // An empty park would raise a banner with nothing to send — a dead end
-    // the operator cannot resolve.
-    const { db, updates } = makeDb([]);
-    const ok = await parkReplyAwaitingValidPhone({
-      db,
-      accountId: 'acct-1',
-      conversationId: 'conv-1',
-      contactId: 'contact-1',
-      text: '   ',
-      reason: 'recipient invalid',
-    });
-
-    expect(ok).toBe(false);
-    expect(updates).toHaveLength(0);
-  });
 });
 
 describe('clearParkedReply', () => {
@@ -163,11 +114,11 @@ describe('flushPendingReplies', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it('does nothing when the contact has no deliverable E.164 number', async () => {
-    // Strict E.164: contacts without a real number are not sent to Meta until
-    // they have a dialable phone. A BSUID/handle alone is never flushed.
+  it('flushes a parked reply when the contact only has a BSUID', async () => {
+    // BSUIDs and handles are deliverable `to` values now: holding the
+    // reply hostage for a real phone number would stall the customer.
     const { db } = makeDb(CONVERSATIONS)
-    const send = vi.fn()
+    const send = vi.fn(async () => {})
 
     const result = await flushPendingReplies({
       db,
@@ -177,8 +128,8 @@ describe('flushPendingReplies', () => {
       send,
     })
 
-    expect(result).toEqual({ sent: 0, failed: 0, conversations: [] })
-    expect(send).not.toHaveBeenCalled()
+    expect(result.sent).toBe(2)
+    expect(send).toHaveBeenCalledTimes(2)
   })
 
   it('sends each parked reply verbatim and clears it', async () => {

@@ -21,8 +21,6 @@ vi.mock('@/lib/contacts/merge', () => ({
 }));
 
 vi.mock('@/lib/whatsapp/pending-reply', () => ({
-  AWAITING_PHONE_NOTICE:
-    'Esperando número de teléfono válido para enviar respuesta',
   flushPendingReplies: mocks.flushPendingReplies,
 }));
 
@@ -258,11 +256,4 @@ describe('PATCH /api/contacts/[id]/phone', () => {
     expect(body).toMatchObject({ ok: true, pending_replies_failed: 1 });
   });
 
-  it('reports how many replies went out so the UI can say so', async () => {
-    const res = await PATCH(request({ phone: '573122182949' }), params);
-    const body = await res.json();
-    expect(body.notice).toBe(
-      'Esperando número de teléfono válido para enviar respuesta'
-    );
-  });
 });

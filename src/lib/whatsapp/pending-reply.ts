@@ -1,77 +1,4 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { toDialable } from '@/lib/whatsapp/recipient-resolver'
-import { AWAITING_PHONE_NOTICE } from '@/lib/whatsapp/pending-reply-notice'
-
-/**
- * Deferred replies: what to do with a bot answer Meta would not accept.
- *
- * The failure this exists for is narrow and specific. Meta rejects the
- * recipient when we have no valid address — typically a contact whose
- * `phone` still holds the BSUID Meta sent for an unregistered number. The
- * model already produced a good answer, so throwing it away means asking
- * the customer to write again, which in practice means losing the thread.
- *
- * Instead we park the exact text on the conversation, flag it so the UI can
- * tell the operator what's waiting, and flush it the moment a real number
- * is recorded. No re-generation: the model is not consulted again, so the
- * customer receives the answer that was already written for them.
- */
-
-// Re-exported so server callers have a single import for the whole
-// feature, while client components can reach the copy without pulling in
-// the recipient resolver.
-export { AWAITING_PHONE_NOTICE }
-
-export interface ParkedReply {
-  conversationId: string
-  contactId: string
-  text: string
-  reason: string
-}
-
-/**
- * Store a reply that could not be delivered, and flag the conversation.
- *
- * A later park overwrites an earlier one: only the newest answer is worth
- * sending, and replaying an older one would deliver stale information to
- * the customer.
- */
-export async function parkReplyAwaitingValidPhone(args: {
-  db: SupabaseClient
-  accountId: string
-  conversationId: string
-  contactId: string
-  text: string
-  reason: string
-}): Promise<boolean> {
-  const { db, accountId, conversationId, contactId, text, reason } = args
-  if (!text || !text.trim()) return false
-
-  const { error } = await db
-    .from('conversations')
-    .update({
-      awaiting_valid_phone: true,
-      pending_reply_text: text,
-      pending_reply_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', conversationId)
-    .eq('account_id', accountId)
-
-  if (error) {
-    console.error(
-      `[pending-reply] conversation ${conversationId}: could not park the reply (contact ${contactId}):`,
-      error.message,
-    )
-    return false
-  }
-
-  console.warn(
-    `[pending-reply] conversation ${conversationId} (contact ${contactId}): Meta rejected every address, parking the reply. ` +
-      `Reason: ${reason}. "${AWAITING_PHONE_NOTICE}" — it will send as soon as a valid phone number is saved.`,
-  )
-  return true
-}
 
 /**
  * Clear the parked reply once it has been delivered (or discarded).
@@ -102,54 +29,6 @@ export async function clearParkedReply(
       error.message,
     )
   }
-}
-
-/**
- * Flag a conversation as needing a real phone number, with no text to park.
- *
- * The companion to `parkReplyAwaitingValidPhone` for the paths where a
- * reply does NOT exist yet:
- *
- *   * a Flow / automation node wants to send but the contact has no dialable
- *     address, so the outbound gate refused before any HTTP call;
- *   * the bot has just asked the customer for their number, so the operator
- *     should see why the thread is stalled until they answer.
- *
- * Deliberately does NOT touch `pending_reply_text`: inventing placeholder
- * text there would make the banner promise a message that was never written.
- * Once a real number arrives, `flushPendingReplies` only runs for rows that
- * actually have text, so this flag is harmless until then.
- */
-export async function flagConversationAwaitingValidPhone(args: {
-  db: SupabaseClient
-  accountId: string
-  conversationId: string
-  reason: string
-}): Promise<boolean> {
-  const { db, accountId, conversationId, reason } = args
-
-  const { error } = await db
-    .from('conversations')
-    .update({
-      awaiting_valid_phone: true,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', conversationId)
-    .eq('account_id', accountId)
-
-  if (error) {
-    console.error(
-      `[pending-reply] conversation ${conversationId}: could not flag the missing phone:`,
-      error.message,
-    )
-    return false
-  }
-
-  console.warn(
-    `[pending-reply] conversation ${conversationId}: flagged as needing a valid phone ` +
-      `(${reason}). "${AWAITING_PHONE_NOTICE}"`,
-  )
-  return true
 }
 
 /** A conversation with a reply waiting for a usable address. */
@@ -197,20 +76,22 @@ export interface FlushRecipient {
 /**
  * True when the contact has an address Meta can be asked to deliver to.
  *
- * Only a dialable E.164 number counts. Meta's `to` field accepts nothing
- * else: a BSUID or a public @handle used to be routed to the `recipient`
- * field, but that path returned 200 while dropping the message, so it is
- * treated as undeliverable everywhere now. A parked reply is therefore only
- * worth flushing once a real number is on file.
+ * Any stored address counts: a dialable E.164 number, a BSUID or a public
+ * @handle. Meta's `to` field accepts all three, so a parked reply is worth
+ * flushing as soon as ANY of them is on file.
  */
 export function hasSendableRecipient(recipient: FlushRecipient): boolean {
-  return Boolean(toDialable(recipient.phone))
+  return Boolean(
+    (recipient.phone && recipient.phone.trim()) ||
+      (recipient.wa_user_id && recipient.wa_user_id.trim()) ||
+      (recipient.username && recipient.username.trim()),
+  )
 }
 
 /**
  * Send every parked reply for a contact, now that it has a usable address.
  *
- * Refuses to run when the contact still has no address at all — this is the
+ * Refuses to run only when the contact has no address at all — this is the
  * last gate before the flush, so a genuinely empty save can never re-trigger
  * the same rejection loop it was meant to fix.
  *

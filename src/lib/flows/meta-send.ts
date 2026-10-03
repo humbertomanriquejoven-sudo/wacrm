@@ -4,7 +4,6 @@ import {
   sendMediaMessage,
   sendTextMessage,
   sendTypingIndicator,
-  InvalidRecipientError,
   type InteractiveButton,
   type InteractiveListSection,
   type MediaKind,
@@ -27,7 +26,6 @@ import {
   toDialable,
   findRecoverablePhone,
 } from '@/lib/whatsapp/recipient-resolver'
-import { flagConversationAwaitingValidPhone } from '@/lib/whatsapp/pending-reply'
 
 // ------------------------------------------------------------
 // Flows-side Meta sender (interactive variants).
@@ -171,19 +169,11 @@ async function recipientAddressQueue(
  * Shared by every sender below so the four paths can't drift apart. The
  * address comes entirely from `resolveRecipient`, which decides at call
  * time whether this contact is reachable by number, by a number we can
- * recover from its own thread, or not at all.
+ * recover from its own thread, or by a stored BSUID/handle.
  *
  * A recovered number is written back onto the contact row: without that,
  * a contact whose `phone` still holds a BSUID would re-run the lookup on
  * every single send.
- *
- * When nothing dialable turns up, this flags the conversation and throws
- * `InvalidRecipientError` — no Meta request is attempted. `resolveRecipient`
- * already exhausted the contact's own `phone` and its own thread history, and
- * the only remaining entries `recipientAddressQueue` could add are a BSUID or
- * an @handle, neither of which Meta will deliver to. So the whole retry queue
- * is provably undeliverable and walking it would only produce one
- * `InvalidRecipientError` per address.
  */
 async function prepareRecipient(
   contact: {
@@ -210,29 +200,9 @@ async function prepareRecipient(
     )
   }
 
-  // Nothing dialable: the only value left is an opaque identifier or handle.
-  // `sanitizePhoneForMeta` / `phoneVariants` only make sense for a real
-  // number, so pass the value through untouched and let the gate reject it.
   const sanitized = recipient.isPhone ? sanitizePhoneForMeta(recipient.to) : recipient.to
   if (recipient.isPhone && !isValidE164(sanitized)) {
     throw new Error(`contact phone invalid: ${recipient.to}`)
-  }
-
-  if (!recipient.isPhone) {
-    if (conversationId) {
-      await flagConversationAwaitingValidPhone({
-        db: supabaseAdmin(),
-        accountId,
-        conversationId,
-        reason: `only "${sanitized}" is on file for contact ${contact.id ?? 'unknown'}`,
-      }).catch((err: unknown) => {
-        console.error(
-          `[flows] conversation ${conversationId}: could not flag the missing phone:`,
-          err instanceof Error ? err.message : err,
-        )
-      })
-    }
-    throw new InvalidRecipientError(sanitized)
   }
 
   return { to: recipient.to, sanitized, isPhone: recipient.isPhone }

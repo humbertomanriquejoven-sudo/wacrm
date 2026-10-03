@@ -50,7 +50,6 @@ import {
 import { deleteAccountMedia } from "@/lib/storage/upload-media";
 import { TemplatePicker } from "./template-picker";
 import { AiThreadBanner } from "./ai-thread-banner";
-import { PhonePendingBanner } from "./phone-pending-banner";
 import { buildReplyPreview } from "./reply-quote";
 import { renderTemplateBody } from "@/lib/whatsapp/template-body";
 import { toast } from "sonner";
@@ -170,7 +169,6 @@ export function MessageThread({
   onRefresh,
   contactPanelOpen,
   onToggleContactPanel,
-  onPhoneSaved,
 }: MessageThreadProps) {
   const t = useTranslations("Inbox.messageThread");
   const tTimer = useTranslations("Inbox.sessionTimer");
@@ -1086,17 +1084,6 @@ export function MessageThread({
           </DropdownMenu>
         </div>
       </div>
-
-      {/* A bot reply we could not deliver (Meta rejects every address for
-          this contact). Sits above the thread, not inside the scroll area,
-          so it stays visible while scrolling and offers the fix in place
-          instead of hiding in the contact panel. */}
-      <PhonePendingBanner
-        contactId={contact.id}
-        awaitingValidPhone={conversation.awaiting_valid_phone}
-        pendingReplyText={conversation.pending_reply_text}
-        onPhoneSaved={onPhoneSaved}
-      />
 
       {/* Messages Area */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">

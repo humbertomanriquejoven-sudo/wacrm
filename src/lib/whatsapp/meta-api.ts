@@ -15,7 +15,7 @@ import {
   normalizePhone,
 } from './phone-utils'
 
-const META_API_VERSION = 'v21.0'
+const META_API_VERSION = 'v26.0'
 const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`
 
 export interface MetaSendResult {
@@ -123,11 +123,11 @@ export class InvalidRecipientError extends MetaApiError {
 
   constructor(address: string) {
     super(
-      `invalid recipient "${address}": Meta's "to" field only accepts a dialable E.164 phone number ` +
-        `(7-13 digits with a country code). No HTTP request was sent — record the customer's real ` +
-        `phone number so the pending reply can be delivered.`,
+      `invalid recipient "${address}": expected a phone number, a BSUID ` +
+        `(e.g. 'CO.1008477715690681') or a WhatsApp username, but got an ` +
+        `empty or unusable value. No HTTP request was sent.`,
       // status 0 / no code: nothing came back from Meta, so there is no HTTP
-      // status to report. The recipientInvalid text probe is what matters.
+      // status to report.
       { status: 0, code: null, subcode: null },
     )
     this.name = 'InvalidRecipientError'
@@ -138,26 +138,23 @@ export class InvalidRecipientError extends MetaApiError {
 /**
  * Pre-flight gate every send helper runs before touching the network.
  *
- * Returns the digits-only form of the address (Meta wants no `+`, no spaces
- * and no dashes) or throws `InvalidRecipientError`. Both halves matter:
- *
- *   * `isDialablePhone` caps the length at 13 digits, which is what separates
- *     a number from a 15-17 digit BSUID, and rejects the `CO.` / `WAID.`
- *     namespace prefixes outright;
- *   * `isValidE164` on the normalized digits rejects a leading zero, so a
- *     value without a country code can't slip through.
- *
- * Every `to` that reaches a send helper already went through
- * `sanitizePhoneForMeta`, so normalizing again is a no-op for real callers —
- * it only matters for a value that arrived straight from the database.
+ * Meta's Cloud API takes the contact's address verbatim in `to` — a real
+ * phone number, a BSUID such as 'CO.1008477715690681' or a public @username —
+ * so this only rejects values with no usable shape at all. A dialable number
+ * is normalized to digits-only (Meta wants no `+`, no spaces and no dashes);
+ * anything else passes through untouched so it can travel as-is in `to`.
  */
 function assertDialableRecipient(address: string): string {
   const value = (address ?? '').trim()
-  const digits = normalizePhone(value)
-  if (!value || !isDialablePhone(value) || !isValidE164(digits)) {
+  if (!value) {
     throw new InvalidRecipientError(value)
   }
-  return digits
+  if (isDialablePhone(value)) {
+    const digits = normalizePhone(value)
+    if (isValidE164(digits)) return digits
+  }
+  // BSUID or @username: sent as-is in `to`.
+  return value
 }
 
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
