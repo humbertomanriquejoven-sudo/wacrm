@@ -11,6 +11,7 @@ import {
   isUniqueViolation,
 } from '@/lib/contacts/dedupe'
 import { reopenClosedConversation } from '@/lib/conversations/reopen'
+import { findMergeableOrphan, mergeContactInto } from '@/lib/contacts/merge'
 import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
@@ -815,7 +816,27 @@ async function processMessage(
     )
     return
   }
-  const contactRecord = contactOutcome.contact
+  let contactRecord = contactOutcome.contact
+
+  // Automatic merge of a BSUID-only orphan into this contact.
+  //
+  // This payload carries a REAL phone number. If the same person also has an
+  // orphan row from an earlier message they sent while unregistered (that row
+  // holds their BSUID in `phone`), the resolution above matched the real
+  // number's row and the orphan is left behind with its own conversation —
+  // two rows, one person, a split thread and a stale contact in the list.
+  //
+  // Folding the orphan in keeps the history whole and, crucially, moves the
+  // BSUID onto the survivor. That BSUID is what lets the next message from
+  // this unregistered number resolve to the right contact instead of
+  // creating a third row.
+  //
+  // Best-effort: a merge failure must never drop the inbound, so it logs
+  // and continues. The next delivery retries.
+  if (rawPhone) {
+    const merged = await autoMergeOrphanInto(supabaseAdmin(), accountId, contactRecord)
+    if (merged) contactRecord = merged
+  }
 
   // Find or create conversation
   const convResult = await findOrCreateConversation(
@@ -949,6 +970,12 @@ async function processMessage(
         // extension from the fetched blob — impossible to do until the
         // bytes had already been fetched successfully.
         media_type: mediaType,
+        // The address Meta used on THIS delivery (migration 050). Kept as
+        // it arrived: the real number when Meta disclosed one, the BSUID
+        // when it didn't. This is the only place the raw value survives —
+        // the contact row may end up holding the BSUID — and the resolver
+        // reads it to recover a valid destination later.
+        sender_phone: message.from,
         message_id: message.id,
         status: 'delivered',
         created_at: new Date(parseInt(message.timestamp) * 1000).toISOString(),
@@ -1523,6 +1550,60 @@ const {
   toDialable,
   identityFilterParts,
 } = recipientResolver
+
+/**
+ * Fold a BSUID-only orphan contact into `survivor`, returning the survivor
+ * row when a merge actually happened.
+ *
+ * Called on every inbound that carries a real phone number. In the normal
+ * case there is no orphan and this costs one indexed lookup that returns
+ * nothing. It never throws: a merge failure is logged and the inbound
+ * continues, because dropping a customer message over a bookkeeping
+ * problem is strictly worse than leaving a duplicate row for the next
+ * delivery to clean up.
+ */
+async function autoMergeOrphanInto(
+  db: ReturnType<typeof supabaseAdmin>,
+  accountId: string,
+  survivor: { id: string; phone?: string | null; username?: string | null; wa_user_id?: string | null },
+): Promise<{ id: string; phone?: string | null; username?: string | null; wa_user_id?: string | null } | null> {
+  try {
+    const orphan = await findMergeableOrphan(db, accountId, survivor)
+    if (!orphan) return null
+
+    const outcome = await mergeContactInto(db, {
+      accountId,
+      survivorId: survivor.id,
+      orphanId: orphan.id,
+    })
+
+    if (!outcome.merged) {
+      console.warn(
+        `[webhook] contact merge skipped for ${survivor.id} + ${orphan.id}:`,
+        outcome.reason,
+      )
+      return null
+    }
+
+    // Re-read the survivor: the merge may have absorbed the BSUID or handle
+    // onto it, and downstream code (the flow engine, the AI) reads these
+    // fields off this object.
+    const { data: refreshed } = await db
+      .from('contacts')
+      .select('id, phone, username, wa_user_id')
+      .eq('id', survivor.id)
+      .eq('account_id', accountId)
+      .maybeSingle()
+
+    return (refreshed as typeof survivor | null) ?? survivor
+  } catch (err) {
+    console.warn(
+      '[webhook] contact merge failed (non-fatal):',
+      err instanceof Error ? err.message : err,
+    )
+    return null
+  }
+}
 
 /**
  * Extract a BSUID from whichever field carries it, returning the id with

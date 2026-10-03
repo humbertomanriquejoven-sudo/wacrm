@@ -401,6 +401,19 @@
       "resumed": "AI resumed.",
       "updateError": "Couldn’t update the AI assistant.",
       "networkError": "Couldn’t reach the server."
+    },
+    "phoneBanner": {
+      "addPhone": "Add phone number",
+      "hint": "The assistant’s reply is on hold — it sends as soon as you save a valid number.",
+      "phoneLabel": "Phone number",
+      "placeholder": "Country code + number, e.g. 573001234567",
+      "saveAndSend": "Save & send",
+      "sending": "Sending…",
+      "cancel": "Cancel",
+      "saved": "Phone number saved.",
+      "sentOne": "Phone number saved — the held reply was sent.",
+      "sentMany": "Phone number saved — {count} held replies were sent.",
+      "saveError": "Couldn’t save the phone number."
     }
   },
   "Contacts": {

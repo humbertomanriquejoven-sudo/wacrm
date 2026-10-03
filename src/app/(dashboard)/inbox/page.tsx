@@ -399,6 +399,36 @@ function InboxPageInner() {
     setResyncToken((n) => n + 1);
   }, []);
 
+  /**
+   * After the operator records a phone number for a contact whose reply was
+   * parked: the route already saved the number and delivered the held
+   * reply, so all that's left is to re-read state. Bumping `resyncToken`
+   * refetches the thread (the reply that just went out appears), and the
+   * conversation row is refetched to clear `awaiting_valid_phone` — realtime
+   * would eventually deliver that UPDATE, but waiting on it leaves a banner
+   * telling the agent to do a job they just finished.
+   */
+  const handlePhoneSaved = useCallback(() => {
+    setResyncToken((n) => n + 1);
+    const convId = activeConversation?.id;
+    if (!convId) return;
+    void (async () => {
+      const supabase = createClient();
+      const { data } = await supabase
+        .from("conversations")
+        .select(CONVERSATION_SELECT)
+        .eq("id", convId)
+        .maybeSingle();
+      if (!data) return;
+      const fetched = normalizeConversation(data);
+      setActiveConversation(fetched);
+      setActiveContact(fetched.contact ?? null);
+      setConversations((prev) =>
+        prev.map((c) => (c.id === fetched.id ? fetched : c))
+      );
+    })();
+  }, [activeConversation?.id]);
+
   const handleConversationsLoaded = useCallback(
     (loaded: Conversation[]) => {
       setConversations(loaded);
@@ -622,6 +652,7 @@ function InboxPageInner() {
             onRefresh={handleManualRefresh}
             contactPanelOpen={contactPanelOpen}
             onToggleContactPanel={handleToggleContactPanel}
+            onPhoneSaved={handlePhoneSaved}
           />
         </div>
 

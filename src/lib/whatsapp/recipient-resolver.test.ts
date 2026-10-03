@@ -7,6 +7,7 @@ import {
   normalizeUsername,
   identityFilterParts,
   isRecipientRejection,
+  findRecoverablePhone,
 } from '@/lib/whatsapp/recipient-resolver'
 import { MetaApiError } from '@/lib/whatsapp/meta-api'
 
@@ -16,16 +17,22 @@ const mocks = vi.hoisted(() => ({
   eq: vi.fn(),
   or: vi.fn(),
   limit: vi.fn(),
+  // The message-history fallback uses `conversations` then `messages`,
+  // so `from` has to be table-aware.
+  fromAny: vi.fn(),
 }))
 
 vi.mock('@/lib/flows/admin-client', () => ({
   supabaseAdmin: () => ({
-    from: mocks.fromContacts,
+    from: mocks.fromAny,
   }),
 }))
 
 beforeEach(() => {
   vi.clearAllMocks()
+  mocks.fromAny.mockImplementation((table: string) =>
+    table === 'contacts' ? { select: mocks.select } : { select: mocks.select }
+  )
   mocks.fromContacts.mockReturnValue({ select: mocks.select })
   mocks.select.mockReturnValue({ eq: mocks.eq })
   mocks.eq.mockReturnValue({ or: mocks.or })
@@ -133,5 +140,102 @@ describe('isRecipientRejection', () => {
     expect(
       isRecipientRejection(new MetaApiError('WhatsApp not configured for this account', { status: 500 })),
     ).toBe(false)
+  })
+})
+
+describe('findRecoverablePhone', () => {
+  const ORPHAN = {
+    id: 'contact-1',
+    phone: 'CO.1008477715690681',
+    name: 'Ana Ruiz',
+    username: null,
+    wa_user_id: '1008477715690681',
+  }
+
+  /**
+   * Chainable stub keyed by table, so each query resolves to the rows that
+   * table is meant to return. Written out rather than reused from the
+   * contact-query mocks above because the history fallback issues two
+   * different shapes (`conversations` then `messages`, the latter with
+   * `.not` and `.order`).
+   */
+  function mockTables(tables: Record<string, unknown[]>) {
+    mocks.fromAny.mockImplementation((table: string) => {
+      // `contacts` keeps the shared mock chain so the sibling search is
+      // steered by `mocks.limit`, exactly as the other tests do it.
+      if (table === 'contacts') return { select: mocks.select }
+
+      const rows = tables[table] ?? []
+      const b: Record<string, unknown> = {}
+      const chain = () => b
+      for (const m of ['select', 'eq', 'in', 'not', 'order']) b[m] = vi.fn(chain)
+      b.limit = vi.fn(() => Promise.resolve({ data: rows, error: null }))
+      b.maybeSingle = vi.fn(() =>
+        Promise.resolve({ data: rows[0] ?? null, error: null }),
+      )
+      b.then = (resolve: (v: unknown) => unknown) =>
+        resolve({ data: rows, error: null })
+      return b
+    })
+  }
+
+  it('reads the contact own row before anything else', async () => {
+    mocks.limit.mockResolvedValue({
+      data: [{ id: 'contact-1', phone: '573122182949' }],
+      error: null,
+    })
+    const found = await findRecoverablePhone(ORPHAN, 'acct-1')
+    expect(found).toEqual({ phone: '573122182949', fromContactId: 'contact-1' })
+  })
+
+  it('returns null when nothing has a usable address', async () => {
+    mockTables({})
+    const found = await findRecoverablePhone(ORPHAN, 'acct-1')
+    expect(found).toBeNull()
+  })
+
+  it('recovers a number from the contact message history', async () => {
+    mocks.limit.mockResolvedValue({ data: [], error: null })
+    mockTables({
+      conversations: [{ id: 'conv-1' }],
+      // Newest first: a BSUID, then the real number Meta used earlier.
+      messages: [{ sender_phone: 'CO.1008477715690681' }, { sender_phone: '573122182949' }],
+    })
+
+    const found = await findRecoverablePhone(ORPHAN, 'acct-1')
+    expect(found).toEqual({ phone: '573122182949', fromContactId: null })
+  })
+
+  it('ignores BSUIDs stored on messages, since they are what it is escaping', async () => {
+    mocks.limit.mockResolvedValue({ data: [], error: null })
+    mockTables({
+      conversations: [{ id: 'conv-1' }],
+      messages: [{ sender_phone: 'CO.1008477715690681' }],
+    })
+
+    const found = await findRecoverablePhone(ORPHAN, 'acct-1')
+    expect(found).toBeNull()
+  })
+
+  it('does not consult history when the contact has no conversations', async () => {
+    mocks.limit.mockResolvedValue({ data: [], error: null })
+    mockTables({ conversations: [], messages: [{ sender_phone: '573122182949' }] })
+
+    const found = await findRecoverablePhone(ORPHAN, 'acct-1')
+    expect(found).toBeNull()
+  })
+
+  it('prefers a sibling contact number over the history fallback', async () => {
+    mocks.limit.mockResolvedValue({
+      data: [{ id: 'contact-2', phone: '573001112233' }],
+      error: null,
+    })
+    mockTables({
+      conversations: [{ id: 'conv-1' }],
+      messages: [{ sender_phone: '573122182949' }],
+    })
+
+    const found = await findRecoverablePhone(ORPHAN, 'acct-1')
+    expect(found).toEqual({ phone: '573001112233', fromContactId: 'contact-2' })
   })
 })

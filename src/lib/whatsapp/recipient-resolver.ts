@@ -135,12 +135,22 @@ export function identityFilterParts(contact: RecipientCandidate): string[] {
  * `contact`, using only identity we already trust for that person.
  *
  * Runs when the contact's own `phone` is not dialable — typically because
- * it holds a BSUID left behind by an older handler. We look for a sibling
- * row (same account, same BSUID / handle / exact display name) that DOES
- * carry a number, which is the common shape after a person first wrote
- * from a registered number and later from an unregistered one.
+ * it holds a BSUID left behind by an older handler. Three sources, in
+ * decreasing trust:
  *
- * Returns null when no sibling has a number: we never fabricate one.
+ *   1. the contact's own row (a stale read-through of a value that is
+ *      already correct);
+ *   2. a sibling row in the same account sharing this contact's BSUID /
+ *      handle / exact display name that DOES carry a number — the common
+ *      shape after a person wrote from a registered number and later from
+ *      an unregistered one;
+ *   3. this contact's own message history, which records the address Meta
+ *      actually used on each delivery.
+ *
+ * Source 3 is scoped to this contact's conversations, so it can only ever
+ * return a number this person really wrote from.
+ *
+ * Returns null when nothing has a number: we never fabricate one.
  */
 export async function findRecoverablePhone(
   contact: RecipientCandidate,
@@ -173,7 +183,74 @@ export async function findRecoverablePhone(
     if (row.id === contact.id) return { phone: dialable, fromContactId: row.id }
     if (!fallback) fallback = { phone: dialable, fromContactId: row.id }
   }
-  return fallback
+
+  // A sibling row holds a current, operator-visible number: prefer it.
+  if (fallback) return fallback
+
+  // Only then the history. Meta sends a real `from` on most deliveries even
+  // when the contact row ended up holding a BSUID, and that address is
+  // recorded per message (`messages.sender_phone`), so a number the CRM
+  // never captured can still be recovered. Ranked last because it is a
+  // snapshot of the past: a sibling's number is more likely to be current.
+  const fromHistory = contact.id
+    ? await findPhoneInMessageHistory(contact.id, accountId).catch(() => null)
+    : null
+  if (fromHistory) return { phone: fromHistory, fromContactId: null }
+
+  return null
+}
+
+/**
+ * The newest real number Meta ever used on this contact's messages.
+ *
+ * Scoped to the contact's own conversations, so a stranger's number can
+ * never be picked up here. Only E.164 values are considered: a stored
+ * BSUID is exactly the thing we're trying to get past.
+ *
+ * Best-effort by design — any failure yields null and the caller falls
+ * through to the identifier branches.
+ */
+async function findPhoneInMessageHistory(
+  contactId: string,
+  accountId: string,
+): Promise<string | null> {
+  const db = supabaseAdmin()
+
+  // `messages` has no account_id (tenancy is via conversation_id), so the
+  // conversations are resolved first. One contact has at most a couple of
+  // threads, so this stays a short IN list rather than a join.
+  const { data: conversations } = await db
+    .from('conversations')
+    .select('id')
+    .eq('account_id', accountId)
+    .eq('contact_id', contactId)
+    .limit(20)
+
+  const ids = ((conversations ?? []) as Array<{ id: string }>).map((c) => c.id)
+  if (ids.length === 0) return null
+
+  // Newest first: a number the customer used recently is far likelier to
+  // be the current one than something from months ago.
+  const { data } = await db
+    .from('messages')
+    .select('sender_phone')
+    .in('conversation_id', ids)
+    .not('sender_phone', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(50)
+
+  for (const row of (data ?? []) as Array<{
+    sender_phone?: string | null;
+  }>) {
+    const dialable = toDialable(row.sender_phone ?? null)
+    if (dialable) {
+      console.log(
+        `[recipient-resolver] recovered a valid number for contact ${contactId} from its message history: ${dialable}`,
+      )
+      return dialable
+    }
+  }
+  return null
 }
 
 /**

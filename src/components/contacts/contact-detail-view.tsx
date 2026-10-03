@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { addContactTag, deleteContactTag } from '@/lib/contacts/tag-api';
+import { updateContactPhone } from '@/lib/contacts/phone-api';
 import { useAuth } from '@/hooks/use-auth';
 import { formatCurrency } from '@/lib/currency';
 import { toast } from 'sonner';
@@ -201,11 +202,33 @@ export function ContactDetailView({
     }
 
     setSavingDetails(true);
+
+    // The phone is routed through the API rather than written inline: that
+    // route is also what delivers a bot reply that was parked because this
+    // contact had no number Meta would accept. A plain column update would
+    // fix the row and leave the customer waiting. Skipped when unchanged so
+    // renaming a contact doesn't re-trigger a flush.
+    let phoneError: unknown = null;
+    if (editPhone.trim() !== (contact?.phone ?? '')) {
+      try {
+        await updateContactPhone(contactId, editPhone.trim());
+      } catch (err) {
+        phoneError = err;
+      }
+    }
+
+    if (phoneError) {
+      toast.error(
+        phoneError instanceof Error ? phoneError.message : t('toastUpdateFailed')
+      );
+      setSavingDetails(false);
+      return;
+    }
+
     const { error } = await supabase
       .from('contacts')
       .update({
         name: editName.trim() || null,
-        phone: editPhone.trim(),
         email: editEmail.trim() || null,
         company: editCompany.trim() || null,
         updated_at: new Date().toISOString(),

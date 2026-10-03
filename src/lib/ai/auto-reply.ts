@@ -22,6 +22,7 @@ import {
   resolveOutboundAddressQueue,
 } from '@/lib/flows/meta-send';
 import { isRecipientRejection } from '@/lib/whatsapp/recipient-resolver';
+import { parkReplyAwaitingValidPhone } from '@/lib/whatsapp/pending-reply';
 import {
   autoUnblockConversation,
   autoUnblockEnabled,
@@ -1051,6 +1052,29 @@ export async function dispatchInboundToAiReply(
             retryErr instanceof Error ? retryErr.message : retryErr
           );
         }
+
+        // Every address the contact has on file was rejected by Meta, so
+        // there is nothing left to try right now. Park the reply instead of
+        // dropping it: the conversation shows a "waiting for a valid phone"
+        // notice, and the moment an operator records a real number the
+        // send fires without the customer having to write again.
+        //
+        // Only for recipient rejections — a template or provider failure
+        // must NOT be parked, since re-sending it later could duplicate a
+        // reply the customer already received.
+        await parkReplyAwaitingValidPhone({
+          db,
+          accountId,
+          conversationId,
+          contactId,
+          text: stripInternalReasoning(finalText),
+          reason: err instanceof Error ? err.message : String(err),
+        }).catch((parkErr: unknown) => {
+          console.error(
+            `[ai auto-reply] conversation ${conversationId}: could not park the undeliverable reply:`,
+            parkErr instanceof Error ? parkErr.message : parkErr
+          );
+        });
       }
       throw err;
     });

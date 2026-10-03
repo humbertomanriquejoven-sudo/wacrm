@@ -401,6 +401,19 @@
       "resumed": "AI가 재개되었습니다.",
       "updateError": "AI 어시스턴트를 업데이트하지 못했습니다.",
       "networkError": "서버에 연결할 수 없습니다."
+    },
+    "phoneBanner": {
+      "addPhone": "전화번호 추가",
+      "hint": "어시스턴트의 답변이 보류 중입니다. 유효한 번호를 저장하면 곧 전송됩니다.",
+      "phoneLabel": "전화번호",
+      "placeholder": "국가번호 + 번호 (예: 573001234567)",
+      "saveAndSend": "저장 및 전송",
+      "sending": "전송 중…",
+      "cancel": "취소",
+      "saved": "전화번호가 저장되었습니다.",
+      "sentOne": "전화번호가 저장되어 보류된 답변을 전송했습니다.",
+      "sentMany": "전화번호가 저장되어 보류된 답변 {count}개를 전송했습니다.",
+      "saveError": "전화번호를 저장하지 못했습니다."
     }
   },
   "Contacts": {

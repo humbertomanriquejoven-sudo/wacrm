@@ -108,6 +108,13 @@ export interface Contact {
   email?: string;
   company?: string;
   avatar_url?: string;
+  /** Facebook/WhatsApp profile username (migration 048). Lets us match and
+   *  address a sender whose phone number Meta never disclosed. */
+  username?: string | null;
+  /** Business-scoped user id Meta sends for unregistered numbers
+   *  (migration 048). Survives a merge onto a contact that has a real
+   *  phone, so later messages from that number resolve to this row. */
+  wa_user_id?: string | null;
   created_at: string;
   updated_at: string;
   /** Hydrated by queries that embed `contact_tags(tags(*))` (e.g. the
@@ -223,6 +230,15 @@ export interface Conversation {
   ai_autoreply_disabled?: boolean;
   ai_reply_count?: number;
   ai_handoff_summary?: string | null;
+  /** True while a bot reply could not be delivered because Meta rejected
+   *  every address we hold for this contact (migration 049). The UI shows
+   *  the reason and an inline way to record the missing phone number. */
+  awaiting_valid_phone?: boolean;
+  /** The exact reply text that is being held back. Kept so it can be sent
+   *  verbatim once a number is known — the model is not asked again. */
+  pending_reply_text?: string | null;
+  /** When the reply was parked, for the "waiting since…" hint. */
+  pending_reply_at?: string | null;
 }
 
 // ============================================================

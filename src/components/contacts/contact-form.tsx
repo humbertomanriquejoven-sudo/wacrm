@@ -25,6 +25,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Loader2, AlertTriangle } from 'lucide-react';
 import { useTranslations } from 'next-intl';
+import { updateContactPhone } from '@/lib/contacts/phone-api';
 
 interface ContactFormProps {
   open: boolean;
@@ -149,11 +150,21 @@ export function ContactForm({
       let contactId = contact?.id;
 
       if (isEdit && contactId) {
+        // The phone goes through the API route, not a direct write: that
+        // route also folds in any orphan contact and delivers a bot reply
+        // that was parked waiting for a valid number. Writing `phone` here
+        // would update the row and leave the customer in silence.
+        //
+        // Only when it actually changed — re-saving an unchanged number
+        // would re-run the merge and flush on every edit of the name.
+        if (phone.trim() !== (contact.phone ?? '')) {
+          await updateContactPhone(contactId, phone.trim());
+        }
+
         const { error } = await supabase
           .from('contacts')
           .update({
             name: name.trim() || null,
-            phone: phone.trim(),
             email: email.trim() || null,
             company: company.trim() || null,
             updated_at: new Date().toISOString(),
