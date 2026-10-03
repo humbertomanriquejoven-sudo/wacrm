@@ -741,11 +741,12 @@ async function processMessage(
   // in the column it actually belongs to.
   // ============================================================
 
-  // Pick the strongest address Meta gave us. When `messages[].from` is a
-  // BSUID/long numeric id, fall back to the real number Meta puts on the
-  // contact object (`contacts[0].wa_id`, then `contacts[0].profile.phone`)
-  // before accepting the raw identifier: the contact's `phone` column must
-  // hold a usable number whenever Meta disclosed one.
+  // Pick the real, dialable number Meta gave us — `messages[].from`,
+  // `contacts[0].wa_id`, or `contacts[0].profile.phone`, whichever is the
+  // first one that is genuinely phone-shaped. When `from` is a BSUID or
+  // long numeric id it is DISCARDED for the `phone` column: `phone` only
+  // ever holds a clean E.164 number, and the opaque id lives solely in
+  // `wa_user_id` so it can never be mistaken for a destination.
   const trimmedFrom = (message.from ?? '').trim()
   const trimmedWaId = (contact.wa_id ?? '').trim()
   const trimmedProfilePhone = (
@@ -757,7 +758,7 @@ async function processMessage(
       ? normalizePhone(trimmedWaId)
       : isPhoneLike(trimmedProfilePhone)
         ? normalizePhone(trimmedProfilePhone)
-        : trimmedFrom || trimmedWaId || trimmedProfilePhone
+        : ''
 
   // Every field that could carry the opaque id, in order of trust. `wa_id` is
   // the last resort because for unregistered senders Meta sometimes puts the
@@ -1921,7 +1922,13 @@ async function purgeEmptyPhoneContacts(): Promise<void> {
       wa_user_id?: string | null
       username?: string | null
     }
-    const rows = orphans as OrphanRow[]
+    const rows = (orphans as OrphanRow[]).filter(
+      // A row still holding a BSUID (`wa_user_id`) or a @username is an
+      // identified contact with real history — purging it would wipe the
+      // thread on every inbound from that sender. Only rows whose phone
+      // is empty AND which carry no identity at all are genuine junk.
+      (row) => !row.wa_user_id && !row.username,
+    )
     const byAccount = new Map<string, OrphanRow[]>()
     for (const row of rows) {
       const list = byAccount.get(row.account_id) ?? []
@@ -2275,20 +2282,11 @@ async function findOrCreateContact(
   // created" it — we attribute to the WhatsApp config owner as a stable
   // default).
   //
-  // `phone` is NOT NULL, so we promote the BSUID (then the username) into
-  // it when Meta sent no number. A BSUID in `phone` is still something the
-  // outbound path can attempt, whereas '' makes `engineSend*` throw
-  // "contact not found" and silently drop every reply — the exact symptom
-  // of "typing indicator shows, nothing arrives". The authoritative BSUID
-  // also goes in its own column for future matches.
-  // `phone` is NOT NULL, so when Meta sent no dialable number we promote the
-  // BSUID into it as a last resort — but ONLY as a placeholder. The same
-  // value is always written to `wa_user_id` as well, so the CRM knows this
-  // row is identified by a BSUID rather than a phone number, and
-  // `repairBsuidPhoneContacts()` swaps in a real number as soon as one is
-  // known. `''` would be worse: `engineSend*` throws "contact not found"
-  // and silently drops every reply.
-  const phoneForRow = phone || waUserId || username || 'unknown'
+  // `phone` is NOT NULL, so an empty string fills it when Meta disclosed
+  // no dialable number. The BSUID and @username columns (`wa_user_id`,
+  // `username`) carry the identity — never promote them into `phone`,
+  // because `phone` must stay a clean E.164 number for outbound sends.
+  const phoneForRow = phone
 
   const { data: newContact, error: createError } = await supabaseAdmin()
     .from('contacts')
@@ -2296,7 +2294,7 @@ async function findOrCreateContact(
       account_id: accountId,
       user_id: configOwnerUserId,
       phone: phoneForRow,
-      name: name || username || phoneForRow,
+      name: name || username || phoneForRow || waUserId || 'unknown',
       username: username ?? undefined,
       wa_user_id: waUserId ?? undefined,
     })
