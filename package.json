@@ -38,7 +38,8 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "db:purge-contacts": "tsx src/lib/db/clear-contacts-only.ts"
+    "db:purge-contacts": "tsx src/lib/db/clear-contacts-only.ts",
+    "db:purge": "tsx src/lib/db/purge-all-contacts.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.6.0",
@@ -74,10 +75,12 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/node": "^26",
+    "@types/pg": "^8.23.1",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.2.12",
+    "pg": "^8.23.1",
     "prettier": "^3.9.6",
     "prettier-plugin-tailwindcss": "^0.8.1",
     "tailwindcss": "^4",
