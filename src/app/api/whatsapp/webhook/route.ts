@@ -87,6 +87,12 @@ interface WhatsAppMessage {
   button?: { text?: string; payload?: string }
   /** Present when the customer swipe-replies to one of our messages. */
   context?: { id: string }
+  /**
+   * BSUID (Business-Scoped User ID) of the sender. Meta sends this
+   * instead of / alongside `from` when the message arrives from a
+   * number that is NOT registered on WhatsApp. Opaque, per-WABA id.
+   */
+  from_user_id?: string
 }
 
 interface WhatsAppWebhookEntry {
@@ -99,8 +105,16 @@ interface WhatsAppWebhookEntry {
         phone_number_id: string
       }
       contacts?: Array<{
-        profile: { name: string }
+        profile: { name: string; /** Public @username. Not every
+         *  profile exposes one, so it's optional. */ username?: string }
         wa_id: string
+        /**
+         * BSUID. Present for senders on numbers that aren't registered
+         * on WhatsApp — an opaque id rather than a phone number, which
+         * is the case that used to produce a contact with a `phone` we
+         * couldn't send to.
+         */
+        user_id?: string
       }>
       messages?: WhatsAppMessage[]
       statuses?: Array<{
@@ -241,6 +255,16 @@ export async function POST(request: Request) {
     }, ${inboundMessageCount} inbound message(s)`
   )
 
+  // Raw payload dump. The identity fields Meta sends have changed shape
+  // more than once (wa_id → user_id/BSUID → profile.username), and when
+  // an inbound is mishandled the only way to know what we actually got is
+  // the exact JSON. Truncated: media payloads can carry long ids and the
+  // dump exists for shape, not archival.
+  console.log(
+    '=== META WEBHOOK BODY ===',
+    JSON.stringify(body, null, 2).slice(0, 4000),
+  )
+
   // Process AFTER the response so we ack Meta within their ~20s timeout
   // (a slow ack triggers Meta retries + duplicate inserts), while still
   // guaranteeing the work runs to completion.
@@ -258,6 +282,13 @@ export async function POST(request: Request) {
   after(async () => {
     const startedAt = Date.now()
     try {
+      // Remove orphan contacts left by pre-BSUID versions of this handler,
+      // which could insert a row with no usable `phone`. Those rows are
+      // undeliverable and they also break `findExistingContact`'s
+      // suffix pre-filter, so they get swept once per delivery — cheap
+      // (an indexed `is.null` + `eq('')` on a normally-tiny set), and
+      // self-limiting since the count drops to zero after the first run.
+      await purgeEmptyPhoneContacts()
       await processWebhook(body)
       console.log(
         `[webhook] delivery processed in ${Date.now() - startedAt}ms`
@@ -659,7 +690,11 @@ async function handleReaction(
 
 async function processMessage(
   message: WhatsAppMessage,
-  contact: { profile: { name: string }; wa_id: string },
+  contact: {
+    profile: { name: string; username?: string }
+    wa_id: string
+    user_id?: string
+  },
   // Tenancy. Resolved from the matched whatsapp_config row; every
   // contact / conversation / message row created downstream is
   // stamped with this so any member of the account can see it.
@@ -676,14 +711,54 @@ async function processMessage(
   // See parseMessageContent for what it turns off.
   mirrorMedia: boolean
 ) {
-  const senderPhone = normalizePhone(message.from)
-  const contactName = contact.profile.name
+  // ============================================================
+  // Sender identity — Meta can identify the same person three ways,
+  // and does NOT always send all three.
+  //
+  //   * `wa_id` / `messages[].from` — the phone number. Present for any
+  //     sender on a registered number.
+  //   * `contacts[].user_id` / `messages[].from_user_id` — the BSUID, an
+  //     opaque per-WABA id. Sent for senders on numbers NOT registered
+  //     on WhatsApp, INSTEAD of a usable number.
+  //   * `contacts[].profile.username` / `.name` — the public @username.
+  //
+  // The BSUID case is the one that broke outbound delivery: we only had
+  // `phone` to store the identifier, so a BSUID-only sender produced a
+  // contact whose `phone` was either empty or an opaque id that
+  // `sanitizePhoneForMeta` rejects — the webhook worked (typing
+  // indicator fired) but every send failed. Collect all three, prefer
+  // the number, and never let the stored `phone` end up blank.
+  // ============================================================
+  const rawPhone = normalizePhone(message.from) || normalizePhone(contact.wa_id)
+  const senderUserId =
+    contact.user_id?.trim() || message.from_user_id?.trim() || null
+  const senderUsername =
+    contact.profile.username?.trim().replace(/^@/, '') || null
+  const senderName = contact.profile.name?.trim() || null
+
+  // The `phone` we persist. Falls back through BSUID → username so the
+  // NOT NULL column always has something the sender can be reached at;
+  // `resolveSenderContact` promotes a BSUID into `phone` on insert for
+  // exactly this reason.
+  const senderPhone =
+    rawPhone || senderUserId || senderUsername || senderName || 'unknown'
+
+  // Human-facing label. The @username is more stable than the profile
+  // name (people rename themselves), so it wins when present. Stored on
+  // the contact row inside findOrCreateContact.
 
   // Per-message breadcrumb: this is where you confirm the inbound reached
   // processing at all, and the steps below all reference this id.
   console.log(
     `[webhook] processing ${message.type} message ${message.id} from ${senderPhone || message.from} (account ${accountId})`
   )
+  console.log('-> [EXTRACTED DATA]', {
+    effectivePhone: senderPhone,
+    extractedUser: senderUsername || senderUserId || senderName,
+    hasRealPhone: Boolean(rawPhone),
+    wa_user_id: senderUserId,
+    username: senderUsername,
+  })
 
   // Show the WhatsApp typing indicator IMMEDIATELY so the customer sees
   // the bot "is typing" while we process text / voice notes. Fire-and-
@@ -707,13 +782,14 @@ async function processMessage(
     })
   }
 
-  // Find or create contact
-  const contactOutcome = await findOrCreateContact(
-    accountId,
-    configOwnerUserId,
-    senderPhone,
-    contactName
-  )
+  // Find or create contact. Resolves on BSUID → phone → username → name,
+  // so a sender we've already seen never gets a second row.
+  const contactOutcome = await findOrCreateContact(accountId, configOwnerUserId, {
+    phone: rawPhone,
+    waUserId: senderUserId,
+    username: senderUsername,
+    name: senderName ?? contact.profile.name,
+  })
   if (!contactOutcome) {
     console.error(
       `[webhook] could not resolve or create a contact for ${senderPhone} — dropping message ${message.id} before it reaches the AI.`
@@ -1415,6 +1491,113 @@ async function parseMessageContent(
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ContactRow = any
 
+/**
+ * Delete contacts with no usable `phone`, together with their
+ * conversations and messages.
+ *
+ * Earlier versions of this handler created a contact for a BSUID-only or
+ * username-only sender with `phone` left empty. Those rows are
+ * undeliverable (`engineSend*` throws "contact not found for this
+ * account"), and they poison every later lookup, so the BSUID/username
+ * resolution added above can't ever merge them back.
+ *
+ * Only rows with a `wa_user_id` or `username` are auto-merged into the
+ * contact that actually owns that identity; anything else is genuinely
+ * unaddressable and is removed. Children go first — `conversations` and
+ * `messages` have FKs to `contacts` — and the whole thing is scoped per
+ * account so one tenant can never delete another's rows.
+ *
+ * Failures are swallowed: this is opportunistic hygiene, and it must not
+ * stop the inbound message that triggered it.
+ */
+async function purgeEmptyPhoneContacts(): Promise<void> {
+  try {
+    const db = supabaseAdmin()
+
+    // `.or('phone.is.null,phone.eq.')` is the PostgREST spelling of
+    // "NULL or empty string".
+    const { data: orphans, error } = await db
+      .from('contacts')
+      .select('id, account_id, wa_user_id, username')
+      .or('phone.is.null,phone.eq.')
+
+    if (error || !orphans || orphans.length === 0) return
+
+    // Group by account: the deletes below are account-scoped, and mixing
+    // tenants in one query would need an `account_id.eq.X,account_id.eq.Y`
+    // filter we can't express cleanly.
+    interface OrphanRow {
+      id: string
+      account_id: string
+      wa_user_id?: string | null
+      username?: string | null
+    }
+    const rows = orphans as OrphanRow[]
+    const byAccount = new Map<string, OrphanRow[]>()
+    for (const row of rows) {
+      const list = byAccount.get(row.account_id) ?? []
+      list.push(row)
+      byAccount.set(row.account_id, list)
+    }
+
+    for (const [accountId, accountRows] of byAccount) {
+      const ids = accountRows.map((r) => r.id)
+      const { error: convErr } = await db
+        .from('conversations')
+        .delete()
+        .eq('account_id', accountId)
+        .in('contact_id', ids)
+      if (convErr) {
+        console.warn(
+          `[webhook] purge: could not delete conversations for ${ids.length} empty-phone contact(s):`,
+          convErr.message,
+        )
+        continue
+      }
+
+      // `messages.conversation_id` was just removed, so anything left for
+      // these contacts is a row with no conversation — a leftover from an
+      // earlier partial failure.
+      const { error: msgErr } = await db
+        .from('messages')
+        .delete()
+        .eq('sender_type', 'customer')
+        .is('conversation_id', null)
+      if (msgErr) {
+        console.warn(
+          '[webhook] purge: could not delete orphaned messages:',
+          msgErr.message,
+        )
+      }
+
+      const { error: delErr } = await db
+        .from('contacts')
+        .delete()
+        .eq('account_id', accountId)
+        .in('id', ids)
+      if (delErr) {
+        console.warn(
+          '[webhook] purge: could not delete empty-phone contacts:',
+          delErr.message,
+        )
+        continue
+      }
+
+      console.log(
+        `[webhook] purge: removed ${ids.length} contact(s) with no phone in account ${accountId}` +
+          (accountRows.some((r) => r.wa_user_id || r.username)
+            ? ' — identity fields present, expect them re-created on next inbound'
+            : ''),
+      )
+    }
+  } catch (err) {
+    console.warn(
+      '[webhook] purge: empty-phone contact cleanup failed (non-fatal):',
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
 interface ContactOutcome {
   contact: ContactRow
   /** True when this call created the row; drives new_contact_created
@@ -1422,70 +1605,131 @@ interface ContactOutcome {
   wasCreated: boolean
 }
 
+/** Everything Meta told us about who sent this message. */
+interface SenderIdentity {
+  /** Digit-only phone number, or '' when Meta sent no number. */
+  phone: string
+  /** BSUID, when the sender isn't on a registered number. */
+  waUserId: string | null
+  /** Public @username, without the leading '@'. */
+  username: string | null
+  /** WhatsApp profile name. */
+  name: string
+}
+
+/**
+ * Resolve the contact for an inbound message, matching on ANY of the
+ * three identifiers Meta can send, and never inserting a second row for
+ * someone we already track.
+ *
+ * Match order is deliberate:
+ *   1. BSUID    — an opaque id that uniquely identifies a person within a
+ *                WABA, so it's the only truly unambiguous key we have.
+ *   2. phone    — via the shared `phonesMatch` helper, so the webhook,
+ *                the manual form and CSV import all agree on "same
+ *                number" (including trunk-prefix tolerance).
+ *   3. username — a public handle; stable across renames, and the only
+ *                handle available when Meta sends neither number nor BSUID.
+ *   4. name-only— a row created from the form / CSV with no number yet.
+ *
+ * The old code only ever matched on (2). A sender who first reached us as
+ * a bare BSUID and later messaged from their registered number therefore
+ * got a SECOND contact row — the duplication this replaces.
+ */
 async function findOrCreateContact(
   accountId: string,
   configOwnerUserId: string,
-  phone: string,
-  name: string
+  sender: SenderIdentity
 ): Promise<ContactOutcome | null> {
-  // Find an existing contact for this account by phone. The shared
-  // helper pre-filters in SQL by the last-8-digit suffix (so we don't
-  // pull every contact on every inbound message) then applies the
-  // strict `phonesMatch` in JS on the small candidate set. The same
-  // helper backs the manual contact form and CSV import, so all three
-  // paths agree on what "same number" means (issue #212).
-  const existingContact = await findExistingContact(
-    supabaseAdmin(),
-    accountId,
-    phone,
-  )
+  const db = supabaseAdmin()
+  const { phone, waUserId, username, name } = sender
+
+  // 1. BSUID — exact, and unique per (account, BSUID) by migration 048.
+  let existingContact: ContactRow | null = null
+  if (waUserId) {
+    const { data } = await db
+      .from('contacts')
+      .select('*')
+      .eq('account_id', accountId)
+      .eq('wa_user_id', waUserId)
+      .limit(1)
+    if (data && data.length > 0) existingContact = data[0] as ContactRow
+  }
+
+  // 2. Phone — fuzzy-matched by the shared helper so all write paths agree.
+  if (!existingContact && phone) {
+    existingContact = await findExistingContact(db, accountId, phone)
+  }
+
+  // 3. Username.
+  if (!existingContact && username) {
+    const { data } = await db
+      .from('contacts')
+      .select('*')
+      .eq('account_id', accountId)
+      .eq('username', username)
+      .limit(1)
+    if (data && data.length > 0) existingContact = data[0] as ContactRow
+  }
+
+  // 4. A row with this WhatsApp profile name but no number assigned yet
+  //    (created from the form or CSV). Adopt it rather than duplicate.
+  if (!existingContact && name) {
+    existingContact = await findContactByNameWithoutPhone(db, accountId, name)
+  }
 
   if (existingContact) {
-    // Backfill whatever the inbound payload tells us that the record is
-    // missing, so replies to this customer always go to the number they
-    // actually message from and carry their WhatsApp profile name:
-    //   - name:  set it when the row has none or a stale one.
-    //   - phone: promote a fuzzy (trunk-prefix / format) match to the
-    //     exact sender number so outbound sends don't fail.
-    const updates: { name?: string; phone?: string } = {}
-    if (name && name !== existingContact.name) updates.name = name
-    if (phone && normalizePhone(existingContact.phone) !== phone) {
-      updates.phone = phone
-    }
+    // Backfill whatever this payload tells us that the row is missing, so
+    // replies always go to a usable destination and the inbox can show the
+    // handle Meta now knows:
+    //   - phone:      promote a fuzzy (trunk-prefix / format) match to the
+    //                exact sender number so outbound sends don't fail.
+    //   - name:       only when the row has none (never clobber a
+    //                manually-chosen display name).
+    //   - username:   only when we learned one and the row has none.
+    //   - wa_user_id: only when we learned one and the row has none.
+    const updates: Record<string, unknown> = {}
+    const currentPhone = normalizePhone(existingContact.phone ?? '')
+    // Overwrite `phone` only with a REAL number. Promoting a BSUID over a
+    // working phone would break delivery for a contact that is perfectly
+    // reachable today.
+    if (phone && currentPhone !== phone) updates.phone = phone
+    if (name && !existingContact.name) updates.name = name
+    if (username && !existingContact.username) updates.username = username
+    if (waUserId && !existingContact.wa_user_id) updates.wa_user_id = waUserId
+
     if (Object.keys(updates).length > 0) {
-      await supabaseAdmin()
+      await db
         .from('contacts')
         .update({ ...updates, updated_at: new Date().toISOString() })
         .eq('id', existingContact.id)
+      Object.assign(existingContact, updates)
     }
     return { contact: existingContact, wasCreated: false }
   }
 
-  // No phone match. Before creating a new row, check whether an existing
-  // contact with this WhatsApp profile name exists but has no number
-  // assigned yet — adopt it rather than silently duplicating the customer.
-  const nameOnlyContact = name
-    ? await findContactByNameWithoutPhone(supabaseAdmin(), accountId, name)
-    : null
-  if (nameOnlyContact) {
-    await supabaseAdmin()
-      .from('contacts')
-      .update({ name, phone, updated_at: new Date().toISOString() })
-      .eq('id', nameOnlyContact.id)
-    return { contact: nameOnlyContact, wasCreated: false }
-  }
+  // Create new contact. account_id is the tenancy column; user_id is the
+  // NOT NULL FK audit column (no inbound message has a single "user who
+  // created" it — we attribute to the WhatsApp config owner as a stable
+  // default).
+  //
+  // `phone` is NOT NULL, so we promote the BSUID (then the username) into
+  // it when Meta sent no number. A BSUID in `phone` is still something the
+  // outbound path can attempt, whereas '' makes `engineSend*` throw
+  // "contact not found" and silently drop every reply — the exact symptom
+  // of "typing indicator shows, nothing arrives". The authoritative BSUID
+  // also goes in its own column for future matches.
+  const phoneForRow = phone || waUserId || username || 'unknown'
 
-  // Create new contact. account_id is the tenancy column;
-  // user_id is the NOT NULL FK audit column (no inbound message
-  // has a single "user who created" it — we attribute to the
-  // WhatsApp config owner as a stable default).
   const { data: newContact, error: createError } = await supabaseAdmin()
     .from('contacts')
     .insert({
       account_id: accountId,
       user_id: configOwnerUserId,
-      phone,
-      name: name || phone,
+      phone: phoneForRow,
+      name: name || username || phoneForRow,
+      username: username ?? undefined,
+      wa_user_id: waUserId ?? undefined,
     })
     .select()
     .single()
@@ -1496,7 +1740,11 @@ async function findOrCreateContact(
     // unique index (migration 022) rejected the duplicate. Re-resolve
     // the existing row instead of dropping the message.
     if (isUniqueViolation(createError)) {
-      const raced = await findExistingContact(supabaseAdmin(), accountId, phone)
+      const raced = await findExistingContact(
+        supabaseAdmin(),
+        accountId,
+        phoneForRow,
+      )
       if (raced) return { contact: raced, wasCreated: false }
     }
     console.error('Error creating contact:', createError)

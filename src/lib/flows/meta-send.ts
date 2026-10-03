@@ -12,6 +12,7 @@ import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import { cleanAiReplyText } from '@/lib/whatsapp/clean-ai-text'
 import {
+  normalizePhone,
   sanitizePhoneForMeta,
   isValidE164,
   phoneVariants,
@@ -65,6 +66,29 @@ interface SendTextEngineArgs {
  * `engineSendBase` once the v2 features (templates with variables,
  * media sends) settle.
  */
+// Resolve the outbound destination once, for every sender below.
+//
+// A contact may have no phone number at all: senders on unregistered
+// WhatsApp numbers arrive with a BSUID (`wa_user_id`) instead, and Meta
+// accepts that as the `to` value just the same. `phone` wins when we have
+// it — it's the canonical destination — and we fall back to the BSUID
+// rather than throwing, because refusing to send is exactly the bug this
+// fixes.
+//
+// `phoneVariants` handles trunk-prefix retries for the number case; a
+// BSUID is passed through untouched because Meta treats it as an opaque
+// id, not a phone to reformat.
+export function resolveOutboundTarget(contact: {
+  phone?: string | null
+  wa_user_id?: string | null
+  username?: string | null
+}): string {
+  const phone = (contact.phone ?? '').trim()
+  const bsuid = (contact.wa_user_id ?? '').trim()
+  const handle = (contact.username ?? '').trim()
+  return phone || bsuid || handle
+}
+
 export async function engineSendText(
   args: SendTextEngineArgs,
 ): Promise<{ whatsapp_message_id: string }> {
@@ -72,17 +96,22 @@ export async function engineSendText(
 
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone')
+    .select('id, phone, wa_user_id, username')
     .eq('id', args.contactId)
     .eq('account_id', args.accountId)
     .maybeSingle()
-  if (contactErr || !contact?.phone) {
+
+  const target = contact ? resolveOutboundTarget(contact) : ''
+  if (contactErr || !contact || !target) {
     throw new Error('contact not found for this account')
   }
 
-  const sanitized = sanitizePhoneForMeta(contact.phone)
-  if (!isValidE164(sanitized)) {
-    throw new Error(`contact phone invalid: ${contact.phone}`)
+  // A BSUID/username is opaque to `sanitizePhoneForMeta`, so only run the
+  // phone pipeline when we actually have a number.
+  const isNumber = Boolean(normalizePhone(target))
+  const sanitized = isNumber ? sanitizePhoneForMeta(target) : target
+  if (isNumber && !isValidE164(sanitized)) {
+    throw new Error(`contact phone invalid: ${target}`)
   }
 
   const { data: config, error: configErr } = await db
@@ -188,17 +217,21 @@ export async function engineSendAiReply(
 
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone')
+    .select('id, phone, wa_user_id, username')
     .eq('id', args.contactId)
     .eq('account_id', args.accountId)
     .maybeSingle()
-  if (contactErr || !contact?.phone) {
+  const target = contact ? resolveOutboundTarget(contact) : ''
+  if (contactErr || !contact || !target) {
     throw new Error('contact not found for this account')
   }
 
-  const sanitized = sanitizePhoneForMeta(contact.phone)
-  if (!isValidE164(sanitized)) {
-    throw new Error(`contact phone invalid: ${contact.phone}`)
+  // A BSUID/username is opaque to `sanitizePhoneForMeta`, so only run the
+  // phone pipeline when we actually have a number.
+  const isNumber = Boolean(normalizePhone(target))
+  const sanitized = isNumber ? sanitizePhoneForMeta(target) : target
+  if (isNumber && !isValidE164(sanitized)) {
+    throw new Error(`contact phone invalid: ${target}`)
   }
 
   const { data: config, error: configErr } = await db
@@ -328,17 +361,21 @@ export async function engineSendMedia(
 
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone')
+    .select('id, phone, wa_user_id, username')
     .eq('id', args.contactId)
     .eq('account_id', args.accountId)
     .maybeSingle()
-  if (contactErr || !contact?.phone) {
+  const target = contact ? resolveOutboundTarget(contact) : ''
+  if (contactErr || !contact || !target) {
     throw new Error('contact not found for this account')
   }
 
-  const sanitized = sanitizePhoneForMeta(contact.phone)
-  if (!isValidE164(sanitized)) {
-    throw new Error(`contact phone invalid: ${contact.phone}`)
+  // A BSUID/username is opaque to `sanitizePhoneForMeta`, so only run the
+  // phone pipeline when we actually have a number.
+  const isNumber = Boolean(normalizePhone(target))
+  const sanitized = isNumber ? sanitizePhoneForMeta(target) : target
+  if (isNumber && !isValidE164(sanitized)) {
+    throw new Error(`contact phone invalid: ${target}`)
   }
 
   const { data: config, error: configErr } = await db
@@ -480,17 +517,21 @@ async function sendInteractiveViaMeta(
   // Migration 017 moved both tables to account-scoped tenancy.
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone')
+    .select('id, phone, wa_user_id, username')
     .eq('id', input.contactId)
     .eq('account_id', input.accountId)
     .maybeSingle()
-  if (contactErr || !contact?.phone) {
+  const target = contact ? resolveOutboundTarget(contact) : ''
+  if (contactErr || !contact || !target) {
     throw new Error('contact not found for this account')
   }
 
-  const sanitized = sanitizePhoneForMeta(contact.phone)
-  if (!isValidE164(sanitized)) {
-    throw new Error(`contact phone invalid: ${contact.phone}`)
+  // A BSUID/username is opaque to `sanitizePhoneForMeta`, so only run the
+  // phone pipeline when we actually have a number.
+  const isNumber = Boolean(normalizePhone(target))
+  const sanitized = isNumber ? sanitizePhoneForMeta(target) : target
+  if (isNumber && !isValidE164(sanitized)) {
+    throw new Error(`contact phone invalid: ${target}`)
   }
 
   const { data: config, error: configErr } = await db

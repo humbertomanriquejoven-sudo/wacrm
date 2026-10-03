@@ -45,6 +45,12 @@ const h = vi.hoisted(() => ({
     contactUpdateCalls: [] as { id?: unknown; patch: Record<string, unknown> }[],
     /** Rows inserted via contacts.insert. */
     contactInsertCalls: [] as Record<string, unknown>[],
+    /** Row returned by contacts.insert().single(). */
+    contactsInsertResponse: null as Record<string, unknown> | null,
+    /** Row returned by the BSUID / username exact-match lookups. */
+    bsuidLookupResponse: null as Record<string, unknown> | null,
+    /** Rows purgeEmptyPhoneContacts() considers orphaned. */
+    emptyPhoneContacts: [] as Record<string, unknown>[],
     /** Transcripts written back onto messages rows ('id' → patch). */
     messageTranscriptUpdates: [] as {
       id: unknown
@@ -130,19 +136,37 @@ vi.mock('@supabase/supabase-js', () => ({
             }),
           }
         case 'contacts':
-          // findContactByNameWithoutPhone: select().eq().eq()
           return {
-            select: () => ({
-              eq: () => ({
-                eq: () =>
+            select: () => {
+              const secondEqResult = {
+                limit: (n: number) =>
+                  Promise.resolve({
+                    data: h.state.bsuidLookupResponse
+                      ? [h.state.bsuidLookupResponse].slice(0, n)
+                      : [],
+                    error: null,
+                  }),
+                then: (
+                  resolve: (v: unknown) => unknown,
+                  reject?: (e: unknown) => unknown,
+                ) =>
                   Promise.resolve({
                     data: h.state.contactByNameResult
                       ? [h.state.contactByNameResult]
                       : [],
                     error: null,
+                  }).then(resolve, reject),
+              }
+              return {
+                eq: () => ({ eq: () => secondEqResult }),
+                // purgeEmptyPhoneContacts: select(...).or('phone.is.null,phone.eq.')
+                or: () =>
+                  Promise.resolve({
+                    data: h.state.emptyPhoneContacts ?? [],
+                    error: null,
                   }),
-              }),
-            }),
+              }
+            },
             update: (patch: Record<string, unknown>) => ({
               eq: (_col: string, value: unknown) => {
                 h.state.contactUpdateCalls.push({
@@ -152,13 +176,21 @@ vi.mock('@supabase/supabase-js', () => ({
                 return Promise.resolve({ data: null, error: null })
               },
             }),
+            delete: () => ({
+              eq: () => ({
+                in: () => Promise.resolve({ data: null, error: null }),
+              }),
+            }),
             insert: (row: Record<string, unknown>) => {
               h.state.contactInsertCalls.push(row)
               return {
                 select: () => ({
                   single: () =>
                     Promise.resolve({
-                      data: { id: 'inserted-1', ...row },
+                      data: h.state.contactsInsertResponse?.data ?? {
+                        id: 'inserted-1',
+                        ...row,
+                      },
                       error: null,
                     }),
                 }),
@@ -332,6 +364,49 @@ function inboundRequest(message: Record<string, unknown> = TEXT_MESSAGE) {
   } as unknown as Request
 }
 
+/**
+ * Inbound from a sender on a number NOT registered on WhatsApp: Meta sends
+ * a BSUID in `contacts[].user_id` and an EMPTY `wa_id`, which is the case
+ * that used to create a contact with an undeliverable `phone`.
+ */
+function bsuidInboundRequest() {
+  const body = {
+    entry: [
+      {
+        changes: [
+          {
+            field: 'messages',
+            value: {
+              metadata: { phone_number_id: 'pn-1' },
+              contacts: [
+                {
+                  wa_id: '',
+                  user_id: 'bsuid-abc',
+                  profile: { name: 'Humberto', username: 'humberto' },
+                },
+              ],
+              messages: [
+                {
+                  id: 'wamid.BSUID1',
+                  from: '',
+                  from_user_id: 'bsuid-abc',
+                  timestamp: '1700000000',
+                  type: 'text',
+                  text: { body: 'hola' },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  }
+  return {
+    text: async () => JSON.stringify(body),
+    headers: { get: () => 'sha256=stub' },
+  } as unknown as Request
+}
+
 async function runWebhook(message?: Record<string, unknown>) {
   const res = await POST(inboundRequest(message))
   // Drain the after() callback exactly as the runtime would.
@@ -355,6 +430,9 @@ beforeEach(() => {
   h.state.storageUploadError = null
   h.state.existingContactResult = null
   h.state.contactByNameResult = null
+  h.state.contactsInsertResponse = null
+  h.state.bsuidLookupResponse = null
+  h.state.emptyPhoneContacts = []
   h.state.contactUpdateCalls = []
   h.state.contactInsertCalls = []
   h.state.messageTranscriptUpdates = []
@@ -889,10 +967,53 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     expect(mockFindContactByNameWithoutPhone).toHaveBeenCalledTimes(1)
     expect(h.state.contactInsertCalls).toHaveLength(0)
     expect(h.state.contactUpdateCalls).toHaveLength(1)
+    // Only `phone` is written: the row already carries the profile name, and
+    // the backfill deliberately never clobbers a stored display name. The
+    // point of this path is filling the empty `phone`.
     expect(h.state.contactUpdateCalls[0].patch).toMatchObject({
-      name: 'Ada',
       phone: '15551230000',
       updated_at: expect.any(String),
     })
+  })
+
+  it('stores a BSUID sender in phone so outbound never sees an empty recipient', async () => {
+    // Senders on numbers NOT registered on WhatsApp arrive with a BSUID
+    // instead of `wa_id`. Previously the contact got an empty `phone`, which
+    // made engineSend* throw "contact not found" — the typing indicator
+    // fired but nothing was ever delivered.
+    mockFindExistingContact.mockResolvedValue(null)
+    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
+
+    const res = await POST(bsuidInboundRequest())
+    for (const cb of h.state.afterCallbacks) await cb()
+    expect(res).toBeDefined()
+
+    expect(h.state.contactInsertCalls).toHaveLength(1)
+    expect(h.state.contactInsertCalls[0]).toMatchObject({
+      phone: 'bsuid-abc',
+      wa_user_id: 'bsuid-abc',
+      username: 'humberto',
+    })
+  })
+
+  it('reuses the contact matched by BSUID instead of inserting a duplicate', async () => {
+    // The same person first reached us as a bare BSUID and now writes from
+    // a registered number. Matching on phone alone would create a second
+    // contact row for them.
+    mockFindExistingContact.mockResolvedValue(null)
+    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
+    h.state.bsuidLookupResponse = {
+      id: 'contact-existing',
+      account_id: 'acc-1',
+      user_id: 'user-1',
+      phone: '15551230000',
+      name: 'Humberto',
+      wa_user_id: 'bsuid-abc',
+    }
+
+    await POST(bsuidInboundRequest())
+    for (const cb of h.state.afterCallbacks) await cb()
+
+    expect(h.state.contactInsertCalls).toHaveLength(0)
   })
 })
