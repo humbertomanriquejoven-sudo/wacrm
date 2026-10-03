@@ -1,6 +1,21 @@
-import { normalizePhone } from './phone-utils'
+import {
+  isMetaIdentifier,
+  normalizeMetaIdentifier,
+  toDialable,
+} from './phone-utils'
 import { MetaApiError } from './meta-api'
 import { supabaseAdmin } from '@/lib/flows/admin-client'
+
+// The phone-vs-identifier boundary is defined once, in `phone-utils`, and
+// shared with the Meta payload builder so a BSUID is classified the same
+// way at resolve time and at send time. Re-exported here because this
+// module is the historical import site for callers and tests.
+export {
+  isDialablePhone,
+  toDialable,
+  isMetaIdentifier,
+  normalizeMetaIdentifier,
+} from './phone-utils'
 
 /**
  * Dynamic recipient resolution.
@@ -17,12 +32,6 @@ import { supabaseAdmin } from '@/lib/flows/admin-client'
  * same code path serves every WABA, every contact and every future
  * Meta identifier shape.
  */
-
-/** E.164 in practice: 7–13 digits. Above 13 a value cannot be a number. */
-const E164_MAX_DIGITS = 13
-const E164_MIN_DIGITS = 7
-/** Meta's namespace prefix on a BSUID. */
-const BSUID_PREFIX_RE = /^(CO|WAID)\./i
 
 /** The identity fields a contact can be addressed by. */
 export interface RecipientCandidate {
@@ -52,53 +61,6 @@ export interface ResolvedRecipient {
    * from. Callers persist this back so the stale value stops recurring.
    */
   recoveredFrom?: { contactId?: string | null; field?: 'phone' | 'wa_user_id' }
-}
-
-/**
- * True when `value` is a real, dialable E.164 phone number.
- *
- * The length ceiling is the load-bearing part. Meta's BSUIDs are 15–17
- * digits, and `normalizePhone` strips every non-digit, so both
- * 'CO.1008477715690681' and a bare '1008477715690681' reduce to the same
- * 16 digits — any "is it just digits?" test accepts them as a phone
- * number. Rejecting the namespace marker and anything past 13 digits is
- * what actually separates a number from an identifier.
- */
-export function isDialablePhone(value: string | null | undefined): boolean {
-  if (!value) return false
-  const trimmed = value.trim()
-  if (!trimmed) return false
-  if (BSUID_PREFIX_RE.test(trimmed)) return false
-  if (!/^\+?[\d\s().-]+$/.test(trimmed)) return false
-  const digits = normalizePhone(trimmed).length
-  return digits >= E164_MIN_DIGITS && digits <= E164_MAX_DIGITS
-}
-
-/** Digits-only form of `value`, or null when it isn't a phone number. */
-export function toDialable(value: string | null | undefined): string | null {
-  if (!value || !isDialablePhone(value)) return null
-  return normalizePhone(value.trim()) || null
-}
-
-/**
- * True when `value` is a Meta identifier rather than a phone number:
- * explicitly namespaced, or simply too long to be E.164.
- */
-export function isMetaIdentifier(value: string | null | undefined): boolean {
-  if (!value) return false
-  const trimmed = value.trim()
-  if (!trimmed) return false
-  if (BSUID_PREFIX_RE.test(trimmed)) return true
-  return /^\d+$/.test(trimmed) && trimmed.length > E164_MAX_DIGITS
-}
-
-/** Normalize a Meta identifier for storage/comparison (drop the prefix). */
-export function normalizeMetaIdentifier(value: string | null | undefined): string | null {
-  if (!value) return null
-  const trimmed = value.trim()
-  if (!trimmed) return null
-  if (BSUID_PREFIX_RE.test(trimmed)) return trimmed.replace(BSUID_PREFIX_RE, '').trim() || null
-  return isMetaIdentifier(trimmed) ? trimmed : null
 }
 
 /** Canonical form of a public handle: leading '@', no duplicate '@'. */

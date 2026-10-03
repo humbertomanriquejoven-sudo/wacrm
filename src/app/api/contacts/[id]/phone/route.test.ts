@@ -179,7 +179,7 @@ describe('PATCH /api/contacts/[id]/phone', () => {
       expect.objectContaining({
         accountId: 'acct-1',
         contactId: 'contact-1',
-        phone: '573122182949',
+        recipient: expect.objectContaining({ phone: '573122182949' }),
       })
     );
   });

@@ -9,6 +9,8 @@
  * instead of a runtime rejection from Meta.
  */
 
+import { metaRecipientFields } from './phone-utils'
+
 const META_API_VERSION = 'v21.0'
 const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`
 
@@ -309,7 +311,7 @@ export async function sendTextMessage(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to,
+    ...metaRecipientFields(to),
     type: 'text',
     text: { body: text },
   }
@@ -377,7 +379,7 @@ export async function sendMediaMessage(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to,
+    ...metaRecipientFields(to),
     type: kind,
     [kind]: media,
   }
@@ -494,7 +496,7 @@ export async function sendTemplateMessage(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to,
+    ...metaRecipientFields(to),
     type: 'template',
     template: templatePayload,
   }
@@ -820,7 +822,7 @@ export async function sendReactionMessage(
     body: JSON.stringify({
       messaging_product: 'whatsapp',
       recipient_type: 'individual',
-      to,
+      ...metaRecipientFields(to),
       type: 'reaction',
       reaction: { message_id: targetMessageId, emoji },
     }),
@@ -941,7 +943,7 @@ export async function sendInteractiveButtons(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to,
+    ...metaRecipientFields(to),
     type: 'interactive',
     interactive,
   }
@@ -1074,7 +1076,7 @@ export async function sendInteractiveList(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to,
+    ...metaRecipientFields(to),
     type: 'interactive',
     interactive,
   }

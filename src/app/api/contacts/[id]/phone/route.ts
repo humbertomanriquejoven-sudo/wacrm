@@ -85,7 +85,11 @@ export async function PATCH(
         ok: true,
         phone,
         changed: false,
-        ...(await deliverParkedReplies(ctx.supabase, ctx.accountId, contactId, phone)),
+        ...(await deliverParkedReplies(ctx.supabase, ctx.accountId, contactId, {
+          phone,
+          wa_user_id: existing.wa_user_id,
+          username: existing.username,
+        })),
       });
     }
 
@@ -151,7 +155,11 @@ export async function PATCH(
       phone,
       changed: true,
       merged,
-      ...(await deliverParkedReplies(ctx.supabase, ctx.accountId, contactId, phone)),
+      ...(await deliverParkedReplies(ctx.supabase, ctx.accountId, contactId, {
+        phone,
+        wa_user_id: (updated ?? existing).wa_user_id,
+        username: (updated ?? existing).username,
+      })),
     });
   } catch (error) {
     return toErrorResponse(error);
@@ -160,23 +168,27 @@ export async function PATCH(
 
 /**
  * Send everything that was parked for this contact, now that it has a
- * real number.
+ * usable address.
  *
- * Failures are reported rather than thrown: the phone save already
- * succeeded, and answering 500 would make the UI claim the number was not
- * saved. A failed flush leaves the reply parked for the next attempt.
+ * Failures are reported rather than thrown: the address save already
+ * succeeded, and answering 500 would make the UI claim it was not saved. A
+ * failed flush leaves the reply parked for the next attempt.
  */
 async function deliverParkedReplies(
   db: SupabaseClient,
   accountId: string,
   contactId: string,
-  phone: string
+  recipient: {
+    phone?: string | null;
+    wa_user_id?: string | null;
+    username?: string | null;
+  }
 ) {
   const result = await flushPendingReplies({
     db,
     accountId,
     contactId,
-    phone,
+    recipient,
     send: async (conversationId, text) => {
       // Reuses the same core as the manual send endpoint, so a deferred
       // reply is persisted, flow-paused and rendered exactly like one an
@@ -191,11 +203,11 @@ async function deliverParkedReplies(
 
   if (result.sent > 0) {
     console.log(
-      `[contacts/${contactId}] delivered ${result.sent} deferred repl${result.sent === 1 ? 'y' : 'ies'} to ${phone}`
+      `[contacts/${contactId}] delivered ${result.sent} deferred repl${result.sent === 1 ? 'y' : 'ies'}`
     );
   } else if (result.failed > 0) {
     console.warn(
-      `[contacts/${contactId}] ${result.failed} deferred repl${result.failed === 1 ? 'y' : 'ies'} still undeliverable to ${phone}`
+      `[contacts/${contactId}] ${result.failed} deferred repl${result.failed === 1 ? 'y' : 'ies'} still undeliverable`
     );
   }
 

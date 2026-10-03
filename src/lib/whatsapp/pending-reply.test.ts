@@ -147,7 +147,7 @@ describe('flushPendingReplies', () => {
     },
   ];
 
-  it('does nothing at all when the phone is not dialable', async () => {
+  it('does nothing at all when the contact has no address', async () => {
     const { db } = makeDb(CONVERSATIONS);
     const send = vi.fn();
 
@@ -155,12 +155,31 @@ describe('flushPendingReplies', () => {
       db,
       accountId: 'acct-1',
       contactId: 'contact-1',
-      phone: 'CO.1008477715690681',
+      recipient: {},
       send,
     });
 
     expect(result).toEqual({ sent: 0, failed: 0, conversations: [] });
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it('flushes a BSUID contact now that Meta accepts a BSUID recipient', async () => {
+    // A BSUID is a first-class recipient (Meta's `recipient` field), so a
+    // contact that only ever wrote from an unregistered number no longer
+    // has to wait for a phone that may never be entered.
+    const { db } = makeDb(CONVERSATIONS);
+    const send = vi.fn(async () => {});
+
+    const result = await flushPendingReplies({
+      db,
+      accountId: 'acct-1',
+      contactId: 'contact-1',
+      recipient: { phone: 'CO.1008477715690681', wa_user_id: '1008477715690681' },
+      send,
+    });
+
+    expect(result.sent).toBe(2);
+    expect(send).toHaveBeenCalledTimes(2);
   });
 
   it('sends each parked reply verbatim and clears it', async () => {
@@ -174,7 +193,7 @@ describe('flushPendingReplies', () => {
       db,
       accountId: 'acct-1',
       contactId: 'contact-1',
-      phone: '573122182949',
+      recipient: { phone: '573122182949' },
       send,
     });
 
@@ -197,7 +216,7 @@ describe('flushPendingReplies', () => {
       db,
       accountId: 'acct-1',
       contactId: 'contact-1',
-      phone: '573122182949',
+      recipient: { phone: '573122182949' },
       send,
     });
 
@@ -218,7 +237,7 @@ describe('flushPendingReplies', () => {
       db,
       accountId: 'acct-1',
       contactId: 'contact-1',
-      phone: '573122182949',
+      recipient: { phone: '573122182949' },
       send,
     });
 

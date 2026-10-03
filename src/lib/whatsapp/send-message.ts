@@ -38,10 +38,14 @@ import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption';
 import { supabaseAdmin } from '@/lib/flows/admin-client';
 import {
   sanitizePhoneForMeta,
-  isValidE164,
   phoneVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils';
+import {
+  isDialablePhone,
+  isRecipientRejection,
+  sendWithRecipientFallback,
+} from '@/lib/whatsapp/recipient-resolver';
 import type { MessageTemplate } from '@/types';
 import {
   resolveTemplateRow,
@@ -234,19 +238,10 @@ export async function sendMessageToConversation(
   }
 
   const contact = conversation.contact;
-  if (!contact?.phone) {
+  if (!contact) {
     throw new SendMessageError(
       'bad_request',
-      'Contact phone number not found',
-      400
-    );
-  }
-
-  const sanitizedPhone = sanitizePhoneForMeta(contact.phone);
-  if (!isValidE164(sanitizedPhone)) {
-    throw new SendMessageError(
-      'bad_request',
-      'Invalid phone number format',
+      'Contact not found for this conversation',
       400
     );
   }
@@ -402,44 +397,67 @@ export async function sendMessageToConversation(
     return result.messageId;
   };
 
-  // Send via Meta — retry across phone-number variants if Meta rejects
-  // with "recipient not in allowed list"; persist a working variant
-  // back to the contact so the next send goes straight through.
+  // Send via Meta.
+  //
+  // The recipient may be a phone number, a BSUID, or a public @handle —
+  // `sendWithRecipientFallback` resolves the best address from the contact
+  // and retries a different identifier when Meta rejects the first. Real
+  // numbers additionally get their trunk-prefix variants (the sandbox's
+  // #131030 quirk); an opaque id has exactly one form.
   let waMessageId = '';
-  let workingPhone = sanitizedPhone;
+  let workingPhone = contact.phone ?? '';
   try {
-    const variants = phoneVariants(sanitizedPhone);
-    let lastError: unknown = null;
-
-    for (const variant of variants) {
-      try {
-        waMessageId = await attempt(variant);
-        workingPhone = variant;
-        lastError = null;
-        break;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (!isRecipientNotAllowedError(message)) {
-          throw err;
+    waMessageId = await sendWithRecipientFallback({
+      contact,
+      accountId,
+      conversationId,
+      send: async (address) => {
+        const variants = isDialablePhone(address)
+          ? phoneVariants(sanitizePhoneForMeta(address))
+          : [address];
+        let lastError: unknown = null;
+        for (const variant of variants) {
+          try {
+            const id = await attempt(variant);
+            workingPhone = variant;
+            return id;
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            if (
+              !isRecipientNotAllowedError(message) &&
+              !isRecipientRejection(err)
+            ) {
+              throw err;
+            }
+            lastError = err;
+            console.warn(
+              `[send-message] variant "${variant}" rejected by Meta, trying next…`
+            );
+          }
         }
-        lastError = err;
-        console.warn(
-          `[send-message] variant "${variant}" rejected by Meta, trying next…`
-        );
-      }
-    }
-
-    if (lastError) throw lastError;
+        throw lastError ?? new Error('Meta rejected every address variant');
+      },
+      onRecovered: async (phone) => {
+        await db.from('contacts').update({ phone }).eq('id', contact.id);
+      },
+    });
   } catch (err) {
     const message =
       err instanceof Error ? err.message : 'Unknown Meta API error';
-    console.error('[send-message] Meta send failed for all variants:', message);
+    console.error('[send-message] Meta send failed:', message);
     throw new SendMessageError('meta_error', `Meta API error: ${message}`, 502);
   }
 
-  if (workingPhone !== sanitizedPhone) {
+  // Persist whichever real number worked so the next send goes straight to
+  // it. Only ever a number — a working BSUID/handle must never overwrite
+  // the phone column.
+  if (
+    workingPhone &&
+    workingPhone !== contact.phone &&
+    isDialablePhone(workingPhone)
+  ) {
     console.log(
-      `[send-message] Auto-corrected contact phone: ${sanitizedPhone} → ${workingPhone}`
+      `[send-message] Auto-corrected contact phone: ${contact.phone} → ${workingPhone}`
     );
     await db
       .from('contacts')

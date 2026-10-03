@@ -1,5 +1,9 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { isDialablePhone, toDialable } from '@/lib/whatsapp/recipient-resolver'
+import {
+  toDialable,
+  normalizeMetaIdentifier,
+  normalizeUsername,
+} from '@/lib/whatsapp/recipient-resolver'
 import { AWAITING_PHONE_NOTICE } from '@/lib/whatsapp/pending-reply-notice'
 
 /**
@@ -137,11 +141,38 @@ export async function listPendingReplies(
 }
 
 /**
- * Send every parked reply for a contact, now that it has a real number.
+ * Any address a contact can be reached at. A parked reply is only worth
+ * flushing when at least one of these is present.
+ */
+export interface FlushRecipient {
+  phone?: string | null
+  wa_user_id?: string | null
+  username?: string | null
+}
+
+/**
+ * True when the contact has an address Meta can be asked to deliver to.
  *
- * Refuses to run unless `phone` is a dialable E.164 number — this is the
- * last gate before the flush, so a bad save can never re-trigger the same
- * rejection loop it was meant to fix.
+ * A dialable number is preferred, but a BSUID is now a first-class
+ * recipient (Meta's `recipient` field, not `to`) and a public @handle is a
+ * last resort — so a contact that only ever wrote from an unregistered
+ * number can finally be answered instead of waiting for a phone that may
+ * never be entered.
+ */
+export function hasSendableRecipient(recipient: FlushRecipient): boolean {
+  return Boolean(
+    toDialable(recipient.phone) ||
+      normalizeMetaIdentifier(recipient.wa_user_id ?? recipient.phone) ||
+      normalizeUsername(recipient.username)
+  )
+}
+
+/**
+ * Send every parked reply for a contact, now that it has a usable address.
+ *
+ * Refuses to run when the contact still has no address at all — this is the
+ * last gate before the flush, so a genuinely empty save can never re-trigger
+ * the same rejection loop it was meant to fix.
  *
  * One conversation's failure doesn't stop the others: each reply is
  * attempted and the successes are collected, because a contact may hold
@@ -152,12 +183,12 @@ export async function flushPendingReplies(args: {
   db: SupabaseClient
   accountId: string
   contactId: string
-  phone: string | null | undefined
+  recipient: FlushRecipient
   send: (conversationId: string, text: string) => Promise<void>
 }): Promise<{ sent: number; failed: number; conversations: string[] }> {
-  const { db, accountId, contactId, phone, send } = args
+  const { db, accountId, contactId, recipient, send } = args
 
-  if (!isDialablePhone(phone)) {
+  if (!hasSendableRecipient(recipient)) {
     return { sent: 0, failed: 0, conversations: [] }
   }
 
@@ -177,7 +208,7 @@ export async function flushPendingReplies(args: {
     } catch (err) {
       failed += 1
       console.error(
-        `[pending-reply] conversation ${conversation.id}: deferred send failed even with phone ${toDialable(phone)}:`,
+        `[pending-reply] conversation ${conversation.id}: deferred send failed for contact ${contactId}:`,
         err instanceof Error ? err.message : err,
       )
     }
