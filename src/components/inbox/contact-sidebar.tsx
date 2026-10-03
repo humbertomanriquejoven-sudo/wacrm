@@ -246,7 +246,7 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
               {!editingPhone && contact.phone && contact.phone !== "unknown" && (
                 <button
                   onClick={() => {
-                    setPhoneDraft(contact.phone);
+                    setPhoneDraft(contact.phone ?? '');
                     setEditingPhone(true);
                   }}
                   className="px-1 text-xs text-muted-foreground underline"

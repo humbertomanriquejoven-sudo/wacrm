@@ -62,11 +62,11 @@ export function serializeConversation(conv: Conversation): ApiConversation {
     unread_count: conv.unread_count ?? 0,
     created_at: conv.created_at,
     updated_at: conv.updated_at,
-    contact: c
+contact: c
       ? {
-          id: c.id,
-          phone: c.phone,
-          name: c.name ?? null,
+           id: c.id,
+           phone: c.phone ?? '',
+           name: c.name ?? null,
           email: c.email ?? null,
           company: c.company ?? null,
           tags: (c.tags ?? []).map((t) => ({

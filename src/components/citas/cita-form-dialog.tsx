@@ -157,7 +157,7 @@ export function CitaFormDialog({
                       type="button"
                       onClick={() => {
                         setSelected(c)
-                        setSearch(c.name ?? c.phone)
+                        setSearch(c.name ?? c.phone ?? '')
                         setResults([])
                       }}
                       className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors ${
