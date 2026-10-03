@@ -438,6 +438,12 @@ interface DispatchArgs {
   /** Meta id (wamid) of the inbound message being answered — used to
    *  keep WhatsApp's typing indicator alive across the multi-part reply. */
   composeMessageId?: string;
+  /**
+   * Set by the webhook when Meta disclosed no dialable number for this
+   * sender (BSUID / @username only). Adds the "ask for your number" rule to
+   * the system prompt — see `buildSystemPrompt`.
+   */
+  missingPhone?: boolean;
 }
 
 /**
@@ -706,6 +712,7 @@ export async function dispatchInboundToAiReply(
       calendarEnabled: calendarConfigured(),
       gmailEnabled: gmailConfigured(),
       citas: contactCtx?.citas,
+      missingPhone: args.missingPhone === true,
     });
 
     // Tool execution loop: the model may request tool calls before

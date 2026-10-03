@@ -135,6 +135,13 @@ export function buildSystemPrompt(args: {
   calendarEnabled?: boolean;
   gmailEnabled?: boolean;
   citas?: { id: string; fecha_inicio: string; estado: string }[] | null;
+  /**
+   * True when the sender reached us on a WhatsApp address that exposes no
+   * dialable number (a BSUID, or a public @username). WhatsApp cannot deliver
+   * a reply to such a conversation, so the only way the thread continues is
+   * asking the customer for their number. Adds the instruction below.
+   */
+  missingPhone?: boolean;
 }): string {
   const {
     userPrompt,
@@ -146,6 +153,7 @@ export function buildSystemPrompt(args: {
     calendarEnabled,
     gmailEnabled,
     citas,
+    missingPhone,
   } = args;
   const parts: string[] = [
     todayContextLine(),
@@ -280,6 +288,27 @@ export function buildSystemPrompt(args: {
         'lo que las herramientas permiten, responde en español ofreciendo la siguiente mejor opción o pidiendo amablemente ' +
         'los datos que faltan (p. ej. una fecha/hora para agendar), pero NUNCA te quedes en silencio ni emitas una ' +
         'secuencia de transferencia.'
+    );
+  }
+
+  // Sender with no dialable number. Placed after the mode block so it reads
+  // as the most recent, most specific instruction — and it deliberately
+  // OVERRIDES the usual "respond answering what they asked", because nothing
+  // else can reach them until they give us a number.
+  if (missingPhone) {
+    parts.push(
+      'ESTE CLIENTE NO TIENE NÚMERO DE TELÉFONO REGISTRADO (escribió desde WhatsApp con un identificador que no ' +
+        'expone su número). Por eso NO podemos enviarle respuestas todavía. ' +
+        'REGLA PRIORITARIA Y OBLIGATORIA: en tu respuesta, pídele AMABLEMENTE su número de WhatsApp o de celular, ' +
+        'con código de país, y dile que con ese número ya podremos seguir con la atención. ' +
+        'Pídelo una sola vez, de forma natural y breve, junto con la respuesta a lo que te escribió — nunca como único ' +
+        'mensaje ni en un tono mecánico o acusatorio. ' +
+        'Ejemplo de cómo integrarlo: "¡Hola! Claro que sí, con gusto te ayudo. Para poder responderte por WhatsApp ' +
+        'necesito tu número de celular con código de país, por ejemplo +57 300 123 4567. En cuanto me lo compartas ' +
+        'continuamos." ' +
+        'PROHIBIDO inventar o suponer un número, pedirle datos de tarjeta, correo o documento, ni afirmar que ya le ' +
+        'enviaste información por WhatsApp. Si el cliente te da el número en este mismo mensaje, agrádescelo y ' +
+        'confírmale que con ese número ya podemos continuar la atención.'
     );
   }
 

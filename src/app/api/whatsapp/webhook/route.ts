@@ -1,9 +1,14 @@
 import { NextResponse, after } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
+import type { SupabaseClient } from '@supabase/supabase-js'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
 import { getMediaUrl, downloadMedia, sendTypingIndicator } from '@/lib/whatsapp/meta-api'
 import { mirrorInboundMedia } from '@/lib/whatsapp/mirror-inbound-media'
-import { normalizePhone } from '@/lib/whatsapp/phone-utils'
+import { extractPhoneFromText, normalizePhone } from '@/lib/whatsapp/phone-utils'
+import {
+  flagConversationAwaitingValidPhone,
+  flushPendingReplies,
+} from '@/lib/whatsapp/pending-reply'
 import * as recipientResolver from '@/lib/whatsapp/recipient-resolver'
 import {
   findExistingContact,
@@ -733,19 +738,22 @@ async function processMessage(
   // typing indicator still fired. Classify first, then store each value
   // in the column it actually belongs to.
   // ============================================================
-  const waIdRaw = message.from || contact.wa_id || ''
 
-  // Classify the sender's identifier BEFORE storing anything. Two facts
-  // drive everything below:
-  //   * `rawPhone` — a dialable E.164 number (10–13 digits), or '' when
-  //     Meta sent us a BSUID instead.
-  //   * `senderUserId` — the BSUID, either prefixed ('CO.1008…') or bare
-  //     but too long to be a number ('1008477715690681').
-  const rawPhone = isPhoneLike(waIdRaw) ? normalizePhone(waIdRaw) : ''
+  // The phone is looked for in BOTH fields rather than taking the first one
+  // that is non-empty. Meta has been seen to put a BSUID in `messages[].from`
+  // while `contacts[].wa_id` carries the real number for the same delivery —
+  // reading only `message.from` discarded a deliverable address and left the
+  // contact holding an identifier it could never be answered at.
+  const rawPhone = firstDialablePhone(message.from, contact.wa_id)
+
+  // Every field that could carry the opaque id, in order of trust. `wa_id` is
+  // the last resort because for unregistered senders Meta sometimes puts the
+  // BSUID there instead of a number.
   const senderUserId = firstOpaqueId(
     contact.user_id,
     message.from_user_id,
-    waIdRaw,
+    !isPhoneLike(contact.wa_id ?? '') ? contact.wa_id : null,
+    !isPhoneLike(message.from ?? '') ? message.from : null,
   )
 
   // Username, stored WITH the leading '@' so it renders the way WhatsApp
@@ -756,10 +764,9 @@ async function processMessage(
   )
   const senderName = contact.profile.name?.trim() || null
 
-  // The `phone` we persist. Only ever a real number — if Meta gave us
-  // none, we fall back to the BSUID so the NOT NULL column holds something
-  // the sender can be addressed by (Meta accepts a BSUID as `to`), but we
-  // never invent a number from a username or a display name.
+  // The address we report for this sender. A real number always wins; the
+  // BSUID is only a label so an operator reading the logs can tell which
+  // conversation a message belongs to.
   const senderPhone = rawPhone || senderUserId || 'unknown'
 
   // Human-facing label. The @username is more stable than the profile
@@ -969,12 +976,14 @@ async function processMessage(
         // extension from the fetched blob — impossible to do until the
         // bytes had already been fetched successfully.
         media_type: mediaType,
-        // The address Meta used on THIS delivery (migration 050). Kept as
-        // it arrived: the real number when Meta disclosed one, the BSUID
-        // when it didn't. This is the only place the raw value survives —
-        // the contact row may end up holding the BSUID — and the resolver
-        // reads it to recover a valid destination later.
-        sender_phone: message.from,
+        // The address Meta used on THIS delivery (migration 050). This is
+        // the only place a number Meta disclosed survives, so the REAL
+        // number is stored whenever we have one — never the BSUID that may
+        // occupy the same field. `recipient-resolver` reads this column to
+        // recover a deliverable destination for a contact whose `phone`
+        // still holds an identifier, so writing the BSUID here would
+        // perpetuate exactly the undeliverable state we're fixing.
+        sender_phone: rawPhone || message.from || null,
         message_id: message.id,
         status: 'delivered',
         created_at: new Date(parseInt(message.timestamp) * 1000).toISOString(),
@@ -1034,6 +1043,20 @@ async function processMessage(
   // so the broadcast's `replied_count` advances (via the aggregate
   // trigger installed in migration 003).
   await flagBroadcastReplyIfAny(accountId, contactRecord.id)
+
+  // No deliverable address for this sender? Learn one from what they just
+  // typed, or tell the bot to ask for it. Runs BEFORE the flow / automation /
+  // AI dispatch so all three re-resolve the recipient against a real number
+  // when one turns up in this very message.
+  const missingPhone = await resolveMissingPhone({
+    accountId,
+    userId: configOwnerUserId,
+    conversationId: conversation.id,
+    contactId: contactRecord.id,
+    contactPhone: contactRecord.phone,
+    inboundText: contentText,
+    isFirstInboundMessage,
+  })
 
   // Voice notes transcribe in the BACKGROUND. The row above was saved
   // immediately (content_text null) so the inbox update is real-time —
@@ -1241,6 +1264,9 @@ await dispatchInboundToAiReply({
       // The inbound wamid - lets the bot keep WhatsApp's typing
       // indicator alive while it streams a multi-part reply.
       composeMessageId: message.id,
+      // Meta disclosed no number for this sender: tell the model to ask for
+      // one, since nothing can be delivered until it arrives.
+      missingPhone,
     })
   }
 
@@ -1605,6 +1631,30 @@ async function autoMergeOrphanInto(
 }
 
 /**
+ * Return the first candidate that is a real, dialable E.164 phone number.
+ *
+ * Meta identifies a sender with up to three independent fields and any one of
+ * them can be the identifier instead of a number. Rather than picking a field
+ * up front and hoping it holds the number, every field is offered here and the
+ * first genuinely dialable value wins. This is what makes a real number win
+ * over a BSUID sitting in `messages[].from` — the case where the contact was
+ * being stored with an undeliverable identifier while a usable number was
+ * sitting in `contacts[].wa_id` the whole time.
+ *
+ * Returns '' when no candidate is a phone number, which is the signal that
+ * this sender has to be asked for one.
+ */
+function firstDialablePhone(
+  ...candidates: Array<string | null | undefined>
+): string {
+  for (const candidate of candidates) {
+    const trimmed = candidate?.trim()
+    if (trimmed && isPhoneLike(trimmed)) return normalizePhone(trimmed)
+  }
+  return ''
+}
+
+/**
  * Extract a BSUID from whichever field carries it, returning the id with
  * its namespace prefix stripped, or null when the value isn't one.
  *
@@ -1902,6 +1952,145 @@ interface ContactOutcome {
   wasCreated: boolean
 }
 
+/**
+ * Work out what to do about a sender we cannot deliver to.
+ *
+ * Meta only hands us a BSUID (or a public @handle) for senders whose number
+ * isn't registered on WhatsApp. Nothing can be sent to such a conversation,
+ * so this resolves it two ways, in order:
+ *
+ *   1. The customer may have simply TYPED their number. When the contact has
+ *      no dialable address, whatever they wrote is mined for one, and a hit
+ *      is written to `contacts.phone` — which also repairs the contact's
+ *      `phone` when it still holds the BSUID. Anything already parked against
+ *      them is then flushed, so the answer they were waiting for finally goes
+ *      out without them having to write again.
+ *   2. Otherwise the bot has to ask. The caller passes the return value into
+ *      the AI's system prompt, and the conversation is flagged
+ *      `awaiting_valid_phone` so the operator can see why the thread is
+ *      stalled instead of guessing.
+ *
+ * Returns true when the caller must ask for the number. Never throws: this
+ * runs inside the inbound path and a failure here must not cost us the
+ * message.
+ */
+async function resolveMissingPhone(args: {
+  accountId: string
+  /** Sender-of-record for the flush, which sends on the contact's behalf. */
+  userId: string
+  conversationId: string
+  contactId: string
+  contactPhone?: string | null
+  inboundText?: string | null
+  isFirstInboundMessage: boolean
+}): Promise<boolean> {
+  const {
+    accountId,
+    userId,
+    conversationId,
+    contactId,
+    contactPhone,
+    inboundText,
+    isFirstInboundMessage,
+  } = args
+
+  try {
+    // Already deliverable — nothing to ask for and nothing to repair.
+    if (isPhoneLike(contactPhone ?? '')) return false
+
+    const typed = extractPhoneFromText(inboundText)
+    if (!typed) {
+      // Flag on the first inbound only, so the banner appears as soon as the
+      // thread is visibly stalled instead of on every single message.
+      if (isFirstInboundMessage) {
+        await flagConversationAwaitingValidPhone({
+          db: supabaseAdmin(),
+          accountId,
+          conversationId,
+          reason: `contact ${contactId} has no dialable number (phone holds "${contactPhone ?? ''}")`,
+        })
+      }
+      return true
+    }
+
+    const { data: updated, error: updateError } = await supabaseAdmin()
+      .from('contacts')
+      .update({ phone: typed, updated_at: new Date().toISOString() })
+      .eq('id', contactId)
+      .eq('account_id', accountId)
+      .select('id, phone, wa_user_id, username')
+      .maybeSingle()
+
+    if (updateError || !updated) {
+      console.warn(
+        `[webhook] contact ${contactId}: could not record the number the customer typed (${typed}):`,
+        updateError?.message ?? 'no row returned',
+      )
+      return true
+    }
+
+    console.log(
+      `[webhook] contact ${contactId}: adopted the number the customer typed (${contactPhone ?? 'empty'} → ${typed}); delivering anything parked for them`,
+    )
+
+    // Best-effort: a failed flush leaves the reply parked for the next
+    // trigger, which is strictly better than dropping it.
+    await flushCapturedPhoneReplies(
+      supabaseAdmin(),
+      accountId,
+      userId,
+      contactId,
+      updated as { phone?: string | null; wa_user_id?: string | null; username?: string | null },
+    )
+
+    return false
+  } catch (err) {
+    console.error(
+      '[webhook] could not resolve the sender phone (non-fatal):',
+      err instanceof Error ? err.message : err,
+    )
+    // Ask for the number rather than assume the worst.
+    return !isPhoneLike(contactPhone ?? '')
+  }
+}
+
+/**
+ * Deliver replies parked while this contact had no valid address.
+ *
+ * Same helper the "save the phone by hand" endpoint uses, so a number learned
+ * from the customer's own message is flushed exactly like one typed into the
+ * CRM form — including clearing the `awaiting_valid_phone` banner.
+ */
+async function flushCapturedPhoneReplies(
+  db: ReturnType<typeof supabaseAdmin>,
+  accountId: string,
+  userId: string,
+  contactId: string,
+  recipient: { phone?: string | null; wa_user_id?: string | null; username?: string | null },
+): Promise<void> {
+  const result = await flushPendingReplies({
+    db: db as unknown as SupabaseClient,
+    accountId,
+    contactId,
+    recipient,
+    send: async (conversationId, text) => {
+      await engineSendText({ accountId, userId, conversationId, contactId, text })
+    },
+  }).catch((err: unknown) => {
+    console.error(
+      `[webhook] contact ${contactId}: flushing parked replies after the number was captured failed:`,
+      err instanceof Error ? err.message : err,
+    )
+    return { sent: 0, failed: 0, conversations: [] as string[] }
+  })
+
+  if (result.sent > 0) {
+    console.log(
+      `[webhook] contact ${contactId}: delivered ${result.sent} parked repl${result.sent === 1 ? 'y' : 'ies'} now that the number is known`,
+    )
+  }
+}
+
 /** Everything Meta told us about who sent this message. */
 interface SenderIdentity {
   /**
@@ -2032,22 +2221,15 @@ async function findOrCreateContact(
     const updates: Record<string, unknown> = {}
     const currentPhone = normalizePhone(existingContact.phone ?? '')
 
-    // `phone` is only ever written with a REAL E.164 number, never a BSUID.
-    // Two guards, in order:
-    //   1. `isPhoneLike` — if the incoming value isn't dialable (Meta sent
-    //      a BSUID, or nothing), we don't touch `phone` at all.
-    //   2. `!isBsuidLike(currentPhone)` — the stored value is itself a BSUID
-    //      left by an older handler, so this real number REPLACES it. This
-    //      is the promotion that unifies '1008477715690681' with '573122182949'.
-    if (phone && isPhoneLike(phone)) {
-      if (currentPhone !== phone && !isBsuidLike(currentPhone)) {
-        updates.phone = phone
-      } else if (!isPhoneLike(existingContact.phone ?? '')) {
-        // The row's `phone` is empty or holds a BSUID, so this real number
-        // is strictly an upgrade — fill it in rather than leaving the
-        // contact undeliverable.
-        updates.phone = phone
-      }
+    // `phone` is written with the REAL E.164 number and nothing else — a
+    // BSUID, a @handle or the `unknown` placeholder can never reach it.
+    // `sender.phone` is already dialable (the extraction site rejects
+    // anything else), so the single guard is "does it differ from what's
+    // stored": any real number replaces whatever was there, which unifies a
+    // contact created from a BSUID ('1486998326437295') with the same person
+    // once Meta discloses their number.
+    if (phone && currentPhone !== phone) {
+      updates.phone = phone
     }
 
     if (name && !existingContact.name) updates.name = name

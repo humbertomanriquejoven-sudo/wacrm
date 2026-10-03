@@ -9,7 +9,11 @@
  * instead of a runtime rejection from Meta.
  */
 
-import { metaRecipientFields } from './phone-utils'
+import {
+  isDialablePhone,
+  isValidE164,
+  normalizePhone,
+} from './phone-utils'
 
 const META_API_VERSION = 'v21.0'
 const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`
@@ -93,6 +97,67 @@ export class MetaApiError extends Error {
       message,
     )
   }
+}
+
+/**
+ * The address we were asked to deliver to is not a phone number we can dial.
+ *
+ * Thrown BEFORE any HTTP request leaves the process. A BSUID (or a public
+ * @handle, or the literal placeholder `unknown`) placed in `to` does not
+ * reliably fail: Meta has been observed to answer 200 and drop the message,
+ * which is indistinguishable from a successful send in the app. Refusing to
+ * make the call at all turns that silent loss into a typed error the senders
+ * can act on — they park the reply and flag the conversation as needing a
+ * real number.
+ *
+ * `recipientInvalid` is deliberately true: this IS "Meta rejected the
+ * recipient", just detected locally instead of over the wire, so the
+ * existing `isRecipientRejection` retry/park machinery handles it with no
+ * special case. That flag is derived from the message text by
+ * `MetaApiError`'s constructor, so the wording below must keep the
+ * `invalid recipient` phrasing.
+ */
+export class InvalidRecipientError extends MetaApiError {
+  /** The rejected address, verbatim, for the caller's logs. */
+  readonly address: string
+
+  constructor(address: string) {
+    super(
+      `invalid recipient "${address}": Meta's "to" field only accepts a dialable E.164 phone number ` +
+        `(7-13 digits with a country code). No HTTP request was sent — record the customer's real ` +
+        `phone number so the pending reply can be delivered.`,
+      // status 0 / no code: nothing came back from Meta, so there is no HTTP
+      // status to report. The recipientInvalid text probe is what matters.
+      { status: 0, code: null, subcode: null },
+    )
+    this.name = 'InvalidRecipientError'
+    this.address = address
+  }
+}
+
+/**
+ * Pre-flight gate every send helper runs before touching the network.
+ *
+ * Returns the digits-only form of the address (Meta wants no `+`, no spaces
+ * and no dashes) or throws `InvalidRecipientError`. Both halves matter:
+ *
+ *   * `isDialablePhone` caps the length at 13 digits, which is what separates
+ *     a number from a 15-17 digit BSUID, and rejects the `CO.` / `WAID.`
+ *     namespace prefixes outright;
+ *   * `isValidE164` on the normalized digits rejects a leading zero, so a
+ *     value without a country code can't slip through.
+ *
+ * Every `to` that reaches a send helper already went through
+ * `sanitizePhoneForMeta`, so normalizing again is a no-op for real callers —
+ * it only matters for a value that arrived straight from the database.
+ */
+function assertDialableRecipient(address: string): string {
+  const value = (address ?? '').trim()
+  const digits = normalizePhone(value)
+  if (!value || !isDialablePhone(value) || !isValidE164(digits)) {
+    throw new InvalidRecipientError(value)
+  }
+  return digits
 }
 
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
@@ -335,11 +400,12 @@ export async function sendTextMessage(
   args: SendTextMessageArgs
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, text, contextMessageId } = args
+  const recipient = assertDialableRecipient(to)
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    ...metaRecipientFields(to),
+    to: recipient,
     type: 'text',
     text: { body: text },
   }
@@ -395,6 +461,7 @@ export async function sendMediaMessage(
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, kind, link, caption, filename, contextMessageId } = args
   if (!link) throw new Error('sendMediaMessage requires a link.')
+  const recipient = assertDialableRecipient(to)
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
 
   // Audio accepts neither caption nor filename per Meta's spec — adding
@@ -407,7 +474,7 @@ export async function sendMediaMessage(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    ...metaRecipientFields(to),
+    to: recipient,
     type: kind,
     [kind]: media,
   }
@@ -491,6 +558,7 @@ export async function sendTemplateMessage(
     messageParams,
     contextMessageId,
   } = args
+  const recipient = assertDialableRecipient(to)
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
 
   const templatePayload: Record<string, unknown> = {
@@ -524,7 +592,7 @@ export async function sendTemplateMessage(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    ...metaRecipientFields(to),
+    to: recipient,
     type: 'template',
     template: templatePayload,
   }
@@ -840,6 +908,7 @@ export async function sendReactionMessage(
   args: SendReactionMessageArgs
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, targetMessageId, emoji } = args
+  const recipient = assertDialableRecipient(to)
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
   const response = await fetch(url, {
     method: 'POST',
@@ -850,7 +919,7 @@ export async function sendReactionMessage(
     body: JSON.stringify({
       messaging_product: 'whatsapp',
       recipient_type: 'individual',
-      ...metaRecipientFields(to),
+      to: recipient,
       type: 'reaction',
       reaction: { message_id: targetMessageId, emoji },
     }),
@@ -930,6 +999,7 @@ export async function sendInteractiveButtons(
     phoneNumberId, accessToken, to,
     bodyText, headerText, footerText, buttons, contextMessageId,
   } = args
+  const recipient = assertDialableRecipient(to)
   validateInteractiveBody(bodyText)
   validateInteractiveHeaderFooter(headerText, footerText)
   if (buttons.length < 1 || buttons.length > INTERACTIVE_LIMITS.maxButtons) {
@@ -971,7 +1041,7 @@ export async function sendInteractiveButtons(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    ...metaRecipientFields(to),
+    to: recipient,
     type: 'interactive',
     interactive,
   }
@@ -1039,6 +1109,7 @@ export async function sendInteractiveList(
     phoneNumberId, accessToken, to,
     bodyText, buttonLabel, headerText, footerText, sections, contextMessageId,
   } = args
+  const recipient = assertDialableRecipient(to)
   validateInteractiveBody(bodyText)
   validateInteractiveHeaderFooter(headerText, footerText)
   if (!buttonLabel) throw new Error('Interactive list requires a buttonLabel.')
@@ -1104,7 +1175,7 @@ export async function sendInteractiveList(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    ...metaRecipientFields(to),
+    to: recipient,
     type: 'interactive',
     interactive,
   }

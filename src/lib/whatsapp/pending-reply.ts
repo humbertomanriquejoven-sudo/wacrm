@@ -1,9 +1,5 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
-import {
-  toDialable,
-  normalizeMetaIdentifier,
-  normalizeUsername,
-} from '@/lib/whatsapp/recipient-resolver'
+import { toDialable } from '@/lib/whatsapp/recipient-resolver'
 import { AWAITING_PHONE_NOTICE } from '@/lib/whatsapp/pending-reply-notice'
 
 /**
@@ -108,6 +104,54 @@ export async function clearParkedReply(
   }
 }
 
+/**
+ * Flag a conversation as needing a real phone number, with no text to park.
+ *
+ * The companion to `parkReplyAwaitingValidPhone` for the paths where a
+ * reply does NOT exist yet:
+ *
+ *   * a Flow / automation node wants to send but the contact has no dialable
+ *     address, so the outbound gate refused before any HTTP call;
+ *   * the bot has just asked the customer for their number, so the operator
+ *     should see why the thread is stalled until they answer.
+ *
+ * Deliberately does NOT touch `pending_reply_text`: inventing placeholder
+ * text there would make the banner promise a message that was never written.
+ * Once a real number arrives, `flushPendingReplies` only runs for rows that
+ * actually have text, so this flag is harmless until then.
+ */
+export async function flagConversationAwaitingValidPhone(args: {
+  db: SupabaseClient
+  accountId: string
+  conversationId: string
+  reason: string
+}): Promise<boolean> {
+  const { db, accountId, conversationId, reason } = args
+
+  const { error } = await db
+    .from('conversations')
+    .update({
+      awaiting_valid_phone: true,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', conversationId)
+    .eq('account_id', accountId)
+
+  if (error) {
+    console.error(
+      `[pending-reply] conversation ${conversationId}: could not flag the missing phone:`,
+      error.message,
+    )
+    return false
+  }
+
+  console.warn(
+    `[pending-reply] conversation ${conversationId}: flagged as needing a valid phone ` +
+      `(${reason}). "${AWAITING_PHONE_NOTICE}"`,
+  )
+  return true
+}
+
 /** A conversation with a reply waiting for a usable address. */
 export interface PendingConversation {
   id: string
@@ -153,18 +197,14 @@ export interface FlushRecipient {
 /**
  * True when the contact has an address Meta can be asked to deliver to.
  *
- * A dialable number is preferred, but a BSUID is now a first-class
- * recipient (Meta's `recipient` field, not `to`) and a public @handle is a
- * last resort — so a contact that only ever wrote from an unregistered
- * number can finally be answered instead of waiting for a phone that may
- * never be entered.
+ * Only a dialable E.164 number counts. Meta's `to` field accepts nothing
+ * else: a BSUID or a public @handle used to be routed to the `recipient`
+ * field, but that path returned 200 while dropping the message, so it is
+ * treated as undeliverable everywhere now. A parked reply is therefore only
+ * worth flushing once a real number is on file.
  */
 export function hasSendableRecipient(recipient: FlushRecipient): boolean {
-  return Boolean(
-    toDialable(recipient.phone) ||
-      normalizeMetaIdentifier(recipient.wa_user_id ?? recipient.phone) ||
-      normalizeUsername(recipient.username)
-  )
+  return Boolean(toDialable(recipient.phone))
 }
 
 /**

@@ -85,6 +85,65 @@ export function toDialable(value: string | null | undefined): string | null {
 }
 
 /**
+ * Pull a phone number the customer TYPED out of their own message text.
+ *
+ * Needed for the senders Meta gives us no number for: the bot asks for their
+ * number, they type it back, and nobody should have to retype it into the CRM
+ * by hand. Only called when the contact has no dialable address already, so
+ * it can only ever fill a blank — never overwrite a good number.
+ *
+ * Deliberately conservative, because the alternative is writing a wrong
+ * number into `phone` and silently redirecting the conversation. Two accepted
+ * shapes, in priority order:
+ *
+ *   1. An explicit international prefix — '+57 300 123 4567'. Unambiguous, so
+ *      it wins over anything else in the message.
+ *   2. A bare 11–13 digit run — '573001234567'. Long enough to carry a country
+ *      code on its own, and bounded so a 15–17 digit BSUID never matches.
+ *
+ * A bare 10-digit number is NOT accepted: without a country code it can't be
+ * told apart from an order/invoice/document number, and guessing the country
+ * would send the customer's messages to a stranger. The bot is instructed to
+ * ask for the number WITH its country code for exactly this reason.
+ *
+ * Returns the digits-only form, or null when nothing plausible was found.
+ */
+export function extractPhoneFromText(text: string | null | undefined): string | null {
+  if (!text) return null
+  // Long enough for any real answer, short enough that a pasted data dump
+  // can't cost a full scan.
+  const value = text.slice(0, 2000)
+
+  const accepted = (digits: string): boolean =>
+    digits.length >= 8 &&
+    digits.length <= E164_MAX_DIGITS &&
+    isValidE164(digits)
+
+  // Pass 1 — explicit '+'. A window is taken from each '+' and then trimmed
+  // to the longest leading phone-shaped run, so trailing prose ("+57 300 123
+  // 4567. Hola") can't be glued onto the digits and invalidate a number that
+  // was right there.
+  let cursor = value.indexOf('+')
+  while (cursor !== -1) {
+    const window = value.slice(cursor, cursor + 30)
+    const match = /^\+\s*\d[\d\s().-]*/.exec(window)
+    if (match) {
+      const digits = normalizePhone(match[0])
+      if (accepted(digits)) return digits
+    }
+    cursor = value.indexOf('+', cursor + 1)
+  }
+
+  // Pass 2 — bare runs that already carry a country code. The lookarounds
+  // keep a longer run from being sliced down into a fake 13-digit match.
+  for (const run of value.match(/(?<!\d)\d{11,13}(?!\d)/g) ?? []) {
+    if (accepted(run)) return run
+  }
+
+  return null
+}
+
+/**
  * True when `value` is a Meta identifier rather than a phone number:
  * explicitly namespaced, or simply too long to be E.164.
  */
