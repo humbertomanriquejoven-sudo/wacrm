@@ -239,13 +239,22 @@ export async function resolveRecipient(
     }
   }
 
-  // 3. The BSUID is a first-class `to` value for Meta.
-  const bsuid = normalizeMetaIdentifier(contact.wa_user_id ?? contact.phone)
-  if (bsuid) return { to: bsuid, source: 'bsuid', isPhone: false }
+  // 3. A stored @handle wins over the opaque id — the handle is the
+  //    destination Meta prefers and the one the webhook now favors.
+  //    Require the leading '@' so the 'unknown' placeholder and bare
+  //    BSUIDs are never mistaken for a handle.
+  const storedHandle =
+    contact.phone && contact.phone.trim().startsWith('@')
+      ? normalizeUsername(contact.phone)
+      : null
+  if (storedHandle) return { to: storedHandle, source: 'username', isPhone: false }
 
-  // 4. Whatever handle we have.
   const handle = normalizeUsername(contact.username)
   if (handle) return { to: handle, source: 'username', isPhone: false }
+
+  // 4. The BSUID is a first-class `to` value for Meta.
+  const bsuid = normalizeMetaIdentifier(contact.wa_user_id ?? contact.phone)
+  if (bsuid) return { to: bsuid, source: 'bsuid', isPhone: false }
 
   return { to: '', source: 'bsuid', isPhone: false }
 }
@@ -315,11 +324,17 @@ export async function sendWithRecipientFallback<T>(args: {
       }
     }
 
-    const bsuid = normalizeMetaIdentifier(contact.wa_user_id ?? contact.phone)
-    if (bsuid && !attempted.has(bsuid)) alternatives.push(bsuid)
+    const storedHandle =
+      contact.phone && contact.phone.trim().startsWith('@')
+        ? normalizeUsername(contact.phone)
+        : null
+    if (storedHandle && !attempted.has(storedHandle)) alternatives.push(storedHandle)
 
     const handle = normalizeUsername(contact.username)
     if (handle && !attempted.has(handle)) alternatives.push(handle)
+
+    const bsuid = normalizeMetaIdentifier(contact.wa_user_id ?? contact.phone)
+    if (bsuid && !attempted.has(bsuid)) alternatives.push(bsuid)
 
     if (alternatives.length === 0) throw err
 

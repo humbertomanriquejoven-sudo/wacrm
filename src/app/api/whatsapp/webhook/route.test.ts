@@ -1194,7 +1194,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     const row = h.state.contactInsertCalls[0]
     expect(row.username).toBeUndefined()
-    expect(row.phone).toBe('999')
+    expect(row.phone).toBe('unknown')
     expect(row.wa_user_id).toBe('999')
   })
 

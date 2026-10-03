@@ -764,17 +764,25 @@ async function processMessage(
   )
   const senderName = contact.profile.name?.trim() || null
 
-  // Destination address for the contact row. Always non-empty: a real
-  // dialable number first, then the public @handle, then the BSUID, then a
-  // last-resort placeholder — so `contacts.phone` never lands blank, which
-  // is what lets the outbound path and the UI always resolve a destination.
-  const rawPhone = isPhoneLike(trimmedFrom)
-    ? normalizePhone(trimmedFrom)
-    : isPhoneLike(trimmedWaId)
-      ? normalizePhone(trimmedWaId)
-      : isPhoneLike(trimmedProfilePhone)
-        ? normalizePhone(trimmedProfilePhone)
-        : (senderUsername ?? senderUserId ?? 'unknown')
+  // Destination address for the contact row, in the user's priority
+  // order:
+  //   a) the public @handle — the primary destination whenever Meta
+  //      discloses one;
+  //   b) a real dialable number from from / wa_id / profile.phone;
+  //   c) `messages[0].from` verbatim, but only when it isn't a long
+  //      numeric Meta id (a BSUID must never be treated as a number);
+  //   d) 'unknown' so the NOT NULL column never stays blank.
+  const rawPhone = senderUsername
+    ? senderUsername
+    : isPhoneLike(trimmedFrom)
+      ? normalizePhone(trimmedFrom)
+      : isPhoneLike(trimmedWaId)
+        ? normalizePhone(trimmedWaId)
+        : isPhoneLike(trimmedProfilePhone)
+          ? normalizePhone(trimmedProfilePhone)
+          : trimmedFrom && !isBsuidLike(trimmedFrom)
+            ? trimmedFrom
+            : 'unknown'
 
   // The address we report for this sender. A real number always wins; the
   // BSUID is only a label so an operator reading the logs can tell which
