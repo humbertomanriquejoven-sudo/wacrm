@@ -1018,7 +1018,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     })
   })
 
-  it('keeps the BSUID out of phone and keeps the handle @-prefixed', async () => {
+  it('stores the @handle in phone and keeps it @-prefixed', async () => {
     // Senders on numbers NOT registered on WhatsApp arrive with a
     // namespaced BSUID ('CO.…') instead of `wa_id`. The contact keeps an
     // EMPTY `phone` — never the Meta id — and the BSUID lives only in
@@ -1030,7 +1030,9 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     expect(h.state.contactInsertCalls).toHaveLength(1)
     expect(h.state.contactInsertCalls[0]).toMatchObject({
-      phone: '',
+      // No dialable number disclosed: the @handle becomes the destination,
+      // `phone` is never blank, and the BSUID lives in wa_user_id.
+      phone: '@anaruiz',
       wa_user_id: '1008477715690681',
       // Username keeps the '@' so it renders as WhatsApp shows it.
       username: '@anaruiz',
@@ -1125,7 +1127,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     expect(h.state.contactInsertCalls).toHaveLength(1)
     expect(h.state.contactInsertCalls[0]).toMatchObject({
-      phone: '',
+      phone: '@anaruiz',
       wa_user_id: '1008477715690681',
     })
     expect(
@@ -1192,7 +1194,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     const row = h.state.contactInsertCalls[0]
     expect(row.username).toBeUndefined()
-    expect(row.phone).toBe('')
+    expect(row.phone).toBe('999')
     expect(row.wa_user_id).toBe('999')
   })
 

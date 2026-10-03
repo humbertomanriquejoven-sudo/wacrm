@@ -743,40 +743,38 @@ async function processMessage(
 
   // Pick the real, dialable number Meta gave us — `messages[].from`,
   // `contacts[0].wa_id`, or `contacts[0].profile.phone`, whichever is the
-  // first one that is genuinely phone-shaped. When `from` is a BSUID or
-  // long numeric id it is DISCARDED for the `phone` column: `phone` only
-  // ever holds a clean E.164 number, and the opaque id lives solely in
-  // `wa_user_id` so it can never be mistaken for a destination.
+  // first one that is genuinely phone-shaped. When only a BSUID or @handle
+  // is disclosed, that id is used as the destination instead — `phone`
+  // must never stay blank.
   const trimmedFrom = (message.from ?? '').trim()
   const trimmedWaId = (contact.wa_id ?? '').trim()
   const trimmedProfilePhone = (
     (contact.profile as { phone?: string } | undefined)?.phone ?? ''
   ).trim()
-  const rawPhone = isPhoneLike(trimmedFrom)
-    ? normalizePhone(trimmedFrom)
-    : isPhoneLike(trimmedWaId)
-      ? normalizePhone(trimmedWaId)
-      : isPhoneLike(trimmedProfilePhone)
-        ? normalizePhone(trimmedProfilePhone)
-        : ''
-
-  // Every field that could carry the opaque id, in order of trust. `wa_id` is
-  // the last resort because for unregistered senders Meta sometimes puts the
-  // BSUID there instead of a number.
+  // The opaque id and the public handle come from the contact payload
+  // regardless of which field carried them.
   const senderUserId = firstOpaqueId(
     contact.user_id,
     message.from_user_id,
     !isPhoneLike(contact.wa_id ?? '') ? contact.wa_id : null,
     !isPhoneLike(message.from ?? '') ? message.from : null,
   )
-
-  // Username, stored WITH the leading '@' so it renders the way WhatsApp
-  // shows it. Strip-then-re-add rather than check-startsWith, so
-  // '@@humberto' also normalizes to '@humberto'.
   const senderUsername = withAtSign(
     contact.profile.username || (contact as { username?: string }).username,
   )
   const senderName = contact.profile.name?.trim() || null
+
+  // Destination address for the contact row. Always non-empty: a real
+  // dialable number first, then the public @handle, then the BSUID, then a
+  // last-resort placeholder — so `contacts.phone` never lands blank, which
+  // is what lets the outbound path and the UI always resolve a destination.
+  const rawPhone = isPhoneLike(trimmedFrom)
+    ? normalizePhone(trimmedFrom)
+    : isPhoneLike(trimmedWaId)
+      ? normalizePhone(trimmedWaId)
+      : isPhoneLike(trimmedProfilePhone)
+        ? normalizePhone(trimmedProfilePhone)
+        : (senderUsername ?? senderUserId ?? 'unknown')
 
   // The address we report for this sender. A real number always wins; the
   // BSUID is only a label so an operator reading the logs can tell which
@@ -2250,11 +2248,17 @@ async function findOrCreateContact(
     const updates: Record<string, unknown> = {}
     const currentPhone = (existingContact.phone ?? '').trim()
 
-    // `sender.phone` is the address Meta handed us verbatim (E.164 number,
-    // BSUID or handle) — keep the row in sync with the latest inbound so a
-    // unified contact created from a BSUID picks up its real number the
-    // moment Meta discloses it.
-    if (phone && currentPhone !== phone) {
+    // Prefer a real number over any stored identifier, and refresh the
+    // stored value when it changed. Never demote a real number to a BSUID
+    // or @handle: only overwrite when the new value is dialable, or when
+    // the row had no dialable value to lose.
+    const incomingIsDialable = isPhoneLike(phone)
+    const storedIsDialable = isPhoneLike(currentPhone)
+    if (
+      phone &&
+      currentPhone !== phone &&
+      (incomingIsDialable || !storedIsDialable)
+    ) {
       updates.phone = phone
     }
 

@@ -21,9 +21,10 @@ import { useTranslations } from "next-intl";
 
 interface ContactSidebarProps {
   contact: Contact | null;
+  onPhoneSaved?: () => void;
 }
 
-export function ContactSidebar({ contact }: ContactSidebarProps) {
+export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
   const tSidebar = useTranslations("Inbox.sidebar");
   const tThread = useTranslations("Inbox.messageThread");
 
@@ -34,6 +35,10 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
   const [tags, setTags] = useState<(Tag & { contact_tag_id: string })[]>([]);
   const [newNote, setNewNote] = useState("");
   const [addingNote, setAddingNote] = useState(false);
+  const [editingPhone, setEditingPhone] = useState(false);
+  const [phoneDraft, setPhoneDraft] = useState("");
+  const [savingPhone, setSavingPhone] = useState(false);
+  const [phoneError, setPhoneError] = useState<string | null>(null);
 
   const fetchContactData = useCallback(async () => {
     if (!contact) return;
@@ -154,20 +159,79 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
             )}
           </div>
 
-          {/* Phone */}
-          <div className="mt-4 space-y-2">
-            <button
-              onClick={handleCopyPhone}
-              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted"
-            >
-              <Phone className="h-4 w-4 text-muted-foreground" />
-              <span className="flex-1 text-left">{contact.phone}</span>
-              {copied ? (
-                <Check className="h-3 w-3 text-primary" />
-              ) : (
-                <Copy className="h-3 w-3 text-muted-foreground" />
+            {/* Phone */}
+            <div className="mt-4 space-y-2">
+              <button
+                onClick={handleCopyPhone}
+                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted"
+              >
+                <Phone className="h-4 w-4 text-muted-foreground" />
+                <span className="flex-1 text-left">{contact.phone}</span>
+                {copied ? (
+                  <Check className="h-3 w-3 text-primary" />
+                ) : (
+                  <Copy className="h-3 w-3 text-muted-foreground" />
+                )}
+              </button>
+
+              {/* Manual phone capture: when the contact has no usable
+                  number yet, the operator can type one here so replies
+                  have a real destination. */}
+              {(!contact.phone || contact.phone === "unknown" || editingPhone) && (
+                <div className="flex items-center gap-2 px-1">
+                  <input
+                    value={phoneDraft}
+                    onChange={(e) => setPhoneDraft(e.target.value)}
+                    placeholder="573167071066"
+                    className="h-8 flex-1 rounded-md border border-border bg-background px-2 text-sm"
+                  />
+                  <Button
+                    size="sm"
+                    disabled={savingPhone || !phoneDraft.trim()}
+                    onClick={async () => {
+                      setSavingPhone(true);
+                      setPhoneError(null);
+                      try {
+                        const res = await fetch(
+                          `/api/contacts/${contact.id}/phone`,
+                          {
+                            method: "PATCH",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ phone: phoneDraft }),
+                          },
+                        );
+                        const body = await res.json().catch(() => ({}));
+                        if (!res.ok) {
+                          setPhoneError(body?.error ?? "Error al guardar");
+                          return;
+                        }
+                        setEditingPhone(false);
+                        setPhoneDraft("");
+                        onPhoneSaved?.();
+                      } finally {
+                        setSavingPhone(false);
+                      }
+                    }}
+                  >
+                    {savingPhone ? "…" : "Guardar"}
+                  </Button>
+                </div>
               )}
-            </button>
+              {phoneError && (
+                <p className="px-1 text-xs text-destructive">{phoneError}</p>
+              )}
+              {!editingPhone && contact.phone && contact.phone !== "unknown" && (
+                <button
+                  onClick={() => {
+                    setPhoneDraft(contact.phone);
+                    setEditingPhone(true);
+                  }}
+                  className="px-1 text-xs text-muted-foreground underline"
+                >
+                  Editar número
+                </button>
+              )}
+
 
             {contact.email && (
               <div className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm text-muted-foreground">

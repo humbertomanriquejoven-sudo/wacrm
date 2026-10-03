@@ -123,9 +123,9 @@ export class InvalidRecipientError extends MetaApiError {
 
   constructor(address: string) {
     super(
-      `invalid recipient "${address}": Meta's "to" field only accepts a dialable E.164 phone number ` +
-        `(7-13 digits with a country code). No HTTP request was sent — ` +
-        `record the customer's real phone number on the contact first.`,
+      `invalid recipient "${address}": expected a phone number, a BSUID ` +
+        `(e.g. 'CO.1008477715690681') or a WhatsApp username, but got an ` +
+        `empty or unusable value. No HTTP request was sent.`,
       // status 0 / no code: nothing came back from Meta, so there is no HTTP
       // status to report.
       { status: 0, code: null, subcode: null },
@@ -148,23 +148,17 @@ export class InvalidRecipientError extends MetaApiError {
  */
 function assertDialableRecipient(address: string): string {
   const value = (address ?? '').trim()
-  if (!value || !isDialablePhone(value)) {
-    console.warn(
-      `[send] blocked: "${address}" is not a valid E.164 phone number ` +
-        `(a BSUID or @handle is not a deliverable phone). Send refused — ` +
-        `no HTTP request was made to Meta.`,
-    )
+  if (!value) {
+    console.warn('[send] blocked: empty recipient, no HTTP request was made to Meta.')
     throw new InvalidRecipientError(value)
   }
-  const digits = normalizePhone(value)
-  if (!isValidE164(digits)) {
-    console.warn(
-      `[send] blocked: "${address}" is not a valid E.164 phone number. ` +
-        `Send refused — no HTTP request was made to Meta.`,
-    )
-    throw new InvalidRecipientError(value)
+  if (isDialablePhone(value)) {
+    const digits = normalizePhone(value)
+    if (isValidE164(digits)) return digits
   }
-  return digits
+  // A BSUID or @handle is a valid destination Meta id: pass it through
+  // untouched. Anything dialable is normalized to E.164 digits above.
+  return value
 }
 
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
