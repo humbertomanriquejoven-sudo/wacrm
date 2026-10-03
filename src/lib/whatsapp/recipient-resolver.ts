@@ -3,6 +3,7 @@ import {
   normalizeMetaIdentifier,
   toDialable,
 } from './phone-utils'
+import type { Contact } from '@/types'
 import { MetaApiError } from './meta-api'
 import { supabaseAdmin } from '@/lib/flows/admin-client'
 
@@ -41,6 +42,7 @@ export interface RecipientCandidate {
   wa_user_id?: string | null
   username?: string | null
   name?: string | null
+  recipient_id?: string | null
 }
 
 /** Where the chosen address came from — useful for logging and tests. */
@@ -333,6 +335,9 @@ export async function sendWithRecipientFallback<T>(args: {
         : null
     if (storedHandle && !attempted.has(storedHandle)) alternatives.push(storedHandle)
 
+    const recipientId = contact.recipient_id
+    if (recipientId && !attempted.has(recipientId)) alternatives.push(recipientId)
+
     if (alternatives.length === 0) throw err
 
     let lastError: unknown = err
@@ -346,4 +351,46 @@ export async function sendWithRecipientFallback<T>(args: {
     }
     throw lastError
   }
+}
+
+/**
+ * Resolve the best recipient identifier for a contact, prioritizing:
+ *   1. `contact.wa_id` or `contact.phone` if it is a dialable E.164 number.
+ *   2. `contact.wa_user_id` (BSUID) — Meta accepts a BSUID as the
+ *      `to` value for BSUID/Threads/API conversations.
+ *   3. `contact.recipient_id` — alternative Meta identifier.
+ *
+ * Returns the `to` value to place in Meta's ``to`` field, or an empty
+ * string when no resolvable identifier is available.
+ */
+export async function resolveBestRecipient(
+  contact: Contact,
+  accountId: string,
+  conversationId?: string | null,
+): Promise<{ to: string; source: RecipientSource; isPhone: boolean }> {
+  // 1. Phone or wa_id — a real number always wins.
+  const phone = toDialable(contact.phone)
+  if (phone) return { to: phone, source: 'phone', isPhone: true }
+
+  const waId = contact.wa_id
+  if (waId && normalizeMetaIdentifier(waId)) return { to: waId, source: 'bsuid', isPhone: false }
+
+  // 2. BSUID.
+  const bsuid = normalizeMetaIdentifier(contact.wa_user_id ?? contact.phone)
+  if (bsuid) return { to: bsuid, source: 'bsuid', isPhone: false }
+
+  // 3. recipient_id — alternative Meta identifier.
+  const recipientId = contact.recipient_id
+  if (recipientId && normalizeMetaIdentifier(recipientId))
+    return { to: recipientId, source: 'bsuid', isPhone: false }
+
+  // 4. Fallback to the existing resolveRecipient logic.
+  const fallback = await resolveRecipient(
+    contact as RecipientCandidate | null,
+    accountId,
+    conversationId,
+  )
+  if (fallback.to) return fallback
+
+  return { to: '', source: 'bsuid', isPhone: false }
 }

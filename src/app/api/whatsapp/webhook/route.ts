@@ -2208,7 +2208,13 @@ interface SenderIdentity {
 async function findOrCreateContact(
   accountId: string,
   configOwnerUserId: string,
-  sender: SenderIdentity
+  sender: SenderIdentity,
+  metaIdentity?: {
+    wa_id?: string
+    phone_number_id?: string
+    identity_type?: 'PHONE_E164' | 'BSUID' | 'USERNAME' | 'LID'
+    display_name?: string
+  }
 ): Promise<ContactOutcome | null> {
   const db = supabaseAdmin()
   const { phone, waUserId, username, name } = sender
@@ -2314,6 +2320,12 @@ async function findOrCreateContact(
     // in `phone` and we're about to write a real number there.
     if (waUserId && !existingContact.wa_user_id) updates.wa_user_id = waUserId
 
+    // Meta Cloud API v26.0 identity columns (migration 053)
+    if (metaIdentity?.wa_id && !existingContact.wa_id) updates.wa_id = metaIdentity.wa_id
+    if (metaIdentity?.phone_number_id && !existingContact.phone_number_id) updates.phone_number_id = metaIdentity.phone_number_id
+    if (metaIdentity?.identity_type && !existingContact.identity_type) updates.identity_type = metaIdentity.identity_type
+    if (metaIdentity?.display_name && !existingContact.display_name) updates.display_name = metaIdentity.display_name
+
     if (Object.keys(updates).length > 0) {
       await db
         .from('contacts')
@@ -2344,6 +2356,12 @@ async function findOrCreateContact(
       name: name || username || phoneForRow || waUserId || 'unknown',
       username: username ?? undefined,
       wa_user_id: waUserId ?? undefined,
+      ...(metaIdentity && {
+        wa_id: metaIdentity.wa_id,
+        phone_number_id: metaIdentity.phone_number_id,
+        identity_type: metaIdentity.identity_type,
+        display_name: metaIdentity.display_name,
+      }),
     })
     .select()
     .single()

@@ -115,6 +115,16 @@ export interface Contact {
    *  (migration 048). Survives a merge onto a contact that has a real
    *  phone, so later messages from that number resolve to this row. */
   wa_user_id?: string | null;
+  /** Native WhatsApp ID from Meta Cloud API webhook (migration 053). */
+  wa_id?: string | null;
+  /** WhatsApp Business API phone_number_id from Meta webhook (migration 053). */
+  phone_number_id?: string | null;
+  /** Technical category of the primary identifier (migration 053). */
+  identity_type?: 'PHONE_E164' | 'BSUID' | 'USERNAME' | 'LID' | null;
+  /** Display name shown in the WhatsApp profile (migration 053). */
+  display_name?: string | null;
+  /** Recipient ID from Meta (migration 053, alternative identifier). */
+  recipient_id?: string | null;
   created_at: string;
   updated_at: string;
   /** Hydrated by queries that embed `contact_tags(tags(*))` (e.g. the
