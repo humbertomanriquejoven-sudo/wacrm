@@ -788,14 +788,25 @@ async function processMessage(
 
   // Per-message breadcrumb: this is where you confirm the inbound reached
   // processing at all, and the steps below all reference this id.
+  const maskedSender =
+    senderPhone && senderPhone.length > 4
+      ? `…${senderPhone.slice(-4)}`
+      : senderPhone
   console.log(
-    `[webhook] processing ${message.type} message ${message.id} from ${senderPhone || message.from} (account ${accountId})`
+    `[webhook] processing ${message.type} message ${message.id} from ${maskedSender} (account ${accountId})`
   )
   console.log('-> [EXTRACTED DATA]', {
     effectivePhone: senderPhone,
     extractedUser: senderUsername || senderUserId || senderName,
-    hasRealPhone: Boolean(rawPhone),
-    wa_user_id: senderUserId,
+    hasRealPhone: Boolean(rawPhone && rawPhone !== 'unknown'),
+    idType: isPhoneLike(senderPhone)
+      ? 'e164-phone'
+      : senderUserId
+        ? 'bsuid'
+        : senderUsername
+          ? 'username'
+          : 'unknown',
+    wa_user_id: senderUserId ? `${senderUserId.slice(0, 4)}…` : null,
     username: senderUsername,
   })
 

@@ -130,7 +130,11 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
     );
   }
 
-  const displayName = contact.name || contact.phone;
+  const displayName =
+    contact.name ||
+    (contact.phone && contact.phone !== "unknown"
+      ? contact.phone
+      : contact.username || contact.wa_user_id || "unknown");
   const initials = displayName.charAt(0).toUpperCase();
 
   return (
@@ -166,7 +170,11 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
                 className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted"
               >
                 <Phone className="h-4 w-4 text-muted-foreground" />
-                <span className="flex-1 text-left">{contact.phone}</span>
+                <span className="flex-1 text-left">
+                  {contact.phone && contact.phone !== "unknown"
+                    ? contact.phone
+                    : contact.username || contact.wa_user_id || contact.phone}
+                </span>
                 {copied ? (
                   <Check className="h-3 w-3 text-primary" />
                 ) : (
