@@ -1,4 +1,5 @@
-import { sendTextMessage, sendTemplateMessage } from '@/lib/whatsapp/meta-api'
+import { sendTextMessage } from '@/lib/whatsapp/meta-api'
+import type { MessageTemplate } from '@/types'
 import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive'
 import {
   engineSendInteractiveButtons,
@@ -67,7 +68,7 @@ interface ResolvedRecipient {
 
 /** Template row result — caller must await before accessing .row. */
 interface ResolvedTemplate {
-  row?: any
+  row: MessageTemplate | null
 }
 
 /** Result of sending a text message via Meta. */
@@ -241,7 +242,7 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
           recipient: isPhone ? undefined : recipient.to!,
           text: messageText,
         }
-        waMessageId = await sendTextMessage(sendInput)
+        waMessageId = (await sendTextMessage(sendInput)).messageId
         workingPhone = v
         lastError = null
         break
@@ -263,7 +264,7 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
         recipient: recipient.to!,
         text: messageText,
       }
-      waMessageId = await sendTextMessage(sendInput)
+      waMessageId = (await sendTextMessage(sendInput)).messageId
     } catch (err) {
       if (!isRecipientNotAllowedError(err instanceof Error ? err.message : String(err))) throw err
       throw err
@@ -277,14 +278,15 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   // Templates persist the substituted body, same as the manual and
   // public-API send paths. This was unconditionally null, so every
   // automation template send rendered as an empty bubble (issue #483).
+  let _resolved: ResolvedTemplate | undefined;
   const templateRow =
     input.kind === 'template'
-      ? await resolveTemplateRow(
+      ? (_resolved = await resolveTemplateRow(
           db,
           input.accountId,
           input.templateName,
           input.language,
-        ).row
+        )).row
       : null
   const content_text = input.kind === 'text' ? messageText : templateContentText(templateRow, input.params ?? [])
   const template_name = input.kind === 'template' ? input.templateName : null
