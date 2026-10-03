@@ -180,6 +180,15 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
                 </div>
               )}
 
+              {/* When no real phone is on file, surface the BSUID so the
+                  operator can still tell who they're talking to — replies
+                  go out through the `recipient` parameter of the Meta API. */}
+              {(!contact.phone || contact.phone === "unknown") && contact.wa_user_id && (
+                <div className="flex items-center gap-2 px-3 py-1 text-xs text-muted-foreground font-mono">
+                  <span className="flex-1 text-left">{contact.wa_user_id}</span>
+                </div>
+              )}
+
               {/* Manual phone capture: when the contact has no usable
                   number yet, the operator can type one here so replies
                   have a real destination. */}

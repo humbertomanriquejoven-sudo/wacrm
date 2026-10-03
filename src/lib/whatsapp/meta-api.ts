@@ -169,6 +169,21 @@ function assertDialableRecipient(address: string): string {
   return bare
 }
 
+/**
+ * The address field(s) for one recipient. A real E.164 number goes in
+ * Meta's `to`; a BSUID / 'user_id' goes in `recipient` (which Meta reads
+ * instead of `to` for those contacts — sending it via `to` silently drops
+ * the message). The two are mutually exclusive because `to` wins when both
+ * are present.
+ */
+function recipientFields(address: string): Record<string, string> {
+  const bare = address.startsWith('@') ? address.slice(1).trim() : address
+  if (isDialablePhone(bare) && isValidE164(normalizePhone(bare))) {
+    return { to: normalizePhone(bare) }
+  }
+  return { recipient: bare }
+}
+
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
   let message = fallback
   let code: number | null = null
@@ -414,7 +429,7 @@ export async function sendTextMessage(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to: recipient,
+    ...recipientFields(recipient),
     type: 'text',
     text: { body: text },
   }
@@ -483,7 +498,7 @@ export async function sendMediaMessage(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to: recipient,
+    ...recipientFields(recipient),
     type: kind,
     [kind]: media,
   }
@@ -601,7 +616,7 @@ export async function sendTemplateMessage(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to: recipient,
+    ...recipientFields(recipient),
     type: 'template',
     template: templatePayload,
   }
@@ -928,7 +943,7 @@ export async function sendReactionMessage(
     body: JSON.stringify({
       messaging_product: 'whatsapp',
       recipient_type: 'individual',
-      to: recipient,
+      ...recipientFields(recipient),
       type: 'reaction',
       reaction: { message_id: targetMessageId, emoji },
     }),
@@ -1050,7 +1065,7 @@ export async function sendInteractiveButtons(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to: recipient,
+    ...recipientFields(recipient),
     type: 'interactive',
     interactive,
   }
@@ -1184,7 +1199,7 @@ export async function sendInteractiveList(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to: recipient,
+    ...recipientFields(recipient),
     type: 'interactive',
     interactive,
   }
