@@ -1,7 +1,8 @@
 -- 051_contact_phone_nullable.sql
 --
 -- `contacts.phone` becomes nullable and stops holding any value that
--- is not a real E.164 number:
+-- is not a real E.164 number. Uses idempotent clauses so the migration
+-- can be re-run safely on an already-migrated database or a fresh one.
 --
 --   * 'unknown' placeholders   -> NULL
 --   * long numeric BSUIDs that leaked into `phone` -> NULL (the id is
@@ -13,7 +14,21 @@
 -- outbound path already resolves BSUID-only contacts through
 -- `contacts.wa_user_id` via Meta's `recipient` parameter.
 
-ALTER TABLE contacts ALTER COLUMN phone DROP NOT NULL;
+-- Idempotent: Drop NOT NULL only if the column exists and is currently NOT NULL.
+-- PostgreSQL does not allow ALTER ... DROP NOT NULL on a column that is already
+-- nullable, so we wrap it in a conditional block that checks the current state.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_name = 'contacts'
+      AND column_name = 'phone'
+      IS NOT NULL
+  ) THEN
+    ALTER TABLE contacts ALTER COLUMN phone DROP NOT NULL;
+  END IF;
+END $$;
 
 UPDATE contacts SET phone = NULL WHERE phone = 'unknown';
 
