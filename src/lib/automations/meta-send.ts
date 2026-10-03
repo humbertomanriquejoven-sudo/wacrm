@@ -122,19 +122,21 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   // new tenancy column.
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone')
+    .select('id, phone, wa_user_id')
     .eq('id', input.contactId)
     .eq('account_id', input.accountId)
     .maybeSingle()
-  if (contactErr || !contact?.phone) {
+  if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
 
+  // E.164 number first; when the contact only has a Meta id/BSUID, use
+  // it directly — the send must never be gated on a missing phone.
   const sanitized = isDialablePhone(contact.phone)
     ? sanitizePhoneForMeta(contact.phone)
-    : contact.phone.trim()
-  if (!sanitized) {
-    throw new Error(`contact phone invalid: ${contact.phone}`)
+    : (contact.wa_user_id ?? contact.phone).trim()
+  if (!sanitized || sanitized === 'unknown') {
+    throw new Error(`contact has no deliverable address: ${contact.phone}`)
   }
 
   const { data: config, error: configErr } = await db
