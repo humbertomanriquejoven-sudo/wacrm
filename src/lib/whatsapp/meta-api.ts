@@ -175,13 +175,43 @@ function assertDialableRecipient(address: string): string {
  * instead of `to` for those contacts — sending it via `to` silently drops
  * the message). The two are mutually exclusive because `to` wins when both
  * are present.
- */
+  */
 function recipientFields(address: string): Record<string, string> {
   const bare = address.startsWith('@') ? address.slice(1).trim() : address
-  if (isDialablePhone(bare) && isValidE164(normalizePhone(bare))) {
-    return { to: normalizePhone(bare) }
+  return recipientAddressField(bare)
+}
+
+/**
+ * The address field Meta expects for one recipient:
+ *
+ *   A. `CO.<digits>` / `WAID.<digits>` (or any namespaced Meta id)
+ *      — kept INTACT, sent as `recipient`. Never run through
+ *      `replace(/\D/g,'')`-style sanitizers: stripping the letters and
+ *      the dot turns it into a fake phone number.
+ *   B. bare digits longer than 14 chars — a numeric BSUID (e.g.
+ *      '1486998326437295'), never a phone number. Sent as `recipient`.
+ *   C. anything else phone-shaped — stripped to E.164 digits and sent
+ *      as `to`.
+ */
+export function recipientAddressField(destination: string): Record<string, string> {
+  const value = (destination ?? '').trim()
+  if (!value) return { to: '' }
+  // Case A — namespaced BSUID: keep the prefix and dot intact.
+  if (/^[A-Za-z]+\.[\w.-]+$/.test(value)) {
+    return { recipient: value }
   }
-  return { recipient: bare }
+  const digitsOnly = /^\+?\d+$/.test(value)
+  const digits = value.replace(/\D/g, '')
+  // Case B — long numeric BSUID.
+  if (digitsOnly && digits.length > 14) {
+    return { recipient: digits }
+  }
+  // Case C — real phone number.
+  if (digits && isDialablePhone(digits) && isValidE164(digits)) {
+    return { to: digits }
+  }
+  // Fallback: treat as a Meta id and send via `recipient`.
+  return { recipient: digits || value }
 }
 
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
