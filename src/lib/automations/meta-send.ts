@@ -16,6 +16,7 @@ import {
   templateContentText,
 } from '@/lib/whatsapp/template-body'
 import { supabaseAdmin } from './admin-client'
+import { resolveRecipient } from '@/lib/whatsapp/recipient-resolver'
 
 // ------------------------------------------------------------
 // Automation-side Meta sender.
@@ -130,14 +131,14 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
     throw new Error('contact not found for this account')
   }
 
-  // E.164 number first; when the contact only has a Meta id/BSUID, use
-  // it directly — the send must never be gated on a missing phone.
-  const sanitized = isDialablePhone(contact.phone)
-    ? sanitizePhoneForMeta(contact.phone)
-    : (contact.wa_user_id ?? contact.phone).trim()
-  if (!sanitized || sanitized === 'unknown') {
-    throw new Error(`contact has no deliverable address: ${contact.phone}`)
-  }
+  // Resolve the best recipient for this contact (phone, BSUID, or username).
+  const recipient = await resolveRecipient(contact, input.accountId, input.conversationId)
+  if (!recipient.to) throw new Error('contact not found for this account')
+
+  // Use the resolved address; if it is a phone we will rely on variants,
+  // otherwise it is a BSUID/handle and will be sent via the `recipient` field.
+  const address = recipient.to
+  const sanitized = recipient.isPhone ? sanitizePhoneForMeta(address) : address
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
