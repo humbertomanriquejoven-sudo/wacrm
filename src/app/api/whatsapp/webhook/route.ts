@@ -109,7 +109,9 @@ interface WhatsAppWebhookEntry {
       }
       contacts?: Array<{
         profile: { name: string; /** Public @username. Not every
-         *  profile exposes one, so it's optional. */ username?: string }
+         *  profile exposes one, so it's optional. */ username?: string;
+          /** Real number Meta sometimes discloses alongside the wa_id. */
+          phone?: string }
         wa_id: string
         /**
          * BSUID. Present for senders on numbers that aren't registered
@@ -288,6 +290,9 @@ export async function POST(request: Request) {
       // Move any identifier that landed in `phone` to `wa_user_id` and
       // adopt a real number where a sibling contact has one.
       await repairBsuidPhoneContacts()
+      // Normalize any stored phone that isn't digits-only (e.g. a legacy
+      // '+57 312 218 2949') so outbound `to` is always clean.
+      await sanitizeStoredPhones()
       // Remove orphan contacts left by pre-BSUID versions of this handler,
       // which could insert a row with no usable `phone`. Those rows are
       // undeliverable and they also break `findExistingContact`'s
@@ -736,18 +741,23 @@ async function processMessage(
   // in the column it actually belongs to.
   // ============================================================
 
-  // The sender's address, stored verbatim: a phone number, a BSUID, or a
-  // username handle — Meta's `to` field accepts all three, so there is no
-  // reason to filter here. A real number still wins when Meta discloses one
-  // (whether in `from` or in `contacts[].wa_id`), otherwise `from` goes in
-  // as-is — BSUID or handle included.
+  // Pick the strongest address Meta gave us. When `messages[].from` is a
+  // BSUID/long numeric id, fall back to the real number Meta puts on the
+  // contact object (`contacts[0].wa_id`, then `contacts[0].profile.phone`)
+  // before accepting the raw identifier: the contact's `phone` column must
+  // hold a usable number whenever Meta disclosed one.
   const trimmedFrom = (message.from ?? '').trim()
   const trimmedWaId = (contact.wa_id ?? '').trim()
+  const trimmedProfilePhone = (
+    (contact.profile as { phone?: string } | undefined)?.phone ?? ''
+  ).trim()
   const rawPhone = isPhoneLike(trimmedFrom)
     ? normalizePhone(trimmedFrom)
     : isPhoneLike(trimmedWaId)
       ? normalizePhone(trimmedWaId)
-      : trimmedFrom || trimmedWaId
+      : isPhoneLike(trimmedProfilePhone)
+        ? normalizePhone(trimmedProfilePhone)
+        : trimmedFrom || trimmedWaId || trimmedProfilePhone
 
   // Every field that could carry the opaque id, in order of trust. `wa_id` is
   // the last resort because for unregistered senders Meta sometimes puts the
@@ -1815,6 +1825,59 @@ async function findRealNumberForIdentity(
     if (isPhoneLike(candidate.phone)) return normalizePhone(candidate.phone)
   }
   return null
+}
+
+/**
+ * Normalize every stored contact `phone` to digits-only E.164 form.
+ *
+ * Rows written before the webhook started normalizing can still hold
+ * '+57 312 218 2949'-style values. Meta's `to` field is used with the
+ * stored value downstream, and a dirty number there is rejected or — worse —
+ * silently misrouted. A row whose phone is a BSUID/identifier is left
+ * alone: `repairBsuidPhoneContacts` owns moving those to `wa_user_id`.
+ *
+ * Only phones that are actually dialable are rewritten; a '+' with a trunk
+ * prefix or punctuation is stripped down to the digits Meta expects.
+ */
+async function sanitizeStoredPhones(): Promise<void> {
+  try {
+    const db = supabaseAdmin()
+
+    // PostgREST has no "contains any of these chars", so OR five LIKE probes
+    // covering the formatting characters a human/legacy import can produce.
+    const { data, error } = await db
+      .from('contacts')
+      .select('id, account_id, phone')
+      .or(
+        'phone.like.%+%,phone.like.% %,phone.like.%-%,phone.like.%(%,phone.like.%)%',
+      )
+      .limit(200)
+
+    if (error || !data || data.length === 0) return
+
+    for (const row of data as Array<{
+      id: string
+      account_id: string
+      phone: string
+    }>) {
+      if (!isPhoneLike(row.phone)) continue
+      const clean = normalizePhone(row.phone)
+      if (!clean || clean === row.phone) continue
+      await db
+        .from('contacts')
+        .update({ phone: clean, updated_at: new Date().toISOString() })
+        .eq('id', row.id)
+        .eq('account_id', row.account_id)
+      console.log(
+        `[webhook] sanitized contact ${row.id}: phone "${row.phone}" → "${clean}"`,
+      )
+    }
+  } catch (err) {
+    console.warn(
+      '[webhook] sanitize: stored-phone cleanup failed (non-fatal):',
+      err instanceof Error ? err.message : err,
+    )
+  }
 }
 
 /**
