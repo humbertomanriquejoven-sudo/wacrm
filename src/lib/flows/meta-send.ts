@@ -26,8 +26,6 @@ import {
   isDialablePhone,
   toDialable,
   findRecoverablePhone,
-  normalizeMetaIdentifier,
-  normalizeUsername,
 } from '@/lib/whatsapp/recipient-resolver'
 import { flagConversationAwaitingValidPhone } from '@/lib/whatsapp/pending-reply'
 

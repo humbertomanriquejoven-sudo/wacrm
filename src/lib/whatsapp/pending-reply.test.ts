@@ -163,12 +163,11 @@ describe('flushPendingReplies', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it('flushes a BSUID contact now that Meta accepts a BSUID recipient', async () => {
-    // A BSUID is a first-class recipient (Meta's `recipient` field), so a
-    // contact that only ever wrote from an unregistered number no longer
-    // has to wait for a phone that may never be entered.
-    const { db } = makeDb(CONVERSATIONS);
-    const send = vi.fn(async () => {});
+  it('does nothing when the contact has no deliverable E.164 number', async () => {
+    // Strict E.164: contacts without a real number are not sent to Meta until
+    // they have a dialable phone. A BSUID/handle alone is never flushed.
+    const { db } = makeDb(CONVERSATIONS)
+    const send = vi.fn()
 
     const result = await flushPendingReplies({
       db,
@@ -176,11 +175,11 @@ describe('flushPendingReplies', () => {
       contactId: 'contact-1',
       recipient: { phone: 'CO.1008477715690681', wa_user_id: '1008477715690681' },
       send,
-    });
+    })
 
-    expect(result.sent).toBe(2);
-    expect(send).toHaveBeenCalledTimes(2);
-  });
+    expect(result).toEqual({ sent: 0, failed: 0, conversations: [] })
+    expect(send).not.toHaveBeenCalled()
+  })
 
   it('sends each parked reply verbatim and clears it', async () => {
     const { db, updates } = makeDb(CONVERSATIONS);
