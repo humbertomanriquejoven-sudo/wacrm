@@ -2,9 +2,9 @@
  * Definitive purge of all contact data. Rows only — schema, FKs,
  * triggers and API routes are untouched:
  *
- *   TRUNCATE TABLE messages CASCADE;
- *   TRUNCATE TABLE conversations CASCADE;
- *   TRUNCATE TABLE contacts CASCADE;
+ *   TRUNCATE TABLE messages, conversations, contact_notes,
+ *     contact_tags, contact_custom_values, broadcast_recipients,
+ *     flow_runs, contacts CASCADE;
  *
  * Prefers a direct Postgres connection (DATABASE_URL / SUPABASE_DB_URL)
  * so the TRUNCATE actually executes; falls back to the Supabase service

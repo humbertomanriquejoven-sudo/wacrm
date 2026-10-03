@@ -427,7 +427,7 @@ function bsuidInboundRequest() {
                 {
                   wa_id: '',
                   user_id: 'CO.1008477715690681',
-                  profile: { name: 'Humberto Manrique', username: 'humbertomanrique' },
+                  profile: { name: 'Ana Ruiz', username: 'anaruiz' },
                 },
               ],
               messages: [
@@ -1028,7 +1028,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
       phone: '1008477715690681',
       wa_user_id: '1008477715690681',
       // Username keeps the '@' so it renders as WhatsApp shows it.
-      username: '@humbertomanrique',
+      username: '@anaruiz',
     })
     // The BSUID must never be stored as the username.
     expect(h.state.contactInsertCalls[0].username).not.toMatch(/^@?CO\./)
@@ -1044,8 +1044,8 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
         id: 'contact-bare',
         account_id: 'acc-1',
         phone: '1008477715690681',
-        name: 'Humberto Manrique',
-        username: '@humbertomanrique',
+        name: 'Ana Ruiz',
+        username: '@anaruiz',
       },
     ]
     h.state.siblingPhoneCandidates = [{ phone: '573122182949' }]
@@ -1067,15 +1067,15 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
         id: 'contact-noat',
         account_id: 'acc-1',
         phone: '1008477715690681',
-        name: 'Humberto Manrique',
-        username: 'humbertomanrique',
+        name: 'Ana Ruiz',
+        username: 'anaruiz',
       },
     ]
 
     await runWebhook()
 
     const patch = h.state.contactUpdateCalls[0]?.patch ?? {}
-    expect(patch.username).toBe('@humbertomanrique')
+    expect(patch.username).toBe('@anaruiz')
     expect(patch.wa_user_id).toBe('1008477715690681')
   })
 
@@ -1102,7 +1102,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
   })
 
   it('gives a BSUID-only sender its own contact and never touches a same-named row', async () => {
-    // 'Humberto Manrique' already has a real number saved on one row, but a
+    // 'Ana Ruiz' already has a real number saved on one row, but a
     // BSUID that is not stored anywhere belongs to nobody yet. Sharing a
     // display name is not identity: the sender gets a new contact and the
     // real number is left untouched.
@@ -1111,8 +1111,8 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
       id: 'contact-real-phone',
       account_id: 'acc-1',
       phone: '573122182949',
-      name: 'Humberto Manrique',
-      username: '@humbertomanrique',
+      name: 'Ana Ruiz',
+      username: '@anaruiz',
     }
 
     await POST(bsuidInboundRequest())
@@ -1136,7 +1136,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
       id: 'contact-other-person',
       account_id: 'acc-1',
       phone: '573000000000',
-      name: 'Humberto Manrique',
+      name: 'Ana Ruiz',
       wa_user_id: '999999999999999',
     }
 
@@ -1160,7 +1160,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
               value: {
                 metadata: { phone_number_id: 'pn-1' },
                 contacts: [
-                  { wa_id: '', user_id: 'CO.999', profile: { name: 'Humberto' } },
+                  { wa_id: '', user_id: 'CO.999', profile: { name: 'Ana' } },
                 ],
                 messages: [
                   {
@@ -1201,8 +1201,8 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
       account_id: 'acc-1',
       user_id: 'user-1',
       phone: '573122182949',
-      name: 'Humberto Manrique',
-      username: '@humbertomanrique',
+      name: 'Ana Ruiz',
+      username: '@anaruiz',
       wa_user_id: '1008477715690681',
     }
 
@@ -1222,8 +1222,8 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
         id: 'contact-broken',
         account_id: 'acc-1',
         phone: 'CO.1008477715690681',
-        name: 'Humberto Manrique',
-        username: 'humbertomanrique',
+        name: 'Ana Ruiz',
+        username: 'anaruiz',
       },
     ]
 
@@ -1232,14 +1232,14 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     expect(h.state.contactUpdateCalls.length).toBeGreaterThan(0)
     const patch = h.state.contactUpdateCalls[0].patch
     expect(patch.wa_user_id).toBe('1008477715690681')
-    expect(patch.username).toBe('@humbertomanrique')
+    expect(patch.username).toBe('@anaruiz')
     // No sibling had a real number, so `phone` must NOT be overwritten with
     // a fabricated one — the row is left for a later inbound to repair.
     expect(patch.phone).toBeUndefined()
   })
 
   it('adopts a sibling contact number when repairing a CO.-prefixed phone', async () => {
-    // 'Humberto Manrique' has two rows: the good one with his real number,
+    // 'Ana Ruiz' has two rows: the good one with his real number,
     // and the broken one holding the BSUID. The repair should adopt the
     // real number from the sibling rather than inventing one.
     mockFindExistingContact.mockResolvedValue(null)
@@ -1248,8 +1248,8 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
         id: 'contact-broken',
         account_id: 'acc-1',
         phone: 'CO.1008477715690681',
-        name: 'Humberto Manrique',
-        username: 'humbertomanrique',
+        name: 'Ana Ruiz',
+        username: 'anaruiz',
       },
     ]
     h.state.siblingPhoneCandidates = [{ phone: '573122182949' }]
@@ -1260,7 +1260,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     expect(h.state.contactUpdateCalls[0].patch).toMatchObject({
       phone: '573122182949',
       wa_user_id: '1008477715690681',
-      username: '@humbertomanrique',
+      username: '@anaruiz',
     })
   })
 })
