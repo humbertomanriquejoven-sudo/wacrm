@@ -24,18 +24,90 @@ export interface MetaPhoneInfo {
 }
 
 interface MetaErrorResponse {
-  error?: { message?: string; code?: number; type?: string }
+  error?: {
+    message?: string
+    code?: number
+    type?: string
+    /** Sub-code carries the finer-grained reason (e.g. which parameter). */
+    error_subcode?: number
+    error_data?: { messaging_product?: string; details?: string }
+  }
+}
+
+/**
+ * A Meta API failure enriched with the details a recipient-resolution
+ * retry needs: the HTTP status, Meta's numeric error code, and whether
+ * the complaint was specifically about the `to` field.
+ *
+ * Meta's "invalid recipient" surfaces as HTTP 400 with code 131009
+ * ("Recipient phone number not in allowed list"), 131026 ("Message
+ * undeliverable") or 131047 ("Re-engagement message"), and the message
+ * text varies by locale and surface. Matching on the numeric codes plus a
+ * text probe is the only reliable way to tell "wrong address" apart from
+ * "bad template", since a template error must NOT trigger a resend to a
+ * different recipient.
+ */
+export class MetaApiError extends Error {
+  readonly status: number
+  readonly code: number | null
+  readonly subcode: number | null
+  readonly recipientInvalid: boolean
+
+  constructor(
+    message: string,
+    opts: { status: number; code?: number | null; subcode?: number | null },
+  ) {
+    super(message)
+    this.name = 'MetaApiError'
+    this.status = opts.status
+    this.code = opts.code ?? null
+    this.subcode = opts.subcode ?? null
+    this.recipientInvalid = MetaApiError.isRecipientComplaint(
+      this.status,
+      this.code,
+      message,
+    )
+  }
+
+  /** Meta error codes that specifically mean "this address is wrong". */
+  private static readonly RECIPIENT_CODES = new Set([
+    131009, // Recipient phone number not in allowed list
+    131026, // Message undeliverable
+    131047, // Re-engagement message
+    131051, // Unsupported message type (wrong destination shape)
+  ])
+
+  static isRecipientComplaint(
+    status: number,
+    code: number | null,
+    message: string,
+  ): boolean {
+    if (code !== null && MetaApiError.RECIPIENT_CODES.has(code)) return true
+    if (status === 404) return true
+    // Text probe for codes we don't know about. Scoped to recipient-ish
+    // wording so unrelated 400s (template issues, ad account problems)
+    // don't get mistaken for an addressable failure.
+    return /invalid\s+(recipient|phone|number)|not\s+in\s+allowed\s+list|undeliverable|recipient/i.test(
+      message,
+    )
+  }
 }
 
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
   let message = fallback
+  let code: number | null = null
+  let subcode: number | null = null
   try {
     const data = (await response.json()) as MetaErrorResponse
     if (data.error?.message) message = data.error.message
+    if (typeof data.error?.code === 'number') code = data.error.code
+    if (typeof data.error?.error_subcode === 'number') {
+      subcode = data.error.error_subcode
+    }
   } catch {
-    // response body wasn't JSON — keep the fallback
+    // response body wasn't JSON - keep the fallback
   }
-  throw new Error(message)
+throw new MetaApiError(message, { status: response.status, code, subcode })
 }
 
 // ============================================================

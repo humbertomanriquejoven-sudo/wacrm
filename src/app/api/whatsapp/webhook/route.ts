@@ -4,6 +4,7 @@ import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
 import { getMediaUrl, downloadMedia, sendTypingIndicator } from '@/lib/whatsapp/meta-api'
 import { mirrorInboundMedia } from '@/lib/whatsapp/mirror-inbound-media'
 import { normalizePhone } from '@/lib/whatsapp/phone-utils'
+import * as recipientResolver from '@/lib/whatsapp/recipient-resolver'
 import {
   findExistingContact,
   findContactByNameWithoutPhone,
@@ -1206,12 +1207,12 @@ async function processMessage(
     console.log(
       `[webhook] message ${message.id}: dispatching to AI auto-reply (${inboundText.trim().slice(0, 80)})`
     )
-    await dispatchInboundToAiReply({
+await dispatchInboundToAiReply({
       accountId,
       conversationId: conversation.id,
       contactId: contactRecord.id,
       configOwnerUserId,
-      // The inbound wamid — lets the bot keep WhatsApp's typing
+      // The inbound wamid - lets the bot keep WhatsApp's typing
       // indicator alive while it streams a multi-part reply.
       composeMessageId: message.id,
     })
@@ -1512,56 +1513,16 @@ type ContactRow = any
 /** Meta's namespace prefixes on a BSUID. Both mark an OPAQUE id. */
 const BSUID_PREFIX_RE = /^(CO|WAID)\./i
 
-/** E.164 allows at most 15 digits; real WhatsApp senders land in 10–13. */
-const E164_MAX_DIGITS = 13
-/**
- * A digit string longer than this cannot be a phone number. Meta's BSUIDs
- * are 15–17 digits ('1008477715690681'), well past anything E.164 permits,
- * so length alone is a reliable discriminator even after the 'CO.' prefix
- * has been stripped by `normalizePhone`.
- */
-const BSUID_MIN_DIGITS = 14
-
-/**
- * True when `value` is a real E.164 phone number: 10–13 digits and nothing
- * but digits / a leading `+` / separators.
- *
- * The length bounds are the important part. `normalizePhone` strips every
- * non-digit, so both 'CO.1008477715690681' and a bare '1008477715690681'
- * collapse to the same 16 digits — and a naive "is it digits?" check calls
- * both a valid phone number, which is exactly how a BSUID ended up in the
- * `phone` column. Rejecting the 'CO.'/'WAID.' marker and anything past 13
- * digits is what actually separates the two.
- */
-function isPhoneLike(value: string | null | undefined): boolean {
-  if (!value) return false
-  const trimmed = value.trim()
-  if (!trimmed) return false
-  if (BSUID_PREFIX_RE.test(trimmed)) return false
-  // Only digits, an optional leading '+', and the usual separators.
-  if (!/^\+?[\d\s().-]+$/.test(trimmed)) return false
-  const digits = normalizePhone(trimmed).length
-  if (digits < 7) return false
-  return digits <= E164_MAX_DIGITS
-}
-
-/**
- * True when `value` is a Meta BSUID rather than a phone number: it carries
- * an explicit `'CO.'` / `'WAID.'` namespace prefix, or it is a digit string
- * too long to be E.164.
- *
- * Unlike `isPhoneLike` this ignores separators and prefixes entirely — it
- * runs on whatever Meta sent, and its job is only to answer "is this
- * addressable but not a dialable number?". Used to decide whether a value
- * belongs in `wa_user_id`.
- */
-function isBsuidLike(value: string | null | undefined): boolean {
-  if (!value) return false
-  const trimmed = value.trim()
-  if (!trimmed) return false
-  if (BSUID_PREFIX_RE.test(trimmed)) return true
-  return /^\d+$/.test(trimmed) && trimmed.length >= BSUID_MIN_DIGITS
-}
+// Phone-vs-identifier classification is shared with the outbound sender
+// (`recipient-resolver`). Both sides must agree on the boundary: any
+// disagreement is precisely how a BSUID ended up stored as a phone number,
+// with the webhook writing one value and the sender validating another.
+const {
+  isDialablePhone: isPhoneLike,
+  isMetaIdentifier: isBsuidLike,
+  toDialable,
+  identityFilterParts,
+} = recipientResolver
 
 /**
  * Extract a BSUID from whichever field carries it, returning the id with
@@ -1977,6 +1938,49 @@ async function findOrCreateContact(
     }
   }
 
+  // 6. Single dynamic `.or()` pass over ALL identifiers at once.
+  //
+  //    Steps 1–5 query each key separately, which is precise but costs a
+  //    round-trip per key. When Meta sends a payload carrying several
+  //    identifiers at once (a phone AND a BSUID, say) the first three
+  //    steps can each match a DIFFERENT row, and picking the first hit
+  //    would leave the person split across two contacts.
+  //
+  //    This asks one question instead: is there a row matching any of the
+  //    identifiers we hold? Built entirely from the payload's own values,
+  //    so it works the same for every contact and every identifier shape.
+  //    Scoped to the account so a match can never cross tenants.
+  if (!existingContact) {
+    const parts = identityFilterParts({
+      phone,
+      wa_user_id: waUserId,
+      username,
+    })
+    if (parts.length > 0) {
+      const { data } = await db
+        .from('contacts')
+        .select('*')
+        .eq('account_id', accountId)
+        .or(parts.join(','))
+        .limit(5)
+      const candidates = (data ?? []) as ContactRow[]
+      if (candidates.length > 0) {
+        // Prefer a row that agrees on the STRONGEST identifier present.
+        // A BSUID match beats a handle match beats a name match, because
+        // those are progressively weaker evidence of identity.
+        existingContact =
+          candidates.find((c) => waUserId && c.wa_user_id === waUserId) ??
+          candidates.find((c) => phone && toDialable(c.phone) === phone) ??
+          candidates.find((c) => username && c.username === username) ??
+          candidates.find((c) => !c.wa_user_id || !waUserId) ??
+          candidates[0]
+        console.log(
+          `[webhook] matched contact ${existingContact.id} via dynamic identity filter (${parts.join(' | ')})`,
+        )
+      }
+    }
+  }
+
   if (existingContact) {
     // Backfill whatever this payload tells us that the row is missing, so
     // replies always go to a usable destination and the inbox can show the
@@ -1999,6 +2003,11 @@ async function findOrCreateContact(
     //      is the promotion that unifies '1008477715690681' with '573122182949'.
     if (phone && isPhoneLike(phone)) {
       if (currentPhone !== phone && !isBsuidLike(currentPhone)) {
+        updates.phone = phone
+      } else if (!isPhoneLike(existingContact.phone ?? '')) {
+        // The row's `phone` is empty or holds a BSUID, so this real number
+        // is strictly an upgrade — fill it in rather than leaving the
+        // contact undeliverable.
         updates.phone = phone
       }
     }

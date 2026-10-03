@@ -16,7 +16,12 @@ import {
 import { calendarConfigured, MEET_FALLBACK_LINK } from '@/lib/calendar';
 import { gmailConfigured } from '@/lib/gmail';
 import { stripRawTimestamps } from '@/lib/whatsapp/clean-ai-text';
-import { engineSendAiReply, engineSendText } from '@/lib/flows/meta-send';
+import {
+  engineSendAiReply,
+  engineSendText,
+  resolveOutboundAddressQueue,
+} from '@/lib/flows/meta-send';
+import { isRecipientRejection } from '@/lib/whatsapp/recipient-resolver';
 import {
   autoUnblockConversation,
   autoUnblockEnabled,
@@ -432,6 +437,69 @@ interface DispatchArgs {
   /** Meta id (wamid) of the inbound message being answered — used to
    *  keep WhatsApp's typing indicator alive across the multi-part reply. */
   composeMessageId?: string;
+}
+
+/**
+ * Re-resolve the recipient and retry the reply once.
+ *
+ * Called only after `engineSendAiReply` threw a recipient rejection, so the
+ * contact row may have changed since the senders read it. Returns true when
+ * the reply went out, false when there was simply no other address to try.
+ *
+ * A retry here is only safe because it happens exclusively on a recipient
+ * error: the previous attempt never reached the customer, so this cannot
+ * duplicate a delivered message.
+ */
+async function retryAiReplyWithFreshRecipient(args: {
+  accountId: string;
+  conversationId: string;
+  contactId: string;
+  userId: string;
+  text: string;
+  composeMessageId?: string;
+  single?: boolean;
+  previousError: unknown;
+}): Promise<boolean> {
+  const db = supabaseAdmin();
+
+  const { data } = await db
+    .from('contacts')
+    .select('id, phone, wa_user_id, username')
+    .eq('id', args.contactId)
+    .eq('account_id', args.accountId)
+    .maybeSingle();
+
+  const contact = (data as
+    | { id: string; phone?: string | null; wa_user_id?: string | null; username?: string | null }
+    | null) ?? null;
+  if (!contact) return false;
+
+  const queue = await resolveOutboundAddressQueue(contact, args.accountId);
+  if (queue.length === 0) return false;
+
+  console.warn(
+    `[ai auto-reply] contact ${args.contactId}: re-resolved ${queue.length} candidate address(es) after a recipient rejection (${args.previousError instanceof Error ? args.previousError.message : String(args.previousError)})`
+  );
+
+  // No address left that the sender didn't already try.
+  if (queue.length <= 1) return false;
+
+  try {
+    await engineSendAiReply({
+      accountId: args.accountId,
+      userId: args.userId,
+      conversationId: args.conversationId,
+      contactId: args.contactId,
+      text: args.text,
+      aiGenerated: true,
+      composeMessageId: args.composeMessageId,
+      single: args.single,
+    });
+    return true;
+  } catch (err) {
+    // The retry walked the same full queue; rethrow so the caller logs it.
+    throw err;
+  }
 }
 
 /** Best-effort phone lookup so every skip diagnostic can name the contact. */
@@ -936,7 +1004,7 @@ export async function dispatchInboundToAiReply(
       // y el enlace de Meet juntos, sin cortes que puedan dejar el enlace
       // fuera o dividido en varios mensajes.
       single: realBooking?.confirmado === true,
-    }).catch((err: unknown) => {
+    }).catch(async (err: unknown) => {
       // The model already produced an answer, so a send failure is the
       // one error the operator most needs verbatim: "contact phone
       // invalid", "WhatsApp not configured for this account", a bad
@@ -948,8 +1016,45 @@ export async function dispatchInboundToAiReply(
           ? { message: err.message, stack: err.stack, ...(err as object) }
           : err
       );
+
+      // Meta rejected the address we picked. The sender already tried every
+      // identifier on the contact row, so the only thing left that it
+      // cannot see is a value the CRM learned since that row was written
+      // — e.g. an operator correcting the number, or a number recovered
+      // from a merged sibling contact. Re-resolve from the current row and
+      // retry once.
+      //
+      // Restricted to recipient rejections: retrying a template, permission
+      // or provider failure against a different address would double-send
+      // the same reply.
+      if (isRecipientRejection(err)) {
+        try {
+          const requeued = await retryAiReplyWithFreshRecipient({
+            accountId,
+            conversationId,
+            contactId,
+            userId: configOwnerUserId,
+            text: stripInternalReasoning(finalText),
+            composeMessageId: args.composeMessageId,
+            single: realBooking?.confirmado === true,
+            previousError: err,
+          });
+          if (requeued) {
+            console.log(
+              `[ai auto-reply] conversation ${conversationId}: reply delivered on retry after re-resolving the recipient`
+            );
+            return;
+          }
+        } catch (retryErr) {
+          console.error(
+            `[ai auto-reply] conversation ${conversationId}: retry after re-resolving the recipient also failed:`,
+            retryErr instanceof Error ? retryErr.message : retryErr
+          );
+        }
+      }
       throw err;
     });
+
     console.log('[AUTO-REPLY] Mensaje enviado con éxito a WhatsApp:', enviado);
   } catch (error) {
     // Global safety net around the ENTIRE reply block. Never throws, so the

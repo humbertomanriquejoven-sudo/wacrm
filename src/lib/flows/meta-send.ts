@@ -12,7 +12,6 @@ import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import { cleanAiReplyText } from '@/lib/whatsapp/clean-ai-text'
 import {
-  normalizePhone,
   sanitizePhoneForMeta,
   isValidE164,
   phoneVariants,
@@ -20,6 +19,15 @@ import {
 } from '@/lib/whatsapp/phone-utils'
 import { splitAiReply } from '@/lib/ai/split-reply'
 import { supabaseAdmin } from './admin-client'
+import {
+  resolveRecipient,
+  isRecipientRejection,
+  isDialablePhone,
+  toDialable,
+  findRecoverablePhone,
+  normalizeMetaIdentifier,
+  normalizeUsername,
+} from '@/lib/whatsapp/recipient-resolver'
 
 // ------------------------------------------------------------
 // Flows-side Meta sender (interactive variants).
@@ -35,6 +43,30 @@ import { supabaseAdmin } from './admin-client'
 // brings the flow runner online and wires it up. Shipping it now
 // keeps the foundation PR self-contained and unit-testable.
 // ------------------------------------------------------------
+
+/**
+ * Every address this contact could be reached at, best first, with
+ * `primary` guaranteed first.
+ *
+ * Exported so the AI dispatcher can re-resolve after a failed send
+ * without duplicating the ordering rules that `prepareRecipient` and
+ * `recipientAddressQueue` share.
+ */
+export async function resolveOutboundAddressQueue(
+  contact: {
+    id?: string | null
+    phone?: string | null
+    wa_user_id?: string | null
+    username?: string | null
+    name?: string | null
+  },
+  accountId: string,
+  primary?: string,
+): Promise<string[]> {
+  const head = primary ?? (await resolveRecipient(contact, accountId)).to
+  if (!head) return []
+  return recipientAddressQueue(contact, accountId, head)
+}
 
 interface SendTextEngineArgs {
   /** Account-level tenancy key. Drives contact + whatsapp_config
@@ -78,15 +110,100 @@ interface SendTextEngineArgs {
 // `phoneVariants` handles trunk-prefix retries for the number case; a
 // BSUID is passed through untouched because Meta treats it as an opaque
 // id, not a phone to reformat.
-export function resolveOutboundTarget(contact: {
-  phone?: string | null
-  wa_user_id?: string | null
-  username?: string | null
-}): string {
-  const phone = (contact.phone ?? '').trim()
-  const bsuid = (contact.wa_user_id ?? '').trim()
-  const handle = (contact.username ?? '').trim()
-  return phone || bsuid || handle
+/**
+ * Address candidates to try for one send, in order.
+ *
+ * A real number contributes its trunk-prefix variants (the format quirks
+ * `phoneVariants` encodes). A BSUID or @handle is opaque to WhatsApp's
+ * number rules and has exactly one form, so it contributes itself.
+ */
+function sendVariantsFor(sanitized: string): string[] {
+  return isDialablePhone(sanitized) ? phoneVariants(sanitized) : [sanitized]
+}
+
+/**
+ * Every address this contact could legitimately be reached at, best first.
+ *
+ * `primary` is whatever `prepareRecipient` resolved. The remaining entries
+ * are the contact's other on-file identifiers, so a rejected `to` can be
+ * retried against a different value without a second round-trip to
+ * resolve. De-duplicated against `primary` so an unchanged contact yields
+ * a single-entry queue and behaves exactly as before.
+ */
+async function recipientAddressQueue(
+  contact: {
+    id?: string | null
+    phone?: string | null
+    wa_user_id?: string | null
+    username?: string | null
+    name?: string | null
+  },
+  accountId: string,
+  primary: string,
+): Promise<string[]> {
+  const queue = [primary]
+  const push = (value: string | null | undefined) => {
+    if (value && !queue.includes(value)) queue.push(value)
+  }
+
+  const own = toDialable(contact.phone)
+  push(own)
+
+  // A number sitting on a sibling identity row — the usual outcome when
+  // `phone` still holds a BSUID but the person has messaged from a
+  // registered number before.
+  const recovered = await findRecoverablePhone(contact, accountId).catch(() => null)
+  push(recovered?.phone)
+
+  push(normalizeMetaIdentifier(contact.wa_user_id ?? contact.phone))
+  push(normalizeUsername(contact.username))
+  return queue
+}
+
+/**
+ * Resolve the outbound address for a contact and format it for Meta.
+ *
+ * Shared by every sender below so the four paths can't drift apart. The
+ * address comes entirely from `resolveRecipient`, which decides at call
+ * time whether this contact is reachable by number, by a number we can
+ * recover from a sibling identity, or by BSUID/handle.
+ *
+ * A recovered number is written back onto the contact row: without that,
+ * a contact whose `phone` still holds a BSUID would re-run the lookup on
+ * every single send.
+ */
+async function prepareRecipient(
+  contact: {
+    id?: string | null
+    phone?: string | null
+    wa_user_id?: string | null
+    username?: string | null
+    name?: string | null
+  },
+  accountId: string,
+): Promise<{ to: string; sanitized: string; isPhone: boolean }> {
+  const recipient = await resolveRecipient(contact, accountId)
+  if (!recipient.to) throw new Error('contact not found for this account')
+
+  if (recipient.source === 'recovered' && recipient.isPhone && contact.id) {
+    await supabaseAdmin()
+      .from('contacts')
+      .update({ phone: recipient.to, updated_at: new Date().toISOString() })
+      .eq('id', contact.id)
+      .eq('account_id', accountId)
+    console.log(
+      `[flows] recovered real phone ${recipient.to} for contact ${contact.id} (phone held a non-dialable value)`,
+    )
+  }
+
+  // `sanitizePhoneForMeta` / `phoneVariants` only make sense for a real
+  // number. A BSUID or handle is opaque to Meta's phone rules and must be
+  // forwarded byte-for-byte.
+  const sanitized = recipient.isPhone ? sanitizePhoneForMeta(recipient.to) : recipient.to
+  if (recipient.isPhone && !isValidE164(sanitized)) {
+    throw new Error(`contact phone invalid: ${recipient.to}`)
+  }
+  return { to: recipient.to, sanitized, isPhone: recipient.isPhone }
 }
 
 export async function engineSendText(
@@ -101,18 +218,10 @@ export async function engineSendText(
     .eq('account_id', args.accountId)
     .maybeSingle()
 
-  const target = contact ? resolveOutboundTarget(contact) : ''
-  if (contactErr || !contact || !target) {
+  if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-
-  // A BSUID/username is opaque to `sanitizePhoneForMeta`, so only run the
-  // phone pipeline when we actually have a number.
-  const isNumber = Boolean(normalizePhone(target))
-  const sanitized = isNumber ? sanitizePhoneForMeta(target) : target
-  if (isNumber && !isValidE164(sanitized)) {
-    throw new Error(`contact phone invalid: ${target}`)
-  }
+  const { to: target, sanitized } = await prepareRecipient(contact, args.accountId)
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
@@ -125,36 +234,60 @@ export async function engineSendText(
 
   const accessToken = decrypt(config.access_token)
 
-  const attempt = async (phone: string): Promise<string> => {
-    const r = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
-      text: args.text,
-    })
-    return r.messageId
-  }
-
-  const variants = phoneVariants(sanitized)
-  let workingPhone = sanitized
+  // Dynamic send loop.
+  //
+  // Two nested levels of retry, both recipient-scoped:
+  //   * OUTER — alternate address. If Meta rejects `to` as an invalid
+  //     recipient, re-resolve the contact and try a different identifier
+  //     (a recovered number, the BSUID, the handle). This is the case
+  //     where a stale value would otherwise drop the reply.
+  //   * INNER — format variants of one address. Real numbers get their
+  //     trunk-prefix variants; opaque ids have exactly one form.
+  //
+  // Non-recipient errors (template, permission, network) abort both loops
+  // immediately: retrying those elsewhere would double-send.
   let waMessageId = ''
+  let workingPhone = ''
   let lastError: unknown = null
-  for (const v of variants) {
-    try {
-      waMessageId = await attempt(v)
-      workingPhone = v
-      lastError = null
-      break
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      if (!isRecipientNotAllowedError(msg)) throw err
-      lastError = err
+  const addressQueue = await recipientAddressQueue(contact, args.accountId, target)
+
+  for (const address of addressQueue) {
+    workingPhone = address
+    for (const v of sendVariantsFor(address)) {
+      try {
+        const r = await sendTextMessage({
+          phoneNumberId: config.phone_number_id,
+          accessToken,
+          to: v,
+          text: args.text,
+        })
+        waMessageId = r.messageId
+        workingPhone = v
+        lastError = null
+        break
+      } catch (err) {
+        lastError = err
+        if (!isRecipientNotAllowedError(String(err)) && !isRecipientRejection(err)) {
+          throw err
+        }
+      }
     }
+    if (!lastError) break
+    console.warn(
+      `[flows] send to ${address} rejected (${lastError instanceof Error ? lastError.message : String(lastError)}); trying the contact's next identifier`,
+    )
   }
   if (lastError) throw lastError
 
-  if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+  // Persist whichever address/variant worked so the next send goes
+  // straight to it. Only ever a real number — a working BSUID is recorded
+  // in `wa_user_id`, never written over a phone column.
+  if (contact.id && workingPhone !== sanitized && isDialablePhone(workingPhone)) {
+    await db
+      .from('contacts')
+      .update({ phone: workingPhone, updated_at: new Date().toISOString() })
+      .eq('id', contact.id)
+      .eq('account_id', args.accountId)
   }
 
   const { error: msgErr } = await db.from('messages').insert({
@@ -221,18 +354,10 @@ export async function engineSendAiReply(
     .eq('id', args.contactId)
     .eq('account_id', args.accountId)
     .maybeSingle()
-  const target = contact ? resolveOutboundTarget(contact) : ''
-  if (contactErr || !contact || !target) {
+  if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-
-  // A BSUID/username is opaque to `sanitizePhoneForMeta`, so only run the
-  // phone pipeline when we actually have a number.
-  const isNumber = Boolean(normalizePhone(target))
-  const sanitized = isNumber ? sanitizePhoneForMeta(target) : target
-  if (isNumber && !isValidE164(sanitized)) {
-    throw new Error(`contact phone invalid: ${target}`)
-  }
+  const { to: target, sanitized } = await prepareRecipient(contact, args.accountId)
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
@@ -256,6 +381,11 @@ export async function engineSendAiReply(
 
   let waMessageId = ''
   let workingPhone = sanitized
+
+  // Dynamic recipient resolution, resolved ONCE for the whole reply rather
+  // than per fragment: every bubble of a reply must reach the same person,
+  // and re-resolving mid-reply could split it across two addresses.
+  const addressQueue = await recipientAddressQueue(contact, args.accountId, target)
 
   for (let i = 0; i < fragments.length; i++) {
     // Keep composing state alive between bubbles. The webhook already
@@ -286,19 +416,30 @@ export async function engineSendAiReply(
       return r.messageId
     }
 
-    const variants = phoneVariants(sanitized)
+    // Walk this contact's addresses until one is accepted. Non-recipient
+    // errors abort immediately — resending a template/permission failure
+    // to a different address would deliver the message twice.
     let lastError: unknown = null
-    for (const v of variants) {
-      try {
-        waMessageId = await attempt(v)
-        workingPhone = v
-        lastError = null
-        break
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        if (!isRecipientNotAllowedError(msg)) throw err
-        lastError = err
+    outer: for (const address of addressQueue) {
+      for (const v of sendVariantsFor(address)) {
+        try {
+          waMessageId = await attempt(v)
+          workingPhone = v
+          lastError = null
+          break outer
+        } catch (err) {
+          lastError = err
+          if (
+            !isRecipientNotAllowedError(String(err)) &&
+            !isRecipientRejection(err)
+          ) {
+            throw err
+          }
+        }
       }
+      console.warn(
+        `[ai reply] address ${address} rejected (${lastError instanceof Error ? lastError.message : String(lastError)}); trying the contact's next identifier`,
+      )
     }
     if (lastError) throw lastError
 
@@ -316,8 +457,14 @@ export async function engineSendAiReply(
     }
   }
 
-  if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+  // Remember a real number that worked, so the next reply goes straight to
+  // it. A working BSUID is never written over the phone column.
+  if (contact.id && workingPhone !== sanitized && isDialablePhone(workingPhone)) {
+    await db
+      .from('contacts')
+      .update({ phone: workingPhone, updated_at: new Date().toISOString() })
+      .eq('id', contact.id)
+      .eq('account_id', args.accountId)
   }
 
   await db
@@ -365,18 +512,10 @@ export async function engineSendMedia(
     .eq('id', args.contactId)
     .eq('account_id', args.accountId)
     .maybeSingle()
-  const target = contact ? resolveOutboundTarget(contact) : ''
-  if (contactErr || !contact || !target) {
+  if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-
-  // A BSUID/username is opaque to `sanitizePhoneForMeta`, so only run the
-  // phone pipeline when we actually have a number.
-  const isNumber = Boolean(normalizePhone(target))
-  const sanitized = isNumber ? sanitizePhoneForMeta(target) : target
-  if (isNumber && !isValidE164(sanitized)) {
-    throw new Error(`contact phone invalid: ${target}`)
-  }
+  const { to: target, sanitized } = await prepareRecipient(contact, args.accountId)
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
@@ -402,26 +541,39 @@ export async function engineSendMedia(
     return r.messageId
   }
 
-  const variants = phoneVariants(sanitized)
+  const addressQueue = await recipientAddressQueue(contact, args.accountId, target)
   let workingPhone = sanitized
   let waMessageId = ''
   let lastError: unknown = null
-  for (const v of variants) {
-    try {
-      waMessageId = await attempt(v)
-      workingPhone = v
-      lastError = null
-      break
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      if (!isRecipientNotAllowedError(msg)) throw err
-      lastError = err
+  outerMedia: for (const address of addressQueue) {
+    for (const v of sendVariantsFor(address)) {
+      try {
+        waMessageId = await attempt(v)
+        workingPhone = v
+        lastError = null
+        break outerMedia
+      } catch (err) {
+        lastError = err
+        if (
+          !isRecipientNotAllowedError(String(err)) &&
+          !isRecipientRejection(err)
+        ) {
+          throw err
+        }
+      }
     }
+    console.warn(
+      `[flows media] address ${address} rejected (${lastError instanceof Error ? lastError.message : String(lastError)}); trying the contact's next identifier`,
+    )
   }
   if (lastError) throw lastError
 
-  if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+  if (contact.id && workingPhone !== sanitized && isDialablePhone(workingPhone)) {
+    await db
+      .from('contacts')
+      .update({ phone: workingPhone, updated_at: new Date().toISOString() })
+      .eq('id', contact.id)
+      .eq('account_id', args.accountId)
   }
 
   // content_type='image'|'video'|'document' — these are already in the
@@ -521,18 +673,10 @@ async function sendInteractiveViaMeta(
     .eq('id', input.contactId)
     .eq('account_id', input.accountId)
     .maybeSingle()
-  const target = contact ? resolveOutboundTarget(contact) : ''
-  if (contactErr || !contact || !target) {
+  if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-
-  // A BSUID/username is opaque to `sanitizePhoneForMeta`, so only run the
-  // phone pipeline when we actually have a number.
-  const isNumber = Boolean(normalizePhone(target))
-  const sanitized = isNumber ? sanitizePhoneForMeta(target) : target
-  if (isNumber && !isValidE164(sanitized)) {
-    throw new Error(`contact phone invalid: ${target}`)
-  }
+const { to: target, sanitized } = await prepareRecipient(contact, input.accountId)
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
@@ -571,29 +715,42 @@ async function sendInteractiveViaMeta(
     return r.messageId
   }
 
-  // Same phone-variant retry as automations/meta-send.ts. Numbers
-  // registered with/without a trunk 0 + Meta's sandbox quirks all
-  // need this to reliably land a message.
-  const variants = phoneVariants(sanitized)
+  // Dynamic recipient resolution + retry, identical policy to the text and
+  // media senders: walk this contact's addresses (and format variants of
+  // each) until Meta accepts one.
+  const addressQueue = await recipientAddressQueue(contact, input.accountId, target)
   let workingPhone = sanitized
   let waMessageId = ''
   let lastError: unknown = null
-  for (const v of variants) {
-    try {
-      waMessageId = await attempt(v)
-      workingPhone = v
-      lastError = null
-      break
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      if (!isRecipientNotAllowedError(msg)) throw err
-      lastError = err
+  outerInteractive: for (const address of addressQueue) {
+    for (const v of sendVariantsFor(address)) {
+      try {
+        waMessageId = await attempt(v)
+        workingPhone = v
+        lastError = null
+        break outerInteractive
+      } catch (err) {
+        lastError = err
+        if (
+          !isRecipientNotAllowedError(String(err)) &&
+          !isRecipientRejection(err)
+        ) {
+          throw err
+        }
+      }
     }
+    console.warn(
+      `[flows interactive] address ${address} rejected (${lastError instanceof Error ? lastError.message : String(lastError)}); trying the contact's next identifier`,
+    )
   }
   if (lastError) throw lastError
 
-  if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+  if (contact.id && workingPhone !== sanitized && isDialablePhone(workingPhone)) {
+    await db
+      .from('contacts')
+      .update({ phone: workingPhone, updated_at: new Date().toISOString() })
+      .eq('id', contact.id)
+      .eq('account_id', input.accountId)
   }
 
   // Persist the bot's prompt to the messages table so it appears in
