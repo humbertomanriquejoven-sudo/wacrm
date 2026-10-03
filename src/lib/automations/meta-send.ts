@@ -6,8 +6,8 @@ import {
 } from '@/lib/flows/meta-send'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import {
-  sanitizePhoneForMeta,
   isDialablePhone,
+  metaRecipientFields,
   phoneVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
@@ -123,7 +123,7 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   // new tenancy column.
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone, wa_user_id')
+    .select('id, phone, wa_user_id, username')
     .eq('id', input.contactId)
     .eq('account_id', input.accountId)
     .maybeSingle()
@@ -133,13 +133,41 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
 
   // Resolve the best recipient for this contact (phone, BSUID, or username).
   const recipient = await resolveRecipient(contact, input.accountId, input.conversationId)
-  if (!recipient.to) throw new Error('contact not found for this account')
+  if (!recipient.to && !recipient.recipient) throw new Error('contact not found for this account')
 
-  // Use the resolved address; if it is a phone we will rely on variants,
-  // otherwise it is a BSUID/handle and will be sent via the `recipient` field.
-  const address = recipient.to
-  const sanitized = recipient.isPhone ? sanitizePhoneForMeta(address) : address
+  // Use metaRecipientFields to route the address to the correct Meta field.
+  // - Phone numbers go in `to`.
+  // - BSUID / username go in `recipient`.
+  // - If neither is present, fall back to the raw resolved address.
+  const { to, recipient: recipientField } = metaRecipientFields(recipient.to ?? recipient.recipient ?? '')
 
+  // Build the body based on whether this is a phone or an opaque identifier.
+  const isPhone = recipient.isPhone
+
+  const attempt = async (address: string): Promise<string> => {
+    if (input.kind === 'template') {
+      const r = await sendTemplateMessage({
+        phoneNumberId: config?.phone_number_id, // will be fetched below
+        accessToken: config?.access_token ? decrypt(config.access_token) : '',
+        to: isPhone ? address : '',
+        recipient: isPhone ? '' : recipientField,
+        templateName: input.templateName,
+        language: input.language,
+        params: input.params,
+      })
+      return r.messageId
+    }
+    const r = await sendTextMessage({
+      phoneNumberId: config?.phone_number_id,
+      accessToken: config?.access_token ? decrypt(config.access_token) : '',
+      to: isPhone ? address : '',
+      recipient: isPhone ? '' : recipientField,
+      text: input.text,
+    })
+    return r.messageId
+  }
+
+  // Fetch config after we know what we're sending, to avoid unnecessary decryption.
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
     .select('*')
@@ -151,66 +179,45 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
 
   const accessToken = decrypt(config.access_token)
 
-  // Local template row — read for the body we persist below, not for
-  // the Meta payload (the wire shape is deliberately unchanged here).
-  // A missing row is fine: the send still goes out, we just can't
-  // reconstruct the text the customer saw.
-  const templateRow =
-    input.kind === 'template'
-      ? (
-          await resolveTemplateRow(
-            db,
-            input.accountId,
-            input.templateName,
-            input.language,
-          )
-        ).row
-      : null
-
-  const attempt = async (phone: string): Promise<string> => {
-    if (input.kind === 'template') {
-      const r = await sendTemplateMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        templateName: input.templateName,
-        language: input.language,
-        params: input.params,
-      })
-      return r.messageId
-    }
-    const r = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
-      text: input.text,
-    })
-    return r.messageId
-  }
-
-  // Same phone-variant retry as /api/whatsapp/send — Meta sandbox and
-  // numbers registered with/without a trunk 0 both require this to
-  // reliably land a message.
-  const variants = phoneVariants(sanitized)
-  let workingPhone = sanitized
+  // Resolve the outbound address.
+  //
+  // Priority:
+  //   1. A real dialable number → send via `to` with trunk-prefix variants.
+  //   2. A BSUID or @username → send via `recipient` (single form, no variants).
+  //
+  // If `recipient.to` is set (dialable number), we use phoneVariants for
+  // trunk-prefix retries. If `recipient.recipient` is set (BSUID/handle),
+  // we send it directly — there is only one form.
   let waMessageId = ''
-  let lastError: unknown = null
-  for (const v of variants) {
-    try {
-      waMessageId = await attempt(v)
-      workingPhone = v
-      lastError = null
-      break
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      if (!isRecipientNotAllowedError(msg)) throw err
-      lastError = err
-    }
-  }
-  if (lastError) throw lastError
+  let workingPhone = ''
 
-  if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+  if (recipient.isPhone) {
+    // Phone number: use variants + retry logic as before.
+    const sanitized = isDialablePhone(recipient.to) ? sanitizePhoneForMeta(recipient.to) : recipient.to
+    const variants = phoneVariants(sanitized)
+    let lastError: unknown = null
+    for (const v of variants) {
+      try {
+        waMessageId = await attempt(v)
+        workingPhone = v
+        lastError = null
+        break
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (!isRecipientNotAllowedError(msg)) throw err
+        lastError = err
+      }
+    }
+    if (lastError) throw lastError
+  } else {
+    // BSUID / username: send directly, no variants needed.
+    workingPhone = recipient.to ?? recipient.recipient ?? ''
+    try {
+      waMessageId = await attempt(workingPhone)
+    } catch (err) {
+      if (!isRecipientNotAllowedError(err instanceof Error ? err.message : String(err))) throw err
+      throw err
+    }
   }
 
   // Persist the sent message so it appears in the inbox with a real
@@ -223,7 +230,7 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   const content_text =
     input.kind === 'text'
       ? input.text
-      : templateContentText(templateRow, input.params ?? [])
+      : templateContentText(resolveTemplateRow(db, input.accountId, input.templateName, input.language)?.row, input.params ?? [])
   const template_name = input.kind === 'template' ? input.templateName : null
 
   const { error: msgErr } = await db.from('messages').insert({

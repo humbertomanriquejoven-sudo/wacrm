@@ -55,7 +55,6 @@ export async function listPendingReplies(
     .select('id, contact_id, pending_reply_text, pending_reply_at')
     .eq('account_id', accountId)
     .eq('contact_id', contactId)
-    .eq('awaiting_valid_phone', true)
     .not('pending_reply_text', 'is', null)
 
   return ((data ?? []) as PendingConversation[]).filter(
