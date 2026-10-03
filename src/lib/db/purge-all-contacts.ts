@@ -36,11 +36,12 @@ async function purgeViaSql(): Promise<void> {
   await client.connect()
   try {
     // contacts is the root; CASCADE sweeps conversations/messages and
-    // every child FK (automations runs, broadcast_recipients, ...).
+    // every child FK. The extra tables are named explicitly so the log
+    // leaves no doubt about what was wiped.
     await client.query(
-      'TRUNCATE TABLE messages, conversations, contacts CASCADE',
+      'TRUNCATE TABLE messages, conversations, contact_notes, contact_tags, contact_custom_values, broadcast_recipients, flow_runs, contacts CASCADE',
     )
-    console.log('[purge] TRUNCATE messages, conversations, contacts CASCADE — done')
+    console.log('[purge] TRUNCATE messages, conversations, contact_notes, contact_tags, contact_custom_values, broadcast_recipients, flow_runs, contacts CASCADE — done')
   } finally {
     await client.end()
   }
@@ -55,9 +56,26 @@ async function purgeViaSupabase(): Promise<void> {
     )
   }
   const db = createClient(url, key)
-  for (const table of ['messages', 'conversations', 'contacts'] as const) {
+  for (const table of [
+    'messages',
+    'conversations',
+    'contact_notes',
+    'contact_tags',
+    'contact_custom_values',
+    'broadcast_recipients',
+    'flow_runs',
+    'contacts',
+  ] as const) {
     const { error } = await db.from(table).delete().not('id', 'is', null)
-    if (error) throw new Error(`${table}: ${error.message}`)
+    if (error) {
+      // flow_runs / broadcast_recipients may not exist on older schemas —
+      // a missing table must not abort the rest of the purge.
+      if (/could not find the table|does not exist/i.test(error.message)) {
+        console.log(`[purge] ${table}: skipped (not present)`)
+        continue
+      }
+      throw new Error(`${table}: ${error.message}`)
+    }
     console.log(`[purge] ${table}: deleted`)
   }
 }
