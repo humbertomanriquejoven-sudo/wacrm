@@ -734,13 +734,13 @@ async function processMessage(
   // ============================================================
   const waIdRaw = message.from || contact.wa_id || ''
 
-  // A real phone number is digits only. Anything with letters, a dot, or
-  // any other character is an identifier we must NOT treat as a number.
+  // Classify the sender's identifier BEFORE storing anything. Two facts
+  // drive everything below:
+  //   * `rawPhone` — a dialable E.164 number (10–13 digits), or '' when
+  //     Meta sent us a BSUID instead.
+  //   * `senderUserId` — the BSUID, either prefixed ('CO.1008…') or bare
+  //     but too long to be a number ('1008477715690681').
   const rawPhone = isPhoneLike(waIdRaw) ? normalizePhone(waIdRaw) : ''
-
-  // BSUID, including its `'CO.'` / `'WAID.'` namespace prefix. Stripped of
-  // the prefix for storage so the value is comparable across payloads,
-  // but only ever written to `wa_user_id` — never to `phone`/`username`.
   const senderUserId = firstOpaqueId(
     contact.user_id,
     message.from_user_id,
@@ -1512,16 +1512,26 @@ type ContactRow = any
 /** Meta's namespace prefixes on a BSUID. Both mark an OPAQUE id. */
 const BSUID_PREFIX_RE = /^(CO|WAID)\./i
 
+/** E.164 allows at most 15 digits; real WhatsApp senders land in 10–13. */
+const E164_MAX_DIGITS = 13
 /**
- * True when `value` is usable as a phone number: at least 7 digits and
- * nothing but digits / a leading `+` / separators.
+ * A digit string longer than this cannot be a phone number. Meta's BSUIDs
+ * are 15–17 digits ('1008477715690681'), well past anything E.164 permits,
+ * so length alone is a reliable discriminator even after the 'CO.' prefix
+ * has been stripped by `normalizePhone`.
+ */
+const BSUID_MIN_DIGITS = 14
+
+/**
+ * True when `value` is a real E.164 phone number: 10–13 digits and nothing
+ * but digits / a leading `+` / separators.
  *
- * The point is to reject BSUIDs. `normalizePhone('CO.1008477715690681')`
- * returns `'1008477715690681'` — pure digits, 16 of them — so a naive
- * digits-only check happily promotes an identifier into the `phone`
- * column, which is exactly how 'CO.…' ended up stored as a phone. Testing
- * for the `CO.` / `WAID.` marker (and for any non-numeric character)
- * before normalizing is what actually separates the two.
+ * The length bounds are the important part. `normalizePhone` strips every
+ * non-digit, so both 'CO.1008477715690681' and a bare '1008477715690681'
+ * collapse to the same 16 digits — and a naive "is it digits?" check calls
+ * both a valid phone number, which is exactly how a BSUID ended up in the
+ * `phone` column. Rejecting the 'CO.'/'WAID.' marker and anything past 13
+ * digits is what actually separates the two.
  */
 function isPhoneLike(value: string | null | undefined): boolean {
   if (!value) return false
@@ -1530,17 +1540,42 @@ function isPhoneLike(value: string | null | undefined): boolean {
   if (BSUID_PREFIX_RE.test(trimmed)) return false
   // Only digits, an optional leading '+', and the usual separators.
   if (!/^\+?[\d\s().-]+$/.test(trimmed)) return false
-  return normalizePhone(trimmed).length >= 7
+  const digits = normalizePhone(trimmed).length
+  if (digits < 7) return false
+  return digits <= E164_MAX_DIGITS
+}
+
+/**
+ * True when `value` is a Meta BSUID rather than a phone number: it carries
+ * an explicit `'CO.'` / `'WAID.'` namespace prefix, or it is a digit string
+ * too long to be E.164.
+ *
+ * Unlike `isPhoneLike` this ignores separators and prefixes entirely — it
+ * runs on whatever Meta sent, and its job is only to answer "is this
+ * addressable but not a dialable number?". Used to decide whether a value
+ * belongs in `wa_user_id`.
+ */
+function isBsuidLike(value: string | null | undefined): boolean {
+  if (!value) return false
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  if (BSUID_PREFIX_RE.test(trimmed)) return true
+  return /^\d+$/.test(trimmed) && trimmed.length >= BSUID_MIN_DIGITS
 }
 
 /**
  * Extract a BSUID from whichever field carries it, returning the id with
  * its namespace prefix stripped, or null when the value isn't one.
  *
- * Candidates are checked in order and each is classified: a real phone
- * number is NOT returned as a BSUID. `wa_id` is included as a last resort
- * because for unregistered senders Meta sometimes puts the 'CO.…' id there
- * instead of a number.
+ * Two shapes are accepted:
+ *   * explicitly prefixed — 'CO.1008477715690681' / 'WAID.…';
+ *   * bare but too long to be a number — '1008477715690681' (16 digits).
+ *
+ * The second case is why `isBsuidLike` exists: a real phone number never
+ * reaches here, but an already-stripped BSUID does, and we must not fall
+ * through to treating it as a dialable number. `wa_id` is included as a
+ * last resort because for unregistered senders Meta sometimes puts the id
+ * there instead of a number.
  */
 function firstOpaqueId(...candidates: Array<string | null | undefined>): string | null {
   for (const candidate of candidates) {
@@ -1549,6 +1584,7 @@ function firstOpaqueId(...candidates: Array<string | null | undefined>): string 
     if (BSUID_PREFIX_RE.test(trimmed)) {
       return trimmed.replace(BSUID_PREFIX_RE, '').trim() || null
     }
+    if (isBsuidLike(trimmed)) return trimmed
   }
   return null
 }
@@ -1603,19 +1639,37 @@ async function repairBsuidPhoneContacts(): Promise<void> {
 
     // PostgREST `like` needs the wildcard in the value. 'CO.%' / 'WAID.%'
     // covers both namespace markers Meta emits.
-    const { data: coBroken, error } = await db
-      .from('contacts')
-      .select('id, account_id, phone, name, username, wa_user_id')
-      .like('phone', 'CO.%')
+    // Three broken shapes to look for:
+    //   1. `phone like 'CO.%'`    — prefixed BSUID, original bug.
+    //   2. `phone like 'WAID.%'` — the phone-scoped namespace.
+    //   3. `phone` of 15+ bare digits — a BSUID whose prefix an earlier
+    //      handler already stripped (exactly '1008477715690681'). PostgREST
+    //      can't express a length test, so match any 15-digit run and let
+    //      `isBsuidLike` filter precisely below.
+    const cols =
+      'id, account_id, phone, name, username, wa_user_id'
 
-    // WAID. ids are rarer; check them too but stay quiet if neither matches.
-    const { data: waidBroken } = await db
-      .from('contacts')
-      .select('id, account_id, phone, name, username, wa_user_id')
-      .like('phone', 'WAID.%')
+    const [coRes, waidRes, longRes] = await Promise.all([
+      db.from('contacts').select(cols).like('phone', 'CO.%'),
+      db.from('contacts').select(cols).like('phone', 'WAID.%'),
+      db.from('contacts').select(cols).like('phone', '______________%'),
+    ])
 
-    const broken = [...(coBroken ?? []), ...(waidBroken ?? [])]
-    if (error && (!coBroken || coBroken.length === 0) && broken.length === 0) return
+    // Union, then keep only what `isBsuidLike` confirms — the 15-digit
+    // LIKE is deliberately over-broad and would otherwise catch a row
+    // whose phone is legitimately long.
+    const seen = new Set<string>()
+    const broken = [
+      ...(coRes.data ?? []),
+      ...(waidRes.data ?? []),
+      ...(longRes.data ?? []),
+    ].filter((row) => {
+      const id = String(row.id ?? '')
+      if (seen.has(id)) return false
+      seen.add(id)
+      return isBsuidLike(String(row.phone ?? ''))
+    })
+
     if (broken.length === 0) return
 
     for (const row of broken as Array<{
@@ -1809,11 +1863,20 @@ interface ContactOutcome {
 
 /** Everything Meta told us about who sent this message. */
 interface SenderIdentity {
-  /** Digit-only phone number, or '' when Meta sent no number. */
+  /**
+   * Digit-only E.164 phone number (10–13 digits), or '' when Meta sent
+   * only a BSUID. A BSUID is NEVER passed here — `isPhoneLike` rejects it
+   * at the extraction site so it can't leak into a phone update.
+   */
   phone: string
-  /** BSUID, when the sender isn't on a registered number. */
+  /**
+   * BSUID, when the sender isn't on a registered number. Stored in the
+   * `wa_user_id` column; a bare BSUID may also be promoted into a new
+   * contact's `phone` as a placeholder (that column is NOT NULL) until a
+   * real number is known.
+   */
   waUserId: string | null
-  /** Public @username, without the leading '@'. */
+  /** Public @username, WITH the leading '@'. */
   username: string | null
   /** WhatsApp profile name. */
   name: string
@@ -1880,6 +1943,40 @@ async function findOrCreateContact(
     existingContact = await findContactByNameWithoutPhone(db, accountId, name)
   }
 
+  // 5. BSUID-only inbound matching a row we already track by NAME.
+  //
+  //    This is the unification case the BSUID change introduced: a person
+  //    who first wrote from their registered number got a row with
+  //    phone='573122182949'; later they write from an unregistered number
+  //    and Meta sends ONLY the BSUID, so steps 1–4 all miss and we'd insert
+  //    a duplicate. An exact profile-name hit is the only remaining
+  //    evidence they are the same person.
+  //
+  //    Guarded deliberately:
+  //    - only when we actually hold a BSUID (no number ⇒ this path is
+  //      reached only for unidentified senders);
+  //    - only an EXACT name match, never fuzzy, since display names are the
+  //      weakest of the four keys;
+  //    - never steal a row already bound to a DIFFERENT BSUID, which would
+  //      merge two genuinely different people.
+  if (!existingContact && waUserId && name) {
+    const { data } = await db
+      .from('contacts')
+      .select('*')
+      .eq('account_id', accountId)
+      .eq('name', name.trim())
+      .limit(5)
+
+    const candidates = (data ?? []) as ContactRow[]
+    existingContact =
+      candidates.find((c) => !c.wa_user_id || c.wa_user_id === waUserId) ?? null
+    if (existingContact) {
+      console.log(
+        `[webhook] unified BSUID-only sender onto existing contact ${existingContact.id} via name "${name}" (wa_user_id ${waUserId})`,
+      )
+    }
+  }
+
   if (existingContact) {
     // Backfill whatever this payload tells us that the row is missing, so
     // replies always go to a usable destination and the inbox can show the
@@ -1892,12 +1989,27 @@ async function findOrCreateContact(
     //   - wa_user_id: only when we learned one and the row has none.
     const updates: Record<string, unknown> = {}
     const currentPhone = normalizePhone(existingContact.phone ?? '')
-    // Overwrite `phone` only with a REAL number. Promoting a BSUID over a
-    // working phone would break delivery for a contact that is perfectly
-    // reachable today.
-    if (phone && currentPhone !== phone) updates.phone = phone
+
+    // `phone` is only ever written with a REAL E.164 number, never a BSUID.
+    // Two guards, in order:
+    //   1. `isPhoneLike` — if the incoming value isn't dialable (Meta sent
+    //      a BSUID, or nothing), we don't touch `phone` at all.
+    //   2. `!isBsuidLike(currentPhone)` — the stored value is itself a BSUID
+    //      left by an older handler, so this real number REPLACES it. This
+    //      is the promotion that unifies '1008477715690681' with '573122182949'.
+    if (phone && isPhoneLike(phone)) {
+      if (currentPhone !== phone && !isBsuidLike(currentPhone)) {
+        updates.phone = phone
+      }
+    }
+
     if (name && !existingContact.name) updates.name = name
+    // Only when the row has none: a handle typed by a human in the CRM is
+    // authoritative and must not be replaced by a later payload.
     if (username && !existingContact.username) updates.username = username
+    // The BSUID is the sender's stable identity, so it backfills whenever
+    // it's missing — including when the row is currently holding the BSUID
+    // in `phone` and we're about to write a real number there.
     if (waUserId && !existingContact.wa_user_id) updates.wa_user_id = waUserId
 
     if (Object.keys(updates).length > 0) {
@@ -1921,6 +2033,13 @@ async function findOrCreateContact(
   // "contact not found" and silently drop every reply — the exact symptom
   // of "typing indicator shows, nothing arrives". The authoritative BSUID
   // also goes in its own column for future matches.
+  // `phone` is NOT NULL, so when Meta sent no dialable number we promote the
+  // BSUID into it as a last resort — but ONLY as a placeholder. The same
+  // value is always written to `wa_user_id` as well, so the CRM knows this
+  // row is identified by a BSUID rather than a phone number, and
+  // `repairBsuidPhoneContacts()` swaps in a real number as soon as one is
+  // known. `''` would be worse: `engineSend*` throws "contact not found"
+  // and silently drops every reply.
   const phoneForRow = phone || waUserId || username || 'unknown'
 
   const { data: newContact, error: createError } = await supabaseAdmin()

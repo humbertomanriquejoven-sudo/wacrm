@@ -142,11 +142,26 @@ vi.mock('@supabase/supabase-js', () => ({
         case 'contacts':
           return {
             select: () => {
+              // `eq()` is called twice with different columns and the
+              // answer must depend on WHICH column: findOrCreateContact
+              // queries by `wa_user_id` (step 1), by `username` (step 3)
+              // and by `name` (step 5), all through the same
+              // `.eq().eq().limit()` shape. Filter the configured row by
+              // the second filter so a `wa_user_id` mismatch doesn't also
+              // masquerade as a name match.
+              let secondFilter: { column: string; value: unknown } | null = null
               const secondEqResult = {
                 limit: (n: number) =>
                   Promise.resolve({
                     data: h.state.bsuidLookupResponse
-                      ? [h.state.bsuidLookupResponse].slice(0, n)
+                      ? [
+                          String(h.state.bsuidLookupResponse[secondFilter!.column]) ===
+                          String(secondFilter!.value)
+                            ? h.state.bsuidLookupResponse
+                            : null,
+                        ]
+                          .filter(Boolean)
+                          .slice(0, n)
                       : [],
                     error: null,
                   }),
@@ -163,17 +178,26 @@ vi.mock('@supabase/supabase-js', () => ({
               }
               return {
                 // repairBsuidPhoneContacts: select(...).like('phone', 'CO.%')
-                like: (column: string, pattern: string) =>
-                  Promise.resolve({
+                like: (column: string, pattern: string) => {
+                  // Translate SQL LIKE wildcards: `_` matches one
+                  // character, `%` matches the rest of the string. The
+                  // repair helper uses '______________%' to catch 15+
+                  // digit phones, so the mock has to honour that.
+                  const re = new RegExp(
+                    '^' +
+                      pattern
+                        .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                        .replace(/%/g, '.*')
+                        .replace(/_/g, '.') +
+                      '$',
+                  )
+                  return Promise.resolve({
                     data: (h.state.bsuidPhoneContacts ?? []).filter((row) =>
-                      pattern.endsWith('%')
-                        ? String(row[column] ?? '').startsWith(
-                            pattern.slice(0, -1),
-                          )
-                        : true,
+                      re.test(String(row[column] ?? '')),
                     ),
                     error: null,
-                  }),
+                  })
+                },
                 // purgeEmptyPhoneContacts: select(...).or('phone.is.null,phone.eq.')
                 or: () =>
                   Promise.resolve({
@@ -185,7 +209,10 @@ vi.mock('@supabase/supabase-js', () => ({
                 // `then`), while findRealNumberForIdentity does
                 // `.eq(account_id).or(clauses).limit(n)`. Support both.
                 eq: () => ({
-                  eq: () => secondEqResult,
+                  eq: (col2: string, val2: unknown) => {
+                    secondFilter = { column: col2, value: val2 }
+                    return secondEqResult
+                  },
                   or: () => ({
                     limit: (n: number) =>
                       Promise.resolve({
@@ -196,15 +223,18 @@ vi.mock('@supabase/supabase-js', () => ({
                 }),
               }
             },
-            update: (patch: Record<string, unknown>) => ({
-              eq: (_col: string, value: unknown) => {
-                h.state.contactUpdateCalls.push({
-                  id: value,
-                  patch,
-                })
-                return Promise.resolve({ data: null, error: null })
-              },
-            }),
+            // update(...).eq('id', x).eq('account_id', y) — the repair helper scopes
+            // by account, findOrCreateContact scopes by id alone. Accept a
+            // trailing `.eq()` either way and record on the first.
+            update: (patch: Record<string, unknown>) => {
+              const record = (value: unknown) => {
+                h.state.contactUpdateCalls.push({ id: value, patch })
+                return {
+                  eq: () => Promise.resolve({ data: null, error: null }),
+                }
+              }
+              return { eq: (_col: string, value: unknown) => record(value as string) }
+            },
             delete: () => ({
               eq: () => ({
                 in: () => Promise.resolve({ data: null, error: null }),
@@ -1029,6 +1059,122 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     })
     // The BSUID must never be stored as the username.
     expect(h.state.contactInsertCalls[0].username).not.toMatch(/^@?CO\./)
+  })
+
+  it('repairs a bare 16-digit BSUID sitting in phone', async () => {
+    // The prefix-stripped shape the task calls out: `phone` holds
+    // '1008477715690681' with no 'CO.' marker at all, so a
+    // `like 'CO.%'`-only repair would miss it entirely.
+    mockFindExistingContact.mockResolvedValue(null)
+    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
+    h.state.bsuidPhoneContacts = [
+      {
+        id: 'contact-bare',
+        account_id: 'acc-1',
+        phone: '1008477715690681',
+        name: 'Humberto Manrique',
+        username: '@humbertomanrique',
+      },
+    ]
+    h.state.siblingPhoneCandidates = [{ phone: '573122182949' }]
+
+    await runWebhook()
+
+    const patch = h.state.contactUpdateCalls[0]?.patch
+    expect(patch).toBeDefined()
+    // Moved into wa_user_id…
+    expect(patch.wa_user_id).toBe('1008477715690681')
+    // …and phone restored to the real number from the sibling row.
+    expect(patch.phone).toBe('573122182949')
+  })
+
+  it('adds the @ prefix to a bare handle during repair', async () => {
+    mockFindExistingContact.mockResolvedValue(null)
+    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
+    h.state.bsuidPhoneContacts = [
+      {
+        id: 'contact-noat',
+        account_id: 'acc-1',
+        phone: '1008477715690681',
+        name: 'Humberto Manrique',
+        username: 'humbertomanrique',
+      },
+    ]
+
+    await runWebhook()
+
+    const patch = h.state.contactUpdateCalls[0]?.patch ?? {}
+    expect(patch.username).toBe('@humbertomanrique')
+    expect(patch.wa_user_id).toBe('1008477715690681')
+  })
+
+  it('leaves a legitimately long E.164 phone alone during repair', async () => {
+    // The 15-digit LIKE is deliberately over-broad. isBsuidLike must
+    // filter it out so a real (if unusually long) number is never
+    // relocated into wa_user_id.
+    mockFindExistingContact.mockResolvedValue(null)
+    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
+    h.state.bsuidPhoneContacts = [
+      {
+        id: 'contact-real',
+        account_id: 'acc-1',
+        phone: '573122182949',
+        name: 'Real Person',
+      },
+    ]
+
+    await runWebhook()
+
+    const patches = h.state.contactUpdateCalls.map((c) => c.patch)
+    expect(
+      patches.some((p) => p.wa_user_id && !String(p.wa_user_id).includes('573122182949')),
+    ).toBe(false)
+  })
+
+  it('never overwrites a real stored phone with a BSUID', async () => {
+    // 'Humberto Manrique' already has his real number saved. An inbound
+    // carrying ONLY the BSUID must unify onto that row (name match) and
+    // must not clobber the number.
+    mockFindExistingContact.mockResolvedValue(null)
+    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
+    h.state.bsuidLookupResponse = {
+      id: 'contact-real-phone',
+      account_id: 'acc-1',
+      phone: '573122182949',
+      name: 'Humberto Manrique',
+      username: '@humbertomanrique',
+    }
+
+    await POST(bsuidInboundRequest())
+    for (const cb of h.state.afterCallbacks) await cb()
+
+    expect(h.state.contactInsertCalls).toHaveLength(0)
+    const patch = h.state.contactUpdateCalls.find(
+      (c) => c.patch.wa_user_id === '1008477715690681',
+    )?.patch
+    expect(patch).toBeDefined()
+    // The real number survives; only the BSUID is backfilled.
+    expect(patch?.phone).toBeUndefined()
+  })
+
+  it('does not steal a contact already bound to a different BSUID', async () => {
+    // Two different people can share a display name. A row already carrying
+    // another BSUID must never be adopted by name match.
+    mockFindExistingContact.mockResolvedValue(null)
+    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
+    h.state.bsuidLookupResponse = {
+      id: 'contact-other-person',
+      account_id: 'acc-1',
+      phone: '573000000000',
+      name: 'Humberto Manrique',
+      wa_user_id: '999999999999999',
+    }
+
+    await POST(bsuidInboundRequest())
+    for (const cb of h.state.afterCallbacks) await cb()
+
+    // Falls through to a fresh insert rather than merging the two people.
+    expect(h.state.contactInsertCalls).toHaveLength(1)
   })
 
   it('never stores a BSUID as the username', async () => {
