@@ -275,6 +275,7 @@ describe("sendTypingIndicator", () => {
   });
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("sends the read-receipt + typing_indicator payload on the newer API version", async () => {
@@ -333,5 +334,33 @@ describe("sendTypingIndicator", () => {
         messageId: "wamid.INBOUND_1",
       }),
     ).rejects.toThrow("Unsupported API version");
+  });
+
+  it("logs the verbatim Meta error body before throwing", async () => {
+    const rawBody = JSON.stringify({
+      error: {
+        message: "Recipient phone number not in allowed list",
+        code: 131030,
+        type: "OAuthException",
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(rawBody, { status: 400 })),
+    );
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(
+      sendTypingIndicator({
+        phoneNumberId: "test-phone",
+        accessToken: "test-token",
+        messageId: "wamid.INBOUND_1",
+      }),
+    ).rejects.toThrow("Recipient phone number not in allowed list");
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("HTTP 400"),
+      rawBody,
+    );
   });
 });

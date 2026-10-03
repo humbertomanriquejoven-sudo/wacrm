@@ -99,17 +99,45 @@ async function throwMetaError(response: Response, fallback: string): Promise<nev
   let message = fallback
   let code: number | null = null
   let subcode: number | null = null
+
+  // Read the body ONCE as text so the exact payload Meta returned is logged
+  // before it is parsed. `response.json()` consumes the stream, so logging
+  // after a json() read would throw; text() + JSON.parse keeps both the raw
+  // diagnostic and the structured error fields. Every send helper funnels
+  // its non-2xx responses through here, so a BSUID/recipient rejection is
+  // never swallowed without the verbatim cause reaching the console.
+  let raw = ''
   try {
-    const data = (await response.json()) as MetaErrorResponse
-    if (data.error?.message) message = data.error.message
-    if (typeof data.error?.code === 'number') code = data.error.code
-    if (typeof data.error?.error_subcode === 'number') {
-      subcode = data.error.error_subcode
-    }
+    raw = typeof response.text === 'function' ? await response.text() : ''
   } catch {
-    // response body wasn't JSON - keep the fallback
+    raw = ''
   }
-throw new MetaApiError(message, { status: response.status, code, subcode })
+  console.error(
+    `[Meta API] HTTP ${response.status} — ${fallback}`,
+    raw || '(empty response body)',
+  )
+
+  let data: MetaErrorResponse = {}
+  if (raw) {
+    try {
+      data = JSON.parse(raw) as MetaErrorResponse
+    } catch {
+      // response body wasn't JSON - keep the fallback
+    }
+  } else {
+    // No text body available (e.g. a partial mock) - fall back to json().
+    try {
+      data = (await response.json()) as MetaErrorResponse
+    } catch {
+      // keep the fallback
+    }
+  }
+  if (data.error?.message) message = data.error.message
+  if (typeof data.error?.code === 'number') code = data.error.code
+  if (typeof data.error?.error_subcode === 'number') {
+    subcode = data.error.error_subcode
+  }
+  throw new MetaApiError(message, { status: response.status, code, subcode })
 }
 
 // ============================================================
