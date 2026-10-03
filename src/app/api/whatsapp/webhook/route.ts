@@ -743,9 +743,9 @@ async function processMessage(
 
   // Pick the real, dialable number Meta gave us — `messages[].from`,
   // `contacts[0].wa_id`, or `contacts[0].profile.phone`, whichever is the
-  // first one that is genuinely phone-shaped. When only a BSUID or @handle
-  // is disclosed, that id is used as the destination instead — `phone`
-  // must never stay blank.
+  // first one that is genuinely phone-shaped. When only a BSUID is
+  // disclosed, that numeric id is used — `phone` never stays blank and
+  // never holds a '@' handle.
   const trimmedFrom = (message.from ?? '').trim()
   const trimmedWaId = (contact.wa_id ?? '').trim()
   const trimmedProfilePhone = (
@@ -764,23 +764,22 @@ async function processMessage(
   )
   const senderName = contact.profile.name?.trim() || null
 
-  // Destination address for the contact row, in the user's priority
-  // order:
-  //   a) the public @handle — the primary destination whenever Meta
-  //      discloses one;
-  //   b) a real dialable number from from / wa_id / profile.phone;
-  //   c) `messages[0].from` verbatim, but only when it isn't a long
-  //      numeric Meta id (a BSUID must never be treated as a number);
+  // RECEPTOR_ENVIO: the destination id that goes in Meta's `to` field.
+  // ALWAYS numeric or a Meta numeric id — NEVER a '@' handle. Priority:
+  //   a) real dialable number from from / wa_id / profile.phone;
+  //   b) the numeric BSUID Meta gave us for this sender;
+  //   c) `messages[0].from` verbatim when it holds no leading '@';
   //   d) 'unknown' so the NOT NULL column never stays blank.
-  const rawPhone = senderUsername
-    ? senderUsername
-    : isPhoneLike(trimmedFrom)
-      ? normalizePhone(trimmedFrom)
-      : isPhoneLike(trimmedWaId)
-        ? normalizePhone(trimmedWaId)
-        : isPhoneLike(trimmedProfilePhone)
-          ? normalizePhone(trimmedProfilePhone)
-          : trimmedFrom && !isBsuidLike(trimmedFrom)
+  // The @handle is DISPLAY data only and goes to `contacts.username`.
+  const rawPhone = isPhoneLike(trimmedFrom)
+    ? normalizePhone(trimmedFrom)
+    : isPhoneLike(trimmedWaId)
+      ? normalizePhone(trimmedWaId)
+      : isPhoneLike(trimmedProfilePhone)
+        ? normalizePhone(trimmedProfilePhone)
+        : senderUserId
+          ? senderUserId
+          : trimmedFrom && !trimmedFrom.startsWith('@') && !isBsuidLike(trimmedFrom)
             ? trimmedFrom
             : 'unknown'
 
@@ -1860,13 +1859,12 @@ async function sanitizeStoredPhones(): Promise<void> {
       )
       .limit(200)
 
-    if (error || !data || data.length === 0) return
+    const dirty =
+      error || !data
+        ? []
+        : (data as Array<{ id: string; account_id: string; phone: string }>)
 
-    for (const row of data as Array<{
-      id: string
-      account_id: string
-      phone: string
-    }>) {
+    for (const row of dirty) {
       if (!isPhoneLike(row.phone)) continue
       const clean = normalizePhone(row.phone)
       if (!clean || clean === row.phone) continue
@@ -1878,6 +1876,38 @@ async function sanitizeStoredPhones(): Promise<void> {
       console.log(
         `[webhook] sanitized contact ${row.id}: phone "${row.phone}" → "${clean}"`,
       )
+    }
+
+    // Self-heal rows whose `phone` holds an '@handle': move the handle to
+    // `username` and restore the numeric sender id from `wa_user_id`.
+    const { data: atRows, error: atErr } = await db
+      .from('contacts')
+      .select('id, account_id, phone, username, wa_user_id')
+      .like('phone', '@%')
+      .limit(200)
+
+    if (!atErr && atRows) {
+      for (const row of atRows as Array<{
+        id: string
+        account_id: string
+        phone: string
+        username: string | null
+        wa_user_id: string | null
+      }>) {
+        const patch: Record<string, unknown> = {
+          phone: row.wa_user_id ?? 'unknown',
+          updated_at: new Date().toISOString(),
+        }
+        if (!row.username) patch.username = row.phone.startsWith('@') ? row.phone : `@${row.phone}`
+        await db
+          .from('contacts')
+          .update(patch)
+          .eq('id', row.id)
+          .eq('account_id', row.account_id)
+        console.log(
+          `[webhook] healed contact ${row.id}: phone "${row.phone}" → "${patch.phone}"`,
+        )
+      }
     }
   } catch (err) {
     console.warn(

@@ -152,13 +152,21 @@ function assertDialableRecipient(address: string): string {
     console.warn('[send] blocked: empty recipient, no HTTP request was made to Meta.')
     throw new InvalidRecipientError(value)
   }
-  if (isDialablePhone(value)) {
-    const digits = normalizePhone(value)
+  // A '@'-prefixed handle is display data: the destination Meta expects
+  // is the bare numeric id, so strip the prefix rather than sending the
+  // human-facing form.
+  const bare = value.startsWith('@') ? value.slice(1).trim() : value
+  if (!bare) {
+    console.warn('[send] blocked: "@"-only recipient, no HTTP request made.')
+    throw new InvalidRecipientError(value)
+  }
+  if (isDialablePhone(bare)) {
+    const digits = normalizePhone(bare)
     if (isValidE164(digits)) return digits
   }
-  // A BSUID or @handle is a valid destination Meta id: pass it through
+  // A BSUID or bare handle is a valid destination Meta id: pass it through
   // untouched. Anything dialable is normalized to E.164 digits above.
-  return value
+  return bare
 }
 
 async function throwMetaError(response: Response, fallback: string): Promise<never> {

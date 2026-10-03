@@ -182,12 +182,14 @@ vi.mock('@supabase/supabase-js', () => ({
                         .replace(/_/g, '.') +
                       '$',
                   )
-                  return Promise.resolve({
-                    data: (h.state.bsuidPhoneContacts ?? []).filter((row) =>
-                      re.test(String(row[column] ?? '')),
-                    ),
-                    error: null,
-                  })
+                  const rows = (h.state.bsuidPhoneContacts ?? []).filter((row) =>
+                    re.test(String(row[column] ?? '')),
+                  )
+                  // sanitizeStoredPhones chains .like('phone','@%').limit(n)
+                  return Object.assign(
+                    Promise.resolve({ data: rows, error: null }),
+                    { limit: () => Promise.resolve({ data: rows, error: null }) },
+                  )
                 },
                 // purgeEmptyPhoneContacts: select(...).or('phone.is.null,phone.eq.')
                 // sanitizeStoredPhones chains .or(...).limit(n) — support both.
@@ -1018,7 +1020,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     })
   })
 
-  it('stores the @handle in phone and keeps it @-prefixed', async () => {
+  it('stores the numeric BSUID in phone and keeps the handle @-prefixed', async () => {
     // Senders on numbers NOT registered on WhatsApp arrive with a
     // namespaced BSUID ('CO.…') instead of `wa_id`. The contact keeps an
     // EMPTY `phone` — never the Meta id — and the BSUID lives only in
@@ -1032,7 +1034,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     expect(h.state.contactInsertCalls[0]).toMatchObject({
       // No dialable number disclosed: the @handle becomes the destination,
       // `phone` is never blank, and the BSUID lives in wa_user_id.
-      phone: '@anaruiz',
+      phone: '1008477715690681',
       wa_user_id: '1008477715690681',
       // Username keeps the '@' so it renders as WhatsApp shows it.
       username: '@anaruiz',
@@ -1127,7 +1129,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     expect(h.state.contactInsertCalls).toHaveLength(1)
     expect(h.state.contactInsertCalls[0]).toMatchObject({
-      phone: '@anaruiz',
+      phone: '1008477715690681',
       wa_user_id: '1008477715690681',
     })
     expect(
@@ -1194,7 +1196,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     const row = h.state.contactInsertCalls[0]
     expect(row.username).toBeUndefined()
-    expect(row.phone).toBe('unknown')
+    expect(row.phone).toBe('999')
     expect(row.wa_user_id).toBe('999')
   })
 
