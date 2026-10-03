@@ -210,7 +210,7 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
       input.templateName,
       input.language,
     )
-    messageText = templateContentText(resolved.row, input.params ?? []) ?? ''
+    messageText = templateContentText(resolved.row, input.params ?? [])
   } else {
     messageText = input.text
   }
