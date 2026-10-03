@@ -434,6 +434,7 @@
       "tableColumns": {
         "name": "Name",
         "phone": "Phone",
+        "username": "Username",
         "email": "Email",
         "company": "Company",
         "tags": "Tags",

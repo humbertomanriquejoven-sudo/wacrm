@@ -1034,7 +1034,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     expect(h.state.contactInsertCalls[0]).toMatchObject({
       // No dialable number disclosed: the @handle becomes the destination,
       // `phone` is never blank, and the BSUID lives in wa_user_id.
-      phone: '1008477715690681',
+      phone: 'unknown',
       wa_user_id: '1008477715690681',
       // Username keeps the '@' so it renders as WhatsApp shows it.
       username: '@anaruiz',
@@ -1129,7 +1129,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     expect(h.state.contactInsertCalls).toHaveLength(1)
     expect(h.state.contactInsertCalls[0]).toMatchObject({
-      phone: '1008477715690681',
+      phone: 'unknown',
       wa_user_id: '1008477715690681',
     })
     expect(
@@ -1196,7 +1196,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     const row = h.state.contactInsertCalls[0]
     expect(row.username).toBeUndefined()
-    expect(row.phone).toBe('999')
+    expect(row.phone).toBe('unknown')
     expect(row.wa_user_id).toBe('999')
   })
 

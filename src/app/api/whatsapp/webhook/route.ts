@@ -764,24 +764,18 @@ async function processMessage(
   )
   const senderName = contact.profile.name?.trim() || null
 
-  // RECEPTOR_ENVIO: the destination id that goes in Meta's `to` field.
-  // ALWAYS numeric or a Meta numeric id — NEVER a '@' handle. Priority:
-  //   a) real dialable number from from / wa_id / profile.phone;
-  //   b) the numeric BSUID Meta gave us for this sender;
-  //   c) `messages[0].from` verbatim when it holds no leading '@';
-  //   d) 'unknown' so the NOT NULL column never stays blank.
-  // The @handle is DISPLAY data only and goes to `contacts.username`.
+  // RECEPTOR_ENVIO: 'phone' holds ONLY a real E.164 number — never a
+  // '@' handle and never a long BSUID. Priority: `messages[0].from`,
+  // `contacts[0].wa_id`, `contacts[0].profile.phone`, first dialable one
+  // wins (so a BSUID in `from` automatically yields to the real number in
+  // `wa_id`). The BSUID lives in `wa_user_id`, the @handle in `username`.
   const rawPhone = isPhoneLike(trimmedFrom)
     ? normalizePhone(trimmedFrom)
     : isPhoneLike(trimmedWaId)
       ? normalizePhone(trimmedWaId)
       : isPhoneLike(trimmedProfilePhone)
         ? normalizePhone(trimmedProfilePhone)
-        : senderUserId
-          ? senderUserId
-          : trimmedFrom && !trimmedFrom.startsWith('@') && !isBsuidLike(trimmedFrom)
-            ? trimmedFrom
-            : 'unknown'
+        : 'unknown'
 
   // The address we report for this sender. A real number always wins; the
   // BSUID is only a label so an operator reading the logs can tell which

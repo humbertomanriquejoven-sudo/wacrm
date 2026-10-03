@@ -174,6 +174,12 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
                 )}
               </button>
 
+              {contact.username && (
+                <div className="flex items-center gap-2 px-3 py-1 text-sm text-muted-foreground">
+                  <span className="flex-1 text-left">{contact.username}</span>
+                </div>
+              )}
+
               {/* Manual phone capture: when the contact has no usable
                   number yet, the operator can type one here so replies
                   have a real destination. */}

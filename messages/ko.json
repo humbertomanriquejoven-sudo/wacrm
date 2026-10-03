@@ -434,6 +434,7 @@
       "tableColumns": {
         "name": "이름",
         "phone": "전화번호",
+        "username": "사용자명",
         "email": "이메일",
         "company": "회사",
         "tags": "태그",
