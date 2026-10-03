@@ -475,7 +475,11 @@ async function retryAiReplyWithFreshRecipient(args: {
     | null) ?? null;
   if (!contact) return false;
 
-  const queue = await resolveOutboundAddressQueue(contact, args.accountId);
+  const queue = await resolveOutboundAddressQueue(
+    contact,
+    args.accountId,
+    args.conversationId,
+  );
   if (queue.length === 0) return false;
 
   console.warn(

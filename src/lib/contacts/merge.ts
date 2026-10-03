@@ -7,24 +7,28 @@ import {
 } from '@/lib/whatsapp/recipient-resolver'
 
 /**
- * Automatic merge of two rows that describe the same person.
+ * Merge of two rows that carry the SAME Meta identifier.
  *
- * Meta identifies a sender three different ways, and the identity a person
- * uses changes over time: a first message from an unregistered number
- * arrives with only a BSUID, creating a contact whose `phone` holds that
- * opaque id. Their next message from a registered number carries the real
- * phone, and the webhook can match it against a DIFFERENT row. Two rows,
- * one person, one split thread.
+ * A person is only ever folded together when both rows share an identical
+ * BSUID — an opaque, per-WABA id Meta issues for a single user. Phone
+ * numbers and BSUIDs are the only keys allowed to justify a merge; display
+ * names and @usernames are NOT, because they are neither unique nor
+ * authenticated. Two different numbers, or two different BSUIDs, must stay
+ * as two independent contacts and conversations even if the visible profile
+ * name is the same.
  *
- * This module folds the orphan into the real contact:
+ * This is the one legitimate merge shape: a contact already holding a real
+ * `phone` plus a BSUID, and a stale orphan row that still has the same BSUID
+ * sitting in its `phone` column (legacy rows created before `wa_user_id`
+ * existed). `findMergeableOrphan` only returns rows that share the BSUID.
+ *
+ * The fold:
  *   1. every conversation moves across, and so do its messages;
- *   2. identity fields the survivor lacks are absorbed from the orphan
- *      (the BSUID is the whole point — it's the only stable key we have);
+ *   2. identity fields the survivor lacks are absorbed from the orphan;
  *   3. the orphan row is deleted.
  *
- * Destructive by design, and only ever called once the caller has proven
- * both rows are the same person. Everything is scoped by `account_id`, so
- * a merge can never cross tenants.
+ * Destructive by design, and scoped by `account_id`, so a merge can never
+ * cross tenants.
  */
 
 /**
@@ -175,193 +179,75 @@ const EMPTY: Omit<MergeOutcome, 'merged' | 'reason'> = {
   fieldsAbsorbed: [],
 }
 
-/** Fold keys, most to least trustworthy. */
-export type MergeKey = 'wa_user_id' | 'username' | 'name'
-
-/**
- * Compare display names for the name-only fallback.
- *
- * Case-, accent- and whitespace-insensitive, because Meta decorates the
- * same person's name differently across messages ("José Ruiz",
- * "jose ruiz", "Jose  Ruiz ") and a strict equality test would miss all
- * three as one person.
- */
-function sameDisplayName(a?: string | null, b?: string | null): boolean {
-  const fold = (value?: string | null) =>
-    (value ?? '')
-      .normalize('NFD')
-      .replace(/[̀-ͯ]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase()
-  const left = fold(a)
-  return left.length > 0 && left === fold(b)
-}
+/** The only key allowed to justify a merge. */
+export type MergeKey = 'wa_user_id'
 
 /**
  * Decide whether `orphan` and `survivor` are the same person.
  *
- * Ordered strongest-evidence-first. A merge deletes a row and rewrites
- * history, so each tier has to earn its risk:
- *
- *   1. `wa_user_id` — a per-WABA identity, stable across renames and
- *      number changes. Unambiguous.
- *   2. `username` — a global handle, likewise stable.
- *   3. `name` — a *display string*, and the weakest evidence there is:
- *      WhatsApp names are not unique and are freely chosen. Accepted only
- *      because the caller has already proven the name is unambiguous within
- *      the account (see `findMergeableOrphan`), which is why this function
- *      does not check it. Never call this standalone to authorise a merge.
+ * The ONLY evidence accepted is an identical BSUID (`wa_user_id`, or a
+ * BSUID still parked in `phone` on a legacy row). Phone numbers and BSUIDs
+ * are opaque identifiers Meta assigns to one person; display names and
+ * @usernames are not — they are free text that two strangers can share, so
+ * they never authorise a merge that would delete a row and rewrite history.
  *
  * Returns the key that justified the decision, for logging.
  */
 export function mergeJustification(
   orphan: MergeCandidate,
   survivor: MergeCandidate,
-  options: { allowNameMatch?: boolean } = {},
 ): MergeKey | null {
   const orphanBsuid = normalizeMetaIdentifier(orphan.wa_user_id ?? orphan.phone)
   const survivorBsuid = normalizeMetaIdentifier(survivor.wa_user_id ?? survivor.phone)
   if (orphanBsuid && survivorBsuid && orphanBsuid === survivorBsuid) return 'wa_user_id'
-
-  const orphanHandle = normalizeUsername(orphan.username)
-  const survivorHandle = normalizeUsername(survivor.username)
-  if (orphanHandle && survivorHandle && orphanHandle === survivorHandle) return 'username'
-
-  // Opt-in only: the caller must have established the name is unique in
-  // this account, otherwise two strangers sharing a name get merged.
-  if (options.allowNameMatch && sameDisplayName(orphan.name, survivor.name)) return 'name'
-
   return null
 }
 
 /**
- * Find an orphan contact that should be folded into `survivor`.
+ * Find a legacy orphan contact that must be folded into `survivor`.
  *
- * An orphan is a row whose `phone` is not dialable — either empty or still
- * holding a BSUID — that plausibly belongs to `survivor`. Returns null when
- * there is nothing to merge, which is the overwhelmingly common case and
- * must stay cheap: one indexed read, and nothing else when no orphan exists.
+ * A merge is only ever justified by a shared BSUID, so this searches for a
+ * row that carries the survivor's BSUID — either in `wa_user_id` or, for
+ * rows created before that column existed, still parked in `phone`. It
+ * deliberately does NOT look at @username or the display name: those are
+ * not identities, and matching on them would silently fold two different
+ * phone numbers into one contact.
  *
- * Matching widens progressively. A shared BSUID or @handle settles it. When
- * the survivor has neither — Meta gave a real number with no other
- * identifier — the search falls back to the display name, and that fallback
- * only fires when the name identifies exactly ONE other row in the account.
- * Two people called "Ana" therefore never merge, while the single "Ana"
- * with a BSUID-only row does.
+ * Returns null when there is nothing safe to merge, which is the normal
+ * case. A survivor without a real phone or without a BSUID can never
+ * produce a candidate.
  */
 export async function findMergeableOrphan(
   db: SupabaseClient,
   accountId: string,
   survivor: MergeCandidate,
 ): Promise<MergeCandidate | null> {
-  // Only a survivor with a REAL phone is a merge candidate: merging two
-  // identifier-only rows would gain nothing and could lose data.
+  // Only a survivor with a REAL phone is a candidate: the merge exists to
+  // give a phone-less orphan row its number back.
   if (!toDialable(survivor.phone)) return null
 
-  const stable: string[] = []
-  const bsuid = normalizeMetaIdentifier(survivor.wa_user_id)
-  if (bsuid) stable.push(`wa_user_id.eq.${bsuid}`)
-  // Stored usernames keep the leading '@' (see the webhook), so the
-  // PostgREST filter has to reproduce that exact shape or the lookup
-  // silently misses every row.
-  const handle = normalizeUsername(survivor.username)
-  if (handle) stable.push(`username.eq.@${handle}`)
+  const bsuid = normalizeMetaIdentifier(survivor.wa_user_id ?? survivor.phone)
+  if (!bsuid) return null
 
-  const select =
-    'id, account_id, phone, name, username, wa_user_id'
+  const select = 'id, account_id, phone, name, username, wa_user_id'
 
-  if (stable.length > 0) {
-    const { data } = await db
-      .from('contacts')
-      .select(select)
-      .eq('account_id', accountId)
-      .neq('id', survivor.id)
-      .or(stable.join(','))
-      .limit(10)
-
-    const candidates = (data ?? []) as MergeCandidate[]
-    for (const candidate of candidates) {
-      // Must itself be an orphan — a row with a real number is a different
-      // situation (two registered numbers), not something to fold away.
-      if (isDialablePhone(candidate.phone)) continue
-      if (!mergeJustification(candidate, survivor)) continue
-      return candidate
-    }
-    return null
-  }
-
-  // --- Name fallback ----------------------------------------------------
-  // No stable identifier on the survivor. Before trusting a display name we
-  // count how many rows in this account carry it: one is a match, two or
-  // more is an ambiguity we refuse rather than guess at. The count is over
-  // orphans only, so a same-named contact that does have a real number
-  // cannot mask a genuine match.
-  const name = survivor.name?.trim()
-  if (!name) return null
-
-  const { data: nameMatches } = await db
+  const { data } = await db
     .from('contacts')
     .select(select)
     .eq('account_id', accountId)
-    .eq('name', name)
     .neq('id', survivor.id)
+    .or(`wa_user_id.eq.${bsuid},phone.eq.${bsuid}`)
     .limit(10)
 
-  const byName = ((nameMatches ?? []) as MergeCandidate[]).filter(
-    (c) => !isDialablePhone(c.phone),
-  )
-
-  if (byName.length !== 1) {
-    if (byName.length > 1) {
-      console.warn(
-        `[contact-merge] ${survivor.id}: name "${name}" matches ${byName.length} orphan contacts — refusing to guess which one is the same person`,
-      )
-    }
-    return null
+  const candidates = (data ?? []) as MergeCandidate[]
+  for (const candidate of candidates) {
+    // Must itself be an orphan — a row that already has a real number is a
+    // genuinely different contact, not something to fold away.
+    if (isDialablePhone(candidate.phone)) continue
+    if (!mergeJustification(candidate, survivor)) continue
+    return candidate
   }
-
-  // The `.eq('name', …)` filter is an exact match, but the caller's own
-  // name may differ in case or accents from what Meta stored, so the
-  // comparison is redone with the folding rules.
-  const candidate = byName[0]
-  if (!mergeJustification(candidate, survivor, { allowNameMatch: true })) return null
-
-  console.log(
-    `[contact-merge] ${survivor.id}: no BSUID or username, falling back to the unique name match "${name}" with orphan ${candidate.id}`,
-  )
-  return candidate
-}
-
-/**
- * Is a display-name match safe to act on for this pair?
- *
- * True only when the two rows share no stable identity (nothing better to
- * go on), their names match, and exactly one orphan in the account carries
- * that name. Re-queries rather than trusting a flag threaded in from the
- * caller, because by the time `mergeContactInto` runs, rows may have moved.
- */
-async function isNameUnambiguous(
-  db: SupabaseClient,
-  accountId: string,
-  survivor: MergeCandidate,
-  orphan: MergeCandidate,
-): Promise<boolean> {
-  // A stable identity shared by both rows already settles it; the name
-  // check is irrelevant and would only add a pointless query.
-  if (mergeJustification(orphan, survivor)) return false
-
-  const name = survivor.name?.trim()
-  if (!name || !orphan.name?.trim()) return false
-
-  const { count } = await db
-    .from('contacts')
-    .select('id', { count: 'exact', head: true })
-    .eq('account_id', accountId)
-    .eq('name', name)
-    .neq('id', survivor.id)
-
-  return count === 1
+  return null
 }
 
 /**
@@ -411,16 +297,15 @@ export async function mergeContactInto(
     return { ...EMPTY, merged: false, reason: 'cross-tenant merge refused' }
   }
 
-// Re-check the evidence here, independently of how the orphan was
+  // Re-check the evidence here, independently of how the orphan was
   // discovered. `findMergeableOrphan` already proved it, but this function
   // is also callable directly (the phone-edit route does), and a caller
   // that hands over two rows it merely *thinks* are the same person must
-  // not be able to trigger a destructive merge. A name match requires the
-  // caller to have established uniqueness via `findMergeableOrphan`.
+  // not be able to trigger a destructive merge. Only an identical BSUID is
+  // accepted — never a name or @username.
   const outcome: MergeOutcome = { merged: false, ...EMPTY }
 
-  const allowNameMatch = await isNameUnambiguous(db, accountId, survivor, orphan)
-  const justification = mergeJustification(orphan, survivor, { allowNameMatch })
+  const justification = mergeJustification(orphan, survivor)
   if (!justification) {
     return { ...outcome, merged: false, reason: 'no shared identity (refusing to merge)' }
   }

@@ -117,7 +117,11 @@ export function normalizeUsername(value: string | null | undefined): string | nu
 /**
  * The identity keys a contact can be looked up by, in the order we trust
  * them. Used to build the PostgREST `.or(...)` filter, so a single query
- * covers phone, BSUID and handle at once.
+ * covers phone and BSUID at once.
+ *
+ * @username is deliberately NOT part of this set: it is not an identifier,
+ * and including it would let a handle match pull a second, different phone
+ * number into the same contact.
  */
 export function identityFilterParts(contact: RecipientCandidate): string[] {
   const parts: string[] = []
@@ -125,87 +129,52 @@ export function identityFilterParts(contact: RecipientCandidate): string[] {
   if (phone) parts.push(`phone.eq.${phone}`)
   const bsuid = normalizeMetaIdentifier(contact.wa_user_id ?? contact.phone)
   if (bsuid) parts.push(`wa_user_id.eq.${bsuid}`)
-  const handle = normalizeUsername(contact.username)
-  if (handle) parts.push(`username.eq.${handle}`)
   return parts
 }
 
 /**
- * Search for a real phone number belonging to the same person as
- * `contact`, using only identity we already trust for that person.
+ * Recover a real phone number for `contact` from its OWN conversation
+ * history only.
  *
- * Runs when the contact's own `phone` is not dialable — typically because
- * it holds a BSUID left behind by an older handler. Three sources, in
- * decreasing trust:
+ * The bot must answer the exact address the customer wrote from. A number
+ * found on any OTHER contact row is out of bounds — it may belong to a
+ * different phone number/profile, and using it would deliver the reply to
+ * the wrong person. So this never queries sibling contacts.
  *
- *   1. the contact's own row (a stale read-through of a value that is
- *      already correct);
- *   2. a sibling row in the same account sharing this contact's BSUID /
- *      handle / exact display name that DOES carry a number — the common
- *      shape after a person wrote from a registered number and later from
- *      an unregistered one;
- *   3. this contact's own message history, which records the address Meta
- *      actually used on each delivery.
- *
- * Source 3 is scoped to this contact's conversations, so it can only ever
- * return a number this person really wrote from.
+ * Resolution order:
+ *   1. the contact's own `phone`, when it is already dialable (a stale
+ *      read-through rather than a recovery);
+ *   2. the newest dialable `sender_phone` recorded on messages of THIS
+ *      contact's conversation. When `conversationId` is given, the search
+ *      is confined to that single thread.
  *
  * Returns null when nothing has a number: we never fabricate one.
  */
 export async function findRecoverablePhone(
   contact: RecipientCandidate,
   accountId: string,
+  conversationId?: string | null,
 ): Promise<{ phone: string; fromContactId: string | null } | null> {
-  const parts = identityFilterParts(contact)
-  if (parts.length === 0) return null
+  const own = toDialable(contact.phone)
+  if (own) return { phone: own, fromContactId: contact.id ?? null }
+  if (!contact.id) return null
 
-  // Display name is the weakest key, so only use it when the row carries
-  // nothing stronger — a fuzzy/shared name must not attach a stranger's
-  // number to this contact.
-  if (!parts.some((p) => p.startsWith('wa_user_id.') || p.startsWith('username.'))) {
-    if (contact.name) parts.push(`name.eq.${contact.name.replace(/[,()]/g, '')}`)
-  }
-
-  const db = supabaseAdmin()
-  const { data } = await db
-    .from('contacts')
-    .select('id, phone')
-    .eq('account_id', accountId)
-    .or(parts.join(','))
-    .limit(25)
-
-  let fallback: { phone: string; fromContactId: string | null } | null = null
-  for (const row of (data ?? []) as Array<{ id: string; phone: string }>) {
-    const dialable = toDialable(row.phone)
-    if (!dialable) continue
-    // Prefer the contact's OWN row: if it has a number we simply read
-    // through a stale snapshot rather than merging another identity.
-    if (row.id === contact.id) return { phone: dialable, fromContactId: row.id }
-    if (!fallback) fallback = { phone: dialable, fromContactId: row.id }
-  }
-
-  // A sibling row holds a current, operator-visible number: prefer it.
-  if (fallback) return fallback
-
-  // Only then the history. Meta sends a real `from` on most deliveries even
-  // when the contact row ended up holding a BSUID, and that address is
-  // recorded per message (`messages.sender_phone`), so a number the CRM
-  // never captured can still be recovered. Ranked last because it is a
-  // snapshot of the past: a sibling's number is more likely to be current.
-  const fromHistory = contact.id
-    ? await findPhoneInMessageHistory(contact.id, accountId).catch(() => null)
-    : null
+  const fromHistory = await findPhoneInMessageHistory(
+    contact.id,
+    accountId,
+    conversationId,
+  ).catch(() => null)
   if (fromHistory) return { phone: fromHistory, fromContactId: null }
-
   return null
 }
 
 /**
- * The newest real number Meta ever used on this contact's messages.
+ * The newest real number Meta ever used on this contact's own messages.
  *
- * Scoped to the contact's own conversations, so a stranger's number can
- * never be picked up here. Only E.164 values are considered: a stored
- * BSUID is exactly the thing we're trying to get past.
+ * Scoped to this contact's conversations — and, when `conversationId` is
+ * given, to that single conversation — so a number that belongs to a
+ * different contact can never be picked up. Only E.164 values are
+ * considered: a stored BSUID is exactly the thing we're trying to get past.
  *
  * Best-effort by design — any failure yields null and the caller falls
  * through to the identifier branches.
@@ -213,20 +182,33 @@ export async function findRecoverablePhone(
 async function findPhoneInMessageHistory(
   contactId: string,
   accountId: string,
+  conversationId?: string | null,
 ): Promise<string | null> {
   const db = supabaseAdmin()
 
-  // `messages` has no account_id (tenancy is via conversation_id), so the
-  // conversations are resolved first. One contact has at most a couple of
-  // threads, so this stays a short IN list rather than a join.
-  const { data: conversations } = await db
-    .from('conversations')
-    .select('id')
-    .eq('account_id', accountId)
-    .eq('contact_id', contactId)
-    .limit(20)
-
-  const ids = ((conversations ?? []) as Array<{ id: string }>).map((c) => c.id)
+  // `messages` has no account_id, so the conversation ids are resolved
+  // first and scoped to this contact. This is the isolation boundary:
+  // another contact's thread must never be consulted.
+  let ids: string[]
+  if (conversationId) {
+    const { data: conversation } = await db
+      .from('conversations')
+      .select('id')
+      .eq('id', conversationId)
+      .eq('account_id', accountId)
+      .eq('contact_id', contactId)
+      .maybeSingle()
+    if (!conversation) return null
+    ids = [(conversation as { id: string }).id]
+  } else {
+    const { data: conversations } = await db
+      .from('conversations')
+      .select('id')
+      .eq('account_id', accountId)
+      .eq('contact_id', contactId)
+      .limit(20)
+    ids = ((conversations ?? []) as Array<{ id: string }>).map((c) => c.id)
+  }
   if (ids.length === 0) return null
 
   // Newest first: a number the customer used recently is far likelier to
@@ -245,7 +227,9 @@ async function findPhoneInMessageHistory(
     const dialable = toDialable(row.sender_phone ?? null)
     if (dialable) {
       console.log(
-        `[recipient-resolver] recovered a valid number for contact ${contactId} from its message history: ${dialable}`,
+        `[recipient-resolver] recovered a valid number for contact ${contactId}${
+          conversationId ? ` in conversation ${conversationId}` : ''
+        } from its message history: ${dialable}`,
       )
       return dialable
     }
@@ -256,10 +240,11 @@ async function findPhoneInMessageHistory(
 /**
  * Resolve the value Meta should receive in `to`, for any contact.
  *
- * Resolution order:
+ * Resolution order — everything comes from THIS contact (and its own
+ * thread), never from another contact:
  *   1. `contact.phone`, if it is a dialable E.164 number.
- *   2. A real number recovered from a sibling row sharing this contact's
- *      identity — the case where `phone` still holds a BSUID.
+ *   2. A real number recovered from this contact's OWN conversation
+ *      history (`messages.sender_phone`), when `phone` still holds a BSUID.
  *   3. `wa_user_id` — Meta accepts a BSUID as the recipient for
  *      BSUID/Threads/API conversations.
  *   4. `username`, as a last resort.
@@ -270,6 +255,7 @@ async function findPhoneInMessageHistory(
 export async function resolveRecipient(
   contact: RecipientCandidate | null | undefined,
   accountId: string,
+  conversationId?: string | null,
 ): Promise<ResolvedRecipient> {
   if (!contact) return { to: '', source: 'bsuid', isPhone: false }
 
@@ -278,8 +264,10 @@ export async function resolveRecipient(
   if (own) return { to: own, source: 'phone', isPhone: true }
 
   // 2. `phone` is missing or holds an identifier — look for a real number
-  //    under the same identity before giving up.
-  const recovered = await findRecoverablePhone(contact, accountId).catch(() => null)
+  //    in this contact's own thread before giving up.
+  const recovered = await findRecoverablePhone(contact, accountId, conversationId).catch(
+    () => null,
+  )
   if (recovered) {
     return {
       to: recovered.phone,
@@ -325,14 +313,16 @@ export function isRecipientRejection(err: unknown): boolean {
 export async function sendWithRecipientFallback<T>(args: {
   contact: RecipientCandidate
   accountId: string
+  /** The contact's thread, so recovery only ever reads its own history. */
+  conversationId?: string | null
   send: (to: string) => Promise<T>
   /** Persist a recovered number so the stale value stops recurring. */
   onRecovered?: (phone: string) => void | Promise<void>
 }): Promise<T> {
-  const { contact, accountId, send, onRecovered } = args
+  const { contact, accountId, conversationId, send, onRecovered } = args
   const attempted = new Set<string>()
 
-  const first = await resolveRecipient(contact, accountId)
+  const first = await resolveRecipient(contact, accountId, conversationId)
   if (!first.to) throw new Error('contact not found for this account')
 
   if (first.source === 'recovered' && first.isPhone && onRecovered) {
@@ -351,7 +341,11 @@ export async function sendWithRecipientFallback<T>(args: {
     const own = toDialable(contact.phone)
     if (own && !attempted.has(own)) alternatives.push(own)
 
-    const recovered = await findRecoverablePhone(contact, accountId).catch(() => null)
+    const recovered = await findRecoverablePhone(
+      contact,
+      accountId,
+      conversationId,
+    ).catch(() => null)
     if (recovered && !attempted.has(recovered.phone)) {
       alternatives.push(recovered.phone)
       if (onRecovered) {

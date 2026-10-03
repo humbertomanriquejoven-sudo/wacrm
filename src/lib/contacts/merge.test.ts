@@ -140,49 +140,39 @@ describe('mergeJustification', () => {
     expect(mergeJustification(ORPHAN_BSUID, SURVIVOR)).toBeNull();
   });
 
-  it('matches on a shared username', () => {
+  it('never matches on a shared username', () => {
+    // Two different numbers can share a handle; merging would be unsafe.
     expect(
       mergeJustification(
         { ...ORPHAN_BSUID, username: '@ana.ruiz' },
-        SURVIVOR
+        { ...SURVIVOR, username: 'ana.ruiz' }
       )
-    ).toBe('username');
+    ).toBeNull();
   });
 
-  it('refuses a name match by default, since names are not unique', () => {
-    expect(mergeJustification(ORPHAN_BSUID, SURVIVOR)).toBeNull();
-  });
-
-  it('accepts a name match only when explicitly allowed', () => {
-    expect(
-      mergeJustification(ORPHAN_BSUID, SURVIVOR, { allowNameMatch: true })
-    ).toBe('name');
-  });
-
-  it('ignores case and accents when a name match is allowed', () => {
+  it('never matches on a shared display name', () => {
     expect(
       mergeJustification(
-        { ...ORPHAN_BSUID, name: '  ANA   RUÍZ ' },
-        { ...SURVIVOR, name: 'ana ruiz' },
-        { allowNameMatch: true }
+        { ...ORPHAN_BSUID, name: 'Ana Ruiz' },
+        { ...SURVIVOR, name: 'Ana Ruiz' }
       )
-    ).toBe('name');
+    ).toBeNull();
   });
 
-  it('does not treat an empty name as a match', () => {
+  it('matches two legacy rows that both park the BSUID in phone', () => {
     expect(
-      mergeJustification({ ...ORPHAN_BSUID, name: null }, SURVIVOR, {
-        allowNameMatch: true,
-      })
-    ).toBeNull();
+      mergeJustification(
+        { ...ORPHAN_BSUID, wa_user_id: null },
+        { ...SURVIVOR, phone: `CO.${BSUID}`, wa_user_id: null }
+      )
+    ).toBe('wa_user_id');
   });
 
   it('returns null when nothing is shared', () => {
     expect(
       mergeJustification(
         { ...ORPHAN_BSUID, username: 'otra', name: 'Otra Persona' },
-        { ...SURVIVOR, username: 'ana.ruiz' },
-        { allowNameMatch: true }
+        SURVIVOR
       )
     ).toBeNull();
   });
@@ -202,11 +192,24 @@ describe('findMergeableOrphan', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('finds an orphan sharing the username', async () => {
-    const { db } = makeDb({
-      contacts: [SURVIVOR, { ...ORPHAN_BSUID, username: '@ana.ruiz' }],
+  it('returns null when the survivor has no BSUID', async () => {
+    const { db, calls } = makeDb({ contacts: [ORPHAN_BSUID] });
+    const found = await findMergeableOrphan(db, 'acct-1', {
+      ...SURVIVOR,
+      wa_user_id: null,
     });
-    const found = await findMergeableOrphan(db, 'acct-1', SURVIVOR);
+    expect(found).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  it('finds an orphan sharing the BSUID', async () => {
+    const { db } = makeDb({
+      contacts: [{ ...SURVIVOR, wa_user_id: BSUID }, ORPHAN_BSUID],
+    });
+    const found = await findMergeableOrphan(db, 'acct-1', {
+      ...SURVIVOR,
+      wa_user_id: BSUID,
+    });
     expect(found?.id).toBe('c-orphan');
   });
 
@@ -214,48 +217,45 @@ describe('findMergeableOrphan', () => {
     const { db } = makeDb({
       contacts: [SURVIVOR, { ...ORPHAN_BSUID, phone: '573009999999' }],
     });
-    const found = await findMergeableOrphan(db, 'acct-1', SURVIVOR);
+    const found = await findMergeableOrphan(db, 'acct-1', {
+      ...SURVIVOR,
+      wa_user_id: BSUID,
+    });
     expect(found).toBeNull();
   });
 
-  it('falls back to the name when the survivor has no stable identity', async () => {
+  it('never returns a same-named row that carries a different BSUID', async () => {
     const { db } = makeDb({
       contacts: [
         SURVIVOR,
-        { ...SURVIVOR, id: 'c-real' }, // the survivor itself
-        { ...ORPHAN_BSUID, username: null },
+        {
+          ...ORPHAN_BSUID,
+          id: 'c-other',
+          name: 'Ana Ruiz',
+          wa_user_id: '1000000000000000',
+          phone: 'CO.1000000000000000',
+        },
       ],
     });
-    const found = await findMergeableOrphan(
-      db,
-      'acct-1',
-      { ...SURVIVOR, username: null, wa_user_id: null }
-    );
-    expect(found?.id).toBe('c-orphan');
-  });
-
-  it('refuses a name match when several orphans share that name', async () => {
-    const { db } = makeDb({
-      contacts: [
-        { ...SURVIVOR, id: 'c-real', username: null, wa_user_id: null },
-        { ...ORPHAN_BSUID, id: 'c-a', username: null },
-        { ...ORPHAN_BSUID, id: 'c-b', username: null },
-      ],
+    const found = await findMergeableOrphan(db, 'acct-1', {
+      ...SURVIVOR,
+      wa_user_id: BSUID,
     });
-    const found = await findMergeableOrphan(
-      db,
-      'acct-1',
-      { ...SURVIVOR, username: null, wa_user_id: null }
-    );
     expect(found).toBeNull();
   });
 
-  it('does not look up by name when the survivor has no name', async () => {
-    const { db } = makeDb({ contacts: [ORPHAN_BSUID] });
+  it('does not fall back to a name match', async () => {
+    const { db } = makeDb({
+      contacts: [
+        SURVIVOR,
+        { ...ORPHAN_BSUID, username: null, name: 'Ana Ruiz' },
+        { ...ORPHAN_BSUID, id: 'c-other', username: null, name: 'Ana Ruiz' },
+      ],
+    });
     const found = await findMergeableOrphan(
       db,
       'acct-1',
-      { ...SURVIVOR, name: null, username: null, wa_user_id: null }
+      { ...SURVIVOR, username: null, wa_user_id: null }
     );
     expect(found).toBeNull();
   });
@@ -295,7 +295,7 @@ describe('mergeContactInto', () => {
     expect(calls.filter((c) => c.op === 'update')).toHaveLength(0);
   });
 
-  it('refuses an ambiguous name match with no shared identity', async () => {
+  it('refuses to merge two rows that share only a name', async () => {
     const { db, calls } = makeDb({
       contacts: [
         { ...SURVIVOR, username: null, wa_user_id: null },
@@ -307,15 +307,13 @@ describe('mergeContactInto', () => {
       survivorId: 'c-real',
       orphanId: 'c-orphan',
     });
-    // One row carries the name, so the name is unambiguous and this
-    // particular pair is allowed — but the orphan must still be an orphan.
-    expect(outcome.merged).toBe(true);
-    expect(calls.some((c) => c.op === 'delete' && c.table === 'contacts')).toBe(
-      true
-    );
+    // A display name is not evidence, so the destructive merge must refuse.
+    expect(outcome.merged).toBe(false);
+    expect(outcome.reason).toMatch(/no shared identity/);
+    expect(calls.filter((c) => c.op === 'delete')).toHaveLength(0);
   });
 
-  it('refuses a name match when a second orphan shares the name', async () => {
+  it('refuses a merge when the pair shares no BSUID', async () => {
     const { db, calls } = makeDb({
       contacts: [
         { ...SURVIVOR, username: null, wa_user_id: null },
@@ -334,8 +332,14 @@ describe('mergeContactInto', () => {
   });
 
   it('absorbs the BSUID onto the survivor and deletes the orphan', async () => {
+    // Legacy survivor: the BSUID is still parked in `phone` and there is no
+    // `wa_user_id` yet. The orphan carries the same BSUID in its own column,
+    // so the merge is justified — and the survivor gains the column.
     const { db, calls } = makeDb({
-      contacts: [SURVIVOR, ORPHAN_BSUID],
+      contacts: [
+        { ...SURVIVOR, phone: `CO.${BSUID}`, wa_user_id: null },
+        ORPHAN_BSUID,
+      ],
       conversations: [],
     });
     const outcome = await mergeContactInto(db, {
@@ -388,7 +392,7 @@ describe('mergeContactInto', () => {
 
   it('folds the orphan thread into the survivor when both already have one', async () => {
     const { db, calls } = makeDb({
-      contacts: [SURVIVOR, ORPHAN_BSUID],
+      contacts: [{ ...SURVIVOR, wa_user_id: BSUID }, ORPHAN_BSUID],
       conversations: [
         { id: 'conv-orphan', account_id: 'acct-1', contact_id: 'c-orphan' },
         { id: 'conv-real', account_id: 'acct-1', contact_id: 'c-real' },
@@ -426,7 +430,7 @@ describe('mergeContactInto', () => {
     // the orphan without moving them would cascade or null them, quietly
     // destroying the history the merge is supposed to preserve.
     const { db, calls } = makeDb({
-      contacts: [SURVIVOR, ORPHAN_BSUID],
+      contacts: [{ ...SURVIVOR, wa_user_id: BSUID }, ORPHAN_BSUID],
       conversations: [],
     });
     const outcome = await mergeContactInto(db, {
@@ -452,7 +456,7 @@ describe('mergeContactInto', () => {
 
   it('reassigns the orphan conversation when the survivor has none', async () => {
     const { db, calls } = makeDb({
-      contacts: [SURVIVOR, ORPHAN_BSUID],
+      contacts: [{ ...SURVIVOR, wa_user_id: BSUID }, ORPHAN_BSUID],
       conversations: [
         { id: 'conv-orphan', account_id: 'acct-1', contact_id: 'c-orphan' },
       ],

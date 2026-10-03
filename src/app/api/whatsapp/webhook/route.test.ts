@@ -35,12 +35,6 @@ const h = vi.hoisted(() => ({
       name: string | null
       phone: string
     } | null,
-    /** findContactByNameWithoutPhone return value. */
-    contactByNameResult: null as {
-      id: string
-      name: string | null
-      phone: string
-    } | null,
     /** Patches applied via contacts.update. */
     contactUpdateCalls: [] as { id?: unknown; patch: Record<string, unknown> }[],
     /** Rows inserted via contacts.insert. */
@@ -144,11 +138,10 @@ vi.mock('@supabase/supabase-js', () => ({
             select: () => {
               // `eq()` is called twice with different columns and the
               // answer must depend on WHICH column: findOrCreateContact
-              // queries by `wa_user_id` (step 1), by `username` (step 3)
-              // and by `name` (step 5), all through the same
-              // `.eq().eq().limit()` shape. Filter the configured row by
-              // the second filter so a `wa_user_id` mismatch doesn't also
-              // masquerade as a name match.
+              // queries by `wa_user_id` (step 1) and by `username` (step 3),
+              // both through the same `.eq().eq().limit()` shape. Filter the
+              // configured row by the second filter so a `wa_user_id`
+              // mismatch doesn't masquerade as a username match.
               let secondFilter: { column: string; value: unknown } | null = null
               const secondEqResult = {
                 limit: (n: number) =>
@@ -170,9 +163,7 @@ vi.mock('@supabase/supabase-js', () => ({
                   reject?: (e: unknown) => unknown,
                 ) =>
                   Promise.resolve({
-                    data: h.state.contactByNameResult
-                      ? [h.state.contactByNameResult]
-                      : [],
+                    data: [],
                     error: null,
                   }).then(resolve, reject),
               }
@@ -345,7 +336,6 @@ vi.mock('@/lib/whatsapp/meta-api', () => ({
 }))
 vi.mock('@/lib/contacts/dedupe', () => ({
   findExistingContact: vi.fn(),
-  findContactByNameWithoutPhone: vi.fn(),
   isUniqueViolation: () => false,
 }))
 vi.mock('@/lib/whatsapp/webhook-signature', () => ({
@@ -379,10 +369,7 @@ import { POST } from './route'
 import { getMediaUrl, downloadMedia, sendTypingIndicator } from '@/lib/whatsapp/meta-api'
 import { transcribeAudio } from '@/lib/ai/transcribe'
 import { engineSendText } from '@/lib/flows/meta-send'
-import {
-  findExistingContact,
-  findContactByNameWithoutPhone,
-} from '@/lib/contacts/dedupe'
+import { findExistingContact } from '@/lib/contacts/dedupe'
 
 const mockGetMediaUrl = vi.mocked(getMediaUrl)
 const mockDownloadMedia = vi.mocked(downloadMedia)
@@ -390,7 +377,6 @@ const mockSendTypingIndicator = vi.mocked(sendTypingIndicator)
 const mockTranscribeAudio = vi.mocked(transcribeAudio)
 const mockEngineSendText = vi.mocked(engineSendText)
 const mockFindExistingContact = vi.mocked(findExistingContact)
-const mockFindContactByNameWithoutPhone = vi.mocked(findContactByNameWithoutPhone)
 
 const TEXT_MESSAGE = {
   id: 'wamid.TEST1',
@@ -488,7 +474,6 @@ beforeEach(() => {
   h.state.storageUploads = []
   h.state.storageUploadError = null
   h.state.existingContactResult = null
-  h.state.contactByNameResult = null
   h.state.contactsInsertResponse = null
   h.state.bsuidLookupResponse = null
   h.state.bsuidPhoneContacts = []
@@ -518,7 +503,6 @@ beforeEach(() => {
     name: 'Ada',
     phone: '15551230000',
   })
-  mockFindContactByNameWithoutPhone.mockResolvedValue(null)
   h.runAutomationsForTrigger.mockImplementation(() => {
     h.state.automationStarted++
     return new Promise<void>((resolve) => {
@@ -1013,27 +997,17 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     })
   })
 
-  it('adopts a number-less contact matched solely by profile name', async () => {
-    // No row matches the number, but an existing contact has the same
-    // WhatsApp profile name and no phone assigned.
+  it('does not adopt a number-less row matched only by profile name', async () => {
+    // Display names are not identities: an inbound carrying a real phone
+    // gets its own contact even when another phone-less row shares the name.
     mockFindExistingContact.mockResolvedValue(null)
-    mockFindContactByNameWithoutPhone.mockResolvedValue({
-      id: 'contact-2',
-      name: 'Ada',
-      phone: '',
-    })
 
     await runWebhook()
 
-    expect(mockFindContactByNameWithoutPhone).toHaveBeenCalledTimes(1)
-    expect(h.state.contactInsertCalls).toHaveLength(0)
-    expect(h.state.contactUpdateCalls).toHaveLength(1)
-    // Only `phone` is written: the row already carries the profile name, and
-    // the backfill deliberately never clobbers a stored display name. The
-    // point of this path is filling the empty `phone`.
-    expect(h.state.contactUpdateCalls[0].patch).toMatchObject({
+    expect(h.state.contactInsertCalls).toHaveLength(1)
+    expect(h.state.contactInsertCalls[0]).toMatchObject({
       phone: '15551230000',
-      updated_at: expect.any(String),
+      name: 'Ada',
     })
   })
 
@@ -1043,7 +1017,6 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     // got an empty `phone`, which made engineSend* throw "contact not
     // found" — the typing indicator fired but nothing was ever delivered.
     mockFindExistingContact.mockResolvedValue(null)
-    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
 
     await POST(bsuidInboundRequest())
     for (const cb of h.state.afterCallbacks) await cb()
@@ -1066,7 +1039,6 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     // '1008477715690681' with no 'CO.' marker at all, so a
     // `like 'CO.%'`-only repair would miss it entirely.
     mockFindExistingContact.mockResolvedValue(null)
-    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
     h.state.bsuidPhoneContacts = [
       {
         id: 'contact-bare',
@@ -1090,7 +1062,6 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
   it('adds the @ prefix to a bare handle during repair', async () => {
     mockFindExistingContact.mockResolvedValue(null)
-    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
     h.state.bsuidPhoneContacts = [
       {
         id: 'contact-noat',
@@ -1113,7 +1084,6 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     // filter it out so a real (if unusually long) number is never
     // relocated into wa_user_id.
     mockFindExistingContact.mockResolvedValue(null)
-    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
     h.state.bsuidPhoneContacts = [
       {
         id: 'contact-real',
@@ -1131,12 +1101,12 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     ).toBe(false)
   })
 
-  it('never overwrites a real stored phone with a BSUID', async () => {
-    // 'Humberto Manrique' already has his real number saved. An inbound
-    // carrying ONLY the BSUID must unify onto that row (name match) and
-    // must not clobber the number.
+  it('gives a BSUID-only sender its own contact and never touches a same-named row', async () => {
+    // 'Humberto Manrique' already has a real number saved on one row, but a
+    // BSUID that is not stored anywhere belongs to nobody yet. Sharing a
+    // display name is not identity: the sender gets a new contact and the
+    // real number is left untouched.
     mockFindExistingContact.mockResolvedValue(null)
-    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
     h.state.bsuidLookupResponse = {
       id: 'contact-real-phone',
       account_id: 'acc-1',
@@ -1148,20 +1118,20 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     await POST(bsuidInboundRequest())
     for (const cb of h.state.afterCallbacks) await cb()
 
-    expect(h.state.contactInsertCalls).toHaveLength(0)
-    const patch = h.state.contactUpdateCalls.find(
-      (c) => c.patch.wa_user_id === '1008477715690681',
-    )?.patch
-    expect(patch).toBeDefined()
-    // The real number survives; only the BSUID is backfilled.
-    expect(patch?.phone).toBeUndefined()
+    expect(h.state.contactInsertCalls).toHaveLength(1)
+    expect(h.state.contactInsertCalls[0]).toMatchObject({
+      phone: '1008477715690681',
+      wa_user_id: '1008477715690681',
+    })
+    expect(
+      h.state.contactUpdateCalls.filter((c) => c.patch.phone),
+    ).toHaveLength(0)
   })
 
   it('does not steal a contact already bound to a different BSUID', async () => {
     // Two different people can share a display name. A row already carrying
-    // another BSUID must never be adopted by name match.
+    // another BSUID must never be adopted by a same-name match.
     mockFindExistingContact.mockResolvedValue(null)
-    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
     h.state.bsuidLookupResponse = {
       id: 'contact-other-person',
       account_id: 'acc-1',
@@ -1180,7 +1150,6 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
   it('never stores a BSUID as the username', async () => {
     // A payload with no usable handle must not end up writing '@CO.…'.
     mockFindExistingContact.mockResolvedValue(null)
-    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
 
     const body = {
       entry: [
@@ -1227,7 +1196,6 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     // a registered number. Matching on phone alone would create a second
     // contact row for them.
     mockFindExistingContact.mockResolvedValue(null)
-    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
     h.state.bsuidLookupResponse = {
       id: 'contact-existing',
       account_id: 'acc-1',
@@ -1249,7 +1217,6 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     // the identifier into wa_user_id and normalizes the handle so the
     // dedupe pre-filter can finally match the real number.
     mockFindExistingContact.mockResolvedValue(null)
-    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
     h.state.bsuidPhoneContacts = [
       {
         id: 'contact-broken',
@@ -1276,7 +1243,6 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     // and the broken one holding the BSUID. The repair should adopt the
     // real number from the sibling rather than inventing one.
     mockFindExistingContact.mockResolvedValue(null)
-    mockFindContactByNameWithoutPhone.mockResolvedValue(null)
     h.state.bsuidPhoneContacts = [
       {
         id: 'contact-broken',

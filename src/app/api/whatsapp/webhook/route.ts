@@ -7,7 +7,6 @@ import { normalizePhone } from '@/lib/whatsapp/phone-utils'
 import * as recipientResolver from '@/lib/whatsapp/recipient-resolver'
 import {
   findExistingContact,
-  findContactByNameWithoutPhone,
   isUniqueViolation,
 } from '@/lib/contacts/dedupe'
 import { reopenClosedConversation } from '@/lib/conversations/reopen'
@@ -1925,23 +1924,27 @@ interface SenderIdentity {
 }
 
 /**
- * Resolve the contact for an inbound message, matching on ANY of the
- * three identifiers Meta can send, and never inserting a second row for
- * someone we already track.
+ * Resolve the contact for an inbound message.
+ *
+ * Profiles are kept INDEPENDENT per real identity: matching only ever uses
+ * the phone number or the BSUID Meta sent. Display names and @usernames are
+ * never used to attach an inbound to an existing row when the sender also
+ * carries a phone or BSUID, because two different numbers that happen to
+ * share a profile name are two different people. A second number therefore
+ * always gets its own contact and its own conversation.
  *
  * Match order is deliberate:
  *   1. BSUID    — an opaque id that uniquely identifies a person within a
  *                WABA, so it's the only truly unambiguous key we have.
- *   2. phone    — via the shared `phonesMatch` helper, so the webhook,
- *                the manual form and CSV import all agree on "same
- *                number" (including trunk-prefix tolerance).
- *   3. username — a public handle; stable across renames, and the only
- *                handle available when Meta sends neither number nor BSUID.
- *   4. name-only— a row created from the form / CSV with no number yet.
+ *   2. phone    — via the shared helper, so the webhook, the manual form
+ *                and CSV import all agree on "same number" (trunk-prefix
+ *                tolerant).
+ *   3. username — used ONLY when Meta sent no number and no BSUID. In that
+ *                case the handle is the sender's only identity, so it is
+ *                safe to match on.
  *
- * The old code only ever matched on (2). A sender who first reached us as
- * a bare BSUID and later messaged from their registered number therefore
- * got a SECOND contact row — the duplication this replaces.
+ * Name is never a key: WhatsApp display names are not unique and must not
+ * merge or adopt a row.
  */
 async function findOrCreateContact(
   accountId: string,
@@ -1968,8 +1971,10 @@ async function findOrCreateContact(
     existingContact = await findExistingContact(db, accountId, phone)
   }
 
-  // 3. Username.
-  if (!existingContact && username) {
+  // 3. Username — ONLY when there is no phone and no BSUID. With either of
+  //    those present, a handle match would fold a different number into this
+  //    row, which is exactly the cross-number unification we forbid.
+  if (!existingContact && !phone && !waUserId && username) {
     const { data } = await db
       .from('contacts')
       .select('*')
@@ -1979,63 +1984,17 @@ async function findOrCreateContact(
     if (data && data.length > 0) existingContact = data[0] as ContactRow
   }
 
-  // 4. A row with this WhatsApp profile name but no number assigned yet
-  //    (created from the form or CSV). Adopt it rather than duplicate.
-  if (!existingContact && name) {
-    existingContact = await findContactByNameWithoutPhone(db, accountId, name)
-  }
-
-  // 5. BSUID-only inbound matching a row we already track by NAME.
+  // 4. Single dynamic `.or()` pass over the strong identifiers only.
   //
-  //    This is the unification case the BSUID change introduced: a person
-  //    who first wrote from their registered number got a row with
-  //    phone='573122182949'; later they write from an unregistered number
-  //    and Meta sends ONLY the BSUID, so steps 1–4 all miss and we'd insert
-  //    a duplicate. An exact profile-name hit is the only remaining
-  //    evidence they are the same person.
-  //
-  //    Guarded deliberately:
-  //    - only when we actually hold a BSUID (no number ⇒ this path is
-  //      reached only for unidentified senders);
-  //    - only an EXACT name match, never fuzzy, since display names are the
-  //      weakest of the four keys;
-  //    - never steal a row already bound to a DIFFERENT BSUID, which would
-  //      merge two genuinely different people.
-  if (!existingContact && waUserId && name) {
-    const { data } = await db
-      .from('contacts')
-      .select('*')
-      .eq('account_id', accountId)
-      .eq('name', name.trim())
-      .limit(5)
-
-    const candidates = (data ?? []) as ContactRow[]
-    existingContact =
-      candidates.find((c) => !c.wa_user_id || c.wa_user_id === waUserId) ?? null
-    if (existingContact) {
-      console.log(
-        `[webhook] unified BSUID-only sender onto existing contact ${existingContact.id} via name "${name}" (wa_user_id ${waUserId})`,
-      )
-    }
-  }
-
-  // 6. Single dynamic `.or()` pass over ALL identifiers at once.
-  //
-  //    Steps 1–5 query each key separately, which is precise but costs a
-  //    round-trip per key. When Meta sends a payload carrying several
-  //    identifiers at once (a phone AND a BSUID, say) the first three
-  //    steps can each match a DIFFERENT row, and picking the first hit
-  //    would leave the person split across two contacts.
-  //
-  //    This asks one question instead: is there a row matching any of the
-  //    identifiers we hold? Built entirely from the payload's own values,
-  //    so it works the same for every contact and every identifier shape.
-  //    Scoped to the account so a match can never cross tenants.
+  //    Steps 1–2 already cover BSUID and phone individually; this asks the
+  //    same question in one round-trip for payloads that carry several
+  //    identifiers at once. Username is deliberately excluded — see the
+  //    match order above. Scoped to the account so it can never cross
+  //    tenants.
   if (!existingContact) {
     const parts = identityFilterParts({
       phone,
       wa_user_id: waUserId,
-      username,
     })
     if (parts.length > 0) {
       const { data } = await db
@@ -2046,14 +2005,11 @@ async function findOrCreateContact(
         .limit(5)
       const candidates = (data ?? []) as ContactRow[]
       if (candidates.length > 0) {
-        // Prefer a row that agrees on the STRONGEST identifier present.
-        // A BSUID match beats a handle match beats a name match, because
-        // those are progressively weaker evidence of identity.
+        // Prefer the strongest identifier present: a BSUID match beats a
+        // phone match.
         existingContact =
           candidates.find((c) => waUserId && c.wa_user_id === waUserId) ??
           candidates.find((c) => phone && toDialable(c.phone) === phone) ??
-          candidates.find((c) => username && c.username === username) ??
-          candidates.find((c) => !c.wa_user_id || !waUserId) ??
           candidates[0]
         console.log(
           `[webhook] matched contact ${existingContact.id} via dynamic identity filter (${parts.join(' | ')})`,
@@ -2061,6 +2017,7 @@ async function findOrCreateContact(
       }
     }
   }
+
 
   if (existingContact) {
     // Backfill whatever this payload tells us that the row is missing, so

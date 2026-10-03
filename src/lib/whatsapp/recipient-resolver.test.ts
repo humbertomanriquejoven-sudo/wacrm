@@ -88,17 +88,23 @@ describe('normalizeUsername', () => {
 })
 
 describe('identityFilterParts', () => {
-  it('builds one filter per identity the payload carries', () => {
+  it('builds one filter per STRONG identity the payload carries', () => {
     const parts = identityFilterParts({
       phone: '573122182949',
       wa_user_id: '1008477715690681',
       username: 'humbertomanrique',
     })
+    // Username is deliberately absent: matching on a handle could pull a
+    // different phone number into this contact.
     expect(parts).toEqual([
       'phone.eq.573122182949',
       'wa_user_id.eq.1008477715690681',
-      'username.eq.@humbertomanrique',
     ])
+  })
+
+  it('never emits a username filter, even when only the handle is present', () => {
+    const parts = identityFilterParts({ username: 'humbertomanrique' })
+    expect(parts).toEqual([])
   })
 
   it('omits a BSUID found sitting in the phone column', () => {
@@ -155,16 +161,12 @@ describe('findRecoverablePhone', () => {
   /**
    * Chainable stub keyed by table, so each query resolves to the rows that
    * table is meant to return. Written out rather than reused from the
-   * contact-query mocks above because the history fallback issues two
+   * contact-query mocks above because the history lookup issues two
    * different shapes (`conversations` then `messages`, the latter with
    * `.not` and `.order`).
    */
   function mockTables(tables: Record<string, unknown[]>) {
     mocks.fromAny.mockImplementation((table: string) => {
-      // `contacts` keeps the shared mock chain so the sibling search is
-      // steered by `mocks.limit`, exactly as the other tests do it.
-      if (table === 'contacts') return { select: mocks.select }
-
       const rows = tables[table] ?? []
       const b: Record<string, unknown> = {}
       const chain = () => b
@@ -179,13 +181,14 @@ describe('findRecoverablePhone', () => {
     })
   }
 
-  it('reads the contact own row before anything else', async () => {
-    mocks.limit.mockResolvedValue({
-      data: [{ id: 'contact-1', phone: '573122182949' }],
-      error: null,
-    })
-    const found = await findRecoverablePhone(ORPHAN, 'acct-1')
+  it('returns the contact own number when it is already dialable', async () => {
+    const found = await findRecoverablePhone(
+      { id: 'contact-1', phone: '573122182949' },
+      'acct-1',
+    )
     expect(found).toEqual({ phone: '573122182949', fromContactId: 'contact-1' })
+    // No history lookup needed.
+    expect(mocks.fromAny).not.toHaveBeenCalled()
   })
 
   it('returns null when nothing has a usable address', async () => {
@@ -194,12 +197,14 @@ describe('findRecoverablePhone', () => {
     expect(found).toBeNull()
   })
 
-  it('recovers a number from the contact message history', async () => {
-    mocks.limit.mockResolvedValue({ data: [], error: null })
+  it('recovers a number from the contact own message history', async () => {
     mockTables({
       conversations: [{ id: 'conv-1' }],
       // Newest first: a BSUID, then the real number Meta used earlier.
-      messages: [{ sender_phone: 'CO.1008477715690681' }, { sender_phone: '573122182949' }],
+      messages: [
+        { sender_phone: 'CO.1008477715690681' },
+        { sender_phone: '573122182949' },
+      ],
     })
 
     const found = await findRecoverablePhone(ORPHAN, 'acct-1')
@@ -207,7 +212,6 @@ describe('findRecoverablePhone', () => {
   })
 
   it('ignores BSUIDs stored on messages, since they are what it is escaping', async () => {
-    mocks.limit.mockResolvedValue({ data: [], error: null })
     mockTables({
       conversations: [{ id: 'conv-1' }],
       messages: [{ sender_phone: 'CO.1008477715690681' }],
@@ -218,24 +222,42 @@ describe('findRecoverablePhone', () => {
   })
 
   it('does not consult history when the contact has no conversations', async () => {
-    mocks.limit.mockResolvedValue({ data: [], error: null })
     mockTables({ conversations: [], messages: [{ sender_phone: '573122182949' }] })
 
     const found = await findRecoverablePhone(ORPHAN, 'acct-1')
     expect(found).toBeNull()
   })
 
-  it('prefers a sibling contact number over the history fallback', async () => {
-    mocks.limit.mockResolvedValue({
-      data: [{ id: 'contact-2', phone: '573001112233' }],
-      error: null,
-    })
+  it('confines the search to the given conversation', async () => {
     mockTables({
-      conversations: [{ id: 'conv-1' }],
+      conversations: [{ id: 'conv-9' }],
       messages: [{ sender_phone: '573122182949' }],
     })
 
+    const found = await findRecoverablePhone(ORPHAN, 'acct-1', 'conv-9')
+    expect(found).toEqual({ phone: '573122182949', fromContactId: null })
+  })
+
+  it('returns null when the given conversation does not belong to the contact', async () => {
+    // `maybeSingle` resolves null, so no message rows are read.
+    mockTables({
+      conversations: [],
+      messages: [{ sender_phone: '573122182949' }],
+    })
+
+    const found = await findRecoverablePhone(
+      ORPHAN,
+      'acct-1',
+      'someone-elses-conv',
+    )
+    expect(found).toBeNull()
+  })
+
+  it('never reads numbers from other contacts', async () => {
+    mockTables({ conversations: [{ id: 'conv-1' }], messages: [] })
     const found = await findRecoverablePhone(ORPHAN, 'acct-1')
-    expect(found).toEqual({ phone: '573001112233', fromContactId: 'contact-2' })
+    expect(found).toBeNull()
+    const queriedTables = mocks.fromAny.mock.calls.map((c) => c[0])
+    expect(queriedTables).not.toContain('contacts')
   })
 })

@@ -61,11 +61,13 @@ export async function resolveOutboundAddressQueue(
     name?: string | null
   },
   accountId: string,
+  conversationId?: string | null,
   primary?: string,
 ): Promise<string[]> {
-  const head = primary ?? (await resolveRecipient(contact, accountId)).to
+  const head =
+    primary ?? (await resolveRecipient(contact, accountId, conversationId)).to
   if (!head) return []
-  return recipientAddressQueue(contact, accountId, head)
+  return recipientAddressQueue(contact, accountId, head, conversationId)
 }
 
 interface SendTextEngineArgs {
@@ -140,6 +142,7 @@ async function recipientAddressQueue(
   },
   accountId: string,
   primary: string,
+  conversationId?: string | null,
 ): Promise<string[]> {
   const queue = [primary]
   const push = (value: string | null | undefined) => {
@@ -149,10 +152,14 @@ async function recipientAddressQueue(
   const own = toDialable(contact.phone)
   push(own)
 
-  // A number sitting on a sibling identity row — the usual outcome when
-  // `phone` still holds a BSUID but the person has messaged from a
-  // registered number before.
-  const recovered = await findRecoverablePhone(contact, accountId).catch(() => null)
+  // A number Meta actually used on THIS contact's own thread — the usual
+  // outcome when `phone` still holds a BSUID but the person has messaged
+  // from a registered number before. Never reads another contact's rows.
+  const recovered = await findRecoverablePhone(
+    contact,
+    accountId,
+    conversationId,
+  ).catch(() => null)
   push(recovered?.phone)
 
   push(normalizeMetaIdentifier(contact.wa_user_id ?? contact.phone))
@@ -166,7 +173,7 @@ async function recipientAddressQueue(
  * Shared by every sender below so the four paths can't drift apart. The
  * address comes entirely from `resolveRecipient`, which decides at call
  * time whether this contact is reachable by number, by a number we can
- * recover from a sibling identity, or by BSUID/handle.
+ * recover from its own thread, or by BSUID/handle.
  *
  * A recovered number is written back onto the contact row: without that,
  * a contact whose `phone` still holds a BSUID would re-run the lookup on
@@ -181,8 +188,9 @@ async function prepareRecipient(
     name?: string | null
   },
   accountId: string,
+  conversationId?: string | null,
 ): Promise<{ to: string; sanitized: string; isPhone: boolean }> {
-  const recipient = await resolveRecipient(contact, accountId)
+  const recipient = await resolveRecipient(contact, accountId, conversationId)
   if (!recipient.to) throw new Error('contact not found for this account')
 
   if (recipient.source === 'recovered' && recipient.isPhone && contact.id) {
@@ -221,7 +229,11 @@ export async function engineSendText(
   if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-  const { to: target, sanitized } = await prepareRecipient(contact, args.accountId)
+  const { to: target, sanitized } = await prepareRecipient(
+    contact,
+    args.accountId,
+    args.conversationId,
+  )
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
@@ -249,7 +261,12 @@ export async function engineSendText(
   let waMessageId = ''
   let workingPhone = ''
   let lastError: unknown = null
-  const addressQueue = await recipientAddressQueue(contact, args.accountId, target)
+  const addressQueue = await recipientAddressQueue(
+    contact,
+    args.accountId,
+    target,
+    args.conversationId,
+  )
 
   for (const address of addressQueue) {
     workingPhone = address
@@ -357,7 +374,11 @@ export async function engineSendAiReply(
   if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-  const { to: target, sanitized } = await prepareRecipient(contact, args.accountId)
+  const { to: target, sanitized } = await prepareRecipient(
+    contact,
+    args.accountId,
+    args.conversationId,
+  )
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
@@ -385,7 +406,12 @@ export async function engineSendAiReply(
   // Dynamic recipient resolution, resolved ONCE for the whole reply rather
   // than per fragment: every bubble of a reply must reach the same person,
   // and re-resolving mid-reply could split it across two addresses.
-  const addressQueue = await recipientAddressQueue(contact, args.accountId, target)
+  const addressQueue = await recipientAddressQueue(
+    contact,
+    args.accountId,
+    target,
+    args.conversationId,
+  )
 
   for (let i = 0; i < fragments.length; i++) {
     // Keep composing state alive between bubbles. The webhook already
@@ -515,7 +541,11 @@ export async function engineSendMedia(
   if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-  const { to: target, sanitized } = await prepareRecipient(contact, args.accountId)
+  const { to: target, sanitized } = await prepareRecipient(
+    contact,
+    args.accountId,
+    args.conversationId,
+  )
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
@@ -541,7 +571,12 @@ export async function engineSendMedia(
     return r.messageId
   }
 
-  const addressQueue = await recipientAddressQueue(contact, args.accountId, target)
+  const addressQueue = await recipientAddressQueue(
+    contact,
+    args.accountId,
+    target,
+    args.conversationId,
+  )
   let workingPhone = sanitized
   let waMessageId = ''
   let lastError: unknown = null
@@ -676,7 +711,11 @@ async function sendInteractiveViaMeta(
   if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-const { to: target, sanitized } = await prepareRecipient(contact, input.accountId)
+const { to: target, sanitized } = await prepareRecipient(
+    contact,
+    input.accountId,
+    input.conversationId,
+  )
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
@@ -718,7 +757,12 @@ const { to: target, sanitized } = await prepareRecipient(contact, input.accountI
   // Dynamic recipient resolution + retry, identical policy to the text and
   // media senders: walk this contact's addresses (and format variants of
   // each) until Meta accepts one.
-  const addressQueue = await recipientAddressQueue(contact, input.accountId, target)
+  const addressQueue = await recipientAddressQueue(
+    contact,
+    input.accountId,
+    target,
+    input.conversationId,
+  )
   let workingPhone = sanitized
   let waMessageId = ''
   let lastError: unknown = null
