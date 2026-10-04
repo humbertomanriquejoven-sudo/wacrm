@@ -335,7 +335,13 @@ export async function ver_disponibilidad(
   const from = parseWindowBound(desde, /* isEnd */ false);
   const to = parseWindowBound(hasta, /* isEnd */ true);
   if (!from || !to) {
-    return 'Error: fecha inválida. Usa formato ISO 8601 en hora de Bogotá, por ejemplo 2026-09-17 o 2026-09-17T15:00:00-05:00.';
+    return [
+      'Error: no se pudo interpretar una de las fechas como fecha.',
+      `Usa formato ISO 8601 en hora de Bogotá, por ejemplo 2026-09-17 o 2026-09-17T15:00:00-05:00.`,
+      'Si el cliente pidió algo relativo ("dentro de 2 días", "el martes que viene"), ' +
+        'resuélvelo con la hora actual de Bogotá antes de llamar a esta herramienta.',
+      `Ahora en Bogotá: ${bogotaIso(new Date())}.`,
+    ].join(' ');
   }
 
   // Flexibilidad con hora puntual: si la consulta es un único instante
@@ -344,10 +350,25 @@ export async function ver_disponibilidad(
   // (18:00 → 18:00-18:45) en lugar de rechazarlo. Así el modelo NUNCA
   // recibe un aviso de que no se puede verificar una hora puntual.
   if (from.getTime() >= to.getTime() && hasExplicitTime(desde)) {
-    const start = parseAppointmentStart(desde);
-    if (start === null) {
-      return 'Error: la hora indicada no es válida o cae fuera del horario de atención (lunes a domingo de 08:00 a 23:00).';
+    const point = parseAppointmentStartDetailed(desde);
+    if (point.kind === 'unparseable') {
+      return [
+        'Error: no se pudo interpretar la hora indicada como fecha.',
+        `Recibido: "${desde}". Usa formato ISO 8601 en hora de Bogotá, por ejemplo 2026-09-18T18:00:00-05:00.`,
+        `Ahora en Bogotá: ${bogotaIso(new Date())}.`,
+      ].join(' ');
     }
+    if (point.kind === 'outside_hours') {
+      return [
+        `Error: la hora "${bogotaIso(point.date)}" es válida pero cae fuera del horario de atención.`,
+        'NO cambies la fecha: solo mueve la hora.',
+        `Horario de atención: ${hhmm(point.openMin)}–${hhmm(point.closeMin)}; la última hora ` +
+          `de inicio posible para una cita de ${APPOINTMENT_DURATION_MIN} minutos es ` +
+          `${hhmm(point.closeMin - APPOINTMENT_DURATION_MIN)}.`,
+        'Vuelve a llamar a ver_disponibilidad con la hora corregida.',
+      ].join(' ');
+    }
+    const start = point.date;
     const end = new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000);
     let busy: BusyInterval[];
     try {
@@ -681,10 +702,11 @@ function withTimeout<T>(
 export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
   const { db, accountId, contactoId, inicio, nombre, motivo, correoCliente } =
     args;
-  const start = parseAppointmentStart(inicio);
-  if (start === null) {
-    return 'Error: "inicio" no es una fecha válida o cae fuera del horario de atención.';
+  const parsedStart = parseAppointmentStartDetailed(inicio);
+  if (parsedStart.kind !== 'ok') {
+    return appointmentStartError(parsedStart, inicio);
   }
+  const start = parsedStart.date;
   // Motivo por defecto: el flujo nunca debe bloquearse preguntando por el
   // motivo cuando el usuario no lo mencionó.
   const motivoFinal = motivo?.trim() || 'Consulta / Valoración';
@@ -1183,18 +1205,107 @@ function parseWindowBound(value: string, isEnd: boolean): Date | null {
   return parseBogotaInstant(trimmed);
 }
 
+/**
+ * Why an appointment start was refused.
+ *
+ * These are genuinely different failures and MUST stay distinguishable:
+ * conflating them tells the model a perfectly valid date was invalid, and
+ * the natural "fix" it then invents is to mangle the date itself.
+ *
+ *   - `unparseable` — the string is not a date at all (e.g. the model passed
+ *     the customer's own words, "dentro de 2 días a las 2pm"). The remedy is
+ *     to CONVERT it to an absolute instant.
+ *   - `outside_hours` — a valid instant that falls outside BUSINESS_HOURS or
+ *     would not fit APPOINTMENT_DURATION_MIN before closing. The date is
+ *     correct; only the time needs to move.
+ *   - `ok` — usable.
+ */
+type AppointmentStartResult =
+  | { kind: 'ok'; date: Date }
+  | { kind: 'unparseable' }
+  | { kind: 'outside_hours'; date: Date; openMin: number; closeMin: number };
+
 /** Validate an appointment start: parseable AND inside business hours. */
-function parseAppointmentStart(value: string): Date | null {
+function parseAppointmentStartDetailed(value: string): AppointmentStartResult {
   const d = parseBogotaInstant(value);
-  if (!d) return null;
+  if (!d) return { kind: 'unparseable' };
 
   const p = bogotaParts(d);
   const hours = BUSINESS_HOURS[p.weekday];
-  if (!hours) return null;
+  if (!hours) return { kind: 'outside_hours', date: d, openMin: 0, closeMin: 0 };
 
   const minuteOfDay = p.hour * 60 + p.minute;
-  if (minuteOfDay < hours.openMin) return null;
-  if (minuteOfDay + APPOINTMENT_DURATION_MIN > hours.closeMin) return null;
+  if (minuteOfDay < hours.openMin) {
+    return { kind: 'outside_hours', date: d, openMin: hours.openMin, closeMin: hours.closeMin };
+  }
+  if (minuteOfDay + APPOINTMENT_DURATION_MIN > hours.closeMin) {
+    return { kind: 'outside_hours', date: d, openMin: hours.openMin, closeMin: hours.closeMin };
+  }
 
-  return d;
+  return { kind: 'ok', date: d };
+}
+
+/**
+ * Validate an appointment start: parseable AND inside business hours.
+ * Null-returning wrapper kept for the existing callers/tests.
+ */
+function parseAppointmentStart(value: string): Date | null {
+  const r = parseAppointmentStartDetailed(value);
+  return r.kind === 'ok' ? r.date : null;
+}
+
+/** Minute-of-day -> "14:30" for human/model-readable windows. */
+function hhmm(minuteOfDay: number): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(Math.floor(minuteOfDay / 60))}:${pad(minuteOfDay % 60)}`;
+}
+
+/** Every weekday currently shares one window, so label it from one entry. */
+const BUSINESS_HOURS_LABEL = `${hhmm(BUSINESS_HOURS[0].openMin)}–${hhmm(
+  BUSINESS_HOURS[0].closeMin
+)}`;
+
+/**
+ * Tool-result text for a refused `inicio`.
+ *
+ * This string is handed straight back to the model, which has only
+ * MAX_TOOL_ROUNDS attempts, so it must be self-sufficient: name the exact
+ * required format, hand over the current Bogotá wall clock (so a relative
+ * phrase like "dentro de 2 días a las 2pm" is resolvable without another
+ * round trip), and state explicitly whether the date was wrong or merely
+ * out of hours.
+ */
+function appointmentStartError(
+  result: Exclude<AppointmentStartResult, { kind: 'ok' }>,
+  received: string
+): string {
+  const now = new Date();
+
+  if (result.kind === 'unparseable') {
+    return [
+      'Error: "inicio" no se pudo interpretar como fecha.',
+      `Recibido: "${received}".`,
+      'Debes convertirlo a un instante absoluto en formato ISO 8601 con hora ' +
+        'y desplazamiento de Bogotá, por ejemplo "2026-09-17T14:00:00-05:00".',
+      'Si el cliente pidió una fecha relativa ("dentro de 2 días", "el martes ' +
+        'que viene", "mañana a las 2pm") o una nota de voz ambigua, no la reenvíes ' +
+        'tal cual: resuélvela con la hora actual de Bogotá que aparece abajo y luego ' +
+        'llama de nuevo a agendar_cita.',
+      `Ahora en Bogotá: ${bogotaIso(now)}.`,
+      `La cita dura ${APPOINTMENT_DURATION_MIN} minutos y el horario de atención es ` +
+        `${BUSINESS_HOURS_LABEL}.`,
+    ].join(' ');
+  }
+
+  const { date, openMin, closeMin } = result;
+  const lastStartMin = closeMin - APPOINTMENT_DURATION_MIN;
+  return [
+    `Error: la fecha "${bogotaIso(date)}" es válida pero cae fuera del horario de atención.`,
+    'NO cambies la fecha: solo mueve la hora.',
+    `Horario de atención para ese día: ${hhmm(openMin)}–${hhmm(closeMin)}. ` +
+      `La última hora posible para empezar una cita de ${APPOINTMENT_DURATION_MIN} ` +
+      `minutos es ${hhmm(lastStartMin)}.`,
+    'Vuelve a llamar a agendar_cita con la fecha corregida, o usa ' +
+      'ver_disponibilidad para ofrecerle al cliente otras opciones.',
+  ].join(' ');
 }

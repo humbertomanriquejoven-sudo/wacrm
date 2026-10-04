@@ -210,7 +210,11 @@ describe('ver_disponibilidad', () => {
 
   it('reports a clear error for an unparseable date', async () => {
     const out = await ver_disponibilidad('no-es-fecha', '2026-09-18');
-    expect(out).toContain('fecha inválida');
+    expect(out).toContain('no se pudo interpretar');
+    // The model needs the target format and the current clock to self-correct
+    // inside its limited tool rounds.
+    expect(out).toMatch(/2026-09-17T15:00:00-05:00/);
+    expect(out).toMatch(/Ahora en Bogotá: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}-05:00/);
   });
 });
 
@@ -324,6 +328,47 @@ describe('agendar_cita', () => {
       nombre: 'X',
     });
     expect(out).toContain('Error');
+    expect(h.insert).not.toHaveBeenCalled();
+  });
+
+  // The two refusal modes used to share one message ("no es una fecha válida
+  // o cae fuera del horario"), which told the model a perfectly good date was
+  // invalid. The model's natural repair is then to mangle the date itself.
+  it('tells the model the date was VALID and only the hour is wrong', async () => {
+    const supabase = db();
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      inicio: '2026-09-14T03:00:00-05:00',
+      nombre: 'X',
+    });
+    expect(out).toContain('es válida');
+    expect(out).toContain('NO cambies la fecha');
+    // Must NOT claim the date itself was unparseable.
+    expect(out).not.toContain('no se pudo interpretar');
+    // Business window + last viable start, so the model needs no extra round.
+    expect(out).toContain('08:00');
+    expect(out).toContain('22:15');
+    expect(h.insert).not.toHaveBeenCalled();
+  });
+
+  it('rejects a relative phrase and hands back the clock to resolve it', async () => {
+    const supabase = db();
+    const out = await agendar_cita({
+      db: supabase as never,
+      accountId: 'acct-1',
+      contactoId: 'contact-1',
+      // What the model passes when it forwards the customer's words verbatim.
+      inicio: 'dentro de 2 días a las 2pm',
+      nombre: 'X',
+    });
+    expect(out).toContain('no se pudo interpretar');
+    expect(out).toContain('dentro de 2 días a las 2pm');
+    // Expected output format spelled out.
+    expect(out).toMatch(/2026-09-17T14:00:00-05:00/);
+    // Current Bogotá wall clock, so "dentro de 2 días" is resolvable here.
+    expect(out).toMatch(/Ahora en Bogotá: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}-05:00/);
     expect(h.insert).not.toHaveBeenCalled();
   });
 
