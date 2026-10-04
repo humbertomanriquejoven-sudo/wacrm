@@ -8,7 +8,6 @@ import {
 import { decrypt } from '@/lib/whatsapp/encryption'
 import {
   isDialablePhone,
-  metaRecipientFields,
   phoneVariants,
   isRecipientNotAllowedError,
   sanitizePhoneForMeta,
@@ -18,7 +17,7 @@ import {
   templateContentText,
 } from '@/lib/whatsapp/template-body'
 import { supabaseAdmin } from './admin-client'
-import { resolveRecipient } from '@/lib/whatsapp/recipient-resolver'
+import { resolveBestRecipient } from '@/lib/whatsapp/recipient-resolver'
 
 // ------------------------------------------------------------
 // Automation-side Meta sender.
@@ -45,6 +44,11 @@ interface SendTextArgs {
   text: string
   /** Meta field destination: 'to' for phone numbers, 'recipient' for BSUID/username. */
   destination?: 'to' | 'recipient'
+  /** Meta id (wamid) of the inbound message this send answers. Used to anchor
+   *  the reply via `context`, which is the only way Meta delivers to a
+   *  contact it cannot address directly. Resolved from the conversation when
+   *  omitted, so callers rarely need to pass it. */
+  contextMessageId?: string
 }
 
 interface SendTemplateArgs {
@@ -56,46 +60,44 @@ interface SendTemplateArgs {
   language?: string
   params?: string[]
   destination?: 'to' | 'recipient'
-}
-
-/** Resolved recipient from `resolveRecipient` — may contain `to` (phone) or
- *  `recipient` (BSUID/username), and `isPhone` tells which field to use. */
-interface ResolvedRecipient {
-  to: string
-  isPhone: boolean
-  recoveredFrom?: { contactId?: string | null; field?: 'phone' | 'wa_user_id' }
-}
-
-/** Template row result — caller must await before accessing .row. */
-interface ResolvedTemplate {
-  row: MessageTemplate | null
-}
-
-/** Result of sending a text message via Meta. */
-interface MetaSendResult {
-  messageId: string
-}
-
-/** Input for sending a text message via Meta Cloud API. */
-interface SendTextMessageInput {
-  phoneNumberId: string
-  accessToken: string
-  to: string
-  recipient?: string
-  text: string
   contextMessageId?: string
 }
 
-/** Input for sending a template message via Meta Cloud API. */
-interface SendTemplateMessageInput {
-  phoneNumberId: string
-  accessToken: string
-  to: string
-  recipient?: string
-  templateName: string
-  language?: string
-  params?: string[]
-  contextMessageId?: string
+/**
+ * The wamid of the most recent INBOUND message in a conversation.
+ *
+ * Meta authorizes a reply to a contact it cannot address directly (a
+ * `@user` / `@lid` display id, or an anonymous id) only when the request
+ * quotes the message that started the thread. This reads that id back from
+ * the thread itself rather than requiring every caller to thread it through,
+ * which keeps the send generic: no destination-specific knowledge, and it
+ * works for any contact regardless of how they entered.
+ *
+ * Best-effort — a conversation with no inbound row yet simply yields null,
+ * and the send then proceeds without a context anchor (and will be refused
+ * by `sendTextMessage` if the address is not independently addressable).
+ */
+async function findInboundWamid(
+  db: ReturnType<typeof supabaseAdmin>,
+  conversationId: string,
+): Promise<string | undefined> {
+  const { data } = await db
+    .from('messages')
+    .select('message_id, sender_type')
+    .eq('conversation_id', conversationId)
+    .not('message_id', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(10)
+
+  // `sender_type` distinguishes the customer's messages from our own; only
+  // the customer's wamid is valid in `context`.
+  for (const row of (data ?? []) as Array<{
+    message_id?: string | null
+    sender_type?: string | null
+  }>) {
+    if (row.message_id && row.sender_type !== 'bot') return row.message_id
+  }
+  return undefined
 }
 
 export async function engineSendText(args: SendTextArgs): Promise<{ whatsapp_message_id: string }> {
@@ -168,7 +170,12 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   // new tenancy column.
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone, wa_user_id, username')
+    // `wa_id` and `recipient_id` are selected deliberately: a contact who
+    // entered through a `@user` / `@lid` display id has no dialable number,
+    // and those two columns are the only place the id Meta actually used is
+    // preserved. Omitting them forced the resolver to fall through to
+    // `username` and then fail.
+    .select('id, phone, wa_user_id, username, wa_id, recipient_id')
     .eq('id', input.contactId)
     .eq('account_id', input.accountId)
     .maybeSingle()
@@ -176,16 +183,19 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
     throw new Error('contact not found for this account')
   }
 
-  // Resolve the best recipient for this contact (phone, BSUID, or username).
-  const recipient = await resolveRecipient(contact, input.accountId, input.conversationId)
+  // Dynamic recipient resolution — nothing about the destination is hardcoded.
+  // Priority is decided from the row at call time:
+  //   1. a dialable `phone`;
+  //   2. `wa_id` (the numeric id from the inbound message's `from`);
+  //   3. `wa_user_id` (the BSUID);
+  //   4. `recipient_id`;
+  //   5. `username`, plus recovery from this contact's own message history.
+  const recipient = await resolveBestRecipient(
+    contact,
+    input.accountId,
+    input.conversationId,
+  )
   if (!recipient.to) throw new Error('contact not found for this account')
-
-  // Use metaRecipientFields to route the address to the correct Meta field.
-  // - Phone numbers go in `to`.
-  // - BSUID / username go in `recipient`.
-  // - The recipientResolution type only exposes `to` and `isPhone`; when
-  //   `isPhone` is false the address in `to` should be sent via `recipient`.
-  const { to: toField, recipient: recipientField } = metaRecipientFields(recipient.to!)
 
   // Build the body based on whether this is a phone or an opaque identifier.
   const isPhone = recipient.isPhone
@@ -203,7 +213,11 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   const accessToken = decrypt(config.access_token)
 
   // Message text — resolved template body for templates, raw text otherwise.
+  // The template row is resolved ONCE here and reused for the persisted
+  // `content_text` below; the two used to be fetched independently, which
+  // meant a second round-trip for a row already in hand.
   let messageText: string
+  let templateRow: MessageTemplate | null = null
   if (input.kind === 'template') {
     const resolved = await resolveTemplateRow(
       db,
@@ -211,6 +225,7 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
       input.templateName,
       input.language,
     )
+    templateRow = resolved.row
     messageText = templateContentText(resolved.row, input.params ?? []) ?? ''
   } else {
     messageText = input.text
@@ -218,31 +233,61 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
 
   // Resolve the outbound address.
   //
-  // Priority:
-  //   1. A real dialable number → send via `to` with trunk-prefix variants.
-  //   2. A BSUID or @username → send via `recipient` (single form, no variants).
+  // The resolved address is passed as `to` and NOTHING else:
+  // `sendTextMessage` owns the routing decision, classifying the value into
+  // Meta's `to` (E.164 phone) or `recipient` (opaque id such as a BSUID or a
+  // `@lid`). This module previously declared its own input shape with a
+  // `recipient` field and sent `to: ''` for the non-phone case — but
+  // `sendTextMessage` never accepted that field, so the id was silently
+  // discarded and `to: ''` tripped `assertDialableRecipient`. Every BSUID /
+  // `@lid` automation send therefore threw before reaching the network.
   //
-  // If `recipient.to` is set (dialable number), we use phoneVariants for
-  // trunk-prefix retries. If `recipient.recipient` is set (BSUID/handle),
-  // we send it directly — there is only one form.
+  // `contextMessageId` anchors the reply to the inbound wamid. That block is
+  // the ONLY thing that authorizes delivery to a contact Meta will not
+  // accept as a bare `to` value, so it is resolved dynamically from the
+  // conversation when the caller didn't supply it.
   let waMessageId = ''
   let workingPhone = ''
 
+  const contextMessageId =
+    input.contextMessageId ?? (await findInboundWamid(db, input.conversationId))
+
+  const attemptSend = async (address: string): Promise<string> => {
+    try {
+      const result = await sendTextMessage({
+        phoneNumberId: config.phone_number_id,
+        accessToken,
+        to: address,
+        text: messageText,
+        contextMessageId,
+      })
+      return result.messageId
+    } catch (err) {
+      // Surface Meta's exact complaint. `MetaApiError` already logs the raw
+      // envelope under META_API_SEND_ERROR inside meta-api; re-logging here
+      // keeps the address that failed attached to it, which is the piece
+      // needed to tell "stale number" from "identifier Meta won't take".
+      console.error(
+        `META_API_SEND_ERROR: ${JSON.stringify({
+          address,
+          conversation_id: input.conversationId,
+          context_message_id: contextMessageId ?? null,
+          reason: err instanceof Error ? err.message : String(err),
+        })}`,
+      )
+      throw err
+    }
+  }
+
   if (isPhone) {
-    // Phone number: use variants + retry logic as before.
+    // A real number: retry its trunk-prefix variants. Meta rejects the
+    // alternate national-format spellings often enough to be worth walking.
     const sanitized = isDialablePhone(recipient.to!) ? sanitizePhoneForMeta(recipient.to!) : recipient.to!
     const variants = phoneVariants(sanitized)
     let lastError: unknown = null
     for (const v of variants) {
       try {
-        const sendInput: SendTextMessageInput = {
-          phoneNumberId: config.phone_number_id,
-          accessToken,
-          to: v,
-          recipient: isPhone ? undefined : recipient.to!,
-          text: messageText,
-        }
-        waMessageId = (await sendTextMessage(sendInput)).messageId
+        waMessageId = await attemptSend(v)
         workingPhone = v
         lastError = null
         break
@@ -254,40 +299,37 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
     }
     if (lastError) throw lastError
   } else {
-    // BSUID / username: send directly via recipient field, no variants needed.
+    // BSUID / @lid / @user: exactly one form, no phone variants. Routed to
+    // `recipient` by sendTextMessage, and delivered via `context` when Meta
+    // has no addressable id for this contact.
     workingPhone = recipient.to!
-    try {
-      const sendInput: SendTextMessageInput = {
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: '',
-        recipient: recipient.to!,
-        text: messageText,
-      }
-      waMessageId = (await sendTextMessage(sendInput)).messageId
-    } catch (err) {
-      if (!isRecipientNotAllowedError(err instanceof Error ? err.message : String(err))) throw err
-      throw err
-    }
+    waMessageId = await attemptSend(recipient.to!)
+  }
+
+  // Remember a real number that worked, so the next send goes straight to it
+  // instead of re-walking the variant list. Gated on `isDialablePhone`: a
+  // working BSUID / `@lid` id is opaque to WhatsApp's numbering rules and must
+  // never be written over the `phone` column — doing so would replace a
+  // deliverable number with an undeliverable one on the next send.
+  if (
+    contact.id &&
+    workingPhone &&
+    workingPhone !== recipient.to &&
+    isDialablePhone(workingPhone)
+  ) {
+    await db
+      .from('contacts')
+      .update({ phone: workingPhone, updated_at: new Date().toISOString() })
+      .eq('id', contact.id)
+      .eq('account_id', input.accountId)
   }
 
   // Persist the sent message so it appears in the inbox with a real
   // Meta message id. sender_type='bot' distinguishes automation sends
-  // from manual agent sends.
+  // from manual agent sends. This runs for EVERY recipient shape — a phone,
+  // a BSUID, a `@lid` / `@user` id — so the AI reply is on screen even when
+  // the contact has no traditional number.
   const content_type = input.kind === 'template' ? 'template' : 'text'
-  // Templates persist the substituted body, same as the manual and
-  // public-API send paths. This was unconditionally null, so every
-  // automation template send rendered as an empty bubble (issue #483).
-  let _resolved: ResolvedTemplate | undefined;
-  const templateRow =
-    input.kind === 'template'
-      ? (_resolved = await resolveTemplateRow(
-          db,
-          input.accountId,
-          input.templateName,
-          input.language,
-        )).row
-      : null
   const content_text = input.kind === 'text' ? messageText : templateContentText(templateRow, input.params ?? [])
   const template_name = input.kind === 'template' ? input.templateName : null
 

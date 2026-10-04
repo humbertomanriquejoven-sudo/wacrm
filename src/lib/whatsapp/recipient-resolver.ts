@@ -3,7 +3,6 @@ import {
   normalizeMetaIdentifier,
   toDialable,
 } from './phone-utils'
-import type { Contact } from '@/types'
 import { MetaApiError } from './meta-api'
 import { supabaseAdmin } from '@/lib/flows/admin-client'
 
@@ -43,6 +42,8 @@ export interface RecipientCandidate {
   username?: string | null
   name?: string | null
   recipient_id?: string | null
+  /** Numeric id Meta used as the inbound `from`. */
+  wa_id?: string | null
 }
 
 /** Where the chosen address came from — useful for logging and tests. */
@@ -354,43 +355,93 @@ export async function sendWithRecipientFallback<T>(args: {
 }
 
 /**
- * Resolve the best recipient identifier for a contact, prioritizing:
- *   1. `contact.wa_id` or `contact.phone` if it is a dialable E.164 number.
- *   2. `contact.wa_user_id` (BSUID) — Meta accepts a BSUID as the
- *      `to` value for BSUID/Threads/API conversations.
- *   3. `contact.recipient_id` — alternative Meta identifier.
+ * The value to hand Meta for a NON-PHONE identifier, or null when unusable.
  *
- * Returns the `to` value to place in Meta's ``to`` field, or an empty
- * string when no resolvable identifier is available.
+ * Deliberately a PASS-THROUGH, unlike `normalizeMetaIdentifier`. That
+ * function is a storage/comparison normalizer: it strips the `CO.` / `WAID.`
+ * prefix and rejects anything not longer than 14 digits. That is correct for
+ * comparing two rows and wrong for addressing a send — `CO.999` would come
+ * back as `999`, and `999` is indistinguishable from a malformed phone
+ * number, so the send would either fail or (worse) fabricate a number.
+ *
+ * Accepts exactly the shapes Meta reads as an identifier:
+ *   - a namespaced id (`CO.…`, `WAID.…`, `LID.…`) — prefix preserved;
+ *   - an all-digit run long enough not to be a truncated phone.
+ *
+ * A bare handle is rejected so it falls through to the `username` branch,
+ * where the leading `@` is restored.
+ */
+function passthroughMetaId(value: string | null | undefined): string | null {
+  if (!value) return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  // Placeholders that older rows / webhook defaults have been known to carry.
+  if (/^(unknown|null|undefined|none|n\/a)$/i.test(trimmed)) return null
+  // Namespaced id — keep the prefix and dot intact.
+  if (/^[A-Za-z]+\.[\w.-]+$/.test(trimmed)) return trimmed
+  // Bare digit run. The 6-digit floor keeps a stray fragment from being
+  // mistaken for an id; there is no upper bound because a BSUID/LID is
+  // routinely far longer than E.164.
+  if (/^\+?\d{6,}$/.test(trimmed)) return trimmed.replace(/\D/g, '')
+  return null
+}
+
+/**
+ * Resolve the best recipient identifier for a contact, in strict priority
+ * order, with NO account- or destination-specific knowledge:
+ *
+ *   1. `phone`, when it is a dialable E.164 number (a `+` or spaces are
+ *      normalized away by `toDialable`).
+ *   2. `wa_id` — the numeric id Meta used as the inbound `from`. This is the
+ *      field that carries a `@lid` / `@user` sender's underlying id.
+ *   3. `wa_user_id` — the BSUID.
+ *   4. `recipient_id` — the alternative Meta identifier.
+ *   5. `username` — the public handle.
+ *
+ * When `accountId` is supplied it also consults `resolveRecipient`, which can
+ * recover a real number from this contact's own conversation history — a
+ * contact whose `phone` still holds an identifier but who has messaged from a
+ * registered number before.
+ *
+ * `accountId` is optional so callers holding a bare identifier set (the
+ * automation engine, which selects a subset of columns) can use this without
+ * widening the query or casting.
  */
 export async function resolveBestRecipient(
-  contact: Contact,
-  accountId: string,
+  contact: RecipientCandidate | null | undefined,
+  accountId?: string | null,
   conversationId?: string | null,
-): Promise<{ to: string; source: RecipientSource; isPhone: boolean }> {
-  // 1. Phone or wa_id — a real number always wins.
+): Promise<ResolvedRecipient> {
+  if (!contact) return { to: '', source: 'bsuid', isPhone: false }
+
+  // 1. Phone — a real number always wins.
   const phone = toDialable(contact.phone)
   if (phone) return { to: phone, source: 'phone', isPhone: true }
 
-  const waId = contact.wa_id
-  if (waId && normalizeMetaIdentifier(waId)) return { to: waId, source: 'bsuid', isPhone: false }
+  // 2. wa_id — the numeric id from the inbound message's `from`. Checked
+  //    before the BSUID because it is the address Meta actually used to reach
+  //    this contact, so it is the one most likely to be accepted back.
+  const waId = passthroughMetaId(contact.wa_id)
+  if (waId) return { to: waId, source: 'bsuid', isPhone: false }
 
-  // 2. BSUID.
-  const bsuid = normalizeMetaIdentifier(contact.wa_user_id ?? contact.phone)
+  // 3. BSUID. Also covers the legacy case where a BSUID was written into
+  //    `phone` before the two concepts were separated.
+  const bsuid = passthroughMetaId(contact.wa_user_id) ?? passthroughMetaId(contact.phone)
   if (bsuid) return { to: bsuid, source: 'bsuid', isPhone: false }
 
-  // 3. recipient_id — alternative Meta identifier.
-  const recipientId = contact.recipient_id
-  if (recipientId && normalizeMetaIdentifier(recipientId))
-    return { to: recipientId, source: 'bsuid', isPhone: false }
+  // 4. recipient_id — alternative Meta identifier.
+  const recipientId = passthroughMetaId(contact.recipient_id)
+  if (recipientId) return { to: recipientId, source: 'bsuid', isPhone: false }
 
-  // 4. Fallback to the existing resolveRecipient logic.
-  const fallback = await resolveRecipient(
-    contact as RecipientCandidate | null,
-    accountId,
-    conversationId,
-  )
-  if (fallback.to) return fallback
+  // 5. Username.
+  const handle = normalizeUsername(contact.username)
+  if (handle) return { to: handle, source: 'username', isPhone: false }
+
+  // Optional deeper pass: recover a number from this contact's own thread.
+  if (accountId) {
+    const fallback = await resolveRecipient(contact, accountId, conversationId)
+    if (fallback.to) return fallback
+  }
 
   return { to: '', source: 'bsuid', isPhone: false }
 }
