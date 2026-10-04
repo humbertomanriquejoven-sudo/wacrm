@@ -156,6 +156,26 @@ describe('engineSendAiReply', () => {
     expect(mockSendTextMessage).toHaveBeenCalledTimes(3)
   })
 
+  it('anchors every fragment to the inbound wamid so @user/@lid contacts are reachable', async () => {
+    await engineSendAiReply(ARGS)
+
+    // A contact known only by a @user/@lid display id cannot be addressed in
+    // `to` at all — the reply only reaches them because it quotes the message
+    // they wrote. Every fragment must carry the context, not just the first.
+    expect(mockSendTextMessage).toHaveBeenCalledTimes(3)
+    for (const call of mockSendTextMessage.mock.calls) {
+      expect(call[0].contextMessageId).toBe('wamid.IN_1')
+    }
+  })
+
+  it('omits the context anchor when the inbound wamid is unknown', async () => {
+    await engineSendAiReply({ ...ARGS, composeMessageId: undefined })
+
+    for (const call of mockSendTextMessage.mock.calls) {
+      expect(call[0].contextMessageId).toBeUndefined()
+    }
+  })
+
   it('never lets a failed typing indicator block the reply', async () => {
     mockSendTypingIndicator.mockRejectedValueOnce(new Error('Meta API error: 400'))
 

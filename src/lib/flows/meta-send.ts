@@ -432,6 +432,14 @@ export async function engineSendAiReply(
         accessToken,
         to: phone,
         text: fragments[i],
+        // Quote the inbound message. This is what makes the reply deliverable
+        // to a contact we cannot address directly: a sender known only by a
+        // `@user` / `@lid` display id, or any id Cloud API will not accept in
+        // `to`, is reachable ONLY as a context-anchored reply on their wamid.
+        // Previously it was threaded through purely to refresh the typing
+        // indicator and never reached the payload, so every such reply was
+        // silently dropped by Meta despite a 200.
+        contextMessageId: args.composeMessageId,
       })
       return r.messageId
     }

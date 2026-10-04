@@ -120,18 +120,30 @@ export class MetaApiError extends Error {
 export class InvalidRecipientError extends MetaApiError {
   /** The rejected address, verbatim, for the caller's logs. */
   readonly address: string
+  /**
+   * Why the address was refused. Drives the operator-facing half of the
+   * message — the distinction that matters in production is "this contact
+   * has no usable identity at all" versus "this contact is reachable, but
+   * only by quoting the message they sent, and the caller didn't pass the
+   * inbound wamid".
+   */
+  readonly reason: string
 
-  constructor(address: string) {
+  constructor(address: string, reason?: string) {
     super(
-      `invalid recipient "${address}": expected a phone number, a BSUID ` +
-        `(e.g. 'CO.1008477715690681') or a WhatsApp username, but got an ` +
-        `empty or unusable value. No HTTP request was sent.`,
+      `invalid recipient "${address}": ${
+        reason ??
+        'expected a phone number, a BSUID (e.g. \'CO.1008477715690681\') ' +
+          'or a WhatsApp username, but got an empty or unusable value. ' +
+          'No HTTP request was sent.'
+      }`,
       // status 0 / no code: nothing came back from Meta, so there is no HTTP
       // status to report.
       { status: 0, code: null, subcode: null },
     )
     this.name = 'InvalidRecipientError'
     this.address = address
+    this.reason = reason ?? 'unusable value'
   }
 }
 
@@ -214,6 +226,52 @@ export function recipientAddressField(destination: string): Record<string, strin
   return { recipient: digits || value }
 }
 
+/**
+ * True when `address` is an opaque Meta id that Cloud API accepts DIRECTLY
+ * in the `recipient` field — i.e. a namespaced BSUID (`CO.1008…`,
+ * `WAID.123…`, `LID.…`) or a bare digit run too long to be a phone number.
+ *
+ * Those need no `context`: Meta already knows the destination, so the
+ * request goes out as an ordinary new message.
+ *
+ * Everything else — a short digit run like `123456` scraped out of an
+ * `@lid`/`@user` display id, a bare handle, a placeholder like `unknown` —
+ * is NOT addressable. Cloud API silently drops those (it answers 200 and no
+ * message ever lands), so the only way to reach such a contact is to quote
+ * the message they actually wrote: a `context` reply anchored on the
+ * inbound `wamid`. See `sendTextMessage`.
+ */
+export function isOpaqueMetaId(address: string): boolean {
+  const value = (address ?? '').trim()
+  if (!value) return false
+  const bare = value.startsWith('@') ? value.slice(1).trim() : value
+  if (!bare) return false
+  // Namespaced id: keep the prefix — `CO.`/`WAID.`/`LID.` carry meaning.
+  if (/^[A-Za-z]+\.[\w.-]+$/.test(bare)) return true
+  // Long digit run: a BSUID, never a phone number.
+  const digits = bare.replace(/\D/g, '')
+  return /^\+?\d+$/.test(bare) && digits.length > 14
+}
+
+/**
+ * Normalize an inbound display id (`@user`, `@lid`, `123456@lid`, …) down
+ * to what Meta expects in `to`.
+ *
+ * WhatsApp hands us display ids whose `@user` / `@lid` suffix is a routing
+ * label, not part of the address. Stripping it leaves either a real number
+ * or a bare opaque id. Letters are NOT stripped from namespaced ids
+ * (`CO.1008…`): running those through a digits-only filter would fabricate
+ * a phone number out of them and send the reply to a stranger.
+ */
+export function cleanRecipientAddress(address: string): string {
+  const value = (address ?? '').trim()
+  if (!value) return ''
+  // Drop a trailing/embedded `@user` / `@lid` routing suffix.
+  const unsuffixed = value.replace(/@(lid|user|c.us)\b/gi, '').trim()
+  const bare = unsuffixed.startsWith('@') ? unsuffixed.slice(1).trim() : unsuffixed
+  return bare
+}
+
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
   let message = fallback
   let code: number | null = null
@@ -251,6 +309,13 @@ async function throwMetaError(response: Response, fallback: string): Promise<nev
       // keep the fallback
     }
   }
+  // Verbatim error envelope on the console. The earlier `[Meta API] HTTP…`
+  // line prints the raw body as text; this one prints it as a single JSON
+  // string under a fixed tag so it can be grepped (`META_API_SEND_ERROR`)
+  // and copy-pasted straight into Meta's debugger / our bug tracker. It is
+  // the "why did this send fail" breadcrumb that was previously missing.
+  console.error('META_API_SEND_ERROR:', JSON.stringify(data))
+
   if (data.error?.message) message = data.error.message
   if (typeof data.error?.code === 'number') code = data.error.code
   if (typeof data.error?.error_subcode === 'number') {
@@ -449,19 +514,58 @@ export interface SendTextMessageArgs {
 /**
  * Send a free-form WhatsApp text message.
  * Only works inside the 24-hour customer service window.
+ *
+ * Three recipient shapes are handled, because a contact reached through a
+ * `@user` / `@lid` display id is a different problem from a phone number:
+ *
+ *   1. A dialable E.164 number → `{ to: "573167071066" }`.
+ *   2. An opaque Meta id (`CO.…`, `WAID.…`, `LID.…`, or a >14-digit run) →
+ *      `{ recipient: "<id>" }`. Meta knows the destination; no context needed.
+ *   3. Anything else — a short digit run scraped out of `@lid`, a bare
+ *      handle, the literal `unknown` — is not addressable on its own. Cloud
+ *      API does NOT reject it: it answers 200 and drops the message, which is
+ *      indistinguishable from a successful send until the customer reports
+ *      they got nothing. The only supported way to reach these contacts is a
+ *      QUOTED REPLY anchored on the inbound `wamid`, so we require
+ *      `contextMessageId` and attach `context`. Without it we refuse the call
+ *      instead of losing the message silently.
  */
 export async function sendTextMessage(
   args: SendTextMessageArgs
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, text, contextMessageId } = args
   const recipient = assertDialableRecipient(to)
+  const address = cleanRecipientAddress(recipient)
+
+  const addressField = recipientAddressField(address)
+  const isPhoneAddress = Boolean(addressField.to)
+
+  if (!isPhoneAddress && !isOpaqueMetaId(address) && !contextMessageId) {
+    // Refuse BEFORE the network call. Sending this address with no context
+    // anchor is a guaranteed silent drop: Cloud API answers 200 and the
+    // message never lands, which the inbox would then show as delivered.
+    console.warn(
+      `[send] blocked: "${address}" is neither a phone number nor a Meta id, ` +
+        `and no contextMessageId was supplied — a reply to this contact must ` +
+        `quote the inbound message. No HTTP request was made to Meta.`,
+    )
+    throw new InvalidRecipientError(
+      address,
+      'not a phone number and not a Meta id, so it is only reachable by ' +
+        'quoting the inbound message. Pass contextMessageId (the wamid of ' +
+        'the message being answered) to send as a reply. No HTTP request was sent.',
+    )
+  }
+
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    ...recipientFields(recipient),
+    // For a context-anchored reply the address is only a thread hint — the
+    // `context` block is what authorizes delivery to an unaddressable contact.
+    ...addressField,
     type: 'text',
-    text: { body: text },
+    text: { preview_url: false, body: text },
   }
   if (contextMessageId) {
     body.context = { message_id: contextMessageId }
