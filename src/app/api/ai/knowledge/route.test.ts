@@ -27,7 +27,11 @@ vi.mock('@/lib/ai/config', () => ({
   loadEmbeddingsKey: vi.fn(async () => ({ key: null, corrupt: false })),
 }));
 
-vi.mock('@/lib/ai/knowledge', () => ({ ingestDocument: vi.fn() }));
+vi.mock('@/lib/ai/knowledge', async (importOriginal) => ({
+  // Keep the real `ingestWarning` so the route's warning text is exercised.
+  ...(await importOriginal<typeof import('@/lib/ai/knowledge')>()),
+  ingestDocument: vi.fn(),
+}));
 
 vi.mock('@/lib/ai/knowledge-schema', () => ({
   isMissingColumnError: mocks.isMissingColumnError,

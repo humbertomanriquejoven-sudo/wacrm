@@ -36,7 +36,10 @@ vi.mock('@/lib/ai/config', () => ({
   loadEmbeddingsKey: mocks.loadEmbeddingsKey,
 }));
 
-vi.mock('@/lib/ai/knowledge', () => ({
+vi.mock('@/lib/ai/knowledge', async (importOriginal) => ({
+  // Spread the real module so `ingestWarning` keeps its real implementation:
+  // stubbing it would let the route's actual warning text go unasserted.
+  ...(await importOriginal<typeof import('@/lib/ai/knowledge')>()),
   ingestDocument: mocks.ingestDocument,
 }));
 
@@ -50,6 +53,7 @@ vi.mock('@/lib/ai/knowledge-parser', () => ({
 }));
 
 import { POST } from './route';
+import { AiError } from '@/lib/ai/types';
 
 const context = {
   supabase: { name: 'scoped-client' },
@@ -215,6 +219,28 @@ describe('/api/ai/knowledge/upload', () => {
     const body = await response.json();
     expect(body.success).toBe(true);
     expect(body.warning).toContain('indexing failed');
+    // The chunks exist, so keyword search really does still answer.
+    expect(body.warning).toContain('Keyword search still works');
+  });
+
+  it('does not promise keyword search when the document got zero chunks', async () => {
+    mocks.ingestDocument.mockRejectedValue(
+      new AiError('row-level security on ai_knowledge_chunks', {
+        code: 'knowledge_chunk_write_failed',
+      })
+    );
+    const response = await POST(multipart(xlsxFile()));
+
+    // Still a 200: the document row was saved, so the UI shows it in the list.
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.success).toBe(true);
+    // But it is unsearchable, and the warning has to say so — the previous
+    // wording claimed keyword search still worked, sending the operator to
+    // debug the wrong layer.
+    expect(body.warning).toContain('NOT searchable');
+    expect(body.warning).not.toContain('still works');
+    expect(body.warning).toContain('row-level security');
   });
 
   it('responds 429 when the admin rate limit is hit', async () => {

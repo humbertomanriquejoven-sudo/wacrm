@@ -5,9 +5,14 @@ const h = vi.hoisted(() => ({ embedTexts: vi.fn() }))
 vi.mock('./embeddings', () => ({
   embedTexts: h.embedTexts,
   toVectorLiteral: (v: number[]) => `[${v.join(',')}]`,
+  // The real value, not a stub: ingestDocument compares every returned
+  // vector against it to decide whether the batch can go into a
+  // vector(1536) column at all, so a fake here would change behaviour.
+  EMBEDDING_DIMENSIONS: 1536,
 }))
 
-import { retrieveKnowledge, ingestDocument } from './knowledge'
+import { retrieveKnowledge, ingestDocument, ingestWarning } from './knowledge'
+import { AiError } from './types'
 
 interface FakeState {
   semantic: { id: string; content: string }[]
@@ -15,6 +20,12 @@ interface FakeState {
   chunkCount: number
   rpcCalls: string[]
   inserted: Record<string, unknown>[] | null
+  /** Every insert batch, in order — a retry adds a second one. */
+  inserts: Record<string, unknown>[][]
+  /** When true, an insert carrying vectors fails (pgvector width mismatch). */
+  failInsertWithVectors: boolean
+  /** When true, every insert fails (RLS / constraint on the chunks table). */
+  failAllInserts: boolean
   deletedFor: string | null
   /** Every filter passed to a delete, in call order. */
   deleteCalls: { col: string; val: unknown }[][]
@@ -29,6 +40,9 @@ function makeDb() {
     chunkCount: 5, // account has a non-empty KB by default
     rpcCalls: [],
     inserted: null,
+    inserts: [],
+    failInsertWithVectors: false,
+    failAllInserts: false,
     deletedFor: null,
     deleteCalls: [],
     ops: [],
@@ -84,8 +98,29 @@ function makeDb() {
       select: () => builder('select'),
       delete: () => builder('delete'),
       insert: (rows: Record<string, unknown>[]) => {
+        state.inserts.push(rows)
         state.inserted = rows
         state.ops.push('insert')
+        // Models pgvector rejecting a statement because a vector's width
+        // does not match the column — the failure that used to cost the
+        // document its entire index.
+        const carriesVector = rows.some(
+          (r) => typeof r.embedding === 'string' && r.embedding !== null
+        )
+        if (state.failAllInserts) {
+          return Promise.resolve({
+            error: { code: '42501', message: 'new row violates row-level security policy' },
+          })
+        }
+        if (state.failInsertWithVectors && carriesVector) {
+          return Promise.resolve({
+            error: {
+              code: '42804',
+              message:
+                'expected 1536 dimensions, not 3072',
+            },
+          })
+        }
         return Promise.resolve({ error: null })
       },
     }),
@@ -93,10 +128,18 @@ function makeDb() {
   return { db: db as unknown as SupabaseClient, state }
 }
 
+/** A vector of the real width the vector(1536) column expects. */
+function fakeVector(seed: number): number[] {
+  return Array.from({ length: 1536 }, (_, i) => (i + seed) % 7)
+}
+
 beforeEach(() => {
   h.embedTexts.mockReset()
+  // Real width: ingestDocument rejects a batch whose vectors do not match
+  // the column, so a 2-element stub here would fail every embedding test
+  // for the wrong reason.
   h.embedTexts.mockImplementation(async (_key: string, inputs: string[]) =>
-    inputs.map((_, i) => [i, i]),
+    inputs.map((_, i) => fakeVector(i)),
   )
 })
 
@@ -165,7 +208,8 @@ describe('ingestDocument', () => {
     expect(h.embedTexts).toHaveBeenCalledTimes(1)
     expect(state.deletedFor).toBe('doc-1')
     expect(state.inserted).toHaveLength(1)
-    expect(state.inserted![0].embedding).toBe('[0,0]') // literal from mocked embed
+    // A real-width vector, formatted as the pgvector text literal.
+    expect(state.inserted![0].embedding).toBe(`[${fakeVector(0).join(',')}]`)
     expect(state.inserted![0].account_id).toBe('acct')
   })
 
@@ -212,6 +256,58 @@ describe('ingestDocument', () => {
     expect(state.ops).toEqual(['insert', 'delete'])
   })
 
+  it('stores keyword-only chunks when the provider returns the wrong vector width', async () => {
+    const { db, state } = makeDb()
+    // text-embedding-3-large answers with 3072 dims; the column is 1536.
+    h.embedTexts.mockImplementationOnce(async (_k: string, inputs: string[]) =>
+      inputs.map(() => Array.from({ length: 3072 }, () => 0.1))
+    )
+    await expect(
+      ingestDocument(db, 'acct', { embeddingsApiKey: 'sk-x' }, 'doc-1', 'hello world')
+    ).rejects.toThrow(/1536/)
+    // The mismatch is caught BEFORE the insert, so the document still gets
+    // its chunks and keyword search keeps working — previously the whole
+    // batch was rejected and the document became unretrievable.
+    expect(state.inserted).toHaveLength(1)
+    expect(state.inserted![0].embedding).toBeNull()
+    expect(state.inserted![0].content).toBe('hello world')
+  })
+
+  it('reports a vector COUNT mismatch before writing anything', async () => {
+    const { db, state } = makeDb()
+    h.embedTexts.mockImplementationOnce(async () => [fakeVector(0)])
+    await expect(
+      ingestDocument(db, 'acct', { embeddingsApiKey: 'sk-x' }, 'doc-1', 'a'.repeat(9000))
+    ).rejects.toThrow(/vectors for \d+ chunks/)
+    // Every chunk of this multi-chunk document is still stored keyword-only.
+    expect(state.inserted!.length).toBeGreaterThan(1)
+    expect(state.inserted!.every((r) => r.embedding === null)).toBe(true)
+  })
+
+  it('retries without vectors when the database rejects the embedding insert', async () => {
+    const { db, state } = makeDb()
+    state.failInsertWithVectors = true
+    await expect(
+      ingestDocument(db, 'acct', { embeddingsApiKey: 'sk-x' }, 'doc-1', 'hello world')
+    ).rejects.toThrow(/rejected the semantic vectors/)
+    // Two attempts: with vectors (rejected), then without (accepted). The
+    // second insert is what makes the route's "lexical search still works"
+    // warning true instead of a lie.
+    expect(state.inserts).toHaveLength(2)
+    expect(state.inserts[0][0].embedding).not.toBeNull()
+    expect(state.inserts[1][0].embedding).toBeNull()
+    expect(state.inserts[1][0].content).toBe('hello world')
+    // The surviving rows are real, so retrieval can find them.
+    expect(state.ops).toEqual(['insert', 'insert', 'delete'])
+  })
+
+  it('does not retry when there were no vectors to begin with', async () => {
+    const { db, state } = makeDb()
+    state.failInsertWithVectors = true // no vectors → nothing to reject
+    await ingestDocument(db, 'acct', { embeddingsApiKey: null }, 'doc-1', 'hello world')
+    expect(state.inserts).toHaveLength(1)
+  })
+
   it('gives new chunks a disjoint index range so they cannot collide with stale rows', async () => {
     const { db, state } = makeDb()
     await ingestDocument(db, 'acct', { embeddingsApiKey: null }, 'doc-1', 'hello world')
@@ -222,5 +318,41 @@ describe('ingestDocument', () => {
     expect(prune.map((f) => f.col)).toContain('document_id')
     const rangeFilter = prune.find((f) => f.col === '__or')
     expect(rangeFilter?.val).toBe('chunk_index.lt.1000000,chunk_index.gte.1000001')
+  })
+
+  it('fails loudly when even the keyword-only write is rejected', async () => {
+    const { db, state } = makeDb()
+    // Every insert fails regardless of vectors — e.g. an RLS or constraint
+    // problem on ai_knowledge_chunks.
+    state.failAllInserts = true
+    await expect(
+      ingestDocument(db, 'acct', { embeddingsApiKey: null }, 'doc-1', 'hello world')
+    ).rejects.toThrow(/No chunks could be stored/)
+    expect(state.inserts).toHaveLength(1)
+  })
+})
+
+describe('ingestWarning', () => {
+  it('promises keyword search only when chunks actually exist', () => {
+    const msg = ingestWarning('Saved', new AiError('rate limited', { code: 'ai_error' }))
+    expect(msg).toContain('Keyword search still works')
+    expect(msg).toContain('rate limited')
+    expect(msg.startsWith('Saved')).toBe(true)
+  })
+
+  it('does NOT claim searchability when the document has zero chunks', () => {
+    const msg = ingestWarning(
+      'Saved',
+      new AiError('row-level security', { code: 'knowledge_chunk_write_failed' })
+    )
+    expect(msg).toContain('NOT searchable')
+    expect(msg).not.toContain('still works')
+    expect(msg).toContain('row-level security')
+  })
+
+  it('survives a non-AiError without claiming anything false', () => {
+    const msg = ingestWarning('Updated', new Error('socket hang up'))
+    expect(msg).toContain('socket hang up')
+    expect(msg.startsWith('Updated')).toBe(true)
   })
 })

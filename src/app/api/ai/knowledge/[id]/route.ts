@@ -6,8 +6,7 @@ import {
 } from '@/lib/auth/account'
 import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
 import { loadEmbeddingsKey } from '@/lib/ai/config'
-import { ingestDocument } from '@/lib/ai/knowledge'
-import { AiError } from '@/lib/ai/types'
+import { ingestDocument, ingestWarning } from '@/lib/ai/knowledge'
 import {
   httpStatusForDbError,
   reportKnowledgeDbError,
@@ -102,12 +101,11 @@ export async function PATCH(request: Request, { params }: Params) {
       try {
         await ingestDocument(supabase, accountId, { embeddingsApiKey }, id, content)
       } catch (err) {
-        const message = err instanceof AiError ? err.message : 'indexing failed'
         console.error('[ai/knowledge/[id] PATCH] ingest error:', err)
         return NextResponse.json(
           {
             success: true,
-            warning: `Updated, but semantic indexing failed (${message}). Lexical search still works; use Reindex to retry.`,
+            warning: ingestWarning('Updated', err),
           },
           { status: 200 },
         )
