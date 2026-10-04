@@ -545,12 +545,31 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
             // 1) Try direct phone fields first
             let phone = extractContactPhone(r.contact as Contact);
             
-            // 2) If no phone found, resolve from conversation history
-            if (!phone && r.contact?.conversation_id) {
-              phone = await resolveDeliveryAddress(supabase, r.contact.id, r.contact.conversation_id);
+            // 2) If no phone found, resolve from conversation history or message store
+            if (!phone) {
+              if (r.contact?.conversation_id) {
+                phone = await resolveDeliveryAddress(supabase, r.contact.id, r.contact.conversation_id);
+              }
+              if (!phone) {
+                const { data: latestMessages } = await supabase
+                  .from('messages')
+                  .select('address, whatsapp_id, from')
+                  .eq('contact_id', r.contact.id)
+                  .order('created_at', { ascending: false })
+                  .limit(1);
+                if (latestMessages && latestMessages.length > 0) {
+                  const msg = latestMessages[0] as any;
+                  const addr = msg.whatsapp_id ?? msg.from ?? msg.address;
+                  if (addr) {
+                    const cleaned = addr.replace(/\D/g, '');
+                    if (cleaned.length === 10 || cleaned.length === 11) phone = `57${cleaned}`;
+                    else if (cleaned.length > 0) phone = cleaned;
+                  }
+                }
+              }
             }
             
-            if (!phone) return []; // invalid_phone — skip this recipient
+            if (!phone) return []; // invalid_phone - skip this recipient
             
             return {
               phone,
