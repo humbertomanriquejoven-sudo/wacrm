@@ -37,7 +37,7 @@ async function listDocuments(
   try {
     const rich = await supabase
       .from('ai_knowledge_documents')
-      .select('id, title, filename, source_type, updated_at')
+      .select('id, title, filename, source_type, created_at, updated_at')
       .eq('account_id', accountId)
       .order('updated_at', { ascending: false });
     if (!rich.error) return rich.data ?? [];
@@ -48,7 +48,7 @@ async function listDocuments(
     }
     const basic = await supabase
       .from('ai_knowledge_documents')
-      .select('id, title, updated_at')
+      .select('id, title, created_at, updated_at')
       .eq('account_id', accountId)
       .order('updated_at', { ascending: false });
     return basic.data ?? [];

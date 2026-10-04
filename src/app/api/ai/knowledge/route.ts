@@ -23,9 +23,13 @@ export async function GET() {
     // list: PostgREST rejects the whole projection when one column is unknown,
     // which would leave the panel showing "No documents yet." on a database
     // that has plenty of documents.
+    //
+    // `created_at` comes from migration 030 (the table's own definition), so
+    // unlike filename/source_type it is always present and is safe to depend
+    // on. The UI uses it to show when a document was added.
     const rich = await supabase
       .from('ai_knowledge_documents')
-      .select('id, title, filename, source_type, updated_at')
+      .select('id, title, filename, source_type, created_at, updated_at')
       .eq('account_id', accountId)
       .order('updated_at', { ascending: false })
 
@@ -46,7 +50,7 @@ export async function GET() {
     )
     const { data, error } = await supabase
       .from('ai_knowledge_documents')
-      .select('id, title, updated_at')
+      .select('id, title, created_at, updated_at')
       .eq('account_id', accountId)
       .order('updated_at', { ascending: false })
     if (error) {
@@ -131,6 +135,48 @@ export async function POST(request: Request) {
       })
     }
     return NextResponse.json({ success: true, id: doc.id })
+  } catch (err) {
+    return toErrorResponse(err)
+  }
+}
+
+/**
+ * DELETE /api/ai/knowledge?id={id}  (admin+)
+ *
+ * Query-param alias of DELETE /api/ai/knowledge/[id]. Both forms are
+ * supported because the id has to travel somewhere: the collection route is
+ * the natural target for `?id=`, the dynamic segment for REST purity. They
+ * share one implementation so the account scoping and the chunk cascade
+ * cannot drift between them.
+ *
+ * Chunks and their embeddings go with the document: the `document_id`
+ * foreign key is ON DELETE CASCADE (migration 030), so the vectors are
+ * physically removed and cannot still be retrieved.
+ */
+export async function DELETE(request: Request) {
+  try {
+    const { supabase, accountId, userId } = await requireRole('admin')
+    const limit = checkRateLimit(`ai-kb:${userId}`, RATE_LIMITS.adminAction)
+    if (!limit.success) return rateLimitResponse(limit)
+
+    const id = new URL(request.url).searchParams.get('id')
+    if (!id) {
+      return NextResponse.json({ error: 'id is required' }, { status: 400 })
+    }
+
+    const { error } = await supabase
+      .from('ai_knowledge_documents')
+      .delete()
+      .eq('account_id', accountId)
+      .eq('id', id)
+    if (error) {
+      console.error('[ai/knowledge DELETE] error:', error)
+      return NextResponse.json(
+        { error: 'Failed to delete document' },
+        { status: 500 },
+      )
+    }
+    return NextResponse.json({ success: true, id })
   } catch (err) {
     return toErrorResponse(err)
   }

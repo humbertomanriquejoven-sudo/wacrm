@@ -23,6 +23,19 @@ const ACCEPTED_EXTENSIONS = [
 ];
 const MAX_FILE_BYTES = 16 * 1024 * 1024;
 
+/**
+ * The `accept` attribute, derived from ACCEPTED_EXTENSIONS so the two can
+ * never drift apart.
+ *
+ * This was a hard-coded literal that had fallen behind: it listed only the
+ * document types, so the native file picker FILTERED OUT every image the
+ * uploader otherwise accepted. Validation, the backend parser and the UI
+ * badges all allowed .png/.jpg/.jpeg/.webp, but a user could not actually
+ * pick one — the dialog simply hid them. Deriving it here makes adding an
+ * extension in one place enough.
+ */
+const ACCEPT_ATTRIBUTE = ACCEPTED_EXTENSIONS.join(',');
+
 function extensionOf(name: string): string {
   const dot = name.lastIndexOf('.');
   return dot >= 0 ? name.slice(dot).toLowerCase() : '';
@@ -176,7 +189,7 @@ export function KnowledgeUploader({
       <input
         ref={inputRef}
         type="file"
-        accept=".xlsx,.xls,.csv,.pdf,.docx,.doc,.txt"
+        accept={ACCEPT_ATTRIBUTE}
         onChange={(e) => handleSelect(e.target.files?.[0] ?? null)}
         className="hidden"
         disabled={uploading}

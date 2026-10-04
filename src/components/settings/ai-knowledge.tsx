@@ -28,6 +28,8 @@ interface DocSummary {
   id: string;
   title: string;
   updated_at: string;
+  /** When the document was first stored (migration 030, always present). */
+  created_at?: string | null;
   /** Original upload name. Absent until migration 055 is applied. */
   filename?: string | null;
   /** Parser that produced the text ('xlsx', 'pdf', 'png', …). */
@@ -304,6 +306,15 @@ export function AiKnowledgeCard({
                         {doc.filename && doc.filename !== doc.title && (
                           <span className="text-muted-foreground block truncate text-xs">
                             {doc.title}
+                          </span>
+                        )}
+                        {/* Proof of persistence: the date comes back from
+                            Postgres, so a row that survived a tab switch or
+                            a reload is visibly a stored row. Formatted with
+                            the browser locale — no translation key needed. */}
+                        {doc.created_at && (
+                          <span className="text-muted-foreground block truncate text-xs">
+                            {new Date(doc.created_at).toLocaleDateString()}
                           </span>
                         )}
                       </span>
