@@ -2,7 +2,7 @@
 
 import { useCallback, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { FileText, Loader2, Upload } from 'lucide-react';
+import { CheckCircle2, FileText, Loader2, Upload } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { cn } from '@/lib/utils';
@@ -66,11 +66,24 @@ export function KnowledgeUploader({
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
+  // Name of the file that was just persisted, kept on screen next to the
+  // dropzone instead of only in a toast.
+  //
+  // The dropzone deliberately returns to its idle state after every upload
+  // (it must be ready for the next file), so right after a successful save
+  // it looks EXACTLY as it did before — which is what made "saved" read as
+  // "nothing happened" whenever the toast was missed or had already
+  // auto-dismissed. This line is the evidence, and it sits where the user's
+  // eye already is.
+  const [savedName, setSavedName] = useState<string | null>(null);
 
   const upload = useCallback(
     async (selected: File) => {
       setFile(selected);
       setUploading(true);
+      // Clear the previous confirmation as soon as a new upload starts, so
+      // it can never be mistaken for the result of the file in flight.
+      setSavedName(null);
       try {
         const fd = new FormData();
         fd.append('file', selected);
@@ -83,6 +96,9 @@ export function KnowledgeUploader({
         if (res.ok) {
           setTitle('');
           setFile(null);
+          // Persistent proof of the save. The list below re-renders from the
+          // same response, but it can sit off-screen; this cannot.
+          setSavedName(title.trim() || selected.name);
           if (data.warning) toast.warning(data.warning);
           else toast.success(t('uploadSuccess'));
           // Prefer the list the upload response already carries; only fall
@@ -184,6 +200,18 @@ export function KnowledgeUploader({
           )}
         </div>
       </div>
+
+      {savedName && !uploading && (
+        <p
+          data-testid="knowledge-saved-confirmation"
+          className="flex items-center gap-2 text-xs text-emerald-700 dark:text-emerald-400"
+        >
+          <CheckCircle2 className="size-4 shrink-0" />
+          <span className="min-w-0 truncate">
+            {t('savedAs')} {savedName}
+          </span>
+        </p>
+      )}
 
       <div className="space-y-1">
         <Label

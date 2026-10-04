@@ -140,30 +140,58 @@ export function AiKnowledgeCard({
   const loadedAccountIdRef = useRef<string | null>(null);
   const t = useTranslations('Settings.aiKnowledge');
 
-  const fetchDocs = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetch('/api/ai/knowledge');
-      const data = await res.json();
-      if (res.ok) {
-        setDocs(data.documents ?? []);
-        setLoadError(false);
-      } else {
-        // Keep the failure distinct from "empty": a failed list must never
-        // render as "No documents yet." or the user concludes their uploads
-        // were deleted.
+  /**
+   * Reload the document list.
+   *
+   * `silent` is for the reconcile that follows an upload. The default mode
+   * flips `loading`, which swaps the WHOLE card body for a spinner and
+   * unmounts the uploader — correct for a tab change or a manual retry, but
+   * wrong moments after a successful upload: it would blank a list the user
+   * is looking at. Silent mode keeps the current rows on screen and never
+   * raises the card-level spinner, so a background reconcile is invisible
+   * unless it actually finds a difference.
+   *
+   * A silent failure is logged but NOT toasted and does NOT set `loadError`:
+   * the visible list came from the upload response and is still trustworthy,
+   * so a failed reconcile must not replace it with an error banner.
+   */
+  const fetchDocs = useCallback(
+    async (opts: { silent?: boolean } = {}) => {
+      const silent = opts.silent === true;
+      if (!silent) setLoading(true);
+      try {
+        const res = await fetch('/api/ai/knowledge');
+        const data = await res.json();
+        if (res.ok) {
+          setDocs(data.documents ?? []);
+          setLoadError(false);
+        } else if (silent) {
+          console.error(
+            '[knowledge] background list reconcile failed:',
+            data?.error
+          );
+        } else {
+          // Keep the failure distinct from "empty": a failed list must never
+          // render as "No documents yet." or the user concludes their uploads
+          // were deleted.
+          setLoadError(true);
+          logKnowledgeFailure('list documents', data, t('loadFailed'));
+          toast.error(data.error ?? t('loadFailed'));
+        }
+      } catch (err) {
+        if (silent) {
+          console.error('[knowledge] background list reconcile threw:', err);
+          return;
+        }
         setLoadError(true);
-        logKnowledgeFailure('list documents', data, t('loadFailed'));
-        toast.error(data.error ?? t('loadFailed'));
+        console.error('[knowledge] list documents threw:', err);
+        toast.error(t('loadFailed'));
+      } finally {
+        if (!silent) setLoading(false);
       }
-    } catch (err) {
-      setLoadError(true);
-      console.error('[knowledge] list documents threw:', err);
-      toast.error(t('loadFailed'));
-    } finally {
-      setLoading(false);
-    }
-  }, [t]);
+    },
+    [t]
+  );
 
   useEffect(() => {
     if (!accountId) {
@@ -252,17 +280,28 @@ export function AiKnowledgeCard({
   };
 
   const remove = async (id: string) => {
+    // Optimistic removal: the row disappears the instant the click lands, and
+    // is restored if the server refuses. Deleting is reversible here (the
+    // document and its vectors are still on the server until the call
+    // returns), so making the user wait on a round trip to see a row
+    // disappear reads as an unresponsive panel.
+    const previous = docs;
+    setDocs((d) => d.filter((x) => x.id !== id));
     try {
-      const res = await fetch(`/api/ai/knowledge/${id}`, { method: 'DELETE' });
+      const res = await fetch(
+        `/api/ai/knowledge?id=${encodeURIComponent(id)}`,
+        { method: 'DELETE' }
+      );
       if (res.ok) {
         toast.success(t('removeSuccess'));
-        setDocs((d) => d.filter((x) => x.id !== id));
       } else {
         const data = await res.json();
+        setDocs(previous);
         logKnowledgeFailure('delete document', data, t('removeFailed'));
         toast.error(data.error ?? t('removeFailed'));
       }
     } catch (err) {
+      setDocs(previous);
       console.error('[knowledge] delete threw:', err);
       toast.error(t('removeFailed'));
     }
@@ -324,15 +363,26 @@ export function AiKnowledgeCard({
             {canEdit && editing === null && (
               <KnowledgeUploader
                 onUploaded={(documents) => {
-                  // A list handed back by the upload response is authoritative:
-                  // apply it directly instead of risking a second request that
-                  // could fail and leave the panel reading "No documents yet.".
+                  // Two steps, in this order on purpose.
+                  //
+                  // 1. Paint instantly from the upload response. The server
+                  //    re-read the table before answering, so this list is
+                  //    authoritative and needs no second round trip to be
+                  //    correct. Doing this first is what makes the saved file
+                  //    appear without a spinner and without a reload.
+                  //
+                  // 2. Then reconcile against the database in the background.
+                  //    Silent: it cannot blank the list the user is looking
+                  //    at, and a failure only logs. This is what would catch
+                  //    a row the response could not describe (an unapplied
+                  //    migration truncating the projection, say) — without
+                  //    risking the "saved but the panel says no documents"
+                  //    state that a hard refetch used to cause.
                   if (documents) {
                     setDocs(documents as DocSummary[]);
                     setLoadError(false);
-                    return;
                   }
-                  void fetchDocs();
+                  void fetchDocs({ silent: true });
                 }}
               />
             )}
