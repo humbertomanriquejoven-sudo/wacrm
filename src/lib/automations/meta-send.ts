@@ -17,7 +17,10 @@ import {
   templateContentText,
 } from '@/lib/whatsapp/template-body'
 import { supabaseAdmin } from './admin-client'
-import { resolveBestRecipient } from '@/lib/whatsapp/recipient-resolver'
+import {
+  resolveBestRecipient,
+  isRecipientRejection,
+} from '@/lib/whatsapp/recipient-resolver'
 
 // ------------------------------------------------------------
 // Automation-side Meta sender.
@@ -61,6 +64,45 @@ interface SendTemplateArgs {
   params?: string[]
   destination?: 'to' | 'recipient'
   contextMessageId?: string
+}
+
+/**
+ * Record a delivery FAILURE as a `messages` row.
+ *
+ * Without this a Meta rejection left no trace in the database at all: the
+ * send threw, the insert never ran, and the only evidence was a console
+ * line that scrolls away. Persisting `status='failed'` with Meta's own
+ * complaint in `content_text` makes the failure visible in the thread and
+ * queryable in the EasyPanel logs, and keeps a retry/audit path open.
+ *
+ * Best-effort by design: this must never mask the original Meta error, so a
+ * failure to write the row is logged and swallowed.
+ */
+async function recordFailedSend(
+  db: ReturnType<typeof supabaseAdmin>,
+  args: {
+    conversationId: string
+    text: string
+    error: unknown
+    address?: string | null
+  },
+): Promise<void> {
+  const detail = args.error instanceof Error ? args.error.message : String(args.error)
+  try {
+    const { error } = await db.from('messages').insert({
+      conversation_id: args.conversationId,
+      sender_type: 'bot',
+      content_type: 'text',
+      content_text: args.text,
+      status: 'failed',
+      error_detail: `${detail}${args.address ? ` (to: ${args.address})` : ''}`,
+    })
+    if (error) {
+      console.error('[meta-send] could not record the failed send:', error.message)
+    }
+  } catch (e) {
+    console.error('[meta-send] could not record the failed send:', e)
+  }
 }
 
 /**
@@ -252,7 +294,10 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   const contextMessageId =
     input.contextMessageId ?? (await findInboundWamid(db, input.conversationId))
 
-  const attemptSend = async (address: string): Promise<string> => {
+  const attemptSend = async (
+    address: string,
+    recipientField?: 'to' | 'recipient',
+  ): Promise<string> => {
     try {
       const result = await sendTextMessage({
         phoneNumberId: config.phone_number_id,
@@ -260,16 +305,19 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
         to: address,
         text: messageText,
         contextMessageId,
+        recipientField,
       })
       return result.messageId
     } catch (err) {
       // Surface Meta's exact complaint. `MetaApiError` already logs the raw
-      // envelope under META_API_SEND_ERROR inside meta-api; re-logging here
-      // keeps the address that failed attached to it, which is the piece
-      // needed to tell "stale number" from "identifier Meta won't take".
+      // envelope under META_API_SEND_ERROR / META_API_REJECTED inside
+      // meta-api; re-logging here keeps the address that failed attached to
+      // it, which is the piece needed to tell "stale number" from
+      // "identifier Meta won't accept".
       console.error(
         `META_API_SEND_ERROR: ${JSON.stringify({
           address,
+          recipient_field: recipientField ?? 'to',
           conversation_id: input.conversationId,
           context_message_id: contextMessageId ?? null,
           reason: err instanceof Error ? err.message : String(err),
@@ -279,31 +327,67 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
     }
   }
 
-  if (isPhone) {
-    // A real number: retry its trunk-prefix variants. Meta rejects the
-    // alternate national-format spellings often enough to be worth walking.
-    const sanitized = isDialablePhone(recipient.to!) ? sanitizePhoneForMeta(recipient.to!) : recipient.to!
-    const variants = phoneVariants(sanitized)
-    let lastError: unknown = null
-    for (const v of variants) {
-      try {
-        waMessageId = await attemptSend(v)
-        workingPhone = v
-        lastError = null
-        break
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        if (!isRecipientNotAllowedError(msg)) throw err
-        lastError = err
-      }
+  /**
+   * Send one address, falling back to Meta's alternate `recipient` field when
+   * the primary `to` form is rejected.
+   *
+   * The primary payload carries a bare numeric id in `to`, which is what Meta
+   * documents for both a phone number and a BSUID / `@lid` id. If Meta refuses
+   * that shape for this account, retrying once with the id intact in
+   * `recipient` covers the other documented addressing mode instead of
+   * dropping the message. Single-shot: a second failure is real and is
+   * surfaced, not looped on.
+   */
+  const sendWithFieldFallback = async (address: string): Promise<string> => {
+    try {
+      return await attemptSend(address)
+    } catch (err) {
+      if (!isRecipientRejection(err)) throw err
+      console.warn(
+        `[meta-send] Meta rejected the "to" form for ${address}; retrying with the "recipient" field.`,
+      )
+      return attemptSend(address, 'recipient')
     }
-    if (lastError) throw lastError
-  } else {
-    // BSUID / @lid / @user: exactly one form, no phone variants. Routed to
-    // `recipient` by sendTextMessage, and delivered via `context` when Meta
-    // has no addressable id for this contact.
-    workingPhone = recipient.to!
-    waMessageId = await attemptSend(recipient.to!)
+  }
+
+  try {
+    if (isPhone) {
+      // A real number: retry its trunk-prefix variants. Meta rejects the
+      // alternate national-format spellings often enough to be worth walking.
+      const sanitized = isDialablePhone(recipient.to!) ? sanitizePhoneForMeta(recipient.to!) : recipient.to!
+      const variants = phoneVariants(sanitized)
+      let lastError: unknown = null
+      for (const v of variants) {
+        try {
+          waMessageId = await sendWithFieldFallback(v)
+          workingPhone = v
+          lastError = null
+          break
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          if (!isRecipientNotAllowedError(msg)) throw err
+          lastError = err
+        }
+      }
+      if (lastError) throw lastError
+    } else {
+      // BSUID / @lid / @user: exactly one form, no phone variants.
+      // `toMetaTargetId` inside sendTextMessage reduces it to the bare
+      // numeric id Meta accepts, anchored by `context` when we have the wamid.
+      workingPhone = recipient.to!
+      waMessageId = await sendWithFieldFallback(recipient.to!)
+    }
+  } catch (err) {
+    // Meta refused the delivery (or the network did). Leave a `failed` row so
+    // the attempt is visible in the thread and in the logs, then rethrow so
+    // the engine's own retry/fallback policy still runs.
+    await recordFailedSend(db, {
+      conversationId: input.conversationId,
+      text: messageText,
+      error: err,
+      address: recipient.to ?? null,
+    })
+    throw err
   }
 
   // Remember a real number that worked, so the next send goes straight to it

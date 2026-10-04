@@ -254,6 +254,32 @@ export function isOpaqueMetaId(address: string): boolean {
 }
 
 /**
+ * Reduce any stored identifier to the bare numeric id Meta accepts in `to`.
+ *
+ *   '573167071066'                 -> '573167071066'  (already a number)
+ *   'CO.1486998326437295'          -> '1486998326437295'
+ *   'WAID.987654321'               -> '987654321'
+ *   '123456@lid'                   -> '123456'
+ *   '@someuser'                    -> 'someuser'
+ *
+ * A namespace prefix (`CO.`, `WAID.`, `LID.`) and an `@user` / `@lid`
+ * routing suffix are display/labelling artefacts, not part of the address;
+ * the digits underneath are the id Meta actually issued. Nothing is invented
+ * here — if the value has no digits at all the non-digit remainder is
+ * returned so the request still goes out and Meta can judge it, rather than
+ * failing locally on a contact we know exists.
+ */
+export function toMetaTargetId(address: string): string {
+  const cleaned = cleanRecipientAddress(address)
+  if (!cleaned) return ''
+  const digits = cleaned.replace(/\D/g, '')
+  if (digits) return digits
+  // No digits (a bare handle): keep the letters so the shape is at least
+  // well-formed and Meta's own error explains what it disliked.
+  return cleaned
+}
+
+/**
  * Normalize an inbound display id (`@user`, `@lid`, `123456@lid`, …) down
  * to what Meta expects in `to`.
  *
@@ -309,12 +335,21 @@ async function throwMetaError(response: Response, fallback: string): Promise<nev
       // keep the fallback
     }
   }
-  // Verbatim error envelope on the console. The earlier `[Meta API] HTTP…`
-  // line prints the raw body as text; this one prints it as a single JSON
-  // string under a fixed tag so it can be grepped (`META_API_SEND_ERROR`)
-  // and copy-pasted straight into Meta's debugger / our bug tracker. It is
-  // the "why did this send fail" breadcrumb that was previously missing.
+  // Verbatim error envelope on the console, twice, under fixed tags:
+  //   * `META_API_SEND_ERROR` — the raw body as one JSON string.
+  //   * `META_API_REJECTED`   — the same body plus the HTTP status and the
+  //     endpoint, so a failure is diagnosable from EasyPanel logs alone.
+  // The earlier `[Meta API] HTTP…` line prints the body as text; these make it
+  // greppable and copy-pasteable into Meta's debugger.
   console.error('META_API_SEND_ERROR:', JSON.stringify(data))
+  console.error(
+    'META_API_REJECTED:',
+    JSON.stringify({
+      status: response.status,
+      endpoint: `${META_API_BASE}/${(fallback.match(/\d{6,}/) ?? ['unknown'])[0]}/messages`,
+      response: data,
+    }),
+  )
 
   if (data.error?.message) message = data.error.message
   if (typeof data.error?.code === 'number') code = data.error.code
@@ -509,6 +544,15 @@ export interface SendTextMessageArgs {
   /** Meta's message_id of the message being replied to. Adds a `context` field
    *  so WhatsApp renders the new message as a reply with a quote preview. */
   contextMessageId?: string
+  /**
+   * Which Meta field carries the destination. Defaults to `to`, which is what
+   * Meta documents for a phone number and for a numeric BSUID / `@lid` id.
+   *
+   * `recipient` sends the address unstripped in Meta's alternate shape. It
+   * exists as a RETRY: if Meta rejects the `to` form, the caller re-sends with
+   * `recipientField: 'recipient'` rather than losing the message.
+   */
+  recipientField?: 'to' | 'recipient'
 }
 
 /**
@@ -534,28 +578,33 @@ export async function sendTextMessage(
   args: SendTextMessageArgs
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, text, contextMessageId } = args
-  const recipient = assertDialableRecipient(to)
-  const address = cleanRecipientAddress(recipient)
-
-  const addressField = recipientAddressField(address)
-  const isPhoneAddress = Boolean(addressField.to)
-
-  if (!isPhoneAddress && !isOpaqueMetaId(address) && !contextMessageId) {
-    // Refuse BEFORE the network call. Sending this address with no context
-    // anchor is a guaranteed silent drop: Cloud API answers 200 and the
-    // message never lands, which the inbox would then show as delivered.
-    console.warn(
-      `[send] blocked: "${address}" is neither a phone number nor a Meta id, ` +
-        `and no contextMessageId was supplied — a reply to this contact must ` +
-        `quote the inbound message. No HTTP request was made to Meta.`,
-    )
+  const recipient = cleanRecipientAddress(to)
+  const address = recipient || (to ?? '').trim()
+  if (!address) {
+    // The ONE case that is still refused locally: there is no address at all
+    // to put in the request. This is not the "not a standard 10-14 digit
+    // number" case — a BSUID, a `@lid` id and a `@handle` all reach the
+    // network. An empty `to` is a guaranteed 400 with no possible delivery,
+    // so failing here only converts a certain error into a certain error.
     throw new InvalidRecipientError(
-      address,
-      'not a phone number and not a Meta id, so it is only reachable by ' +
-        'quoting the inbound message. Pass contextMessageId (the wamid of ' +
-        'the message being answered) to send as a reply. No HTTP request was sent.',
+      '',
+      'no destination is available for this contact: `phone`, `wa_id`, ' +
+        '`wa_user_id` and `recipient_id` are all empty or "unknown". ' +
+        'No HTTP request was sent.',
     )
   }
+
+  // Primary shape, per Meta's documented payload: the destination always
+  // travels in `to`, carrying the numeric id with any namespace and `@`
+  // removed (`CO.1486998326437295` -> `1486998326437295`). Letters and `@`
+  // are NOT legal in `to`; Meta rejects them outright.
+  const targetId = toMetaTargetId(address)
+  const addressField: Record<string, string> =
+    args.recipientField === 'recipient'
+      ? // Escape hatch for the alternate Meta shape (an unstripped id in
+        // `recipient`). Used as a RETRY when Meta rejects the `to` form.
+        { recipient: address }
+      : { to: targetId }
 
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
   const body: Record<string, unknown> = {

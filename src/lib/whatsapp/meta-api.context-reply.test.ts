@@ -4,7 +4,9 @@ import {
   cleanRecipientAddress,
   isOpaqueMetaId,
   InvalidRecipientError,
+  MetaApiError,
   sendTextMessage,
+  toMetaTargetId,
 } from '@/lib/whatsapp/meta-api'
 
 /** Capture the JSON body of the single fetch call a send made. */
@@ -41,6 +43,36 @@ describe('cleanRecipientAddress', () => {
 
   it('is empty for an empty address', () => {
     expect(cleanRecipientAddress('')).toBe('')
+  })
+})
+
+describe('toMetaTargetId', () => {
+  it('leaves a plain phone number untouched', () => {
+    expect(toMetaTargetId('573167071066')).toBe('573167071066')
+  })
+
+  it('strips a CO. namespace down to the numeric id', () => {
+    expect(toMetaTargetId('CO.1008477715690681')).toBe('1008477715690681')
+  })
+
+  it('strips a WAID. namespace', () => {
+    expect(toMetaTargetId('WAID.987654321')).toBe('987654321')
+  })
+
+  it('strips an @lid routing suffix', () => {
+    expect(toMetaTargetId('123456@lid')).toBe('123456')
+  })
+
+  it('strips an @user routing suffix', () => {
+    expect(toMetaTargetId('987654321@user')).toBe('987654321')
+  })
+
+  it('returns the bare handle when there are no digits at all', () => {
+    expect(toMetaTargetId('@someuser')).toBe('someuser')
+  })
+
+  it('is empty for an empty address', () => {
+    expect(toMetaTargetId('')).toBe('')
   })
 })
 
@@ -102,7 +134,7 @@ describe('sendTextMessage recipient shapes', () => {
     expect(body.context).toBeUndefined()
   })
 
-  it('sends a namespaced BSUID via "recipient" with no context required', async () => {
+  it('sends a namespaced BSUID as a bare numeric id in "to" (letters stripped)', async () => {
     await sendTextMessage({
       phoneNumberId: 'PNID',
       accessToken: 'TOKEN',
@@ -110,9 +142,46 @@ describe('sendTextMessage recipient shapes', () => {
       text: 'hola',
     })
     const body = sentBody(fetchMock)
+    // Meta rejects letters and dots in `to`; the digits are the real id.
+    expect(body.to).toBe('1008477715690681')
+    expect(body.recipient).toBeUndefined()
+    expect(body.context).toBeUndefined()
+  })
+
+  it('supports the alternate "recipient" field as an explicit retry', async () => {
+    await sendTextMessage({
+      phoneNumberId: 'PNID',
+      accessToken: 'TOKEN',
+      to: 'CO.1008477715690681',
+      text: 'hola',
+      recipientField: 'recipient',
+    })
+    const body = sentBody(fetchMock)
+    // Escape hatch keeps the address intact for Meta's alternate shape.
     expect(body.recipient).toBe('CO.1008477715690681')
     expect(body.to).toBeUndefined()
-    expect(body.context).toBeUndefined()
+  })
+
+  it('reaches the network for an @lid id instead of refusing it locally', async () => {
+    // Regression guard for the production bug: a contact whose phone is
+    // "unknown" must never be dropped by a local assertion. Meta is the
+    // authority on whether the destination is deliverable.
+    await sendTextMessage({
+      phoneNumberId: 'PNID',
+      accessToken: 'TOKEN',
+      to: '123456@lid',
+      text: 'se enviaría',
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const body = sentBody(fetchMock)
+    expect(body.to).toBe('123456')
+  })
+
+  it('still refuses only when there is no destination at all', async () => {
+    await expect(
+      sendTextMessage({ phoneNumberId: 'PNID', accessToken: 'TOKEN', to: '', text: 'x' }),
+    ).rejects.toBeInstanceOf(InvalidRecipientError)
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it('answers an unaddressable @lid id by quoting the inbound wamid', async () => {
@@ -128,35 +197,7 @@ describe('sendTextMessage recipient shapes', () => {
     expect(body.text).toEqual({ preview_url: false, body: 'respuesta IA' })
   })
 
-  it('refuses to send to an unaddressable id with no context rather than dropping it', async () => {
-    await expect(
-      sendTextMessage({
-        phoneNumberId: 'PNID',
-        accessToken: 'TOKEN',
-        to: '123456@lid',
-        text: 'se perdería',
-      }),
-    ).rejects.toBeInstanceOf(InvalidRecipientError)
-
-    // No HTTP request may be made — a 200 here would be recorded as delivered.
-    expect(fetchMock).not.toHaveBeenCalled()
-  })
-
-  it('flags the context-less refusal as a recipient rejection so callers retry another address', async () => {
-    const err = await sendTextMessage({
-      phoneNumberId: 'PNID',
-      accessToken: 'TOKEN',
-      to: 'unknown',
-      text: 'x',
-    }).catch((e: unknown) => e)
-
-    expect(err).toBeInstanceOf(InvalidRecipientError)
-    const rejection = err as InvalidRecipientError
-    // MetaApiError's classification is text-derived, so the wording matters.
-    expect(rejection.recipientInvalid).toBe(true)
-  })
-
-  it('logs the verbatim Meta error envelope under META_API_SEND_ERROR', async () => {
+  it('logs the verbatim Meta error envelope under META_API_SEND_ERROR and META_API_REJECTED', async () => {
     fetchMock.mockResolvedValue({
       ok: false,
       status: 400,
@@ -177,5 +218,33 @@ describe('sendTextMessage recipient shapes', () => {
     expect(JSON.parse(String(tagged![1]))).toEqual({
       error: { message: 'Invalid parameter', code: 100 },
     })
+
+    // The EasyPanel-facing tag carries the HTTP status alongside the body.
+    const rejected = errorSpy.mock.calls.find((c) => c[0] === 'META_API_REJECTED:')
+    expect(rejected).toBeDefined()
+    const parsed = JSON.parse(String(rejected![1])) as Record<string, unknown>
+    expect(parsed.status).toBe(400)
+    expect(parsed.response).toEqual({ error: { message: 'Invalid parameter', code: 100 } })
+  })
+
+  it('classifies a Meta recipient rejection so callers retry the other field', async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 400,
+      text: async () =>
+        JSON.stringify({
+          error: { message: 'Recipient phone number not in allowed list', code: 131009 },
+        }),
+    } as unknown as Response)
+
+    const err = await sendTextMessage({
+      phoneNumberId: 'PNID',
+      accessToken: 'TOKEN',
+      to: '1486998326437295',
+      text: 'x',
+    }).catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(MetaApiError)
+    expect((err as MetaApiError).recipientInvalid).toBe(true)
   })
 })
