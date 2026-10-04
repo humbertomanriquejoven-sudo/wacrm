@@ -210,6 +210,31 @@ export const AGENDAR_FALLBACK_MESSAGE =
   'Tu cita ha sido procesada, pero tuvimos un inconveniente generando el enlace de Google Meet. Un asesor te contactará en breve.';
 
 /**
+ * Neutral acknowledgement for the turns where the grounding guard
+ * deliberately DROPS the model's text (an ungrounded booking claim, or a
+ * bare "un momento…" / link promise with no real link behind it), and for
+ * turns that end with no text at all.
+ *
+ * Dropping the text is right — it stops a fabricated confirmation reaching the
+ * customer — but returning without sending anything leaves the thread on
+ * "seen", which is the exact failure mode this whole path exists to prevent.
+ * So we send THIS instead of nothing.
+ *
+ * It deliberately asserts nothing that could be false:
+ *   - no confirmed cita, no date, no link (so it can never contradict a real
+ *     agendar_cita result);
+ *   - no promise that a human was assigned — this path NEVER auto-assigns, so
+ *     "un asesor te contactará" would be a lie. It asks for the next step
+ *     instead, which also keeps the booking flow moving.
+ */
+export function buildUngroundedAckMessage(contactName?: string | null): string {
+  const nombre = contactName?.trim();
+  return nombre
+    ? `¡Gracias, ${nombre}! Recibí tu información. ¿Deseas que agende tu cita ahora?`
+    : '¡Gracias! Recibí tu información. ¿Deseas que agende tu cita ahora?';
+}
+
+/**
  * Deterministic, customer-facing booking confirmation built from the REAL
  * agendar_cita tool result (fecha/hora/link) — it does not depend on the
  * model echoing the link back. Dispatched by the backend the instant a
@@ -923,21 +948,23 @@ export async function dispatchInboundToAiReply(
         !looksLikeBookingConfirmation(raw);
       if (finalText === null && isWaitOnly) {
         console.log(
-          '[ai auto-reply] dropped an empty reply without a link (no handoff, no mute).'
+          '[ai auto-reply] dropped an empty reply without a link — sending a neutral acknowledgement instead of staying silent.'
         );
         if (bypass) {
           await sendOutboundProbe(args, 'model produced only a link promise');
+          return;
         }
-        return;
+        finalText = buildUngroundedAckMessage(contactCtx?.name);
       }
       if (finalText === null) {
         console.log(
-          '[ai auto-reply] dropped an ungrounded text (no mute, no handoff).'
+          '[ai auto-reply] dropped an ungrounded text — sending a neutral acknowledgement instead of staying silent.'
         );
         if (bypass) {
           await sendOutboundProbe(args, 'model text failed the grounding guard');
+          return;
         }
-        return;
+        finalText = buildUngroundedAckMessage(contactCtx?.name);
       }
     }
 
@@ -951,17 +978,21 @@ export async function dispatchInboundToAiReply(
       usage: finalUsage,
     });
 
-    // Si no hay texto final, no hay nada que enviar — pero JAMÁS se marca
-    // la conversación como muda ni se la asigna a un humano
-    // automáticamente: el siguiente mensaje se responde normal.
+    // El modelo se quedó sin texto (turno en blanco tras usar herramientas).
+    // Antes este caso devolvía el turno sin enviar NADA, dejando al cliente
+    // con el mensaje en visto. Ahora se responde con un acuse neutro: no
+    // afirma que exista una cita, no inventa fecha ni enlace, y no marca la
+    // conversación como muda ni la asigna a un humano — el siguiente mensaje
+    // se sigue respondiendo con normalidad.
     if (!finalText) {
       console.log(
-        '[ai auto-reply] no final text to send — skipping without muting.'
+        '[ai auto-reply] no final text — sending a neutral acknowledgement instead of staying silent.'
       );
       if (bypass) {
         await sendOutboundProbe(args, 'the model returned empty text');
+        return;
       }
-      return;
+      finalText = buildUngroundedAckMessage(contactCtx?.name);
     }
 
     // The per-conversation slot claim. It exists to keep the row-level lock

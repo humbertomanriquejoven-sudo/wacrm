@@ -232,6 +232,14 @@ export function buildSystemPrompt(args: {
         'Está TERMINANTEMENTE PROHIBIDO que el bot quede "congelado" o en visto: ninguna solicitud de cita puede terminar sin un mensaje de WhatsApp.'
     );
     parts.push(
+      'REGLA DE ACUSE INMEDIATO: bajo ninguna circunstancia debes finalizar un turno sin enviar un mensaje al usuario. ' +
+        'Si el cliente te entrega un dato que habías pedido (por ejemplo su nombre completo, "Juan Perea", justo después de solicitárselo), ' +
+        'acuse recibo de inmediato en el MISMO turno y continúa con el siguiente paso: agenda con `agendar_cita` si ya tienes fecha y hora, ' +
+        'o pide únicamente el dato que aún falte. ' +
+        'Nunca respondas con una frase vacía, un "un momento" sin contenido, ni dejes la conversación en visto. ' +
+        'Si una herramienta falla, NO te quedes en silencio: explica brevemente el inconveniente y ofrece el siguiente paso.'
+    );
+    parts.push(
       'REGLA OBLIGATORIA DE CONFIRMACIÓN DE CITA: ' +
         'Cada vez que confirmes un agendamiento por WhatsApp, DEBES incluir OBLIGATORIAMENTE la URL de Google Meet que te devuelve la herramienta `agendar_cita`. ' +
         'La herramienta `agendar_cita` comienza su resultado con la línea "ÉXITO: Cita creada para {nombre} el {fecha} a las {hora}. Enlace de Google Meet OBLIGATORIO: {url}" — ' +

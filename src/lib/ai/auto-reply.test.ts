@@ -513,11 +513,13 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
 });
 
 describe('dispatchInboundToAiReply — handoff', () => {
-  it('never mutes nor sends when the model yields nothing (empty handoff)', async () => {
+  it('never mutes, and answers instead of staying silent, when the model yields nothing', async () => {
     h.generateReply.mockResolvedValue({ text: '', handoff: true });
     await dispatchInboundToAiReply(ARGS);
     expect(h.engineSendText).not.toHaveBeenCalled();
-    expect(h.state.rpcCalls).toHaveLength(0);
+    // Empty turn used to return without sending anything (customer on "seen").
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string;
+    expect(sent).toContain('Recibí tu información');
     // The conversation is NOT silenced and NOT auto-assigned to a human.
     expectNeverMuted();
   });
@@ -526,7 +528,10 @@ describe('dispatchInboundToAiReply — handoff', () => {
     h.loadAiConfig.mockResolvedValue(aiConfig({ handoffAgentId: 'agent-7' }));
     h.generateReply.mockResolvedValue({ text: '', handoff: true });
     await dispatchInboundToAiReply(ARGS);
-    expect(h.engineSendText).not.toHaveBeenCalled();
+    // The ack must NOT claim a human took the conversation: this path never
+    // auto-assigns, so promising an advisor would be false.
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string;
+    expect(sent).not.toMatch(/asesor|te contactaremos|un asesor/i);
     expectNeverMuted();
   });
 });
@@ -708,7 +713,7 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     expect(sent).not.toContain('xxx-yyyy-zzz');
   });
 
-  it('never sends a booking confirmation that has no real tool success — dropped without muting', async () => {
+  it('never sends a booking confirmation that has no real tool success — neutral ack instead of silence', async () => {
     h.buildConversationContext.mockResolvedValue([
       {
         role: 'user',
@@ -724,7 +729,13 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
 
     expect(h.generateReply).toHaveBeenCalledTimes(1);
     expect(h.executeToolCall).not.toHaveBeenCalled();
-    expect(h.engineSendAiReply).not.toHaveBeenCalled();
+    // The fabricated confirmation is still discarded — the guard holds.
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string;
+    expect(sent).not.toContain('xxx-yyyy-zzz');
+    expect(sent).not.toContain('meet.google.com');
+    expect(sent).not.toMatch(/agendada/i);
+    // But the customer is no longer left on "seen".
+    expect(sent).toContain('Recibí tu información');
     expectNeverMuted();
   });
 
@@ -739,10 +750,12 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
 
     await dispatchInboundToAiReply(ARGS);
 
-    // The wait phrase is dropped for this turn, but the conversation stays
-    // enabled so the NEXT message is answered normally (no mute, no
-    // handoff flag is ever written).
-    expect(h.engineSendAiReply).not.toHaveBeenCalled();
+    // The bare wait phrase never reaches the customer, but the conversation
+    // stays enabled so the NEXT message is answered normally (no mute, no
+    // handoff flag is ever written) — and this turn is no longer silent.
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string;
+    expect(sent).not.toMatch(/un momento/i);
+    expect(sent).toContain('Recibí tu información');
     expectNeverMuted();
   });
 
@@ -810,7 +823,7 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
     expect(sent).toContain('¡Listo, Carlos!');
   });
 
-  it('never sends a link-promise with a fake URL — drops the turn without muting', async () => {
+  it('never sends a link-promise with a fake URL — neutral ack instead of silence', async () => {
     h.generateReply.mockResolvedValue({
       text: 'Este es el enlace de Google Meet para que te conectes: https://meet.google.com/xxx-yyyy-zzz',
       handoff: false,
@@ -818,7 +831,12 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
 
     await dispatchInboundToAiReply(ARGS);
 
-    expect(h.engineSendAiReply).not.toHaveBeenCalled();
+    // The invented URL never leaves the building…
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string;
+    expect(sent).not.toContain('xxx-yyyy-zzz');
+    expect(sent).not.toContain('meet.google.com');
+    // …but the customer still gets an answer.
+    expect(sent).toContain('Recibí tu información');
     expectNeverMuted();
   });
 
