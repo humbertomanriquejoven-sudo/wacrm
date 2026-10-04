@@ -123,11 +123,31 @@ export function resolveVariables(
 
     // custom_field
     return customValues?.get(v.value) ?? '';
-  });
+});
 }
 
-/**
- * Bulk-fetch contact_custom_values for a set of contacts. Returns an
+/* -------------------------------------------------------------------------- */
+/* Helper functions for broadcast phone normalisation                      */
+/* -------------------------------------------------------------------------- */
+/** Clean a raw phone string: keep only digits, then ensure E.164 with Colombia default. */
+function cleanAndNormalizePhone(raw: string | undefined): string {
+  if (!raw) return '';
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length === 10 || digits.length === 11) return `57${digits}`;
+  return '';
+}
+
+/** Extract a valid E.164 phone from a contact, trying the standard fields in order. */
+function extractContactPhone(contact: Contact): string {
+  const phone =
+    (contact as any)?.phone
+    || (contact as any)?.whatsapp_number
+    || (contact as any)?.mobile;
+  return cleanAndNormalizePhone(phone);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Bulk-fetch contact_custom_values for a set of contacts. Returns an
  * index keyed by contact_id → field_id → value.
  */
 async function fetchCustomValueIndex(
@@ -478,19 +498,38 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
         const batch = recipients.slice(i, i + SEND_BATCH_SIZE);
 
+        // Build the Meta recipient list, extracting phone from the contact's
+        // real phone fields (phone / whatsapp_number / mobile) rather than
+        // usernames, chat IDs, or '@' tags.  Invalid phones are omitted
+        // here and will be marked 'invalid_phone' in the DB so the broadcast
+        // can continue with only valid recipients.
         const apiRecipients = batch
-          .filter((r) => r.contact?.phone)
-          .map((r) => ({
-            phone: r.contact!.phone as string,
-            // Read back off the row rather than re-resolved, so this
-            // pass and any later resume send identical params.
-            params: Array.isArray(r.template_params) ? r.template_params : [],
-            ...(messageParams ? { messageParams } : {}),
-          }));
+          .filter((r) => r.contact)
+          .flatMap((r) => {
+            const phone = extractContactPhone(r.contact as Contact);
+            if (!phone) return []; // invalid_phone — skip this recipient
+            return {
+              phone,
+              params: Array.isArray(r.template_params) ? r.template_params : [],
+              ...(messageParams ? { messageParams } : {}),
+            };
+          });
 
-        if (apiRecipients.length === 0) continue;
+if (apiRecipients.length === 0) continue;
 
-        try {
+      // Mark recipients with no valid phone as 'invalid_phone' in the DB
+      // so the broadcast can continue with only valid numbers.
+      const invalidPhoneIds = recipients
+        .filter((r) => !extractContactPhone(r.contact as Contact))
+        .map((r) => r.id);
+      if (invalidPhoneIds.length > 0) {
+        await supabase
+          .from('broadcast_recipients')
+          .update({ status: 'invalid_phone' })
+          .in('id', invalidPhoneIds);
+      }
+
+      try {
           // Send the batch, waiting out a 429 rather than writing the
           // whole batch off as failed. Only 429 is replayed — see
           // batchRetryDelayMs for why nothing else can be.
