@@ -33,15 +33,9 @@ export async function ingestDocument(
 ): Promise<void> {
   const chunks = chunkText(content)
 
-  // Replace, don't append — re-ingest must be idempotent.
-  const { error: delErr } = await db
-    .from('ai_knowledge_chunks')
-    .delete()
-    .eq('document_id', documentId)
-  if (delErr) throw delErr
-
-  if (chunks.length === 0) return
-
+  // Embed FIRST, before touching any stored state: this is a remote call and
+  // the slowest step, so nothing should be at risk while it is in flight.
+  //
   // Embed if a key is set, but DON'T let an embedding failure stop the
   // chunks from being stored: a failed embed must still leave the
   // document searchable lexically. We record the error and rethrow it
@@ -50,7 +44,7 @@ export async function ingestDocument(
   // search really does still work.
   let embeddings: number[][] | null = null
   let embedError: unknown = null
-  if (config.embeddingsApiKey) {
+  if (chunks.length > 0 && config.embeddingsApiKey) {
     try {
       embeddings = await embedTexts(config.embeddingsApiKey, chunks)
     } catch (err) {
@@ -58,16 +52,58 @@ export async function ingestDocument(
     }
   }
 
-  const rows = chunks.map((content, i) => ({
+  // No content left: the document genuinely has nothing to index, so clearing
+  // its chunks is the correct end state.
+  if (chunks.length === 0) {
+    const { error: delErr } = await db
+      .from('ai_knowledge_chunks')
+      .delete()
+      .eq('document_id', documentId)
+    if (delErr) throw delErr
+    return
+  }
+
+  // WRITE-THEN-PRUNE, not delete-then-insert.
+  //
+  // The previous order (DELETE old → remote embed → INSERT new) had a window
+  // where the document had ZERO chunks: if the insert failed or the process
+  // restarted mid-flight, the document row survived, the route still answered
+  // 200, and the content became permanently unretrievable — a silent,
+  // unrecoverable data loss. Reindex ran that destructive cycle across every
+  // document in the account.
+  //
+  // New rows are written into a high, disjoint index range first, so they can
+  // never collide with the rows being replaced. Only once they are safely in
+  // the database do we remove the superseded ones. If the prune then fails,
+  // the worst case is duplicate chunks — retrieval still works.
+  const NEW_INDEX_BASE = 1_000_000;
+  const rows = chunks.map((chunkContent, i) => ({
     document_id: documentId,
     account_id: accountId,
-    chunk_index: i,
-    content,
+    chunk_index: NEW_INDEX_BASE + i,
+    content: chunkContent,
     embedding: embeddings ? toVectorLiteral(embeddings[i]) : null,
   }))
 
   const { error: insErr } = await db.from('ai_knowledge_chunks').insert(rows)
   if (insErr) throw insErr
+
+  // Prune everything outside the freshly written range (i.e. all pre-existing
+  // rows for this document).
+  const { error: pruneErr } = await db
+    .from('ai_knowledge_chunks')
+    .delete()
+    .eq('document_id', documentId)
+    .or(`chunk_index.lt.${NEW_INDEX_BASE},chunk_index.gte.${NEW_INDEX_BASE + chunks.length}`)
+  if (pruneErr) {
+    // The new chunks are already stored and searchable; only the stale ones
+    // linger. Surface it, but do NOT throw — throwing here would make the route
+    // report a failed save for what is really a successful, usable index.
+    console.error(
+      `[knowledge] stale chunks for document ${documentId} were not pruned:`,
+      pruneErr
+    )
+  }
 
   if (embedError) throw embedError
 }

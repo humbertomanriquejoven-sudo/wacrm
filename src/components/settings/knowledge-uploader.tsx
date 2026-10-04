@@ -16,6 +16,10 @@ const ACCEPTED_EXTENSIONS = [
   '.docx',
   '.doc',
   '.txt',
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.webp',
 ];
 const MAX_FILE_BYTES = 16 * 1024 * 1024;
 
@@ -36,8 +40,12 @@ function truncateFilename(name: string): string {
 export function KnowledgeUploader({
   onUploaded,
 }: {
-  /** Called after a successful upload so the parent can refresh its list. */
-  onUploaded: () => void | Promise<void>;
+  /**
+   * Called after a successful upload so the parent can refresh its list.
+   * Receives the already-reloaded document list when the API returned one,
+   * which spares the client a second request (and the rate-limit slot).
+   */
+  onUploaded: (documents?: unknown[]) => void | Promise<void>;
 }) {
   const t = useTranslations('Settings.aiKnowledge');
   const inputRef = useRef<HTMLInputElement>(null);
@@ -64,7 +72,9 @@ export function KnowledgeUploader({
           setFile(null);
           if (data.warning) toast.warning(data.warning);
           else toast.success(t('uploadSuccess'));
-          await onUploaded();
+          // Prefer the list the upload response already carries; only fall
+          // back to a refetch when the server could not produce one.
+          await onUploaded(Array.isArray(data.documents) ? data.documents : undefined);
         } else {
           toast.error(data.error ?? t('uploadFailed'));
         }

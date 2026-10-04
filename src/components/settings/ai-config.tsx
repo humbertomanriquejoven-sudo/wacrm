@@ -235,7 +235,13 @@ export function AiConfig() {
     }
   };
 
-  if (loading || profileLoading) {
+  // Only gate on the FIRST load. A save calls fetchConfig(), which flips
+  // `loading` back to true; returning the loader here unmounted
+  // AiKnowledgeCard, discarding its `docs` state, and the remount then showed
+  // "No documents yet." whenever that follow-up GET failed or hit the shared
+  // ai-kb rate limit. Once we have a config on screen, keep the subtree
+  // mounted so the knowledge list survives a save.
+  if ((loading || profileLoading) && !configured) {
     return (
       <div className="flex items-center justify-center py-16 text-muted-foreground">
         <Loader2 className="mr-2 h-4 w-4 animate-spin" /> {t('loadFailed')} {/* Re-using label or a global one, wait, loading is better. Let's use useTranslations from overview or just hardcode Loading... actually I should add loading to aiConfig */}

@@ -45,3 +45,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# tesseract.js OCR language data (~15 MB of binaries). Fetched on demand at
+# runtime and cached in the working directory; never belongs in the repo.
+*.traineddata

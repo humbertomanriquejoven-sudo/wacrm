@@ -21,6 +21,38 @@ const MAX_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_TEXT_CHARS = 1_000_000;
 
 /**
+ * The account's document summaries, in the exact shape GET /api/ai/knowledge
+ * returns, so a caller can reconcile its list from an upload response.
+ *
+ * Best-effort by design: if this read fails the upload has STILL succeeded,
+ * so it degrades to an empty array rather than turning a good upload into a
+ * 500. An empty list makes the client refetch, which is the old behaviour —
+ * strictly better than failing the save.
+ */
+async function listDocuments(
+  supabase: Awaited<ReturnType<typeof requireRole>>['supabase'],
+  accountId: string
+) {
+  try {
+    const { data, error } = await supabase
+      .from('ai_knowledge_documents')
+      .select('id, title, updated_at')
+      .eq('account_id', accountId)
+      .order('updated_at', { ascending: false });
+    if (error) {
+      console.error('[ai/knowledge/upload] could not reload list:', error);
+      return [];
+    }
+    return data ?? [];
+  } catch (err) {
+    // Belt and braces: this list is a convenience for the UI. It must never
+    // be able to turn a successful upload into a failed request.
+    console.error('[ai/knowledge/upload] list reload threw:', err);
+    return [];
+  }
+}
+
+/**
  * POST /api/ai/knowledge/upload  (admin+)
  *
  * Accept a multipart upload (.xlsx .xls .csv .pdf .docx .doc .txt),
@@ -56,7 +88,7 @@ export async function POST(request: Request) {
       return NextResponse.json(
         {
           error:
-            'Unsupported file type. Use .xlsx, .xls, .csv, .pdf, .docx, .doc or .txt',
+            'Unsupported file type. Use .xlsx, .xls, .csv, .pdf, .docx, .doc, .txt, .png, .jpg, .jpeg or .webp',
         },
         { status: 400 }
       );
@@ -93,7 +125,14 @@ export async function POST(request: Request) {
 
     const { data: doc, error } = await supabase
       .from('ai_knowledge_documents')
-      .insert({ account_id: accountId, created_by: userId, title, content })
+      .insert({
+        account_id: accountId,
+        created_by: userId,
+        title,
+        content,
+        filename: file.name,
+        source_type: extension,
+      })
       .select('id')
       .single();
     if (error || !doc) {
@@ -124,6 +163,7 @@ export async function POST(request: Request) {
           success: true,
           id: doc.id,
           warning: `Saved, but semantic indexing failed (${message}). Lexical search still works; use Reindex to retry.`,
+          documents: await listDocuments(supabase, accountId),
         },
         { status: 200 }
       );
@@ -134,6 +174,11 @@ export async function POST(request: Request) {
       id: doc.id,
       title,
       chars: content.length,
+      // The refreshed list, so the client can reconcile its state from this
+      // response instead of issuing a follow-up GET. That follow-up is the
+      // step that used to fail (rate limit / remount) and leave the panel
+      // reading "No documents yet." right after a successful upload.
+      documents: await listDocuments(supabase, accountId),
     };
     if (truncated) {
       return NextResponse.json({

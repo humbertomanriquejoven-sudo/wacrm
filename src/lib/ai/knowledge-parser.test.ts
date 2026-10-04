@@ -12,7 +12,14 @@ const h = vi.hoisted(() => ({
   convertToHtml: vi.fn(),
   extractRawText: vi.fn(),
   pdfParse: vi.fn(),
+  recognize: vi.fn(),
   docBody: '',
+}));
+
+// OCR engine stubbed: the real one downloads language data and takes
+// seconds per image, which has no place in a unit test.
+vi.mock('tesseract.js', () => ({
+  recognize: h.recognize,
 }));
 
 vi.mock('mammoth', () => ({
@@ -68,6 +75,33 @@ function fileFrom(
   return { name, arrayBuffer: () => Promise.resolve(ab) };
 }
 
+describe('parseKnowledgeFile — images / OCR', () => {
+  it('OCRs an image and returns the recognized text', async () => {
+    h.recognize.mockResolvedValueOnce({
+      data: { text: 'MAQUILA  $12.500 /kg\nTOLVA 3m3  $850.000\n' },
+    });
+    const out = await parseKnowledgeFile(fileFrom('catalogo.png', new Uint8Array([1, 2, 3])));
+    expect(out.extension).toBe('png');
+    expect(out.text).toContain('MAQUILA');
+    expect(out.text).toContain('850.000');
+    // Spanish + English together: accents matter for extracted prices.
+    expect(h.recognize).toHaveBeenCalledWith(
+      expect.anything(),
+      'spa+eng',
+      expect.anything()
+    );
+  });
+
+  it('throws when the image yields no text instead of storing an empty document', async () => {
+    h.recognize.mockResolvedValueOnce({ data: { text: '   ' } });
+    // An empty document would be indexed and then answer nothing, which looks
+    // to the customer like the bot ignored their file.
+    await expect(
+      parseKnowledgeFile(fileFrom('blanco.png', new Uint8Array([1])))
+    ).rejects.toThrow(/No text could be read/i);
+  });
+});
+
 describe('knowledgeFileExtension / hasKnowledgeFileExtension', () => {
   it('recognizes supported extensions case-insensitively', () => {
     for (const ext of [...KNOWLEDGE_FILE_EXTENSIONS, 'XLSX', 'Csv']) {
@@ -77,10 +111,17 @@ describe('knowledgeFileExtension / hasKnowledgeFileExtension', () => {
   });
 
   it('returns null for unsupported, hidden, or extension-less names', () => {
-    expect(knowledgeFileExtension('photo.png')).toBeNull();
     expect(knowledgeFileExtension('.gitignore')).toBeNull();
     expect(knowledgeFileExtension('README')).toBeNull();
+    expect(knowledgeFileExtension('clip.gif')).toBeNull();
     expect(hasKnowledgeFileExtension('evil.exe')).toBe(false);
+  });
+
+  it('accepts image extensions for OCR', () => {
+    for (const ext of ['png', 'jpg', 'jpeg', 'webp', 'PNG', 'JPEG']) {
+      expect(knowledgeFileExtension(`catalogo.${ext}`)).toBe(ext.toLowerCase());
+      expect(hasKnowledgeFileExtension(`catalogo.${ext}`)).toBe(true);
+    }
   });
 });
 

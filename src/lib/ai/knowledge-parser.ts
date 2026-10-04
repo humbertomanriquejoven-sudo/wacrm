@@ -28,6 +28,10 @@ export const KNOWLEDGE_FILE_EXTENSIONS = [
   'docx',
   'doc',
   'txt',
+  'png',
+  'jpg',
+  'jpeg',
+  'webp',
 ] as const;
 
 export type KnowledgeFileExtension = (typeof KNOWLEDGE_FILE_EXTENSIONS)[number];
@@ -67,7 +71,7 @@ export async function parseKnowledgeFile(
   const extension = knowledgeFileExtension(file.name);
   if (!extension) {
     throw new Error(
-      `Unsupported file type: ${file.name}. Supported: .xlsx, .xls, .csv, .pdf, .docx, .doc, .txt`
+      `Unsupported file type: ${file.name}. Supported: .xlsx, .xls, .csv, .pdf, .docx, .doc, .txt, .png, .jpg, .jpeg, .webp`
     );
   }
 
@@ -99,7 +103,45 @@ export async function parseKnowledgeFile(
           .trim(),
         extension,
       };
+    case 'png':
+    case 'jpg':
+    case 'jpeg':
+    case 'webp':
+      return { text: await imageToText(buffer, file.name), extension };
   }
+}
+
+/**
+ * OCR for an image (price lists, catalogue photos, whiteboard notes).
+ *
+ * tesseract.js is loaded lazily so the ~heavy OCR engine is only pulled in
+ * when an image is actually uploaded — spreadsheets, PDFs and .docx keep
+ * paying nothing for it. Worker + language data are cached per process, so
+ * a burst of images pays the start-up cost once.
+ *
+ * `spa` (Latin American Spanish) is used rather than plain `eng` because the
+ * documents this serves are priced/described in Spanish, and misreading
+ * accents and ñ measurably degrades the extracted prices.
+ *
+ * Fails loudly on purpose: a knowledge document whose text silently came
+ * back empty would be indexed as an empty document and answer nothing.
+ */
+async function imageToText(buffer: Buffer, fileName: string): Promise<string> {
+  const { recognize } = await import('tesseract.js');
+
+  const result = await recognize(buffer, 'spa+eng', {
+    logger: () => {
+      /* progress is noise in server logs */
+    },
+  });
+
+  const text = (result.data.text ?? '').replace(/\u0000/g, '').trim();
+  if (!text) {
+    throw new Error(
+      `No text could be read from the image "${fileName}". If it is a photo of a document, make sure it is in focus and contains printed text — a drawing or photo without text cannot be indexed.`
+    );
+  }
+  return text;
 }
 
 // ------------------------------------------------------------

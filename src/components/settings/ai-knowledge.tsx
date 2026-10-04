@@ -49,6 +49,8 @@ export function AiKnowledgeCard({
   const [content, setContent] = useState('');
   const [saving, setSaving] = useState(false);
   const [reindexing, setReindexing] = useState(false);
+  // True when the list could not be loaded (as opposed to being empty).
+  const [loadError, setLoadError] = useState(false);
   const loadedAccountIdRef = useRef<string | null>(null);
   const t = useTranslations('Settings.aiKnowledge');
 
@@ -57,9 +59,18 @@ export function AiKnowledgeCard({
     try {
       const res = await fetch('/api/ai/knowledge');
       const data = await res.json();
-      if (res.ok) setDocs(data.documents ?? []);
-      else toast.error(data.error ?? t('loadFailed'));
+      if (res.ok) {
+        setDocs(data.documents ?? []);
+        setLoadError(false);
+      } else {
+        // Keep the failure distinct from "empty": a failed list must never
+        // render as "No documents yet." or the user concludes their uploads
+        // were deleted.
+        setLoadError(true);
+        toast.error(data.error ?? t('loadFailed'));
+      }
     } catch {
+      setLoadError(true);
       toast.error(t('loadFailed'));
     } finally {
       setLoading(false);
@@ -190,12 +201,35 @@ export function AiKnowledgeCard({
           </div>
         ) : (
           <>
-            {docs.length === 0 && editing === null && (
-              <p className="text-muted-foreground text-sm">{t('noDocs')}</p>
-            )}
+            {loadError ? (
+          <div className="rounded-md border border-destructive/40 p-3">
+            <p className="text-destructive text-sm">{t('loadFailed')}</p>
+            <button
+              type="button"
+              onClick={() => void fetchDocs()}
+              className="text-primary mt-2 text-sm underline"
+            >
+              {t('retry', { default: 'Reintentar' })}
+            </button>
+          </div>
+        ) : docs.length === 0 && editing === null ? (
+          <p className="text-muted-foreground text-sm">{t('noDocs')}</p>
+        ) : null}
 
             {canEdit && editing === null && (
-              <KnowledgeUploader onUploaded={fetchDocs} />
+              <KnowledgeUploader
+                onUploaded={(documents) => {
+                  // A list handed back by the upload response is authoritative:
+                  // apply it directly instead of risking a second request that
+                  // could fail and leave the panel reading "No documents yet.".
+                  if (documents) {
+                    setDocs(documents as DocSummary[]);
+                    setLoadError(false);
+                    return;
+                  }
+                  void fetchDocs();
+                }}
+              />
             )}
 
             {docs.length > 0 && (

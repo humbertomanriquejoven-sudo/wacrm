@@ -144,6 +144,10 @@ describe('/api/ai/knowledge/upload', () => {
         created_by: 'user-1',
         title: 'lista-precios',
         content: 'Producto, Precio\nMolino, 300',
+        // The real upload name and the parser used, so a weak extraction
+        // (e.g. an unreadable image) can be identified and re-uploaded.
+        filename: 'lista-precios.xlsx',
+        source_type: 'xlsx',
       },
     });
     expect(mocks.ingestDocument).toHaveBeenCalledWith(
