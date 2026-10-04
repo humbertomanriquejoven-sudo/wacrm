@@ -45,9 +45,12 @@ const ACCOUNT = {
 
 /** Captures the columns each `.select()` asked for, per call. */
 const selects: string[] = [];
+/** Captures each `.order(column, opts)` call, per call. */
+const orders: { column: string; ascending: boolean | undefined }[] = [];
 
 function makeListDb(opts: { richFails?: boolean } = {}) {
   selects.length = 0;
+  orders.length = 0;
   mocks.deletions.length = 0;
   return {
     from: (table: string) => {
@@ -73,8 +76,9 @@ function makeListDb(opts: { richFails?: boolean } = {}) {
           const shouldFail = rich && opts.richFails;
           const chain: Record<string, unknown> = {
             eq: () => chain,
-            order: () =>
-              Promise.resolve({
+            order: (column: string, orderOpts?: { ascending?: boolean }) => {
+              orders.push({ column, ascending: orderOpts?.ascending });
+              return Promise.resolve({
                 data: shouldFail
                   ? null
                   : [
@@ -88,7 +92,8 @@ function makeListDb(opts: { richFails?: boolean } = {}) {
                       },
                     ],
                 error: shouldFail ? { message: 'column does not exist' } : null,
-              }),
+              });
+            },
           };
           return chain;
         },
@@ -101,6 +106,7 @@ function makeListDb(opts: { richFails?: boolean } = {}) {
 beforeEach(() => {
   vi.clearAllMocks();
   selects.length = 0;
+  orders.length = 0;
   mocks.deletions.length = 0;
   mocks.getCurrentAccount.mockResolvedValue(ACCOUNT);
   mocks.requireRole.mockResolvedValue(ACCOUNT);
@@ -109,6 +115,32 @@ beforeEach(() => {
 });
 
 describe('GET /api/ai/knowledge', () => {
+  it('orders by created_at DESC, newest upload first', async () => {
+    // This panel is an upload log. Ordering by updated_at made a document
+    // edited months later jump to the top as if it had just been added.
+    mocks.getCurrentAccount.mockResolvedValue({
+      ...ACCOUNT,
+      supabase: makeListDb(),
+    });
+    await GET();
+    expect(orders).toEqual([{ column: 'created_at', ascending: false }]);
+  });
+
+  it('keeps the same ordering on the 055-degraded path', async () => {
+    mocks.isMissingColumnError.mockReturnValue(true);
+    mocks.getCurrentAccount.mockResolvedValue({
+      ...ACCOUNT,
+      supabase: makeListDb({ richFails: true }),
+    });
+    await GET();
+    // Both reads must sort identically, or the list reshuffles itself
+    // depending on whether the migration happens to be applied.
+    expect(orders).toEqual([
+      { column: 'created_at', ascending: false },
+      { column: 'created_at', ascending: false },
+    ]);
+  });
+
   it('returns created_at so the UI can prove a document is stored', async () => {
     mocks.getCurrentAccount.mockResolvedValue({
       ...ACCOUNT,

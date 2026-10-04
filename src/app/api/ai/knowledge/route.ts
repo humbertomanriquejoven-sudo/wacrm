@@ -31,11 +31,14 @@ export async function GET() {
     // `created_at` comes from migration 030 (the table's own definition), so
     // unlike filename/source_type it is always present and is safe to depend
     // on. The UI uses it to show when a document was added.
+    // Ordered by created_at DESC, not updated_at: this panel is an upload
+    // log ("what did I add, most recent first"), so a document edited months
+    // later should not jump to the top as if it had just been added.
     const rich = await supabase
       .from('ai_knowledge_documents')
       .select('id, title, filename, source_type, created_at, updated_at')
       .eq('account_id', accountId)
-      .order('updated_at', { ascending: false })
+      .order('created_at', { ascending: false })
 
     if (!rich.error) {
       return NextResponse.json({ documents: rich.data ?? [] })
@@ -59,7 +62,7 @@ export async function GET() {
       .from('ai_knowledge_documents')
       .select('id, title, created_at, updated_at')
       .eq('account_id', accountId)
-      .order('updated_at', { ascending: false })
+      .order('created_at', { ascending: false })
     if (error) {
       console.error('[ai/knowledge GET] error:', error)
       return NextResponse.json(

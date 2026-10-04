@@ -39,11 +39,14 @@ async function listDocuments(
   accountId: string
 ) {
   try {
+    // Same ordering as GET /api/ai/knowledge. If the two disagreed, the list
+    // would visibly reshuffle the moment an upload landed — the freshly
+    // uploaded row would not be where the user just saw it appear.
     const rich = await supabase
       .from('ai_knowledge_documents')
       .select('id, title, filename, source_type, created_at, updated_at')
       .eq('account_id', accountId)
-      .order('updated_at', { ascending: false });
+      .order('created_at', { ascending: false });
     if (!rich.error) return rich.data ?? [];
     // Same tolerance as the GET route: an unapplied 055 must not break this.
     if (!isMissingColumnError(rich.error)) {
@@ -54,7 +57,7 @@ async function listDocuments(
       .from('ai_knowledge_documents')
       .select('id, title, created_at, updated_at')
       .eq('account_id', accountId)
-      .order('updated_at', { ascending: false });
+      .order('created_at', { ascending: false });
     return basic.data ?? [];
   } catch (err) {
     // Belt and braces: this list is a convenience for the UI. It must never
