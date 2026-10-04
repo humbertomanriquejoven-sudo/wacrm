@@ -126,6 +126,7 @@ export function resolveVariables(
 });
 }
 
+
 /* -------------------------------------------------------------------------- */
 /* Helper functions for broadcast phone normalisation                      */
 /* -------------------------------------------------------------------------- */
@@ -138,12 +139,9 @@ function cleanAndNormalizePhone(raw: string | undefined): string {
 }
 
 /** Extract a valid E.164 phone from a contact, trying the standard fields in order. */
-function extractContactPhone(contact: Contact): string {
-  const phone =
-    (contact as any)?.phone
-    || (contact as any)?.whatsapp_number
-    || (contact as any)?.mobile;
-  return cleanAndNormalizePhone(phone);
+function extractContactPhone(contact: Contact): string | null {
+  const phone = contact.phone ?? contact.username ?? contact.wa_user_id ?? contact.wa_id ?? null;
+  return phone ? cleanAndNormalizePhone(phone) : null;
 }
 
 /* -------------------------------------------------------------------------- */
