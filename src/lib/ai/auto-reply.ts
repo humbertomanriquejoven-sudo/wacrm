@@ -35,6 +35,104 @@ const MAX_TOOL_ROUNDS = 3;
 
 /**
  * ============================================================
+ * GOLDEN RULE: NEVER LEAVE A CUSTOMER WITHOUT A WHATSAPP REPLY.
+ * ============================================================
+ * The pre-LLM context (knowledge retrieval + contact profile) is the one
+ * part of the turn that talks to Postgres and to the embeddings provider
+ * BEFORE anything has been said to the customer. If either of those hangs,
+ * the whole turn dies while the UI still shows "AI assistant is replying
+ * automatically" — which is precisely the frozen state this guards
+ * against.
+ *
+ * So neither lookup is allowed to block the reply:
+ *   * retrieveKnowledge gets KNOWLEDGE_TIMEOUT_MS. Past that the bot
+ *     answers from the system prompt alone (fewer sources, never zero
+ *     words).
+ *   * loadContactContext degrades to no profile/citas.
+ * Both are best-effort by design: a missing knowledge excerpt or a missing
+ * name is a slightly worse answer, a silent thread is no answer at all.
+ */
+const KNOWLEDGE_TIMEOUT_MS = 2_500;
+
+/**
+ * Rejects with a labelled error if `promise` has not settled within `ms`.
+ * The timer is always cleared, so a fast resolution never keeps the event
+ * loop (or a serverless invocation) alive for the rest of the timeout.
+ */
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`[ai auto-reply] ${label} timed out after ${ms}ms`));
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+/**
+ * Knowledge retrieval under a hard 2.5s ceiling. NEVER rejects: a timeout,
+ * a dead database or a failed embeddings call all resolve to no excerpts so
+ * the model still generates and the reply still goes out.
+ */
+async function safeRetrieveKnowledge(
+  db: SupabaseClient,
+  accountId: string,
+  config: Pick<AiConfigLike, 'embeddingsApiKey'>,
+  queryText: string
+): Promise<string[]> {
+  try {
+    return await withTimeout(
+      retrieveKnowledge(db, accountId, config, queryText),
+      KNOWLEDGE_TIMEOUT_MS,
+      'knowledge retrieval'
+    );
+  } catch (err) {
+    console.error(
+      `[ai auto-reply] knowledge retrieval unavailable for account ${accountId} — continuing WITHOUT the knowledge base so the customer still gets an answer:`,
+      err instanceof Error ? err.message : err
+    );
+    return [];
+  }
+}
+
+/**
+ * Contact profile/citas for the prompt. NEVER rejects — `loadContactContext`
+ * has no error handling of its own, so an unguarded throw here used to
+ * reject the shared `Promise.all` and cancel the entire turn.
+ */
+async function safeLoadContactContext(
+  db: SupabaseClient,
+  contactId: string
+): Promise<Awaited<ReturnType<typeof loadContactContext>>> {
+  try {
+    return await withTimeout(
+      loadContactContext(db, contactId),
+      KNOWLEDGE_TIMEOUT_MS,
+      'contact context lookup'
+    );
+  } catch (err) {
+    console.error(
+      `[ai auto-reply] contact context unavailable for contact ${contactId} — continuing without it:`,
+      err instanceof Error ? err.message : err
+    );
+    return null;
+  }
+}
+
+/**
+ * ============================================================
  * DIAGNOSTIC BYPASS — TEMPORAL. QUÍTALO AL TERMINAR LA PRUEBA.
  * ============================================================
  * Activar con `AI_AUTOREPLY_BYPASS=true` en el entorno.
@@ -581,6 +679,14 @@ export async function dispatchInboundToAiReply(
     );
   }
 
+  // Tracks whether this turn already put a message on the wire, and whether
+  // it was entitled to. `entitled` only becomes true once every INTENTIONAL
+  // gate (config, automation override, human assignment, context, rate
+  // limit) has been passed, so the catch block's fallback send can never
+  // override a decision to deliberately stay silent.
+  let replyDispatched = false;
+  let entitledToReply = false;
+
   try {
     const db = supabaseAdmin();
 
@@ -718,12 +824,26 @@ export async function dispatchInboundToAiReply(
       }
     }
 
+    // Every gate that deliberately stays silent has now passed. From here
+    // on, ANY failure must still reach the customer.
+    entitledToReply = true;
+
     // Pre-LLM context is fetched in parallel (knowledge retrieval and
     // the contact profile/citas are independent) so the reply isn't held
     // for two sequential DB + embedding round trips.
+    //
+    // BOTH are wrapped: knowledge under a 2.5s ceiling, contact context
+    // against any rejection. Neither may cancel the turn — if either one
+    // hangs or fails, the bot answers from what it already has rather
+    // than leaving the message on "seen" forever.
     const [knowledge, contactCtx] = await Promise.all([
-      retrieveKnowledge(db, accountId, config, latestUserMessage(messages)),
-      loadContactContext(db, contactId),
+      safeRetrieveKnowledge(
+        db,
+        accountId,
+        config,
+        latestUserMessage(messages)
+      ),
+      safeLoadContactContext(db, contactId),
     ]);
 
     const systemPrompt = buildSystemPrompt({
@@ -1099,6 +1219,7 @@ export async function dispatchInboundToAiReply(
     });
 
     console.log('[AUTO-REPLY] Mensaje enviado con éxito a WhatsApp:', enviado);
+    replyDispatched = true;
   } catch (error) {
     // Global safety net around the ENTIRE reply block. Never throws, so the
     // webhook's 200 to Meta is unaffected — but a turn can no longer die
@@ -1124,6 +1245,41 @@ export async function dispatchInboundToAiReply(
     // that look identical from the customer's side.
     if (bypassEnabled()) {
       await sendOutboundProbe(args, 'dispatch threw');
+      return;
+    }
+
+    // The turn blew up after every deliberate gate had already passed and
+    // before anything reached WhatsApp. This is the exact shape of "the
+    // customer is staring at a typing indicator that never resolves", so
+    // the last resort is not another log line: send the neutral
+    // acknowledgement. It asserts nothing that could be false (no cita, no
+    // date, no link, no promise of a human), and it keeps the thread alive.
+    if (entitledToReply && !replyDispatched) {
+      try {
+        await engineSendAiReply({
+          accountId,
+          userId: configOwnerUserId,
+          conversationId,
+          contactId,
+          text: buildUngroundedAckMessage(),
+          aiGenerated: true,
+          composeMessageId: args.composeMessageId,
+          single: true,
+        });
+        replyDispatched = true;
+        console.warn(
+          `[ai auto-reply] conversation ${conversationId}: the turn failed but a fallback acknowledgement WAS delivered so the customer is not left without an answer.`
+        );
+      } catch (fallbackErr) {
+        // WhatsApp itself is unreachable — there is no third option left to
+        // try, so record the original failure together with this one.
+        console.error(
+          `[ai auto-reply] conversation ${conversationId}: FAILED to send even the fallback acknowledgement:`,
+          fallbackErr instanceof Error
+            ? { message: fallbackErr.message, stack: fallbackErr.stack }
+            : fallbackErr
+        );
+      }
     }
   }
 }

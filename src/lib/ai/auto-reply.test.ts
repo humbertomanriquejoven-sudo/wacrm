@@ -461,12 +461,56 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     }
   });
 
-  it('BYPASS off by default: a provider failure sends nothing', async () => {
+  it('BYPASS off by default: a provider failure still answers the customer', async () => {
+    // Golden rule: a turn that got past every deliberate gate must NEVER
+    // end without reaching WhatsApp. A dead provider used to leave the
+    // customer staring at a typing indicator that never resolved. The
+    // fallback is the neutral acknowledgement — it asserts nothing that
+    // could be false (no cita, no date, no link).
     delete process.env.AI_AUTOREPLY_BYPASS;
     h.generateReply.mockRejectedValue(new Error('401 invalid_api_key'));
     await dispatchInboundToAiReply(ARGS);
     expect(h.engineSendText).not.toHaveBeenCalled();
-    expect(h.engineSendAiReply).not.toHaveBeenCalled();
+    expect(h.engineSendAiReply).toHaveBeenCalledTimes(1);
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 'conv-1',
+        contactId: 'contact-1',
+        single: true,
+        text: '¡Gracias! Recibí tu información. ¿Deseas que agende tu cita ahora?',
+      })
+    );
+  });
+
+  it('a knowledge-base failure does not block the reply', async () => {
+    // retrieveKnowledge rejects (dead DB / RPC). The turn must continue and
+    // still produce a normal generated reply — not a fallback, not silence.
+    delete process.env.AI_AUTOREPLY_BYPASS;
+    h.retrieveKnowledge.mockRejectedValue(new Error('connection terminated'));
+    await dispatchInboundToAiReply(ARGS);
+    expect(h.engineSendAiReply).toHaveBeenCalledTimes(1);
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'Hello!' })
+    );
+  });
+
+  it('a knowledge-base hang past the 2.5s ceiling still answers', async () => {
+    // The failure mode that froze the thread: the promise never settles, so
+    // without a ceiling the whole dispatch would wait forever. Real timers,
+    // no fake clock: retrieveKnowledge returns a promise that never resolves.
+    delete process.env.AI_AUTOREPLY_BYPASS;
+    h.retrieveKnowledge.mockImplementation(() => new Promise<string[]>(() => {}));
+    await dispatchInboundToAiReply(ARGS);
+    expect(h.engineSendAiReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('a contact-context failure does not block the reply', async () => {
+    // loadContactContext has no error handling of its own; unguarded, its
+    // rejection cancelled the entire turn through the shared Promise.all.
+    delete process.env.AI_AUTOREPLY_BYPASS;
+    h.loadContactContext.mockRejectedValue(new Error('contacts read failed'));
+    await dispatchInboundToAiReply(ARGS);
+    expect(h.engineSendAiReply).toHaveBeenCalledTimes(1);
   });
 
   it('skips when the per-conversation cap is reached (a low stored value never blocks)', async () => {
