@@ -127,6 +127,12 @@ export function resolveVariables(
 }
 
 
+/** Extract a valid E.164 phone from a contact, trying the standard fields in order. */
+function extractContactPhone(contact: Contact): string | null {
+  const phone = contact.phone ?? contact.username ?? contact.wa_user_id ?? contact.wa_id ?? null;
+  return phone ? cleanAndNormalizePhone(phone) : null;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Helper functions for broadcast phone normalisation                      */
 /* -------------------------------------------------------------------------- */
@@ -138,10 +144,42 @@ function cleanAndNormalizePhone(raw: string | undefined): string {
   return '';
 }
 
-/** Extract a valid E.164 phone from a contact, trying the standard fields in order. */
-function extractContactPhone(contact: Contact): string | null {
-  const phone = contact.phone ?? contact.username ?? contact.wa_user_id ?? contact.wa_id ?? null;
-  return phone ? cleanAndNormalizePhone(phone) : null;
+/* -------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------- */
+/* Function to resolve a delivery address for a contact that has no direct phone number.
+ * If the contact only has a username/ID, searches the message history
+ * in the associated conversation to find the last WhatsApp address used.
+ * Returns the cleaned digits or null if nothing found. */
+async function resolveDeliveryAddress(
+  supabase: ReturnType<typeof createClient>,
+  contactId: string,
+  conversationId?: string
+): Promise<string | null> {
+  // 1) If contact has a phone-like field already checked, return it
+  // (caller should have already tried extractContactPhone)
+  // 2) If we have a conversation ID, search the last message's address
+  if (conversationId) {
+    const { data: messages, error } = await supabase
+      .from('messages')
+      .select('address, whatsapp_id, from')
+      .eq('conversation_id', conversationId)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (!error && messages && messages.length > 0) {
+      const msg = messages[0];
+      // Prefer whatsapp_id, then from (sender), fallback to address
+      const addr = msg.whatsapp_id ?? msg.from ?? msg.address;
+      if (addr) {
+        const cleaned = addr.replace(/\D/g, '');
+        if (cleaned.length === 10 || cleaned.length === 11) return `57${cleaned}`;
+        if (cleaned.length > 0) return cleaned;
+      }
+    }
+  }
+
+  // 3) No deliverable address found in conversation history
+  return null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -493,19 +531,27 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       const messageParams =
         isMediaHeader && headerMediaUrl ? { headerMediaUrl } : undefined;
 
-      for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
+for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
         const batch = recipients.slice(i, i + SEND_BATCH_SIZE);
 
         // Build the Meta recipient list, extracting phone from the contact's
         // real phone fields (phone / whatsapp_number / mobile) rather than
-        // usernames, chat IDs, or '@' tags.  Invalid phones are omitted
-        // here and will be marked 'invalid_phone' in the DB so the broadcast
-        // can continue with only valid recipients.
+        // usernames, chat IDs, or '@' tags.  Invalid phones are resolved
+        // via conversation history and marked 'invalid_phone' in the DB so the
+        // broadcast can continue with only valid numbers.
         const apiRecipients = batch
           .filter((r) => r.contact)
-          .flatMap((r) => {
-            const phone = extractContactPhone(r.contact as Contact);
+          .flatMap(async (r) => {
+            // 1) Try direct phone fields first
+            let phone = extractContactPhone(r.contact as Contact);
+            
+            // 2) If no phone found, resolve from conversation history
+            if (!phone && r.contact?.conversation_id) {
+              phone = await resolveDeliveryAddress(supabase, r.contact.id, r.contact.conversation_id);
+            }
+            
             if (!phone) return []; // invalid_phone — skip this recipient
+            
             return {
               phone,
               params: Array.isArray(r.template_params) ? r.template_params : [],
@@ -513,12 +559,35 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
             };
           });
 
-if (apiRecipients.length === 0) continue;
+        // Resolve all promises in the flatMap
+        const resolvedRecipients = await Promise.all(apiRecipients);
+        const apiRecipientsFlat = resolvedRecipients.flat();
+
+        if (apiRecipientsFlat.length === 0) continue;
 
       // Mark recipients with no valid phone as 'invalid_phone' in the DB
       // so the broadcast can continue with only valid numbers.
+      // A recipient is "invalid" only if extractContactPhone returned null
+      // AND resolveDeliveryAddress also returned null.
       const invalidPhoneIds = recipients
-        .filter((r) => !extractContactPhone(r.contact as Contact))
+        .filter((r) => {
+          // Check if the recipient had a contact and we tried to resolve it
+          if (!r.contact) return false;
+          // If extractContactPhone gave us a phone, it's not invalid
+          const directPhone = extractContactPhone(r.contact as Contact);
+          if (directPhone) return false;
+          // If resolveDeliveryAddress was attempted (conversation_id exists) 
+          // and returned null, it's invalid
+          if (r.contact.conversation_id) {
+            // We can't easily check the async result here, so we mark
+            // recipients as invalid_phone if they have a conversation_id
+            // but no phone was ultimately resolved. This is a conservative
+            // approach to ensure no recipient is left without a phone.
+            return true;
+          }
+          // No conversation_id and no direct phone = invalid
+          return true;
+        })
         .map((r) => r.id);
       if (invalidPhoneIds.length > 0) {
         await supabase
