@@ -115,7 +115,16 @@ export function AiKnowledgeCard({
   }, [t]);
 
   useEffect(() => {
-    if (!accountId || loadedAccountIdRef.current === accountId) return;
+    if (!accountId) {
+      loadedAccountIdRef.current = null;
+      setDocs([]);
+      setLoadError(false);
+      setLoading(false);
+      return;
+    }
+    // Fetch whenever the account becomes known (mount, tab change, or after
+    // the parent re-mounts). This ensures the list survives a container
+    // restart or switching away/ back to the tab.
     loadedAccountIdRef.current = accountId;
     void fetchDocs();
   }, [accountId, fetchDocs]);
