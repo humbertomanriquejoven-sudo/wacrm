@@ -231,4 +231,102 @@ describe('/api/ai/knowledge/upload', () => {
     expect(response.status).toBe(403);
     expect(inserted).toHaveLength(0);
   });
+
+  // ---------------------------------------------------------------------
+  // Diagnosability: a failed insert must name the database's own reason.
+  // These used to collapse into `{ error: 'Failed to save document' }`,
+  // which is why "my file doesn't save" could not be diagnosed from either
+  // the server log or DevTools.
+  // ---------------------------------------------------------------------
+  describe('insert failures are surfaced, not swallowed', () => {
+    function dbFailingWith(error: object) {
+      return {
+        from: () => ({
+          insert: () => ({
+            select: () => ({
+              single: () => Promise.resolve({ data: null, error }),
+            }),
+          }),
+        }),
+      };
+    }
+
+    it('returns the SQLSTATE and message for an RLS rejection', async () => {
+      mocks.requireRole.mockResolvedValue({
+        ...context,
+        supabase: dbFailingWith({
+          code: '42501',
+          message: 'new row violates row-level security policy for table "ai_knowledge_documents"',
+          details: '',
+          hint: '',
+        }),
+      });
+      const response = await POST(multipart(xlsxFile()));
+
+      // 403, not 500: "your role cannot write here" is a different problem
+      // from "the server broke".
+      expect(response.status).toBe(403);
+      const body = await response.json();
+      expect(body.db_code).toBe('42501');
+      expect(body.error).toContain('row-level security policy');
+      expect(body.advice).toMatch(/admin member/i);
+    });
+
+    it('returns 400 and names migration 055 when a column is missing', async () => {
+      mocks.requireRole.mockResolvedValue({
+        ...context,
+        supabase: dbFailingWith({
+          code: '42703',
+          message: 'column ai_knowledge_documents.filename does not exist',
+          details: '',
+          hint: '',
+        }),
+      });
+      const response = await POST(multipart(xlsxFile()));
+
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.db_code).toBe('42703');
+      expect(body.advice).toContain('055_knowledge_document_filename.sql');
+    });
+
+    it('never returns the old opaque message', async () => {
+      mocks.requireRole.mockResolvedValue({
+        ...context,
+        supabase: dbFailingWith({
+          code: '23505',
+          message: 'duplicate key value violates unique constraint "ai_knowledge_documents_pkey"',
+          details: '',
+          hint: '',
+        }),
+      });
+      const response = await POST(multipart(xlsxFile()));
+      const body = await response.json();
+      expect(body.error).not.toBe('Failed to save document');
+    });
+
+    it('logs KNOWLEDLEDGE_BASE_DB_ERROR with the failing filename', async () => {
+      const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      mocks.requireRole.mockResolvedValue({
+        ...context,
+        supabase: dbFailingWith({
+          code: '42501',
+          message: 'new row violates row-level security policy',
+          details: '',
+          hint: '',
+        }),
+      });
+      await POST(multipart(xlsxFile('tarifario.xlsx')));
+
+      const tagged = spy.mock.calls.filter((c) =>
+        String(c[0]).includes('KNOWLEDGE_BASE_DB_ERROR')
+      );
+      expect(tagged.length).toBeGreaterThan(0);
+      expect(tagged[0][1]).toMatchObject({
+        filename: 'tarifario.xlsx',
+        code: '42501',
+      });
+      spy.mockRestore();
+    });
+  });
 });

@@ -8,6 +8,10 @@ import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit
 import { loadEmbeddingsKey } from '@/lib/ai/config'
 import { ingestDocument } from '@/lib/ai/knowledge'
 import { AiError } from '@/lib/ai/types'
+import {
+  httpStatusForDbError,
+  reportKnowledgeDbError,
+} from '@/lib/ai/knowledge-errors'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -26,7 +30,13 @@ export async function GET(_request: Request, { params }: Params) {
       .maybeSingle()
     if (error) {
       console.error('[ai/knowledge/[id] GET] error:', error)
-      return NextResponse.json({ error: 'Failed to load document' }, { status: 500 })
+      return NextResponse.json(
+        reportKnowledgeDbError(error, 'load knowledge document', {
+          accountId,
+          documentId: id,
+        }),
+        { status: httpStatusForDbError(error) },
+      )
     }
     if (!data) return NextResponse.json({ error: 'Not found' }, { status: 404 })
     return NextResponse.json(data)
@@ -72,7 +82,15 @@ export async function PATCH(request: Request, { params }: Params) {
       .maybeSingle()
     if (error) {
       console.error('[ai/knowledge/[id] PATCH] error:', error)
-      return NextResponse.json({ error: 'Failed to update document' }, { status: 500 })
+      return NextResponse.json(
+        reportKnowledgeDbError(error, 'update knowledge document', {
+          accountId,
+          userId,
+          documentId: id,
+          fields: Object.keys(update),
+        }),
+        { status: httpStatusForDbError(error) },
+      )
     }
     if (!updated) return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
@@ -123,7 +141,13 @@ export async function DELETE(_request: Request, { params }: Params) {
       .eq('id', id)
     if (error) {
       console.error('[ai/knowledge/[id] DELETE] error:', error)
-      return NextResponse.json({ error: 'Failed to delete document' }, { status: 500 })
+      return NextResponse.json(
+        reportKnowledgeDbError(error, 'delete knowledge document', {
+          accountId,
+          documentId: id,
+        }),
+        { status: httpStatusForDbError(error) },
+      )
     }
     return NextResponse.json({ success: true })
   } catch (err) {

@@ -9,6 +9,10 @@ import { loadEmbeddingsKey } from '@/lib/ai/config'
 import { ingestDocument } from '@/lib/ai/knowledge'
 import { AiError } from '@/lib/ai/types'
 import { isMissingColumnError } from '@/lib/ai/knowledge-schema'
+import {
+  httpStatusForDbError,
+  reportKnowledgeDbError,
+} from '@/lib/ai/knowledge-errors'
 
 /**
  * GET /api/ai/knowledge
@@ -40,8 +44,11 @@ export async function GET() {
     if (!isMissingColumnError(rich.error)) {
       console.error('[ai/knowledge GET] error:', rich.error)
       return NextResponse.json(
-        { error: 'Failed to load knowledge base' },
-        { status: 500 },
+        reportKnowledgeDbError(rich.error, 'list knowledge documents', {
+          accountId,
+          projection: 'rich',
+        }),
+        { status: httpStatusForDbError(rich.error) },
       )
     }
 
@@ -56,8 +63,11 @@ export async function GET() {
     if (error) {
       console.error('[ai/knowledge GET] error:', error)
       return NextResponse.json(
-        { error: 'Failed to load knowledge base' },
-        { status: 500 },
+        reportKnowledgeDbError(error, 'list knowledge documents (legacy shape)', {
+          accountId,
+          projection: 'legacy',
+        }),
+        { status: httpStatusForDbError(error) },
       )
     }
     return NextResponse.json({ documents: data ?? [] })
@@ -96,8 +106,13 @@ export async function POST(request: Request) {
     if (error || !doc) {
       console.error('[ai/knowledge POST] insert error:', error)
       return NextResponse.json(
-        { error: 'Failed to save document' },
-        { status: 500 },
+        reportKnowledgeDbError(error, 'create knowledge document', {
+          accountId,
+          userId,
+          title,
+          contentChars: content.length,
+        }),
+        { status: httpStatusForDbError(error) },
       )
     }
 
@@ -172,8 +187,11 @@ export async function DELETE(request: Request) {
     if (error) {
       console.error('[ai/knowledge DELETE] error:', error)
       return NextResponse.json(
-        { error: 'Failed to delete document' },
-        { status: 500 },
+        reportKnowledgeDbError(error, 'delete knowledge document', {
+          accountId,
+          documentId: id,
+        }),
+        { status: httpStatusForDbError(error) },
       )
     }
     return NextResponse.json({ success: true, id })

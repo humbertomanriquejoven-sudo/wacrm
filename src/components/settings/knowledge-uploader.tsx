@@ -89,9 +89,24 @@ export function KnowledgeUploader({
           // back to a refetch when the server could not produce one.
           await onUploaded(Array.isArray(data.documents) ? data.documents : undefined);
         } else {
+          // A failed insert used to surface only as a generic toast, which
+          // made "my file didn't save" undiagnosable. The API now returns
+          // the SQLSTATE and the database message; print them so the browser
+          // console carries the same detail as the server log.
+          console.error('[knowledge] upload failed', {
+            file: selected.name,
+            bytes: selected.size,
+            httpStatus: res.status,
+            sqlstate: data?.db_code,
+            message: data?.db_message ?? data?.error,
+            details: data?.db_details,
+            hint: data?.db_hint,
+            advice: data?.advice,
+          });
           toast.error(data.error ?? t('uploadFailed'));
         }
-      } catch {
+      } catch (err) {
+        console.error('[knowledge] upload threw:', err);
         toast.error(t('uploadFailed'));
       } finally {
         setUploading(false);

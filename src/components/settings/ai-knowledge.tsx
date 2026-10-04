@@ -72,6 +72,53 @@ function documentExtension(doc: DocSummary): string | null {
 /** Editor target: 'new' when creating, a doc id when editing, null when closed. */
 type EditTarget = 'new' | string | null;
 
+/**
+ * Print a failed knowledge-base response to the browser console with the
+ * database fields the API now returns (`db_code`, `db_message`, `db_details`,
+ * `db_hint`, `advice`).
+ *
+ * The API stopped collapsing failures into "Failed to save document", so the
+ * cause is now in the response body — but only if someone looks. Logging it
+ * here means the browser's console carries the same SQLSTATE the server log
+ * does, which is what turns "the file didn't save" into a diagnosis.
+ *
+ * Silently ignored: a body that is not JSON, or an older server response
+ * without the db_* fields. Never throws — this runs inside error handlers.
+ */
+function logKnowledgeFailure(
+  operation: string,
+  body: unknown,
+  fallbackMessage?: string
+): void {
+  const payload =
+    body && typeof body === 'object'
+      ? (body as {
+          error?: string;
+          db_code?: string;
+          db_message?: string;
+          db_details?: string;
+          db_hint?: string;
+          advice?: string;
+        })
+      : null;
+  if (!payload) {
+    console.error(`[knowledge] ${operation} failed`, body ?? fallbackMessage);
+    return;
+  }
+  console.error(
+    `[knowledge] ${operation} failed`,
+    payload.db_code
+      ? {
+          sqlstate: payload.db_code,
+          message: payload.db_message ?? payload.error,
+          details: payload.db_details,
+          hint: payload.db_hint,
+          advice: payload.advice,
+        }
+      : payload.error ?? fallbackMessage
+  );
+}
+
 export function AiKnowledgeCard({
   accountId,
   canEdit,
@@ -106,10 +153,12 @@ export function AiKnowledgeCard({
         // render as "No documents yet." or the user concludes their uploads
         // were deleted.
         setLoadError(true);
+        logKnowledgeFailure('list documents', data, t('loadFailed'));
         toast.error(data.error ?? t('loadFailed'));
       }
-    } catch {
+    } catch (err) {
       setLoadError(true);
+      console.error('[knowledge] list documents threw:', err);
       toast.error(t('loadFailed'));
     } finally {
       setLoading(false);
@@ -187,9 +236,15 @@ export function AiKnowledgeCard({
         cancelEdit();
         await fetchDocs();
       } else {
+        logKnowledgeFailure(
+          isNew ? 'create document' : 'update document',
+          data,
+          t('saveFailed')
+        );
         toast.error(data.error ?? t('saveFailed'));
       }
-    } catch {
+    } catch (err) {
+      console.error('[knowledge] save threw:', err);
       toast.error(t('saveFailed'));
     } finally {
       setSaving(false);
@@ -204,9 +259,11 @@ export function AiKnowledgeCard({
         setDocs((d) => d.filter((x) => x.id !== id));
       } else {
         const data = await res.json();
+        logKnowledgeFailure('delete document', data, t('removeFailed'));
         toast.error(data.error ?? t('removeFailed'));
       }
-    } catch {
+    } catch (err) {
+      console.error('[knowledge] delete threw:', err);
       toast.error(t('removeFailed'));
     }
   };

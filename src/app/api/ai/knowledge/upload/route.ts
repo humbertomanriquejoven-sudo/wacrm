@@ -13,6 +13,10 @@ import {
   parseKnowledgeFile,
 } from '@/lib/ai/knowledge-parser';
 import { isMissingColumnError } from '@/lib/ai/knowledge-schema';
+import {
+  httpStatusForDbError,
+  reportKnowledgeDbError,
+} from '@/lib/ai/knowledge-errors';
 
 // 16 MB — the repo-wide upload ceiling. Large enough for catalogs and
 // policies, small enough to keep the documents table sane.
@@ -177,16 +181,34 @@ export async function POST(request: Request) {
             fallback.error ?? attempt.error
           );
           return NextResponse.json(
-            { error: 'Failed to save document' },
-            { status: 500 }
+            reportKnowledgeDbError(
+              fallback.error ?? attempt.error,
+              'insert knowledge document (legacy shape, 055 not applied)',
+              {
+                accountId,
+                userId,
+                title,
+                contentChars: content.length,
+                filename: file.name,
+                sourceType: extension,
+              }
+            ),
+            { status: httpStatusForDbError(fallback.error ?? attempt.error) }
           );
         }
         doc = fallback.data;
       } else {
         console.error('[ai/knowledge/upload] insert error:', attempt.error);
         return NextResponse.json(
-          { error: 'Failed to save document' },
-          { status: 500 }
+          reportKnowledgeDbError(attempt.error, 'insert knowledge document', {
+            accountId,
+            userId,
+            title,
+            contentChars: content.length,
+            filename: file.name,
+            sourceType: extension,
+          }),
+          { status: httpStatusForDbError(attempt.error) }
         );
       }
     }
