@@ -4,6 +4,7 @@ import {
   describeDbError,
   httpStatusForDbError,
   reportKnowledgeDbError,
+  reportKnowledgeFatalError,
 } from './knowledge-errors';
 
 afterEach(() => {
@@ -129,5 +130,75 @@ describe('reportKnowledgeDbError', () => {
     );
     expect(body.error).toBe('connection terminated unexpectedly');
     expect(body.db_code).toBe('');
+  });
+
+  it('names the missing table when the whole table is absent (42P01)', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    // The failure that makes EVERY upload fail identically when the
+    // knowledge-base migrations were never applied.
+    const body = reportKnowledgeDbError(
+      pgError('42P01', 'relation "ai_knowledge_documents" does not exist'),
+      'insert knowledge document'
+    );
+    expect(body.advice).toContain('ai_knowledge_documents');
+    expect(body.advice).toContain('030_ai_knowledge.sql');
+    expect(body.advice).toContain('055_knowledge_document_filename.sql');
+    // 500 is honest — the server's schema is wrong — but it is no longer blank.
+    expect(httpStatusForDbError(pgError('42P01', 'x'))).toBe(500);
+  });
+
+  it('maps the newly handled codes to meaningful statuses', () => {
+    expect(httpStatusForDbError(pgError('22001', 'value too long'))).toBe(400);
+    expect(httpStatusForDbError(pgError('23P01', 'conflict'))).toBe(409);
+    expect(httpStatusForDbError(pgError('PGRST116', 'no rows'))).toBe(404);
+  });
+
+  it('explains a truncation and an exclusion conflict', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(
+      reportKnowledgeDbError(pgError('22001', 'value too long'), 'insert').advice
+    ).toMatch(/column/i);
+    expect(
+      reportKnowledgeDbError(pgError('23P01', 'conflict'), 'insert').advice
+    ).toMatch(/exclusion/i);
+  });
+});
+
+describe('reportKnowledgeFatalError', () => {
+  it('surfaces the real message instead of "Internal server error"', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const body = reportKnowledgeFatalError(
+      new Error('supabaseUrl is required'),
+      'POST /api/ai/knowledge/upload'
+    );
+    // The whole point: a systemic fault fails every upload the same way, so
+    // a generic message leaves nothing to act on.
+    expect(body.error).toContain('supabaseUrl is required');
+    expect(body.error).not.toMatch(/^Internal server error$/);
+    expect(body.error).toContain('KNOWLEDGE_BASE_DB_ERROR');
+  });
+
+  it('logs the failure server-side with its operation', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    reportKnowledgeFatalError(new Error('boom'), 'POST /api/ai/knowledge/upload');
+    expect(spy).toHaveBeenCalledWith(
+      expect.stringContaining('KNOWLEDGE_BASE_DB_ERROR'),
+      expect.objectContaining({ operation: 'POST /api/ai/knowledge/upload' })
+    );
+  });
+
+  it('handles a thrown non-Error without producing an empty message', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(reportKnowledgeFatalError('plain string', 'op').error).toContain(
+      'plain string'
+    );
+    expect(reportKnowledgeFatalError(undefined, 'op').error).not.toBe('');
+  });
+
+  it('reports empty db_* fields so clients cannot mistake it for a DB error', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const body = reportKnowledgeFatalError(new Error('x'), 'op');
+    expect(body.db_code).toBe('');
+    expect(body.db_message).toBe('x');
   });
 });

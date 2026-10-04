@@ -24,6 +24,15 @@ vi.mock('@/lib/auth/account', () => ({
   toErrorResponse: vi.fn(() =>
     Response.json({ error: 'auth failed' }, { status: 403 })
   ),
+  // Real classes: the route's outer catch does `instanceof` on these to keep
+  // 401/403 instead of turning an auth rejection into a 500. Omitting them
+  // made `instanceof` receive undefined and threw.
+  UnauthorizedError: class UnauthorizedError extends Error {
+    status = 401;
+  },
+  ForbiddenError: class ForbiddenError extends Error {
+    status = 403;
+  },
 }));
 
 vi.mock('@/lib/rate-limit', () => ({
@@ -251,11 +260,36 @@ describe('/api/ai/knowledge/upload', () => {
     expect(inserted).toHaveLength(0);
   });
 
-  it('returns toErrorResponse for auth failures', async () => {
-    mocks.requireRole.mockRejectedValueOnce(new Error('nope'));
+  it('keeps 403 for a real ForbiddenError instead of masking it as a 500', async () => {
+    const { ForbiddenError } = await import('@/lib/auth/account');
+    mocks.requireRole.mockRejectedValueOnce(
+      new ForbiddenError('admin role required')
+    );
     const response = await POST(multipart(xlsxFile()));
+    // An auth rejection must not read as a server fault.
     expect(response.status).toBe(403);
     expect(inserted).toHaveLength(0);
+  });
+
+  it('keeps 401 for a real UnauthorizedError', async () => {
+    const { UnauthorizedError } = await import('@/lib/auth/account');
+    mocks.requireRole.mockRejectedValueOnce(new UnauthorizedError('sign in'));
+    const response = await POST(multipart(xlsxFile()));
+    expect(response.status).toBe(401);
+  });
+
+  it('reports the cause of a non-auth failure instead of "Internal server error"', async () => {
+    // A systemic fault (missing env var, broken auth client) fails EVERY
+    // upload identically. The old path returned a bare 500 whose body said
+    // nothing, which is why this class of bug was undiagnosable.
+    mocks.requireRole.mockRejectedValueOnce(
+      new Error('supabaseUrl is required')
+    );
+    const response = await POST(multipart(xlsxFile()));
+    expect(response.status).toBe(500);
+    const body = await response.json();
+    expect(body.error).toContain('supabaseUrl is required');
+    expect(body.error).not.toBe('Internal server error');
   });
 
   // ---------------------------------------------------------------------

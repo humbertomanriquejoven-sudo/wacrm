@@ -78,15 +78,29 @@ export function httpStatusForDbError(error: unknown): number {
     case '23503':
     case '23514':
       return 409;
-    // not_null_violation, undefined_column, invalid_text_representation.
+    // not_null_violation, undefined_column, invalid_text_representation,
+    // string_data_right_truncation (extracted text longer than the column).
     case '23502':
     case '42703':
     case '22P02':
+    case '22001':
       return 400;
     // PostgREST could not resolve the projection (unknown column).
     case 'PGRST204':
     case 'PGRST205':
       return 400;
+    // undefined_table. A 500 is the honest status — the server's schema is
+    // wrong, not the request — but it now travels with advice naming the
+    // missing relation, because this is the single failure that makes
+    // EVERY upload fail identically.
+    case '42P01':
+      return 500;
+    // exclusion_violation.
+    case '23P01':
+      return 409;
+    // PGRST116: a single() lookup matched no rows.
+    case 'PGRST116':
+      return 404;
     // query_canceled — usually a statement timeout on a large upload.
     case '57014':
       return 504;
@@ -106,6 +120,12 @@ export function httpStatusForDbError(error: unknown): number {
  * Purely advisory — the raw database message always rides along next to it.
  */
 function adviceFor(parts: KnowledgeDbErrorParts): string | undefined {
+  if (parts.code === '42P01') {
+    // The relation named in the Postgres message is the one to create; it is
+    // quoted after `relation "..." does not exist`.
+    const relation = parts.message.match(/relation\s+"([^"]+)"/i)?.[1];
+    return `The database is missing the table or function "${relation ?? '(unnamed)'}", so every knowledge-base write fails the same way. Apply the knowledge-base migrations in order: supabase/migrations/030_ai_knowledge.sql, then 055_knowledge_document_filename.sql.`;
+  }
   if (parts.code === '42501') {
     return 'Row-level security rejected this write. The signed-in user must be an admin member of the account (ai_knowledge_documents INSERT policy requires is_account_member(account_id, \'admin\')).';
   }
@@ -118,6 +138,15 @@ function adviceFor(parts: KnowledgeDbErrorParts): string | undefined {
   ) {
     return 'The database schema is missing a column this app expects. Apply supabase/migrations/055_knowledge_document_filename.sql (filename, source_type).';
   }
+  if (parts.code === '22001') {
+    return 'A text value was longer than its column allows. The extracted document text exceeded the column limit; split the file or raise the column width.';
+  }
+  if (parts.code === '23P01') {
+    return 'An exclusion constraint rejected the row — the account already has a knowledge document covering that time range.';
+  }
+  if (parts.code === 'PGRST116') {
+    return 'No matching row was found, or it is not visible under your account/role. The document may belong to another account, or it may have been deleted.';
+  }
   if (parts.code === '57014') {
     return 'The statement timed out. The extracted text may be too large to index in one request.';
   }
@@ -128,6 +157,44 @@ function adviceFor(parts: KnowledgeDbErrorParts): string | undefined {
     return 'The database was unreachable. Check the Supabase project status and the service_role key.';
   }
   return undefined;
+}
+
+/**
+ * Report a NON-database failure — an exception thrown outside the guarded
+ * database calls (auth, request parsing, a bug in this handler).
+ *
+ * These routes are admin-gated, so the message reaches only a signed-in admin
+ * of the account, and it used to be replaced wholesale by
+ * `{ error: "Internal server error" }`. That is the same blind spot this
+ * module exists to remove, one layer up: a systemic fault (a missing env
+ * var, a broken auth client) fails every upload identically and says nothing
+ * about why. The status stays 500 — the server is at fault — but the response
+ * now names the cause and points at the server log.
+ */
+export function reportKnowledgeFatalError(
+  error: unknown,
+  operation: string,
+  context: Record<string, unknown> = {},
+): { error: string; db_code: ''; db_message: string; details: string; hint: string } {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === 'string'
+        ? error
+        : 'The knowledge base request failed with an unrecognised error.';
+  console.error(`${LOG_TAG}: ${operation} threw`, {
+    operation,
+    ...context,
+    message,
+    raw: error,
+  });
+  return {
+    error: `${message} (see server logs: ${LOG_TAG})`,
+    db_code: '',
+    db_message: message,
+    details: '',
+    hint: '',
+  };
 }
 
 /**

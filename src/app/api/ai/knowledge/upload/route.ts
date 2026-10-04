@@ -1,5 +1,9 @@
 import { NextResponse } from 'next/server';
-import { requireRole, toErrorResponse } from '@/lib/auth/account';
+import {
+  ForbiddenError,
+  requireRole,
+  UnauthorizedError,
+} from '@/lib/auth/account';
 import {
   checkRateLimit,
   rateLimitResponse,
@@ -15,6 +19,7 @@ import { isMissingColumnError } from '@/lib/ai/knowledge-schema';
 import {
   httpStatusForDbError,
   reportKnowledgeDbError,
+  reportKnowledgeFatalError,
 } from '@/lib/ai/knowledge-errors';
 
 // 16 MB — the repo-wide upload ceiling. Large enough for catalogs and
@@ -280,6 +285,19 @@ export async function POST(request: Request) {
     }
     return NextResponse.json(base);
   } catch (err) {
-    return toErrorResponse(err);
+    // Auth failures keep their real status — a non-admin must see 401/403,
+    // not a 500 that reads like a server fault.
+    if (err instanceof UnauthorizedError || err instanceof ForbiddenError) {
+      return NextResponse.json({ error: err.message }, { status: err.status });
+    }
+    // Everything else previously collapsed into `toErrorResponse`, which
+    // answers a bare 500 `{ error: "Internal server error" }`. A systemic
+    // fault here fails EVERY upload the same way and named nothing, so there
+    // was no way to tell a missing env var from a broken auth client.
+    // Admin-gated, so the message is safe to return.
+    return NextResponse.json(
+      reportKnowledgeFatalError(err, 'POST /api/ai/knowledge/upload'),
+      { status: 500 }
+    );
   }
 }
