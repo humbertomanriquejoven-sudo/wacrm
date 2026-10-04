@@ -69,6 +69,29 @@ describe('buildSystemPrompt', () => {
     );
   });
 
+  it('opens with the inviolable golden rule, ahead of every other directive', () => {
+    const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' });
+    expect(prompt).toContain('REGLA DE ORO INVIOLABLE');
+    expect(prompt).toContain('SIEMPRE RESPONDER');
+    expect(prompt).toContain('EXCELENCIA Y COHERENCIA');
+    expect(prompt).toContain('ATENCIÓN CONTINUA');
+    expect(prompt).toContain('MANEJO DE INFORMACIÓN');
+    // Max priority == it must come first, before the identity/persona and the
+    // tool rules. Only the clock line may precede it.
+    const golden = prompt.indexOf('REGLA DE ORO INVIOLABLE');
+    expect(golden).toBeGreaterThan(-1);
+    expect(golden).toBeLessThan(prompt.indexOf('Eres un asistente de mensajería'));
+    expect(golden).toBeLessThan(prompt.indexOf('REGLAS OBLIGATORIAS (ESTRICTAS)'));
+  });
+
+  it('offers company details only when backed by context, never invented', () => {
+    const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' });
+    // Directive 4 must NOT become a licence to fabricate an address: the
+    // business location is not hardcoded anywhere in the prompt.
+    expect(prompt).toContain('NUNCA lo inventes ni lo adivines');
+    expect(prompt).not.toMatch(/calle \d|carrera \d|av\. \d/i);
+  });
+
   it('never teaches an automatic handoff and demands a reply to every message', () => {
     const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' });
     // CERO handoff automático: el inline no instruye el sentinel y ninguna
