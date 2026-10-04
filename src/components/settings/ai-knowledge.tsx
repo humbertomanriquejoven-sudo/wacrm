@@ -28,6 +28,43 @@ interface DocSummary {
   id: string;
   title: string;
   updated_at: string;
+  /** Original upload name. Absent until migration 055 is applied. */
+  filename?: string | null;
+  /** Parser that produced the text ('xlsx', 'pdf', 'png', …). */
+  source_type?: string | null;
+}
+
+/** Badge tone per file family, so a price sheet reads differently to a photo. */
+function fileBadgeKind(
+  ext: string
+): 'sheet' | 'doc' | 'pdf' | 'image' | 'text' | 'other' {
+  if (['xlsx', 'xls', 'csv'].includes(ext)) return 'sheet';
+  if (['docx', 'doc'].includes(ext)) return 'doc';
+  if (ext === 'pdf') return 'pdf';
+  if (['png', 'jpg', 'jpeg', 'webp'].includes(ext)) return 'image';
+  if (ext === 'txt') return 'text';
+  return 'other';
+}
+
+const BADGE_CLASS: Record<ReturnType<typeof fileBadgeKind>, string> = {
+  sheet: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300',
+  doc: 'bg-sky-500/15 text-sky-700 dark:text-sky-300',
+  pdf: 'bg-rose-500/15 text-rose-700 dark:text-rose-300',
+  image: 'bg-violet-500/15 text-violet-700 dark:text-violet-300',
+  text: 'bg-muted text-muted-foreground',
+  other: 'bg-muted text-muted-foreground',
+};
+
+/**
+ * The extension to badge, preferring the stored filename and falling back to
+ * the recorded source_type. Documents created before 055 (or hand-typed in the
+ * editor) have neither, in which case there is simply no badge — better than
+ * showing a wrong one.
+ */
+function documentExtension(doc: DocSummary): string | null {
+  const fromName = doc.filename?.match(/\.([A-Za-z0-9]+)$/)?.[1];
+  const ext = (fromName ?? doc.source_type ?? '').toLowerCase();
+  return ext || null;
 }
 
 /** Editor target: 'new' when creating, a doc id when editing, null when closed. */
@@ -234,13 +271,33 @@ export function AiKnowledgeCard({
 
             {docs.length > 0 && (
               <ul className="divide-border border-border divide-y rounded-md border">
-                {docs.map((doc) => (
+                {docs.map((doc) => {
+                  const ext = documentExtension(doc);
+                  return (
                   <li
                     key={doc.id}
                     className="flex items-center justify-between gap-2 px-3 py-2"
                   >
-                    <span className="text-foreground min-w-0 truncate text-sm">
-                      {doc.title}
+                    <span className="flex min-w-0 items-center gap-2">
+                      {ext && (
+                        <span
+                          className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] uppercase ${BADGE_CLASS[fileBadgeKind(ext)]}`}
+                        >
+                          {ext}
+                        </span>
+                      )}
+                      <span className="min-w-0">
+                        {/* The real upload name is the most recognisable label;
+                            hand-typed documents only have a title. */}
+                        <span className="text-foreground block truncate text-sm">
+                          {doc.filename || doc.title}
+                        </span>
+                        {doc.filename && doc.filename !== doc.title && (
+                          <span className="text-muted-foreground block truncate text-xs">
+                            {doc.title}
+                          </span>
+                        )}
+                      </span>
                     </span>
                     {canEdit && (
                       <span className="flex shrink-0 gap-1">
@@ -265,7 +322,8 @@ export function AiKnowledgeCard({
                       </span>
                     )}
                   </li>
-                ))}
+                  );
+                })}
               </ul>
             )}
 

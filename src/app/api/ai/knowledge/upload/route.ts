@@ -12,6 +12,7 @@ import {
   knowledgeFileExtension,
   parseKnowledgeFile,
 } from '@/lib/ai/knowledge-parser';
+import { isMissingColumnError } from '@/lib/ai/knowledge-schema';
 
 // 16 MB — the repo-wide upload ceiling. Large enough for catalogs and
 // policies, small enough to keep the documents table sane.
@@ -34,16 +35,23 @@ async function listDocuments(
   accountId: string
 ) {
   try {
-    const { data, error } = await supabase
+    const rich = await supabase
+      .from('ai_knowledge_documents')
+      .select('id, title, filename, source_type, updated_at')
+      .eq('account_id', accountId)
+      .order('updated_at', { ascending: false });
+    if (!rich.error) return rich.data ?? [];
+    // Same tolerance as the GET route: an unapplied 055 must not break this.
+    if (!isMissingColumnError(rich.error)) {
+      console.error('[ai/knowledge/upload] could not reload list:', rich.error);
+      return [];
+    }
+    const basic = await supabase
       .from('ai_knowledge_documents')
       .select('id, title, updated_at')
       .eq('account_id', accountId)
       .order('updated_at', { ascending: false });
-    if (error) {
-      console.error('[ai/knowledge/upload] could not reload list:', error);
-      return [];
-    }
-    return data ?? [];
+    return basic.data ?? [];
   } catch (err) {
     // Belt and braces: this list is a convenience for the UI. It must never
     // be able to turn a successful upload into a failed request.
@@ -123,24 +131,64 @@ export async function POST(request: Request) {
     const truncated = content.length > MAX_TEXT_CHARS;
     if (truncated) content = content.slice(0, MAX_TEXT_CHARS);
 
-    const { data: doc, error } = await supabase
-      .from('ai_knowledge_documents')
-      .insert({
-        account_id: accountId,
-        created_by: userId,
-        title,
-        content,
-        filename: file.name,
-        source_type: extension,
-      })
-      .select('id')
-      .single();
-    if (error || !doc) {
-      console.error('[ai/knowledge/upload] insert error:', error);
-      return NextResponse.json(
-        { error: 'Failed to save document' },
-        { status: 500 }
-      );
+    const insertRow = {
+      account_id: accountId,
+      created_by: userId,
+      title,
+      content,
+      // The real upload name and the parser used, so a weak extraction
+      // (e.g. an unreadable image) can be identified and re-uploaded.
+      filename: file.name,
+      source_type: extension,
+    };
+
+    let doc: { id: string } | null = null;
+    let degradedSchema = false;
+    {
+      const attempt = await supabase
+        .from('ai_knowledge_documents')
+        .insert(insertRow)
+        .select('id')
+        .single();
+      if (!attempt.error && attempt.data) {
+        doc = attempt.data;
+      } else if (isMissingColumnError(attempt.error)) {
+        // Migration 055 is not applied on this database yet. Store the
+        // document with the legacy shape instead of failing the request —
+        // losing an upload because a cosmetic column is missing would be a
+        // far worse outcome than not recording the filename.
+        console.warn(
+          '[ai/knowledge/upload] 055 not applied; saving without filename/source_type.'
+        );
+        degradedSchema = true;
+        const fallback = await supabase
+          .from('ai_knowledge_documents')
+          .insert({
+            account_id: accountId,
+            created_by: userId,
+            title,
+            content,
+          })
+          .select('id')
+          .single();
+        if (fallback.error || !fallback.data) {
+          console.error(
+            '[ai/knowledge/upload] insert error:',
+            fallback.error ?? attempt.error
+          );
+          return NextResponse.json(
+            { error: 'Failed to save document' },
+            { status: 500 }
+          );
+        }
+        doc = fallback.data;
+      } else {
+        console.error('[ai/knowledge/upload] insert error:', attempt.error);
+        return NextResponse.json(
+          { error: 'Failed to save document' },
+          { status: 500 }
+        );
+      }
     }
 
     const { key: embeddingsApiKey, corrupt } = await loadEmbeddingsKey(
@@ -174,6 +222,10 @@ export async function POST(request: Request) {
       id: doc.id,
       title,
       chars: content.length,
+      // True when migration 055 is missing on this database and the document
+      // was stored without its filename/type. Surfaced so the UI can say so
+      // instead of silently losing that data.
+      degradedSchema,
       // The refreshed list, so the client can reconcile its state from this
       // response instead of issuing a follow-up GET. That follow-up is the
       // step that used to fail (rate limit / remount) and leave the panel
@@ -183,14 +235,24 @@ export async function POST(request: Request) {
     if (truncated) {
       return NextResponse.json({
         ...base,
-        warning: `File was larger than ${MAX_TEXT_CHARS} characters; only the first part was indexed.`,
+        warning: `File was larger than ${MAX_TEXT_CHARS} characters; only the first part was indexed.${
+          degradedSchema ? ' (Database migration 055 pending: filename/type not recorded.)' : ''
+        }`,
       });
     }
     if (corrupt) {
       return NextResponse.json({
         ...base,
+        warning: `Saved with keyword search only — your embeddings key could not be decrypted (check ENCRYPTION_KEY, then re-enter the key).${
+          degradedSchema ? ' (Database migration 055 pending: filename/type not recorded.)' : ''
+        }`,
+      });
+    }
+    if (degradedSchema) {
+      return NextResponse.json({
+        ...base,
         warning:
-          'Saved with keyword search only — your embeddings key could not be decrypted (check ENCRYPTION_KEY, then re-enter the key).',
+          'Saved, but database migration 055 is not applied yet: the original filename and file type were not recorded. Apply supabase/migrations/055_knowledge_document_filename.sql to enable them.',
       });
     }
     return NextResponse.json(base);

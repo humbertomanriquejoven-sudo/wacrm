@@ -8,6 +8,7 @@ import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit
 import { loadEmbeddingsKey } from '@/lib/ai/config'
 import { ingestDocument } from '@/lib/ai/knowledge'
 import { AiError } from '@/lib/ai/types'
+import { isMissingColumnError } from '@/lib/ai/knowledge-schema'
 
 /**
  * GET /api/ai/knowledge
@@ -17,6 +18,32 @@ import { AiError } from '@/lib/ai/types'
 export async function GET() {
   try {
     const { supabase, accountId } = await getCurrentAccount()
+
+    // Ask for the 055 columns first, but never let their absence break the
+    // list: PostgREST rejects the whole projection when one column is unknown,
+    // which would leave the panel showing "No documents yet." on a database
+    // that has plenty of documents.
+    const rich = await supabase
+      .from('ai_knowledge_documents')
+      .select('id, title, filename, source_type, updated_at')
+      .eq('account_id', accountId)
+      .order('updated_at', { ascending: false })
+
+    if (!rich.error) {
+      return NextResponse.json({ documents: rich.data ?? [] })
+    }
+
+    if (!isMissingColumnError(rich.error)) {
+      console.error('[ai/knowledge GET] error:', rich.error)
+      return NextResponse.json(
+        { error: 'Failed to load knowledge base' },
+        { status: 500 },
+      )
+    }
+
+    console.warn(
+      '[ai/knowledge GET] 055 not applied; listing documents without filename/source_type.',
+    )
     const { data, error } = await supabase
       .from('ai_knowledge_documents')
       .select('id, title, updated_at')
