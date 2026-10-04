@@ -558,7 +558,11 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
                   .order('created_at', { ascending: false })
                   .limit(1);
                 if (latestMessages && latestMessages.length > 0) {
-                  const msg = latestMessages[0] as any;
+                  const msg = latestMessages[0] as {
+                    whatsapp_id?: string | null;
+                    from?: string | null;
+                    address?: string | null;
+                  };
                   const addr = msg.whatsapp_id ?? msg.from ?? msg.address;
                   if (addr) {
                     const cleaned = addr.replace(/\D/g, '');
