@@ -1,6 +1,55 @@
 import { describe, expect, it } from 'vitest'
 
-import { recipientAddressField } from '@/lib/whatsapp/meta-api'
+import { recipientAddressField, templateRecipientField } from '@/lib/whatsapp/meta-api'
+
+describe('templateRecipientField', () => {
+  // A template addresses an opaque id through `to`, like the Inbox's
+  // sendTextMessage. Using `recipient` here is what produced
+  // "(#100) Invalid parameter".
+  it('puts an opaque BSUID in "to" with the namespace stripped', () => {
+    expect(templateRecipientField('CO.1486998326437295')).toEqual({
+      to: '1486998326437295',
+    })
+    expect(templateRecipientField('WAID.987654321')).toEqual({ to: '987654321' })
+  })
+
+  it('puts a long numeric id in "to" unchanged', () => {
+    expect(templateRecipientField('1486998326437295')).toEqual({
+      to: '1486998326437295',
+    })
+  })
+
+  it('still normalizes a real number to E.164 digits', () => {
+    expect(templateRecipientField('+57 316 707 1066')).toEqual({
+      to: '573167071066',
+    })
+  })
+
+  it('never reduces a handle to the digits it happens to contain', () => {
+    // toMetaTargetId returns digits only, so applying it to a handle
+    // manufactures a number out of someone's display name.
+    expect(templateRecipientField('@jjuanpablo22222')).toEqual({
+      to: 'jjuanpablo22222',
+    })
+    expect(templateRecipientField('jjuanpablo22222')).toEqual({
+      to: 'jjuanpablo22222',
+    })
+  })
+
+  it('never emits a "recipient" key', () => {
+    // `to` wins when both are present, so mixing them is how the two
+    // shapes drifted apart in the first place.
+    for (const value of [
+      '573167071066',
+      'CO.1486998326437295',
+      '1486998326437295',
+      '@jjuanpablo22222',
+    ]) {
+      expect(templateRecipientField(value).recipient).toBeUndefined()
+      expect(templateRecipientField(value).to).toBeTruthy()
+    }
+  })
+})
 
 describe('recipientAddressField', () => {
   it('routes an E.164 phone number to "to" as digits', () => {

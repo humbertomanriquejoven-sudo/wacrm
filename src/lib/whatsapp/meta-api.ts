@@ -236,6 +236,41 @@ export function recipientAddressField(destination: string): Record<string, strin
 }
 
 /**
+ * The address field for a TEMPLATE send.
+ *
+ * Templates address the recipient through `to`, exactly as `sendTextMessage`
+ * does — the proven Inbox path. `recipient` is not accepted for a template's
+ * opaque id: Meta answers `(#100) Invalid parameter`. The other send
+ * helpers still use {@link recipientAddressField}, which keeps `recipient`
+ * for ids, because those message types accept it.
+ *
+ * A number and an opaque Meta id therefore share one canonical form: `to`,
+ * carrying the numeric id with any namespace removed
+ * (`CO.1486998326437295` → `1486998326437295`), which is what
+ * `toMetaTargetId` produces.
+ *
+ * A bare handle is deliberately NOT run through `toMetaTargetId`: that
+ * function returns only digits, so it would reduce `@jjuanpablo22222` to
+ * `22222` — a number invented from a display name, aimed at whoever owns
+ * it. The handle is forwarded as held; what actually makes such a send
+ * deliverable is the accompanying `context` quoting a message they wrote.
+ */
+export function templateRecipientField(destination: string): Record<string, string> {
+  const bare = cleanRecipientAddress(destination)
+  if (!bare) return { to: '' }
+  // A real number in any formatting, or an opaque Meta id (namespaced, or a
+  // pure digit run). Both go through the Inbox's canonical form.
+  if (
+    isDialablePhone(bare) ||
+    /^[A-Za-z]+\.[\w.-]+$/.test(bare) ||
+    /^\+?\d+$/.test(bare)
+  ) {
+    return { to: toMetaTargetId(bare) }
+  }
+  return { to: bare }
+}
+
+/**
  * True when `address` is an opaque Meta id that Cloud API accepts DIRECTLY
  * in the `recipient` field — i.e. a namespaced BSUID (`CO.1008…`,
  * `WAID.123…`, `LID.…`) or a bare digit run too long to be a phone number.
@@ -808,7 +843,7 @@ export async function sendTemplateMessage(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    ...recipientFields(recipient),
+    ...templateRecipientField(recipient),
     type: 'template',
     template: templatePayload,
   }
