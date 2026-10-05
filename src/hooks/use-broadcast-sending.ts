@@ -521,6 +521,7 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
         const undeliverable: Array<{ id: string; error: string }> = [];
         const apiRecipients: Array<{
           phone: string;
+          contact_id?: string;
           params: string[];
           messageParams?: { headerMediaUrl: string };
         }> = [];
@@ -551,6 +552,10 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
           addressByRecipient.set(row.id, address.to);
           apiRecipients.push({
             phone: address.to,
+            // Sent so the API can anchor a quoted reply on one of this
+            // contact's own inbound messages when the address is a bare
+            // @handle, which Meta cannot deliver to on its own.
+            contact_id: contact.id,
             params: Array.isArray(row.template_params)
               ? row.template_params.filter((p): p is string => typeof p === 'string')
               : [],

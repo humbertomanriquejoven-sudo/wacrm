@@ -17,6 +17,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
+import { isOpaqueMetaId } from './meta-api';
 import {
   isDialablePhone,
   normalizeUsername,
@@ -277,6 +278,120 @@ export async function recoverAddressesFromHistory(
     }
   }
   return recovered;
+}
+
+/**
+ * True when `address` is only deliverable as a quoted reply.
+ *
+ * Buckets, per the classification in `meta-api.ts`:
+ *   - a dialable number — addressable, no anchor needed;
+ *   - an opaque Meta id (`CO.…`, `WAID.…`, or a >14-digit run) — addressable
+ *     on its own, no anchor needed;
+ *   - anything else (a bare `@handle`, a short digit run scraped out of an
+ *     `@lid`, the literal `unknown`) — NOT a destination. Meta answers
+ *     `(#100) Invalid parameter`, or 200 with the message silently dropped.
+ *     The only supported route is a quote anchored on a message they wrote.
+ */
+export function needsQuotedAnchor(address: string | null | undefined): boolean {
+  const value = (address ?? '').trim();
+  if (!value) return false;
+  return !isDialablePhone(value) && !isOpaqueMetaId(value);
+}
+
+/**
+ * The newest inbound WhatsApp message id (`wamid`) per contact, for use as
+ * a quoted-reply anchor.
+ *
+ * Meta does not treat a public @handle as a destination: `to`/`recipient`
+ * carrying one is either rejected with `(#100) Invalid parameter` or
+ * silently dropped (HTTP 200, nothing delivered). The one supported way to
+ * reach such a contact is a QUOTED REPLY anchored on a message they
+ * actually wrote — see the classification in `meta-api.ts`.
+ *
+ * `messages` has no `direction` column: an inbound message is
+ * `sender_type = 'customer'` ('agent'/'bot' are ours). `message_id` holds
+ * the wamid and is nullable, so rows without one are excluded rather than
+ * sent as a null anchor.
+ *
+ * Scoped to each contact's OWN conversations, newest first — the isolation
+ * boundary is the same one `recoverAddressesFromHistory` uses, so a wamid
+ * belonging to a different customer is never quoted at this one.
+ *
+ * Batched: two queries for the whole send, not two per recipient.
+ */
+export async function recoverInboundWamids(
+  db: SupabaseClient,
+  contactIds: string[],
+): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  const ids = [...new Set(contactIds.filter((id) => typeof id === 'string' && id.length > 0))];
+  if (ids.length === 0) return result;
+
+  const { data: convRows, error: convError } = await db
+    .from('conversations')
+    .select('id, contact_id')
+    .in('contact_id', ids);
+
+  if (convError) {
+    console.warn(
+      '[broadcast] conversation lookup failed; no wamid can be anchored',
+      convError.message,
+    );
+    return result;
+  }
+
+  const convIdsByContact = new Map<string, string[]>();
+  for (const row of (convRows ?? []) as Array<{
+    id: string;
+    contact_id: string;
+  }>) {
+    const list = convIdsByContact.get(row.contact_id) ?? [];
+    list.push(row.id);
+    convIdsByContact.set(row.contact_id, list);
+  }
+
+  const conversationIds = [...new Set([...convIdsByContact.values()].flat())];
+  if (conversationIds.length === 0) return result;
+
+  const { data: msgRows, error: msgError } = await db
+    .from('messages')
+    .select('conversation_id, message_id')
+    .in('conversation_id', conversationIds)
+    .eq('sender_type', 'customer')
+    .not('message_id', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(HISTORY_SCAN_LIMIT);
+
+  if (msgError) {
+    console.warn(
+      '[broadcast] inbound-message lookup failed; no wamid can be anchored',
+      msgError.message,
+    );
+    return result;
+  }
+
+  // Newest-first from the query, so the first wamid seen per thread wins.
+  const wamidByConversation = new Map<string, string>();
+  for (const row of (msgRows ?? []) as Array<{
+    conversation_id: string;
+    message_id: string | null;
+  }>) {
+    if (!row.message_id) continue;
+    if (!wamidByConversation.has(row.conversation_id)) {
+      wamidByConversation.set(row.conversation_id, row.message_id);
+    }
+  }
+
+  for (const contactId of ids) {
+    for (const conversationId of convIdsByContact.get(contactId) ?? []) {
+      const wamid = wamidByConversation.get(conversationId);
+      if (wamid) {
+        result.set(contactId, wamid);
+        break;
+      }
+    }
+  }
+  return result;
 }
 
 /**

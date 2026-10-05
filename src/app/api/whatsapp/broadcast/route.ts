@@ -1,13 +1,17 @@
 import { NextResponse } from 'next/server'
 import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
-import { decrypt } from '@/lib/whatsapp/encryption'
-import type { SendTimeParams } from '@/lib/whatsapp/template-send-builder'
-import { resolveTemplateRow } from '@/lib/whatsapp/template-body'
+import {
+  needsQuotedAnchor,
+  recoverInboundWamids,
+} from '@/lib/whatsapp/broadcast-address'
 import {
   recipientAddressVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
+import { decrypt } from '@/lib/whatsapp/encryption'
+import type { SendTimeParams } from '@/lib/whatsapp/template-send-builder'
+import { resolveTemplateRow } from '@/lib/whatsapp/template-body'
 import {
   checkRateLimit,
   rateLimitResponse,
@@ -45,6 +49,15 @@ interface BroadcastResult {
  */
 interface NewRecipient {
   phone: string
+  /**
+   * The contact this recipient was resolved from. Used server-side to find
+   * an inbound message to quote when the address is a bare @handle, which
+   * Meta cannot accept as a destination on its own. Deliberately resolved
+   * here rather than accepting a wamid from the client: the anchor has to
+   * belong to this contact's own conversation, or a caller could quote
+   * messages they cannot see.
+   */
+  contact_id?: string
   /** Body variable values, one per {{N}}. Legacy field. */
   params?: string[]
   /**
@@ -162,6 +175,21 @@ export async function POST(request: Request) {
     let sentCount = 0
     let failedCount = 0
 
+    // One batched lookup for the whole campaign, and only when some
+    // recipient actually needs an anchor — a broadcast of plain numbers
+    // pays nothing for this.
+    const needsAnyQuote = recipients.some((r) =>
+      needsQuotedAnchor(typeof r?.phone === 'string' ? r.phone : ''),
+    )
+    const wamidsByContact = needsAnyQuote
+      ? await recoverInboundWamids(
+          supabase,
+          recipients
+            .map((r) => (typeof r?.contact_id === 'string' ? r.contact_id : ''))
+            .filter((id) => id.length > 0),
+        )
+      : new Map<string, string>()
+
     for (const recipient of recipients) {
       // Only an EMPTY address is undeliverable. This used to additionally
       // demand `isValidE164(...)`, which rejected every BSUID and @handle —
@@ -181,6 +209,34 @@ export async function POST(request: Request) {
       let sentMessageId: string | null = null
       let lastError: string | null = null
 
+      // A bare @handle is not a destination Meta accepts: it answers
+      // (#100) Invalid parameter, or 200 with the message silently dropped.
+      // The one supported route to such a contact is a quoted reply anchored
+      // on a message they actually wrote, so resolve that anchor here.
+      //
+      // Only for the handle bucket. A dialable number needs nothing, and an
+      // opaque Meta id (BSUID / WAID) is addressable on its own — quoting it
+      // would turn an ordinary send into a reply for no reason.
+      const needsQuote = needsQuotedAnchor(recipient.phone)
+
+      let contextMessageId: string | undefined
+      if (needsQuote) {
+        const contactId =
+          typeof recipient.contact_id === 'string' ? recipient.contact_id : ''
+        const wamid = contactId ? wamidsByContact.get(contactId) : undefined
+        if (!wamid) {
+          // Refuse locally rather than fire a request that cannot deliver.
+          results.push({
+            phone: recipient.phone,
+            status: 'failed',
+            error: 'Requires phone number or previous inbound message',
+          })
+          failedCount++
+          continue
+        }
+        contextMessageId = wamid
+      }
+
       for (const variant of variants) {
         try {
           const result = await sendTemplateMessage({
@@ -192,6 +248,7 @@ export async function POST(request: Request) {
             template: templateRow ?? undefined,
             messageParams: recipient.messageParams,
             params: recipient.params ?? [],
+            ...(contextMessageId ? { contextMessageId } : {}),
           })
           sentMessageId = result.messageId
           lastError = null

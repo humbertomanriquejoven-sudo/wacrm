@@ -2,9 +2,11 @@ import { describe, it, expect, vi } from 'vitest'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import {
   contactPhone,
+  needsQuotedAnchor,
   normalizeToE164,
   persistRecoveredAddress,
   recoverAddressesFromHistory,
+  recoverInboundWamids,
   resolveBroadcastAddress,
 } from './broadcast-address'
 import type { Contact } from '@/types'
@@ -366,6 +368,130 @@ describe('resolveBroadcastAddress', () => {
   it('reports no address when the row holds nothing usable', () => {
     expect(resolveBroadcastAddress(contact({ phone: 'unknown' }))).toBeNull()
     expect(resolveBroadcastAddress(null)).toBeNull()
+  })
+})
+
+/** Fake covering the chains `recoverInboundWamids` uses:
+ *  conversations: from().select().in() → { data, error }
+ *  messages:     from().select().in().eq().not().order().limit() → { data } */
+function wamidDb(
+  conversations: Array<{ id: string; contact_id: string }>,
+  messages: Array<{ conversation_id: string; message_id: string | null }>,
+): SupabaseClient {
+  const chain: Record<string, (...args: never[]) => unknown> = {
+    from: (table: string) => {
+      if (table === 'conversations') {
+        return {
+          select: () => ({
+            in: () => Promise.resolve({ data: conversations, error: null }),
+          }),
+        }
+      }
+      const filters: Record<string, string> = {}
+      const builder: Record<string, unknown> = {
+        in: () => builder,
+        eq: (column: string, value: string) => {
+          filters[column] = value
+          return builder
+        },
+        not: () => builder,
+        order: () => builder,
+        limit: () => Promise.resolve({ data: messages, error: null }),
+      }
+      void filters
+      return { select: () => builder }
+    },
+  }
+  return chain as unknown as SupabaseClient
+}
+
+describe('needsQuotedAnchor', () => {
+  it('is false for an address Meta can already deliver to', () => {
+    // A real number and an opaque Meta id are both destinations in their
+    // own right; quoting them would turn a plain send into a reply.
+    expect(needsQuotedAnchor('573121828949')).toBe(false)
+    expect(needsQuotedAnchor('CO.1008477715690681')).toBe(false)
+    expect(needsQuotedAnchor('1486998326437295')).toBe(false)
+    expect(needsQuotedAnchor('WAID.987654321')).toBe(false)
+  })
+
+  it('is true for a bare handle, which Meta cannot address', () => {
+    expect(needsQuotedAnchor('@jjuanpablo22222')).toBe(true)
+    expect(needsQuotedAnchor('jjuanpablo22222')).toBe(true)
+  })
+
+  it('is false when there is no address to quote towards', () => {
+    expect(needsQuotedAnchor('')).toBe(false)
+    expect(needsQuotedAnchor(null)).toBe(false)
+  })
+})
+
+describe('recoverInboundWamids', () => {
+  it('anchors on the newest inbound message of the contact own thread', async () => {
+    const wamids = await recoverInboundWamids(
+      wamidDb(
+        [{ id: 'conv-1', contact_id: 'contact-1' }],
+        [{ conversation_id: 'conv-1', message_id: 'wamid.NEWEST' }],
+      ),
+      ['contact-1'],
+    )
+    expect(wamids.get('contact-1')).toBe('wamid.NEWEST')
+  })
+
+  it('only considers inbound messages, and only ones with a wamid', async () => {
+    // `messages` has no `direction` column: inbound is sender_type
+    // 'customer'. A null message_id cannot anchor a quote.
+    const log = { filters: [] as Array<{ column: string; value: string }> };
+    const chain = wamidDb(
+      [{ id: 'conv-1', contact_id: 'contact-1' }],
+      [{ conversation_id: 'conv-1', message_id: null }],
+    );
+    const spied = new Proxy(chain as object, {
+      get(target, prop) {
+        if (prop === 'from') {
+          return (table: string) => {
+            const base = (target as { from: (t: string) => unknown }).from(table);
+            if (table !== 'messages') return base;
+            return {
+              select: () => {
+                const b: Record<string, unknown> = {
+                  in: () => b,
+                  eq: (column: string, value: string) => {
+                    log.filters.push({ column, value })
+                    return b
+                  },
+                  not: () => b,
+                  order: () => b,
+                  limit: () => Promise.resolve({ data: [], error: null }),
+                };
+                return b
+              },
+            };
+          };
+        }
+        return (target as Record<string | symbol, unknown>)[prop];
+      },
+    }) as SupabaseClient;
+
+    const wamids = await recoverInboundWamids(spied, ['contact-1']);
+    expect(log.filters).toEqual([{ column: 'sender_type', value: 'customer' }]);
+    expect(wamids.size).toBe(0);
+  });
+
+  it('never quotes a message belonging to another contact', async () => {
+    const wamids = await recoverInboundWamids(
+      wamidDb(
+        [{ id: 'conv-other', contact_id: 'contact-2' }],
+        [{ conversation_id: 'conv-other', message_id: 'wamid.SOMEONE_ELSE' }],
+      ),
+      ['contact-1'],
+    )
+    expect(wamids.size).toBe(0);
+  })
+
+  it('returns nothing for a contact that has no conversation', async () => {
+    const wamids = await recoverInboundWamids(wamidDb([], []), ['contact-1'])
+    expect(wamids.size).toBe(0)
   })
 })
 
