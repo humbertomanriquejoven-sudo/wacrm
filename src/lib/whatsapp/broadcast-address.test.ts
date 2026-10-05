@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import {
+  metaIdFromRawPayload,
   contactPhone,
   normalizeToE164,
   persistRecoveredAddress,
@@ -574,6 +575,69 @@ it('never uses a bare @handle as the destination', () => {
   it('reports no address when the row holds nothing usable', () => {
     expect(resolveBroadcastAddress(contact({ phone: 'unknown' }))).toBeNull()
     expect(resolveBroadcastAddress(null)).toBeNull()
+  })
+})
+
+describe('metaIdFromRawPayload', () => {
+  // The column is written by the webhook as `{ message, contact }`, so these
+  // fixtures mirror that shape exactly rather than a synthetic one.
+  it('reads the message-level BSUID when `from` is the placeholder', () => {
+    // Meta sends `from: 'unknown'` (or '') for a sender on an unregistered
+    // number, so `from_user_id` is the only real id on the message.
+    expect(
+      metaIdFromRawPayload({
+        message: { id: 'wamid.1', from: 'unknown', from_user_id: 'CO.1008477715690681' },
+        contact: { wa_id: 'unknown', profile: { name: 'Ana' } },
+      }),
+    ).toBe('CO.1008477715690681')
+  })
+
+  it('reads the contact-level BSUID when the message omits it', () => {
+    expect(
+      metaIdFromRawPayload({
+        message: { id: 'wamid.2', from: 'unknown' },
+        contact: { wa_id: '', user_id: 'CO.1008477715690681', profile: { name: 'Ana' } },
+      }),
+    ).toBe('CO.1008477715690681')
+  })
+
+  it('reaches an id nested in a full Cloud API entry', () => {
+    // Depth 5: entry -> changes -> value -> messages -> the id-bearing node.
+    expect(
+      metaIdFromRawPayload({
+        entry: [
+          {
+            changes: [
+              {
+                value: {
+                  contacts: [{ wa_id: '', user_id: 'CO.1008477715690681' }],
+                  messages: [{ from: 'unknown' }],
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    ).toBe('CO.1008477715690681')
+  })
+
+  it('never returns the placeholder, a display name, or a phone_number_id', () => {
+    expect(
+      metaIdFromRawPayload({
+        message: { from: 'unknown', from_user_id: 'unknown' },
+        contact: {
+          wa_id: 'unknown',
+          profile: { name: 'Ana Ruiz' },
+        },
+      }),
+    ).toBeNull()
+    // metadata.phone_number_id is OUR number, not the sender's.
+    expect(
+      metaIdFromRawPayload({
+        message: { from: 'unknown' },
+        metadata: { phone_number_id: '15551230000' },
+      }),
+    ).toBeNull()
   })
 })
 

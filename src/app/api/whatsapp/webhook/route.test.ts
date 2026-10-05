@@ -15,6 +15,10 @@ const h = vi.hoisted(() => ({
     replyContextParent: null as { id: string } | null,
     conversation: { id: 'conv-1', unread_count: 0, account_id: 'acc-1' },
     upsertCalls: [] as { row: Record<string, unknown>; options: unknown }[],
+    /** Simulate a database without migration 052. */
+    missingRawPayloadColumn: false as boolean,
+    /** Non-column error returned by the upsert, for the no-retry path. */
+    upsertError: null as string | null,
     rpcCalls: [] as { name: string; args: Record<string, unknown> }[],
     afterCallbacks: [] as (() => Promise<void> | void)[],
     automationStarted: 0,
@@ -288,6 +292,33 @@ vi.mock('@supabase/supabase-js', () => ({
             // Idempotent insert: upsert(...).select('id')
             upsert: (row: Record<string, unknown>, options: unknown) => {
               h.state.upsertCalls.push({ row, options })
+              // Simulates a database without migration 052: PostgREST
+              // rejects the whole projection rather than nulling one column.
+              if (
+                h.state.missingRawPayloadColumn &&
+                'raw_meta_payload' in row
+              ) {
+                return {
+                  select: () =>
+                    Promise.resolve({
+                      data: null,
+                      error: {
+                        code: '42703',
+                        message:
+                          'column messages.raw_meta_payload does not exist',
+                      },
+                    }),
+                }
+              }
+              if (h.state.upsertError) {
+                return {
+                  select: () =>
+                    Promise.resolve({
+                      data: null,
+                      error: { message: h.state.upsertError },
+                    }),
+                }
+              }
               return {
                 select: () =>
                   Promise.resolve({
@@ -374,11 +405,12 @@ vi.mock('@/lib/flows/meta-send', () => ({
   engineSendAiReply: vi.fn(),
 }))
 
-import { POST } from './route'
+import { POST, __resetRawMetaPayloadColumnForTests } from './route'
 import { getMediaUrl, downloadMedia, sendTypingIndicator } from '@/lib/whatsapp/meta-api'
 import { transcribeAudio } from '@/lib/ai/transcribe'
 import { engineSendText } from '@/lib/flows/meta-send'
 import { findExistingContact } from '@/lib/contacts/dedupe'
+import { metaIdFromRawPayload } from '@/lib/whatsapp/broadcast-address'
 
 const mockGetMediaUrl = vi.mocked(getMediaUrl)
 const mockDownloadMedia = vi.mocked(downloadMedia)
@@ -475,6 +507,9 @@ beforeEach(() => {
   h.state.replyContextParent = null
   h.state.conversation = { id: 'conv-1', unread_count: 0, account_id: 'acc-1' }
   h.state.upsertCalls = []
+  h.state.missingRawPayloadColumn = false
+  __resetRawMetaPayloadColumnForTests()
+  h.state.upsertError = null
   h.state.rpcCalls = []
   h.state.afterCallbacks = []
   h.state.automationStarted = 0
@@ -520,6 +555,77 @@ beforeEach(() => {
         resolve()
       }, 0)
     })
+  })
+})
+
+describe('inbound webhook: raw_meta_payload persistence (migration 052)', () => {
+  it('stores the Meta message and contact objects on the row', async () => {
+    await runWebhook()
+
+    const row = h.state.upsertCalls[0].row
+    const raw = row.raw_meta_payload as {
+      message?: { id?: string }
+      contact?: { wa_id?: string }
+    }
+    expect(raw).toBeDefined()
+    // Both halves, not just the message: Meta does not always put the BSUID
+    // in the same place, and storing the message alone would leave the
+    // contact-level ids unreachable.
+    expect(raw.message?.id).toBe('wamid.TEST1')
+    expect(raw.contact?.wa_id).toBe('15551230000')
+  })
+
+  it('preserves the BSUID of a sender who disclosed no number', async () => {
+    // The case the whole column exists for. `sender_phone` is NULL here (no
+    // number was disclosed), so the payload is the only place the id
+    // survives — and `metaIdFromRawPayload` must be able to read it back.
+    h.state.existingContactResult = null
+    await POST(bsuidInboundRequest())
+    for (const cb of h.state.afterCallbacks) await cb()
+
+    const row = h.state.upsertCalls[0].row
+    expect(row.sender_phone).toBeNull()
+
+    const raw = row.raw_meta_payload as {
+      message?: { from_user_id?: string }
+      contact?: { user_id?: string; wa_id?: string }
+    }
+    expect(raw.message?.from_user_id).toBe('CO.1008477715690681')
+    expect(raw.contact?.user_id).toBe('CO.1008477715690681')
+
+    // The read side agrees with the write side.
+    expect(metaIdFromRawPayload(raw)).toBe('CO.1008477715690681')
+  })
+
+  it('retries without the column when migration 052 is not applied', async () => {
+    // PostgREST 42703s the whole projection, so an unapplied 052 would
+    // otherwise drop EVERY inbound message. One optional audit column is an
+    // acceptable loss; losing the inbox is not.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.state.missingRawPayloadColumn = true
+
+    const res = await runWebhook()
+
+    expect(res).toBeDefined()
+    // Two attempts: with the column, then without.
+    expect(h.state.upsertCalls).toHaveLength(2)
+    expect(h.state.upsertCalls[0].row).toHaveProperty('raw_meta_payload')
+    expect(h.state.upsertCalls[1].row).not.toHaveProperty('raw_meta_payload')
+    // The message itself still landed, so the rest of the pipeline ran.
+    expect(h.state.rpcCalls.length).toBeGreaterThan(0)
+    errorSpy.mockRestore()
+  })
+
+  it('does not retry on an unrelated insert failure', async () => {
+    // A blanket retry would mask an RLS denial or a constraint violation
+    // behind a second identical attempt.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.state.upsertError = 'permission denied for table messages'
+
+    await runWebhook()
+
+    expect(h.state.upsertCalls).toHaveLength(1)
+    errorSpy.mockRestore()
   })
 })
 

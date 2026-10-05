@@ -84,7 +84,18 @@ export const NO_DELIVERABLE_ADDRESS =
  * directory-scoped id. All are validated by `passthroughMetaId`, so a
  * display name or `phone_number_id` can never be mistaken for one of them.
  */
-const RAW_PAYLOAD_ID_KEYS = ['wa_id', 'wa_user_id', 'from', 'user_id', 'lid'] as const;
+const RAW_PAYLOAD_ID_KEYS = [
+  'wa_id',
+  'wa_user_id',
+  'from',
+  // Meta sends the message-level BSUID here for a sender on a number that is
+  // not registered on WhatsApp. It is NOT the same field as `from` (which is
+  // the literal string 'unknown' in exactly the case we care about), so it
+  // needs its own key to be reachable.
+  'from_user_id',
+  'user_id',
+  'lid',
+] as const;
 
 /**
  * How deep to walk a stored webhook payload.

@@ -49,6 +49,100 @@ function supabaseAdmin() {
   return _adminClient
 }
 
+/**
+ * Whether `messages.raw_meta_payload` is believed to exist (migration 052).
+ *
+ * `null` = not yet probed, so the column is included optimistically.
+ */
+let rawMetaPayloadColumn: boolean | null = null
+
+/**
+ * Test-only: forget the cached migration-052 verdict.
+ *
+ * The flag is instance-scoped by design (one extra round trip per cold
+ * start), which would otherwise leak between test cases — a single fallback
+ * test would silently strip the column from every test after it.
+ */
+export function __resetRawMetaPayloadColumnForTests() {
+  rawMetaPayloadColumn = null
+}
+
+/** PostgREST reports an unknown column as 42703 / PGRST204, or in prose. */
+function isMissingColumnError(message: string): boolean {
+  return /column .* does not exist|42703|PGRST204|schema cache/i.test(message)
+}
+
+/**
+ * Insert one inbound message, tolerating a database without migration 052.
+ *
+ * `raw_meta_payload` is written because it is the only place the BSUID of a
+ * sender who disclosed no phone number survives — `sender_phone` is NULL for
+ * exactly that sender, and the handle is not a deliverable address. Without
+ * the column, `recoverAddressesFromHistory` can never resolve those contacts
+ * and every campaign to them fails.
+ *
+ * But PostgREST rejects the WHOLE request when any named column is missing, so
+ * adding it unguarded would turn an unapplied 052 into "every inbound message
+ * is dropped" — the inbox, unread counts, automations and flows all broken.
+ * Losing one optional audit column is an acceptable degradation; losing every
+ * inbound message is not. So the insert is retried once without the column and
+ * the verdict is cached for the life of the instance, making the cost at most
+ * one extra round trip per cold start.
+ *
+ * Only a missing-column error triggers the retry: an RLS denial, a constraint
+ * violation or a network fault is reported rather than masked by a second
+ * identical attempt.
+ */
+async function upsertInboundMessage(
+  row: Record<string, unknown>,
+): Promise<{ data: unknown[] | null; error: { message: string } | null }> {
+  const attempt = async (toInsert: Record<string, unknown>) =>
+    await supabaseAdmin()
+      .from('messages')
+      .upsert(toInsert, {
+        onConflict: 'conversation_id,message_id',
+        ignoreDuplicates: true,
+      })
+      .select('id')
+
+  const first = await attempt(row)
+
+  if (!first.error) {
+    rawMetaPayloadColumn = true
+    return {
+      data: (first.data ?? null) as unknown[] | null,
+      error: null,
+    }
+  }
+
+  const hasColumn = Object.prototype.hasOwnProperty.call(
+    row,
+    'raw_meta_payload',
+  )
+  if (!hasColumn || !isMissingColumnError(first.error.message)) {
+    return {
+      data: (first.data ?? null) as unknown[] | null,
+      error: { message: first.error.message },
+    }
+  }
+
+  console.error(
+    '[webhook] messages.raw_meta_payload is missing — retrying without it. ' +
+      'BSUID resolution for handle contacts stays broken until migration 052 ' +
+      'is applied.',
+    first.error.message,
+  )
+  rawMetaPayloadColumn = false
+
+  const { raw_meta_payload: _omitted, ...withoutColumn } = row
+  void _omitted
+  const retry = await attempt(withoutColumn)
+  return {
+    data: (retry.data ?? null) as unknown[] | null,
+    error: retry.error ? { message: retry.error.message } : null,
+  }
+}
+
 interface WhatsAppMessage {
   id: string
   from: string
@@ -987,55 +1081,65 @@ async function processMessage(
     .eq('sender_type', 'customer')
   const isFirstInboundMessage = (priorCustomerMsgCount ?? 0) === 0
 
-  // Idempotent insert. Meta retries webhook deliveries (a slow ack, a
-  // transient 5xx), and each retry replays the exact same message.id. The
-  // unique index on (conversation_id, message_id) added in migration 037
-  // makes a replay conflict; `ignoreDuplicates` turns that into an ON
-  // CONFLICT DO NOTHING, and the `.select()` then returns the inserted row
-  // ONLY on a genuine first insert — an empty result means this delivery
-  // was a replay. This is the single idempotency boundary that must sit
-  // BEFORE the unread bump and all downstream fan-out below (issue #367).
-  const { data: insertedRows, error: msgError } = await supabaseAdmin()
-    .from('messages')
-    .upsert(
-      {
-        conversation_id: conversation.id,
-        sender_type: 'customer',
-        content_type: contentType,
-        content_text: contentText,
-        media_url: mediaUrl,
-        // Meta's MIME type for the attachment (migration 039). Was
-        // discarded before, which forced the download path to guess an
-        // extension from the fetched blob — impossible to do until the
-        // bytes had already been fetched successfully.
-        media_type: mediaType,
-        // The address Meta used on THIS delivery (migration 050). This is
-        // the only place a number Meta disclosed survives, so the REAL
-        // number is stored whenever we have one — never the BSUID that may
-        // occupy the same field. `recipient-resolver` reads this column to
-        // recover a deliverable destination for a contact whose `phone`
-        // still holds an identifier, so writing the BSUID here would
-        // perpetuate exactly the undeliverable state we're fixing.
-        //
-        // The placeholder guard is load-bearing: `rawPhone` is the literal
-        // string 'unknown' when Meta disclosed no number, and 'unknown' is
-        // truthy, so `rawPhone || message.from` used to store the placeholder
-        // and never reach `message.from`. `sender_phone` is nullable, so the
-        // honest value is NULL — which also keeps the placeholder out of the
-        // `.not('sender_phone','is',null)` history scans entirely.
-        sender_phone: rawPhone === 'unknown' ? null : rawPhone,
-        message_id: message.id,
-        status: 'delivered',
-        created_at: new Date(parseInt(message.timestamp) * 1000).toISOString(),
-        reply_to_message_id: replyToInternalId,
-        // Only populated for content_type='interactive'. Migration 010 added
-        // the column; null for every other content_type so existing inserts
-        // behave identically.
-        interactive_reply_id: interactiveReplyId,
-      },
-      { onConflict: 'conversation_id,message_id', ignoreDuplicates: true }
-    )
-    .select('id')
+  const messageRow = {
+    conversation_id: conversation.id,
+    sender_type: 'customer',
+    content_type: contentType,
+    content_text: contentText,
+    media_url: mediaUrl,
+    // Meta's MIME type for the attachment (migration 039). Was
+    // discarded before, which forced the download path to guess an
+    // extension from the fetched blob — impossible to do until the
+    // bytes had already been fetched successfully.
+    media_type: mediaType,
+    // The address Meta used on THIS delivery (migration 050). This is
+    // the only place a number Meta disclosed survives, so the REAL
+    // number is stored whenever we have one — never the BSUID that may
+    // occupy the same field. `recipient-resolver` reads this column to
+    // recover a deliverable destination for a contact whose `phone`
+    // still holds an identifier, so writing the BSUID here would
+    // perpetuate exactly the undeliverable state we're fixing.
+    //
+    // The placeholder guard is load-bearing: `rawPhone` is the literal
+    // string 'unknown' when Meta disclosed no number, and 'unknown' is
+    // truthy, so `rawPhone || message.from` used to store the placeholder
+    // and never reach `message.from`. `sender_phone` is nullable, so the
+    // honest value is NULL — which also keeps the placeholder out of the
+    // `.not('sender_phone','is',null)` history scans entirely.
+    sender_phone: rawPhone === 'unknown' ? null : rawPhone,
+    // The Meta objects this row was built from (migration 052).
+    //
+    // `sender_phone` above is NULL whenever Meta disclosed no number —
+    // which is precisely the sender we still need to reach. The BSUID for
+    // that sender then survives ONLY inside these payloads:
+    // `contacts[].user_id`, `contacts[].wa_id`, or `messages[].from_user_id`
+    // (`from` is the literal 'unknown' there, so the dedicated id fields
+    // are the only real value). `metaIdFromRawPayload` walks them, and
+    // `recoverAddressesFromHistory` uses the result as the `to` for a
+    // contact known publicly only by `@handle`.
+    //
+    // Both halves are stored, not just `message`, because Meta does not
+    // always put the id in the same place: storing the message alone
+    // leaves the contact-level ids unreachable and the contact stays
+    // undeliverable. Whichever field carries it is a delivery-shape
+    // detail, so none of the keys are assumed.
+    //
+    // Undefined while the column is believed to be missing (see
+    // `rawMetaPayloadColumn`), so a database without migration 052 keeps
+    // accepting messages instead of rejecting every inbound one.
+    ...(rawMetaPayloadColumn === false ? {} : { raw_meta_payload: { message, contact } }),
+    message_id: message.id,
+    status: 'delivered',
+    created_at: new Date(parseInt(message.timestamp) * 1000).toISOString(),
+    reply_to_message_id: replyToInternalId,
+    // Only populated for content_type='interactive'. Migration 010 added
+    // the column; null for every other content_type so existing inserts
+    // behave identically.
+    interactive_reply_id: interactiveReplyId,
+  } as Record<string, unknown>
+
+  const { data: insertedRows, error: msgError } =
+    await upsertInboundMessage(messageRow)
 
   if (msgError) {
     console.error('Error inserting message:', msgError)
@@ -1157,7 +1261,10 @@ async function processMessage(
       const { error: transcriptError } = await supabaseAdmin()
         .from('messages')
         .update({ content_text: transcript })
-        .eq('id', insertedRows[0].id)
+        .eq(
+          'id',
+          (insertedRows[0] as { id: string }).id,
+        )
       if (transcriptError) {
         console.error('[webhook][audio] failed to persist transcript:', transcriptError)
       }
