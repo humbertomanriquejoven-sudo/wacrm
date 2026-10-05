@@ -19,6 +19,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api';
+import { recoverContextMessageIds } from '@/lib/whatsapp/broadcast-address';
 import { decrypt } from '@/lib/whatsapp/encryption';
 import {
   sanitizePhoneForMeta,
@@ -69,6 +70,12 @@ interface PlannedRecipient {
    * history lookup stays scoped to the recipient's own thread.
    */
   contactId: string;
+  /**
+   * Newest inbound `wamid` from THIS contact, forwarded as
+   * `context.message_id` so the template renders as a quoted reply. Absent
+   * when the contact has never written in.
+   */
+  contextMessageId?: string;
 }
 
 export interface BroadcastPlan {
@@ -234,14 +241,25 @@ export async function createBroadcast(
   // Pair each inserted recipient row back to its phone/params by
   // contact_id — unambiguous now that duplicates are collapsed.
   const byContact = new Map(deduped.map((r) => [r.contactId, r]));
+
+  // Newest inbound wamid per contact, so each template can be anchored to the
+  // message its own recipient wrote. Best-effort: a failure here costs the
+  // quote preview, not the delivery, so it must never fail the broadcast.
+  const anchors = await recoverContextMessageIds(
+    db,
+    createdRows.map((r: { contact_id: string }) => r.contact_id),
+  ).catch(() => new Map<string, string>());
+
   const planned: PlannedRecipient[] = createdRows.map(
     (row: { recipient_id: string; contact_id: string }) => {
       const r = byContact.get(row.contact_id)!;
+      const contextMessageId = anchors.get(row.contact_id);
       return {
         recipientRowId: row.recipient_id,
         phone: r.phone,
         params: r.params,
         contactId: row.contact_id,
+        ...(contextMessageId ? { contextMessageId } : {}),
       };
     }
   );
@@ -296,6 +314,14 @@ const variants = recipientAddressVariants(recipient.phone);
             language: plan.templateLanguage,
             template: plan.templateRow ?? undefined,
             params: recipient.params,
+            // Anchor the template to the newest message THIS contact wrote, so
+            // the send renders as a quoted reply the way an Inbox answer does.
+            // Strictly per recipient: a wamid belongs to one conversation, and
+            // reusing another recipient's would put a stranger's message in
+            // this chat. Omitted when the contact has never written in, which
+            // is the normal case for a cold list — the send then proceeds
+            // unquoted, since the anchor is presentational.
+            contextMessageId: recipient.contextMessageId,
           });
         sentMessageId = result.messageId;
         lastError = null;

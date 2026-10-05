@@ -25,6 +25,7 @@ import { recipientAddressVariants } from '@/lib/whatsapp/phone-utils';
 import {
   NO_DELIVERABLE_ADDRESS,
   recoverAddressesFromHistory,
+  recoverContextMessageIds,
   resolveBroadcastAddress,
   type BroadcastAddress,
   type BroadcastIdentity,
@@ -317,6 +318,16 @@ export async function planBroadcastResume(
   }
   const recovered = await recoverAddressesFromHistory(db, unresolved);
 
+  // Newest inbound wamid per contact on this page, for the same per-recipient
+  // quote anchor a fresh broadcast uses. A wamid belongs to one conversation,
+  // so this is keyed by contact and never shared across recipients.
+  const anchors = await recoverContextMessageIds(
+    db,
+    rows
+      .map((row) => contactIdentity(row)?.id)
+      .filter((id): id is string => Boolean(id)),
+  ).catch(() => new Map<string, string>());
+
   for (const row of rows) {
     const resolved = resolveRowAddress(row, recovered);
     const addressable =
@@ -401,6 +412,11 @@ export async function planBroadcastResume(
       // the history tier was then handed an EMPTY destination here and the
       // send targeted nobody while still being marked sent.
       phone: addressByRowId.get(row.id) ?? '',
+      // Same anchor a fresh broadcast carries, so a resumed campaign does not
+      // quietly change how the message renders halfway through.
+      ...(anchors.get(row.contact_id)
+        ? { contextMessageId: anchors.get(row.contact_id)! }
+        : {}),
       params: Array.isArray(row.template_params)
         ? row.template_params.filter((p): p is string => typeof p === 'string')
         : [],

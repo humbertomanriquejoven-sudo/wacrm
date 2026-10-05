@@ -619,13 +619,22 @@ export interface SendTextMessageArgs {
  *   2. An opaque Meta id (`CO.…`, `WAID.…`, `LID.…`, or a >14-digit run) →
  *      `{ recipient: "<id>" }`. Meta knows the destination; no context needed.
  *   3. Anything else — a short digit run scraped out of `@lid`, a bare
- *      handle, the literal `unknown` — is not addressable on its own. Cloud
- *      API does NOT reject it: it answers 200 and drops the message, which is
- *      indistinguishable from a successful send until the customer reports
- *      they got nothing. The only supported way to reach these contacts is a
- *      QUOTED REPLY anchored on the inbound `wamid`, so we require
- *      `contextMessageId` and attach `context`. Without it we refuse the call
- *      instead of losing the message silently.
+ *      handle, the literal `unknown` — is not a usable destination. Such a
+ *      send cannot be rescued by quoting: an earlier version of this docblock
+ *      claimed a QUOTED REPLY anchored on the inbound `wamid` was "the only
+ *      supported way" to reach these contacts and that `context` "authorizes"
+ *      delivery. Both were wrong. Meta answers (#100) Invalid parameter for a
+ *      bare `@handle` in `to` whether or not `context` is present — quoting
+ *      makes the send a reply, it does not make the destination addressable —
+ *      and the Inbox proves the working path is simply putting the numerical
+ *      id in `to` (see `resolveRecipient`). `context` is therefore
+ *      presentational here and is set only for an explicit reply.
+ *
+ * So the only thing refused locally is an EMPTY address. A non-addressable
+ * value is forwarded as-is: the caller (`resolveRecipient` /
+ * `resolveBroadcastAddress`) is responsible for never producing one, and it
+ * records an actionable failure locally rather than letting Meta answer with
+ * something that looks like success.
  */
 export async function sendTextMessage(
   args: SendTextMessageArgs
@@ -663,8 +672,25 @@ export async function sendTextMessage(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    // For a context-anchored reply the address is only a thread hint — the
-    // `context` block is what authorizes delivery to an unaddressable contact.
+    // `addressField` is what authorizes delivery, `context` or not. A previous
+    // version of this comment claimed the opposite — that the `context` block
+    // is what authorizes delivery to an unaddressable contact and `to` is
+    // "only a thread hint". That is wrong, and believing it is costly twice
+    // over:
+    //
+    //   * It is contradicted by the Inbox, which reaches every id-only contact
+    //     today. `flows/meta-send.ts` calls `sendTextMessage` with no
+    //     `contextMessageId` at all and succeeds, because `resolveRecipient`
+    //     puts the BSUID in `to`.
+    //   * It was already disproved on the broadcast side: a bare `@handle` in
+    //     `to` is rejected with (#100) Invalid parameter, and adding
+    //     `context.message_id` does NOT make it addressable — quoting makes the
+    //     send a reply, it does not make the destination valid.
+    //
+    // `context` is therefore purely presentational here: it renders the
+    // message as a quoted reply. It is set only when a caller is explicitly
+    // replying to a known message (`replyToMessageId`), never as a delivery
+    // workaround.
     ...addressField,
     type: 'text',
     text: { preview_url: false, body: text },

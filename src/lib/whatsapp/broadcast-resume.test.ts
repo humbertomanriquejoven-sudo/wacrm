@@ -392,6 +392,54 @@ describe('planBroadcastResume', () => {
     expect(plan.planned[0].phone).toBe('CO.1008477715690681');
   });
 
+  it('anchors each resumed template to that contact\'s own inbound wamid', async () => {
+    // Per recipient, never shared: a wamid belongs to one conversation, so a
+    // single broadcast-wide anchor would quote one person's message inside
+    // another person's chat.
+    const writes: PlanWrites = {};
+    const { plan } = await planBroadcastResume(
+      planDb(
+        {
+          broadcast: BROADCAST,
+          config: CONFIG,
+          recipients: [
+            identifierRecipient('r1', { id: 'c-r1', phone: null }),
+            identifierRecipient('r2', { id: 'c-r2', phone: null }),
+          ],
+          conversations: [
+            { id: 'cv-1', contact_id: 'c-r1' },
+            { id: 'cv-2', contact_id: 'c-r2' },
+          ],
+          messages: [
+            {
+              conversation_id: 'cv-1',
+              sender_phone: '573121828949',
+              raw_meta_payload: null,
+              message_id: 'wamid.A1',
+            },
+            {
+              conversation_id: 'cv-2',
+              sender_phone: '573121828948',
+              raw_meta_payload: null,
+              message_id: 'wamid.B1',
+            },
+          ],
+        },
+        writes,
+      ),
+      'acct-1',
+      'bc-1',
+      'pending',
+    );
+
+    const byRow = new Map(plan.planned.map((p) => [p.recipientRowId, p]));
+    expect(byRow.get('r1')?.contextMessageId).toBe('wamid.A1');
+    expect(byRow.get('r2')?.contextMessageId).toBe('wamid.B1');
+    // And the destinations stayed with their own contacts.
+    expect(byRow.get('r1')?.phone).toBe('573121828949');
+    expect(byRow.get('r2')?.phone).toBe('573121828948');
+  });
+
   it('still fails a recipient with no deliverable address', async () => {
     const writes: PlanWrites = {};
     // Paired with a reachable recipient: an ALL-unsendable plan throws

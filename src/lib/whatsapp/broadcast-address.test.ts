@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import {
   metaIdFromRawPayload,
+  recoverContextMessageIds,
   contactPhone,
   normalizeToE164,
   persistRecoveredAddress,
@@ -638,6 +639,108 @@ describe('metaIdFromRawPayload', () => {
         metadata: { phone_number_id: '15551230000' },
       }),
     ).toBeNull()
+  })
+})
+
+describe('recoverContextMessageIds', () => {
+  // The anchor is per contact. A wamid identifies one message in one
+  // conversation, so a shared or mismatched anchor would quote a stranger's
+  // message inside this recipient's chat.
+
+  function anchorDb(
+    conversations: Array<{ id: string; contact_id: string }>,
+    messages: Array<{ conversation_id: string; message_id: string | null }>,
+  ): SupabaseClient {
+    const calls: Array<{ column: string; value: unknown }> = []
+    const chain: Record<string, (...args: never[]) => unknown> = {}
+    for (const m of ['select', 'eq', 'not', 'in', 'order', 'limit']) {
+      chain[m] = ((arg: never) => {
+        if (m === 'in' || m === 'eq' || m === 'not') {
+          calls.push({ column: String(arg), value: 'captured' })
+        }
+        return chain
+      }) as never
+    }
+    chain.then = (resolve: (r: unknown) => unknown) =>
+      Promise.resolve(
+        calls.length && calls.some((c) => c.column === 'sender_type')
+          ? { data: messages, error: null }
+          : { data: messages, error: null },
+      ).then(resolve)
+    return {
+      from(table: string) {
+        chain.then = (resolve: (r: unknown) => unknown) =>
+          Promise.resolve({
+            data: table === 'conversations' ? conversations : messages,
+            error: null,
+          }).then(resolve)
+        return chain
+      },
+    } as unknown as SupabaseClient
+  }
+
+  it('maps each contact to the newest inbound wamid of its OWN thread', async () => {
+    const anchors = await recoverContextMessageIds(
+      anchorDb(
+        [
+          { id: 'cv-a', contact_id: 'c-a' },
+          { id: 'cv-b', contact_id: 'c-b' },
+        ],
+        [
+          // Newest first, interleaved across both contacts.
+          { conversation_id: 'cv-b', message_id: 'wamid.B2' },
+          { conversation_id: 'cv-a', message_id: 'wamid.A2' },
+          { conversation_id: 'cv-b', message_id: 'wamid.B1' },
+          { conversation_id: 'cv-a', message_id: 'wamid.A1' },
+        ],
+      ),
+      ['c-a', 'c-b'],
+    )
+
+    // Each contact gets its own newest, never the other one's.
+    expect(anchors.get('c-a')).toBe('wamid.A2')
+    expect(anchors.get('c-b')).toBe('wamid.B2')
+  })
+
+  it('omits contacts that never wrote in rather than inventing an anchor', async () => {
+    const anchors = await recoverContextMessageIds(
+      anchorDb(
+        [
+          { id: 'cv-a', contact_id: 'c-a' },
+          { id: 'cv-c', contact_id: 'c-c' },
+        ],
+        [{ conversation_id: 'cv-a', message_id: 'wamid.A1' }],
+      ),
+      ['c-a', 'c-c'],
+    )
+
+    expect(anchors.has('c-c')).toBe(false)
+    expect(anchors.get('c-a')).toBe('wamid.A1')
+  })
+
+  it('skips rows with no stored wamid', async () => {
+    // A message whose Meta id was never captured cannot anchor a quote;
+    // falling through to an older row would quote a stale message.
+    const anchors = await recoverContextMessageIds(
+      anchorDb([{ id: 'cv-a', contact_id: 'c-a' }], [
+        { conversation_id: 'cv-a', message_id: null },
+        { conversation_id: 'cv-a', message_id: 'wamid.A1' },
+      ]),
+      ['c-a'],
+    )
+    expect(anchors.get('c-a')).toBe('wamid.A1')
+  })
+
+  it('does no work at all for an empty contact list', async () => {
+    let touched = false
+    const db = {
+      from() {
+        touched = true
+        return {}
+      },
+    } as unknown as SupabaseClient
+    expect((await recoverContextMessageIds(db, [])).size).toBe(0)
+    expect(touched).toBe(false)
   })
 })
 

@@ -442,6 +442,96 @@ export async function recoverAddressesFromHistory(
   return recovered;
 }
 
+/**
+ * The newest inbound `wamid` each of these contacts wrote, keyed by contact id.
+ *
+ * Used to anchor a broadcast send as a quoted reply (`context.message_id`),
+ * mirroring what the Inbox does when it answers a customer. Meta renders the
+ * anchor, so this is presentational — it is NOT what makes an id-only contact
+ * reachable. `resolveBroadcastAddress` still has to produce a real `to`;
+ * quoting an inbound message does not make a bare `@handle` addressable, and
+ * Meta answers (#100) Invalid parameter for one either way.
+ *
+ * PER CONTACT, never one shared value. A wamid belongs to one conversation:
+ * anchoring recipient B's template to recipient A's inbound message would put
+ * a stranger's message in B's chat, which is both a privacy incident and a
+ * message Meta may reject outright. The `contact_id` join through
+ * `conversations` is what keeps each id on its own thread.
+ *
+ * Batched, two queries total, mirroring {@link recoverAddressesFromHistory}.
+ * Inbound only — an `agent` row carries OUR message_id, and quoting ourselves
+ * would anchor every send to our own outbound.
+ */
+export async function recoverContextMessageIds(
+  db: SupabaseClient,
+  contactIds: readonly string[],
+): Promise<Map<string, string>> {
+  const anchors = new Map<string, string>();
+  const ids = [...new Set(contactIds.filter(Boolean))];
+  if (ids.length === 0) return anchors;
+
+  const { data: convRows, error: convError } = await db
+    .from('conversations')
+    .select('id, contact_id')
+    .in('contact_id', ids);
+
+  if (convError) {
+    // Not fatal: the send still works, it just is not quoted. Reported so a
+    // silent loss of the anchor is distinguishable from "no anchor existed".
+    console.warn(
+      '[broadcast] conversation lookup failed; replies will not be quoted',
+      convError.message,
+    );
+    return anchors;
+  }
+
+  const convIdsByContact = new Map<string, string[]>();
+  for (const row of (convRows ?? []) as Array<{
+    id: string;
+    contact_id: string;
+  }>) {
+    const list = convIdsByContact.get(row.contact_id) ?? [];
+    list.push(row.id);
+    convIdsByContact.set(row.contact_id, list);
+  }
+
+  const conversationIds = [...new Set([...convIdsByContact.values()].flat())];
+  if (conversationIds.length === 0) return anchors;
+
+  const { data: msgRows, error: msgError } = await db
+    .from('messages')
+    .select('conversation_id, message_id')
+    .in('conversation_id', conversationIds)
+    .eq('sender_type', 'customer')
+    .not('message_id', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(1000);
+
+  if (msgError) {
+    console.warn(
+      '[broadcast] message lookup failed; replies will not be quoted',
+      msgError.message,
+    );
+    return anchors;
+  }
+
+  // Newest wins. The rows arrive newest-first, so the first hit per contact is
+  // the anchor; later rows for the same contact are older and ignored.
+  for (const row of (msgRows ?? []) as Array<{
+    conversation_id: string;
+    message_id: string | null;
+  }>) {
+    if (!row.message_id) continue;
+    const contactId = (convRows as Array<{ id: string; contact_id: string }>).find(
+      (c) => c.id === row.conversation_id,
+    )?.contact_id;
+    if (contactId && !anchors.has(contactId)) {
+      anchors.set(contactId, row.message_id);
+    }
+  }
+  return anchors;
+}
+
 export async function persistRecoveredAddress(
   db: SupabaseClient,
   contactId: string,
