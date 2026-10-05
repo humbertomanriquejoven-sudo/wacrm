@@ -239,7 +239,7 @@ function bogotaParts(instant: Date): BogotaParts {
 function bogotaIso(instant: Date): string {
   const p = bogotaParts(instant);
   const pad = (n: number) => String(n).padStart(2, '0');
-  return `${p.year}-${pad(p.month)}-${pad(p.day)}T${p.hour}:${pad(p.minute)}:${pad(p.second)}${BOGOTA_OFFSET}`;
+  return `${p.year}-${pad(p.month)}-${pad(p.day)}T${pad(p.hour)}:${pad(p.minute)}:${pad(p.second)}${BOGOTA_OFFSET}`;
 }
 
 function bogotaDateKey(instant: Date): string {
