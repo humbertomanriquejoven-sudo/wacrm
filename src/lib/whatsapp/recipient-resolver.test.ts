@@ -8,6 +8,9 @@ import {
   identityFilterParts,
   isRecipientRejection,
   findRecoverablePhone,
+  resolveRecipient,
+  recipientAddressQueue,
+  latestInboundAnchorId,
 } from '@/lib/whatsapp/recipient-resolver'
 import { MetaApiError } from '@/lib/whatsapp/meta-api'
 
@@ -259,5 +262,199 @@ describe('findRecoverablePhone', () => {
     expect(found).toBeNull()
     const queriedTables = mocks.fromAny.mock.calls.map((c) => c[0])
     expect(queriedTables).not.toContain('contacts')
+  })
+})
+// ============================================================
+// One ladder, one queue, for every sender.
+//
+// The bug this covers: the AI could answer a contact known only by an
+// opaque id while an operator sending the same thing from the INBOX could
+// not. Two causes, both fixed in this module:
+//   1. `resolveRecipient` ignored `wa_id` / `recipient_id`, so it could
+//      resolve an address the projection had not even selected.
+//   2. the AI's retry list was `isDialablePhone`-gated, so it could never
+//      retry a BSUID or a handle - the very addresses that get rejected.
+// ============================================================
+describe('resolveRecipient - one ladder for all senders', () => {
+  beforeEach(() => {
+    mocks.fromAny.mockImplementation(() => {
+      const b: Record<string, unknown> = {}
+      const chain = () => b
+      for (const m of ['select', 'eq', 'in', 'not', 'order']) b[m] = vi.fn(chain)
+      b.limit = vi.fn(() => Promise.resolve({ data: [], error: null }))
+      b.maybeSingle = vi.fn(() => Promise.resolve({ data: null, error: null }))
+      b.then = (resolve: (v: unknown) => unknown) =>
+        resolve({ data: [], error: null })
+      return b
+    })
+  })
+
+  it('prefers a dialable number, unchanged', async () => {
+    const r = await resolveRecipient(
+      { id: 'c1', phone: '+57 312 218 2949' },
+      'acct-1',
+    )
+    expect(r).toMatchObject({ to: '573122182949', source: 'phone', isPhone: true })
+  })
+
+  it('falls back to wa_id when no number exists anywhere', async () => {
+    const r = await resolveRecipient(
+      { id: 'c1', phone: null, wa_id: '5511999999999' },
+      'acct-1',
+    )
+    expect(r.to).toBe('5511999999999')
+    expect(r.isPhone).toBe(false)
+  })
+
+  it('falls back to recipient_id when wa_id and the BSUID are absent', async () => {
+    const r = await resolveRecipient(
+      { id: 'c1', phone: null, wa_user_id: null, recipient_id: '99887766' },
+      'acct-1',
+    )
+    expect(r.to).toBe('99887766')
+  })
+
+  it('still resolves a @handle stored in the phone column', async () => {
+    const r = await resolveRecipient({ id: 'c1', phone: '@tienda' }, 'acct-1')
+    expect(r).toMatchObject({ to: '@tienda', source: 'username', isPhone: false })
+  })
+
+  it('recovers a real number from the contact own thread before any id', async () => {
+    mocks.fromAny.mockImplementation((table: string) => {
+      const rows =
+        table === 'conversations'
+          ? [{ id: 'conv-1' }]
+          : table === 'messages'
+            ? [{ sender_phone: '573001234567' }]
+            : []
+      const b: Record<string, unknown> = {}
+      const chain = () => b
+      for (const m of ['select', 'eq', 'in', 'not', 'order']) b[m] = vi.fn(chain)
+      b.limit = vi.fn(() => Promise.resolve({ data: rows, error: null }))
+      b.maybeSingle = vi.fn(() => Promise.resolve({ data: rows[0] ?? null, error: null }))
+      b.then = (resolve: (v: unknown) => unknown) => resolve({ data: rows, error: null })
+      return b
+    })
+
+    const r = await resolveRecipient(
+      { id: 'c1', phone: 'CO.1008477715690681', wa_user_id: '1008477715690681' },
+      'acct-1',
+      'conv-1',
+    )
+    expect(r).toMatchObject({ to: '573001234567', source: 'recovered', isPhone: true })
+  })
+})
+
+describe('recipientAddressQueue - shared by the AI and the manual sender', () => {
+  beforeEach(() => {
+    mocks.fromAny.mockImplementation((table: string) => {
+      const rows = table === 'conversations' ? [{ id: 'conv-1' }] : []
+      const b: Record<string, unknown> = {}
+      const chain = () => b
+      for (const m of ['select', 'eq', 'in', 'not', 'order']) b[m] = vi.fn(chain)
+      b.limit = vi.fn(() => Promise.resolve({ data: rows, error: null }))
+      b.maybeSingle = vi.fn(() => Promise.resolve({ data: rows[0] ?? null, error: null }))
+      b.then = (resolve: (v: unknown) => unknown) => resolve({ data: rows, error: null })
+      return b
+    })
+  })
+
+  it('includes opaque ids, which the old AI-only queue filtered out', async () => {
+    const queue = await recipientAddressQueue(
+      {
+        id: 'c1',
+        phone: 'CO.1008477715690681',
+        wa_user_id: '1008477715690681',
+        wa_id: '5511999999999',
+        recipient_id: '99887766',
+        username: 'tienda',
+      },
+      'acct-1',
+      'CO.1008477715690681',
+      'conv-1',
+    )
+
+    expect(queue[0]).toBe('CO.1008477715690681')
+    expect(queue).toContain('5511999999999')
+    expect(queue).toContain('1008477715690681')
+    expect(queue).toContain('99887766')
+    expect(queue).toContain('@tienda')
+  })
+
+  it('de-duplicates, so an unchanged contact yields one entry', async () => {
+    const queue = await recipientAddressQueue(
+      { id: 'c1', phone: '573122182949' },
+      'acct-1',
+      '573122182949',
+      'conv-1',
+    )
+    expect(queue).toEqual(['573122182949'])
+  })
+
+  it('reports a number recovered from history so it can be persisted', async () => {
+    mocks.fromAny.mockImplementation((table: string) => {
+      const rows =
+        table === 'conversations'
+          ? [{ id: 'conv-1' }]
+          : table === 'messages'
+            ? [{ sender_phone: '573001234567' }]
+            : []
+      const b: Record<string, unknown> = {}
+      const chain = () => b
+      for (const m of ['select', 'eq', 'in', 'not', 'order']) b[m] = vi.fn(chain)
+      b.limit = vi.fn(() => Promise.resolve({ data: rows, error: null }))
+      b.maybeSingle = vi.fn(() => Promise.resolve({ data: rows[0] ?? null, error: null }))
+      b.then = (resolve: (v: unknown) => unknown) => resolve({ data: rows, error: null })
+      return b
+    })
+
+    const onRecovered = vi.fn()
+    const queue = await recipientAddressQueue(
+      { id: 'c1', phone: 'CO.1008477715690681' },
+      'acct-1',
+      'CO.1008477715690681',
+      'conv-1',
+      { onRecovered },
+    )
+
+    // `primary` stays first; the recovered dialable number is the next thing to
+    // try. (In the real flow `resolveRecipient` already prefers the recovered
+    // number, so it arrives here as the primary.)
+    expect(queue[0]).toBe('CO.1008477715690681')
+    expect(queue).toContain('573001234567')
+    expect(onRecovered).toHaveBeenCalledWith('573001234567')
+  })
+})
+
+describe('latestInboundAnchorId', () => {
+  function anchorDb(rows: unknown[]) {
+    const b: Record<string, unknown> = {}
+    const chain = () => b
+    for (const m of ['select', 'eq', 'not', 'order']) b[m] = vi.fn(chain)
+    b.limit = vi.fn(() => Promise.resolve({ data: rows, error: null }))
+    return { from: vi.fn(() => b) }
+  }
+
+  it('returns the newest inbound wamid', async () => {
+    expect(
+      await latestInboundAnchorId(anchorDb([{ message_id: 'wamid.NEW' }]) as never, 'conv-1'),
+    ).toBe('wamid.NEW')
+  })
+
+  it('returns null when the thread has no anchored inbound', async () => {
+    expect(await latestInboundAnchorId(anchorDb([]) as never, 'conv-1')).toBeNull()
+    expect(await latestInboundAnchorId(anchorDb([]) as never, null)).toBeNull()
+  })
+
+  it('only ever reads customer messages in the given conversation', async () => {
+    const db = anchorDb([{ message_id: 'wamid.NEW' }])
+    await latestInboundAnchorId(db as never, 'conv-9')
+
+    const builder = db.from() as unknown as {
+      eq: { mock: { calls: unknown[][] } }
+    }
+    const eqCalls = builder.eq.mock.calls.map((c) => [c[0], c[1]])
+    expect(eqCalls).toContainEqual(['conversation_id', 'conv-9'])
+    expect(eqCalls).toContainEqual(['sender_type', 'customer'])
   })
 })

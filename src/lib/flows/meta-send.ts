@@ -23,9 +23,9 @@ import {
   resolveRecipient,
   isRecipientRejection,
   isDialablePhone,
-  toDialable,
-  findRecoverablePhone,
+  recipientAddressQueue,
 } from '@/lib/whatsapp/recipient-resolver'
+import type { RecipientCandidate } from '@/lib/whatsapp/recipient-resolver'
 
 // ------------------------------------------------------------
 // Flows-side Meta sender (interactive variants).
@@ -43,6 +43,15 @@ import {
 // ------------------------------------------------------------
 
 /**
+ * The contact columns every outbound sender needs.
+ *
+ * `wa_id` and `recipient_id` were missing here, so `resolveRecipient` could not
+ * see them even though it consults both — the projection was silently starving
+ * the resolver. One constant so the four senders below can't drift again.
+ */
+const OUTBOUND_CONTACT_COLUMNS = 'id, phone, wa_user_id, wa_id, recipient_id, username'
+
+/**
  * Every address this contact could be reached at, best first, with
  * `primary` guaranteed first.
  *
@@ -51,13 +60,7 @@ import {
  * `recipientAddressQueue` share.
  */
 export async function resolveOutboundAddressQueue(
-  contact: {
-    id?: string | null
-    phone?: string | null
-    wa_user_id?: string | null
-    username?: string | null
-    name?: string | null
-  },
+  contact: RecipientCandidate,
   accountId: string,
   conversationId?: string | null,
   primary?: string,
@@ -122,48 +125,6 @@ function sendVariantsFor(sanitized: string): string[] {
 }
 
 /**
- * Every address this contact could legitimately be reached at, best first.
- *
- * `primary` is whatever `prepareRecipient` resolved. The remaining entries
- * are the contact's other on-file identifiers, so a rejected `to` can be
- * retried against a different value without a second round-trip to
- * resolve. De-duplicated against `primary` so an unchanged contact yields
- * a single-entry queue and behaves exactly as before.
- */
-async function recipientAddressQueue(
-  contact: {
-    id?: string | null
-    phone?: string | null
-    wa_user_id?: string | null
-    username?: string | null
-    name?: string | null
-  },
-  accountId: string,
-  primary: string,
-  conversationId?: string | null,
-): Promise<string[]> {
-  const queue = [primary]
-  const push = (value: string | null | undefined) => {
-    if (value && isDialablePhone(value) && !queue.includes(value)) queue.push(value)
-  }
-
-  const own = toDialable(contact.phone)
-  push(own)
-
-  // A number Meta actually used on THIS contact's own thread — the usual
-  // outcome when `phone` still holds a BSUID but the person has messaged
-  // from a registered number before. Never reads another contact's rows.
-  const recovered = await findRecoverablePhone(
-    contact,
-    accountId,
-    conversationId,
-  ).catch(() => null)
-  push(recovered?.phone)
-
-  return queue
-}
-
-/**
  * Resolve the outbound address for a contact and format it for Meta.
  *
  * Shared by every sender below so the four paths can't drift apart. The
@@ -176,13 +137,7 @@ async function recipientAddressQueue(
  * every single send.
  */
 async function prepareRecipient(
-  contact: {
-    id?: string | null
-    phone?: string | null
-    wa_user_id?: string | null
-    username?: string | null
-    name?: string | null
-  },
+  contact: RecipientCandidate,
   accountId: string,
   conversationId?: string | null,
 ): Promise<{ to: string; sanitized: string; isPhone: boolean }> {
@@ -215,7 +170,7 @@ export async function engineSendText(
 
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone, wa_user_id, username')
+    .select(OUTBOUND_CONTACT_COLUMNS)
     .eq('id', args.contactId)
     .eq('account_id', args.accountId)
     .maybeSingle()
@@ -361,7 +316,7 @@ export async function engineSendAiReply(
 
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone, wa_user_id, username')
+    .select(OUTBOUND_CONTACT_COLUMNS)
     .eq('id', args.contactId)
     .eq('account_id', args.accountId)
     .maybeSingle()
@@ -536,7 +491,7 @@ export async function engineSendMedia(
 
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone, wa_user_id, username')
+    .select(OUTBOUND_CONTACT_COLUMNS)
     .eq('id', args.contactId)
     .eq('account_id', args.accountId)
     .maybeSingle()
@@ -706,7 +661,7 @@ async function sendInteractiveViaMeta(
   // Migration 017 moved both tables to account-scoped tenancy.
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone, wa_user_id, username')
+    .select(OUTBOUND_CONTACT_COLUMNS)
     .eq('id', input.contactId)
     .eq('account_id', input.accountId)
     .maybeSingle()

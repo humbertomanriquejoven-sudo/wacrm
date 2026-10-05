@@ -206,23 +206,39 @@ interface CapturedWrites {
  */
 function sendPathDb(
   templateRows: unknown[],
-  captured: CapturedWrites
+  captured: CapturedWrites,
+  opts?: {
+    contact?: Record<string, unknown>;
+    inboundRows?: unknown[];
+    /** Row returned when the send resolves an explicit `reply_to_message_id`. */
+    replyParent?: { message_id?: string | null };
+  }
 ): SupabaseClient {
   const conversation = {
     id: 'cv-1',
-    contact: { id: 'ct-1', phone: '+15551234567' },
+    contact: opts?.contact ?? { id: 'ct-1', phone: '+15551234567' },
   };
   const config = {
     id: 'cfg-1',
     phone_number_id: 'pn-1',
     access_token: 'token',
   };
+  // Inbound rows returned by the anchor lookup. `latestInboundAnchorId` reads
+  // the newest customer wamid so a send to an opaque-id contact can be quoted.
+  const inboundRows = opts?.inboundRows ?? [];
 
   return {
     from(table: string) {
       const builder: Record<string, unknown> = {
         select: () => builder,
         eq: () => builder,
+        in: () => builder,
+        not: () => builder,
+        order: () => builder,
+        limit: async () => ({
+          data: table === 'messages' ? inboundRows : [],
+          error: null,
+        }),
         insert: (row: Record<string, unknown>) => {
           if (table === 'messages') captured.message = row;
           return builder;
@@ -231,7 +247,10 @@ function sendPathDb(
           if (table === 'conversations') captured.conversation = row;
           return builder;
         },
-        maybeSingle: async () => ({ data: null, error: null }),
+        maybeSingle: async () => ({
+          data: table === 'messages' ? (opts?.replyParent ?? null) : null,
+          error: null,
+        }),
         single: async () => {
           if (table === 'conversations') {
             return { data: conversation, error: null };
@@ -344,5 +363,125 @@ describe('sendMessageToConversation — template persistence (#483)', () => {
     // name rather than inventing a body.
     expect(captured.message?.content_text).toBeNull();
     expect(captured.conversation?.last_message_text).toBe('[template]');
+  });
+});
+
+// ============================================================
+// INBOX <-> AI parity for opaque-id recipients.
+//
+// WhatsApp will not accept a BSUID / `@user` / `WAID.` id in `to`. It only
+// accepts such a message as a QUOTE of one of that person's own messages. The
+// AI path always passed the inbound wamid along as that quote, so the bot could
+// answer these contacts; the manual INBOX path only did it when the operator
+// explicitly hit "Reply", so the same person was undeliverable by hand. These
+// tests pin the manual path to the AI's behaviour.
+// ============================================================
+describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', () => {
+  const OPAQUE_CONTACT = {
+    id: 'ct-1',
+    phone: 'CO.1008477715690681',
+    wa_user_id: '1008477715690681',
+    username: null,
+  };
+
+  function textSend() {
+    return sendMessageToConversation(
+      sendPathDb([], {}, {
+        contact: OPAQUE_CONTACT,
+        inboundRows: [{ message_id: 'wamid.INBOUND' }],
+      }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'Hola, te escribo por aqui',
+      }
+    );
+  }
+
+  it('anchors the send to the newest inbound wamid when the id is opaque', async () => {
+    await textSend();
+
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ contextMessageId: 'wamid.INBOUND' })
+    );
+  });
+
+  it('addresses the opaque id directly, as the AI path does', async () => {
+    await textSend();
+
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: '1008477715690681' })
+    );
+  });
+
+  it('leaves an ordinary dialable number completely untouched', async () => {
+    // Regression guard: the anchor is only ever added for opaque addresses. A
+    // customer with a real number must keep being addressed directly, with no
+    // quote, exactly as before.
+    await sendMessageToConversation(
+      sendPathDb([], {}, {
+        contact: { id: 'ct-1', phone: '+15551234567' },
+        inboundRows: [{ message_id: 'wamid.INBOUND' }],
+      }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'Hola',
+      }
+    );
+
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: '15551234567' })
+    );
+    const call = vi.mocked(sendTextMessage).mock.calls[0][0];
+    expect(call.contextMessageId).toBeUndefined();
+  });
+
+  it('still sends when the thread has no inbound wamid to quote', async () => {
+    // No anchor available: attempt the direct address anyway rather than
+    // failing the operator's send outright.
+    await sendMessageToConversation(
+      sendPathDb([], {}, { contact: OPAQUE_CONTACT, inboundRows: [] }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'Hola',
+      }
+    );
+
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: '1008477715690681' })
+    );
+    expect(vi.mocked(sendTextMessage).mock.calls[0][0].contextMessageId).toBeUndefined();
+  });
+
+  it('keeps an explicit operator reply target over the thread anchor', async () => {
+    await sendMessageToConversation(
+      sendPathDb([], {}, {
+        contact: OPAQUE_CONTACT,
+        inboundRows: [{ message_id: 'wamid.NEWEST' }],
+        replyParent: { message_id: 'wamid.CHOSEN' },
+      }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'Hola',
+        replyToMessageId: 'msg-1',
+      }
+    );
+
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    // The bubble the operator actually clicked wins over the newest inbound.
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ contextMessageId: 'wamid.CHOSEN' })
+    );
   });
 });

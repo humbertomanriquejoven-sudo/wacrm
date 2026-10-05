@@ -45,6 +45,8 @@ import {
   isDialablePhone,
   isRecipientRejection,
   sendWithRecipientFallback,
+  resolveRecipient,
+  latestInboundAnchorId,
 } from '@/lib/whatsapp/recipient-resolver';
 import type { MessageTemplate } from '@/types';
 import {
@@ -304,6 +306,39 @@ export async function sendMessageToConversation(
       );
     } else {
       contextMessageId = parent.message_id;
+    }
+  }
+
+  // The parity fix.
+  //
+  // A contact we can only identify by an opaque id — a `@user` display id, a
+  // BSUID, a `WAID.`/`LID.` id — CANNOT be addressed directly in Meta's `to`.
+  // WhatsApp only accepts such a message as a QUOTE of one of that person's own
+  // messages. The AI path always supplied that anchor, which is why the bot
+  // could answer these contacts while an operator typing the same thing in the
+  // INBOX got a 200 and no delivery.
+  //
+  // So when the resolved address is opaque, anchor to the newest inbound wamid
+  // in this thread — exactly what `engineSendAiReply` does with the inbound it
+  // was answering. Only for opaque addresses: a contact with a dialable number
+  // is addressed directly and is left completely untouched, so the ordinary
+  // case is byte-identical to before.
+  if (!contextMessageId) {
+    const resolved = await resolveRecipient(contact, accountId, conversationId);
+    if (resolved.to && !resolved.isPhone) {
+      contextMessageId =
+        (await latestInboundAnchorId(db, conversationId)) ?? undefined;
+      if (contextMessageId) {
+        console.log(
+          `[send-message] contact ${contact.id} is addressed by an opaque id (${resolved.source}); ` +
+            `anchoring the send to inbound message ${contextMessageId} so WhatsApp accepts it`
+        );
+      } else {
+        console.warn(
+          `[send-message] contact ${contact.id} has no dialable number and this conversation has ` +
+            `no inbound wamid to quote; the send may be rejected by WhatsApp`
+        );
+      }
     }
   }
 

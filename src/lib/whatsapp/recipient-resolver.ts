@@ -6,6 +6,7 @@ import {
 } from './phone-utils'
 import { MetaApiError } from './meta-api'
 import { supabaseAdmin } from '@/lib/flows/admin-client'
+import type { SupabaseClient } from '@supabase/supabase-js'
 
 // The phone-vs-identifier boundary is defined once, in `phone-utils`, and
 // shared with the Meta payload builder so a BSUID is classified the same
@@ -200,9 +201,18 @@ async function findPhoneInMessageHistory(
  *   1. `contact.phone`, if it is a dialable E.164 number.
  *   2. A real number recovered from this contact's OWN conversation
  *      history (`messages.sender_phone`), when `phone` still holds a BSUID.
- *   3. `wa_user_id` — Meta accepts a BSUID as the recipient for
+ *   3. `wa_id` — the numeric id Meta used as the inbound `from`, i.e. the
+ *      address that demonstrably reached us, so the one most likely to be
+ *      accepted back.
+ *   4. `wa_user_id` — the BSUID. Meta accepts a BSUID as the recipient for
  *      BSUID/Threads/API conversations.
- *   4. `username`, as a last resort.
+ *   5. `recipient_id` — the alternative Meta identifier.
+ *   6. `username`, as a last resort.
+ *
+ * `wa_id` and `recipient_id` used to be consulted only by `resolveBestRecipient`,
+ * so the AI reply and the INBOX manual send could disagree about the same
+ * contact: the automation engine could reach someone the bot could not. One
+ * ladder, consulted identically by every sender.
  *
  * Nothing here is specific to a WABA, a number or an identifier: every
  * branch is decided by the data present at call time.
@@ -232,11 +242,19 @@ export async function resolveRecipient(
     }
   }
 
-  // 3. The BSUID is a first-class `to` value for Meta.
+  // 3. `wa_id` — what Meta itself addressed us with on the inbound message.
+  const waId = passthroughMetaId(contact.wa_id)
+  if (waId) return { to: waId, source: 'bsuid', isPhone: false }
+
+  // 4. The BSUID is a first-class `to` value for Meta.
   const bsuid = normalizeMetaIdentifier(contact.wa_user_id ?? contact.phone)
   if (bsuid) return { to: bsuid, source: 'bsuid', isPhone: false }
 
-  // 4. The public handle, as `@user`.
+  // 5. `recipient_id` — the alternative Meta identifier.
+  const recipientId = passthroughMetaId(contact.recipient_id)
+  if (recipientId) return { to: recipientId, source: 'bsuid', isPhone: false }
+
+  // 6. The public handle, as `@user`.
   const storedHandle =
     contact.phone && contact.phone.trim().startsWith('@')
       ? normalizeUsername(contact.phone)
@@ -247,6 +265,131 @@ export async function resolveRecipient(
   if (handle) return { to: handle, source: 'username', isPhone: false }
 
   return { to: '', source: 'bsuid', isPhone: false }
+}
+
+/**
+ * Every address this contact could legitimately be reached at, best first.
+ *
+ * THE single retry list for all outbound paths. It used to exist twice: a
+ * hand-rolled copy inside `sendWithRecipientFallback` (manual INBOX send) and
+ * `recipientAddressQueue` in `flows/meta-send` (AI reply, flows). They drifted
+ * in the one way that mattered — the AI copy gated every candidate through
+ * `isDialablePhone`, so it could never retry a BSUID, a `@handle` or a
+ * `recipient_id`. Opaque identifiers are exactly the addresses that get
+ * rejected, so that gate made the AI retry useless for the contacts least
+ * likely to be reachable. One permissive list, both paths.
+ *
+ * `primary` comes first and is de-duplicated, so an unchanged contact yields a
+ * single-entry queue and behaves exactly as before.
+ *
+ * Every entry comes from THIS contact or its own thread. Nothing here reads a
+ * sibling contact's rows: an address found elsewhere may belong to a different
+ * person, and delivering to it would send the message to a stranger.
+ */
+export async function recipientAddressQueue(
+  contact: RecipientCandidate | null | undefined,
+  accountId: string,
+  primary: string,
+  conversationId?: string | null,
+  options?: {
+    /**
+     * Invoked when a dialable number is dug out of the contact's own history.
+     * Callers persist it so the stale identifier stops recurring on every send
+     * — without it, a contact whose `phone` still holds a BSUID re-runs the
+     * lookup forever.
+     */
+    onRecovered?: (phone: string) => void | Promise<void>
+  },
+): Promise<string[]> {
+  const queue: string[] = []
+  const push = (value: string | null | undefined) => {
+    if (value && !queue.includes(value)) queue.push(value)
+  }
+
+  push(primary)
+  if (!contact) return queue
+
+  // A number Meta actually used on THIS contact's own thread — the usual
+  // outcome when `phone` still holds a BSUID but the person has messaged
+  // from a registered number before. Never reads another contact's rows.
+  const recovered = await findRecoverablePhone(
+    contact,
+    accountId,
+    conversationId,
+  ).catch(() => null)
+  if (recovered?.phone && !queue.includes(recovered.phone)) {
+    queue.push(recovered.phone)
+    if (options?.onRecovered && toDialable(contact.phone) !== recovered.phone) {
+      await Promise.resolve(options.onRecovered(recovered.phone)).catch(
+        () => undefined,
+      )
+    }
+  }
+
+  push(toDialable(contact.phone))
+  push(passthroughMetaId(contact.wa_id))
+  push(normalizeMetaIdentifier(contact.wa_user_id ?? contact.phone))
+  push(passthroughMetaId(contact.recipient_id))
+  push(
+    contact.phone && contact.phone.trim().startsWith('@')
+      ? normalizeUsername(contact.phone)
+      : null,
+  )
+  push(normalizeUsername(contact.username))
+
+  return queue
+}
+
+/**
+ * The newest inbound wamid in a conversation, to be used as Meta's
+ * `context.message_id` anchor.
+ *
+ * WHY THIS EXISTS — the actual cause of "the AI answers these contacts but the
+ * INBOX can't send to them":
+ *
+ * A contact we can only identify by an opaque id (a `@user` display id, a
+ * BSUID, a `WAID.`/`LID.` id) cannot be addressed directly in `to`. WhatsApp
+ * will only accept such a message as a QUOTE of one of that person's own
+ * messages. The AI path always passed its inbound wamid along
+ * (`engineSendAiReply` -> `contextMessageId: args.composeMessageId`), so its
+ * replies landed. The manual INBOX path only set `contextMessageId` when the
+ * operator explicitly hit "Reply" on a specific bubble, so a plain new message
+ * to the same contact went out unanchored and was silently dropped by Meta
+ * despite a 200 response.
+ *
+ * Scoped to customer-sent messages in this one conversation: the anchor must be
+ * a message the recipient actually wrote, and must never come from another
+ * thread.
+ */
+export async function latestInboundAnchorId(
+  db: Pick<SupabaseClient, 'from'>,
+  conversationId: string | null | undefined,
+): Promise<string | null> {
+  if (!conversationId) return null
+
+  const { data, error } = await db
+    .from('messages')
+    .select('message_id')
+    .eq('conversation_id', conversationId)
+    .eq('sender_type', 'customer')
+    .not('message_id', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(1)
+
+  if (error) {
+    // Best-effort: an anchor we cannot read must not fail the send. The caller
+    // falls back to addressing the contact directly.
+    console.warn(
+      '[recipient-resolver] could not read an inbound anchor for conversation',
+      conversationId,
+      '-',
+      error.message,
+    )
+    return null
+  }
+
+  const row = (data ?? [])[0] as { message_id?: string | null } | undefined
+  return row?.message_id ?? null
 }
 
 /**
@@ -264,12 +407,10 @@ export function isRecipientRejection(err: unknown): boolean {
 
 /**
  * Run `send` against the best address for `contact`, and if Meta rejects
- * that address, re-resolve once and retry against a different identifier.
+ * that address, walk the shared `recipientAddressQueue` until one works.
  *
- * The retry is deliberately single-shot and identity-preserving: we only
- * try again when the contact actually has another address on file, and we
- * skip addresses already attempted, so a contact with three stale values
- * can't produce a duplicate send.
+ * The retry is identity-preserving: addresses already attempted are skipped,
+ * so a contact with three stale values cannot produce a duplicate send.
  */
 export async function sendWithRecipientFallback<T>(args: {
   contact: RecipientCandidate
@@ -281,7 +422,6 @@ export async function sendWithRecipientFallback<T>(args: {
   onRecovered?: (phone: string) => void | Promise<void>
 }): Promise<T> {
   const { contact, accountId, conversationId, send, onRecovered } = args
-  const attempted = new Set<string>()
 
   const first = await resolveRecipient(contact, accountId, conversationId)
   if (!first.to) throw new Error('contact not found for this account')
@@ -289,46 +429,24 @@ export async function sendWithRecipientFallback<T>(args: {
   if (first.source === 'recovered' && first.isPhone && onRecovered) {
     await Promise.resolve(onRecovered(first.to)).catch(() => undefined)
   }
-  attempted.add(first.to)
+
+  // One list, shared with the AI reply path. It used to be rebuilt inline here,
+  // which is how the manual sender and the bot ended up with different ideas of
+  // which addresses this contact can be reached at.
+  const queue = await recipientAddressQueue(
+    contact,
+    accountId,
+    first.to,
+    conversationId,
+    { onRecovered },
+  )
+  // Everything after the address we already tried.
+  const alternatives = queue.filter((to) => to !== first.to)
 
   try {
     return await send(first.to)
   } catch (err) {
     if (!isRecipientRejection(err)) throw err
-
-    // The address Meta rejected. Build the list of alternatives this
-    // contact still has and try each until one works.
-    const alternatives: string[] = []
-    const own = toDialable(contact.phone)
-    if (own && !attempted.has(own)) alternatives.push(own)
-
-    const recovered = await findRecoverablePhone(
-      contact,
-      accountId,
-      conversationId,
-    ).catch(() => null)
-    if (recovered && !attempted.has(recovered.phone)) {
-      alternatives.push(recovered.phone)
-      if (onRecovered) {
-        await Promise.resolve(onRecovered(recovered.phone)).catch(() => undefined)
-      }
-    }
-
-    const bsuid = normalizeMetaIdentifier(contact.wa_user_id ?? contact.phone)
-    if (bsuid && !attempted.has(bsuid)) alternatives.push(bsuid)
-
-    const handle = normalizeUsername(contact.username)
-    if (handle && !attempted.has(handle)) alternatives.push(handle)
-
-    const storedHandle =
-      contact.phone && contact.phone.trim().startsWith('@')
-        ? normalizeUsername(contact.phone)
-        : null
-    if (storedHandle && !attempted.has(storedHandle)) alternatives.push(storedHandle)
-
-    const recipientId = contact.recipient_id
-    if (recipientId && !attempted.has(recipientId)) alternatives.push(recipientId)
-
     if (alternatives.length === 0) throw err
 
     let lastError: unknown = err
