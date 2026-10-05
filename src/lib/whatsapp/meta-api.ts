@@ -223,7 +223,16 @@ export function recipientAddressField(destination: string): Record<string, strin
     return { to: digits }
   }
   // Fallback: treat as a Meta id and send via `recipient`.
-  return { recipient: digits || value }
+  //
+  // A digits-only value is forwarded as those digits — even a short run,
+  // because that is genuinely the id we hold. A value containing letters is
+  // forwarded INTACT instead. This used to prefer the stripped digits
+  // (`digits || value`), which reduced an @handle to the few digits it
+  // happened to contain: '@jjuanpablo22222' was sent as recipient:"22222",
+  // and Meta answered "(#100) Invalid parameter". Handing Meta a number we
+  // invented from someone's display name is strictly worse than handing it
+  // the value we actually hold.
+  return { recipient: digitsOnly ? digits : value }
 }
 
 /**

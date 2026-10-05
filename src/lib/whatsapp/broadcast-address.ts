@@ -67,6 +67,22 @@ export function normalizeToE164(raw: string | null | undefined): string | null {
 }
 
 /**
+ * The minimum a contact must carry to be addressed.
+ *
+ * Structural rather than the full `Contact` row so the server-side resume
+ * path — which selects a handful of identity columns via an embedded join —
+ * can call the SAME resolver the dashboard uses. One resolver, two call
+ * sites; they cannot drift.
+ */
+export interface BroadcastIdentity {
+  phone?: string | null;
+  wa_id?: string | null;
+  wa_user_id?: string | null;
+  username?: string | null;
+  recipient_id?: string | null;
+}
+
+/**
  * The real phone number already stored on the contact row, or null.
  *
  * Only genuinely numeric values are consulted, and the `'unknown'`
@@ -80,7 +96,9 @@ export function normalizeToE164(raw: string | null | undefined): string | null {
  * would let an opaque id pre-empt a real number sitting further down the
  * priority list.
  */
-export function contactPhone(contact: Contact | null | undefined): string | null {
+export function contactPhone(
+  contact: BroadcastIdentity | null | undefined,
+): string | null {
   if (!contact) return null;
   return normalizeToE164(contact.phone) ?? normalizeToE164(contact.wa_id);
 }
@@ -124,7 +142,7 @@ export interface BroadcastAddress {
  * WABA-, number- or account-specific knowledge.
  */
 export function resolveBroadcastAddress(
-  contact: Contact | null | undefined,
+  contact: BroadcastIdentity | null | undefined,
   recovered?: string | null,
 ): BroadcastAddress | null {
   if (!contact) return null;
@@ -145,9 +163,7 @@ export function resolveBroadcastAddress(
   if (bsuid) return { to: bsuid, isPhone: false };
 
   // 5. recipient_id — the alternative Meta identifier.
-  const recipientId = passthroughMetaId(
-    (contact as { recipient_id?: string | null }).recipient_id,
-  );
+  const recipientId = passthroughMetaId(contact.recipient_id);
   if (recipientId) return { to: recipientId, isPhone: false };
 
   // 6. The public handle, as `@user`.

@@ -21,7 +21,12 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { BroadcastError, type BroadcastPlan } from '@/lib/whatsapp/broadcast-core';
 import { decrypt } from '@/lib/whatsapp/encryption';
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
-import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
+import { recipientAddressVariants } from '@/lib/whatsapp/phone-utils';
+import {
+  resolveBroadcastAddress,
+  type BroadcastAddress,
+  type BroadcastIdentity,
+} from '@/lib/whatsapp/broadcast-address';
 
 /** Which recipients a resume pass picks up. */
 export type ResumeScope = 'pending' | 'failed' | 'all';
@@ -118,13 +123,41 @@ export interface ResumePlan {
 interface RecipientRow {
   id: string;
   template_params: unknown;
-  contact: { phone?: string | null } | { phone?: string | null }[] | null;
+  contact:
+    | {
+        phone?: string | null;
+        wa_id?: string | null;
+        wa_user_id?: string | null;
+        username?: string | null;
+        recipient_id?: string | null;
+      }
+    | Array<{
+        phone?: string | null;
+        wa_id?: string | null;
+        wa_user_id?: string | null;
+        username?: string | null;
+        recipient_id?: string | null;
+      }>
+    | null;
 }
 
 /** Supabase renders an embedded to-one join as an object or a 1-array. */
-function contactPhone(row: RecipientRow): string | null {
+function contactIdentity(row: RecipientRow): BroadcastIdentity | null {
   const c = Array.isArray(row.contact) ? row.contact[0] : row.contact;
-  return c?.phone ?? null;
+  return c ?? null;
+}
+
+/**
+ * The address this recipient should be sent to, resolved exactly as the
+ * dashboard resolves it.
+ *
+ * Resume used to read only `contacts.phone` and gate it on `isValidE164`,
+ * so a BSUID or @handle recipient was stamped failed with 'No valid phone
+ * number on contact' — a campaign could go out on the first pass and then
+ * silently lose every identifier recipient on resume.
+ */
+function resolveRowAddress(row: RecipientRow): BroadcastAddress | null {
+  return resolveBroadcastAddress(contactIdentity(row));
 }
 
 /**
@@ -158,7 +191,9 @@ export async function planBroadcastResume(
   const statuses = scopeStatuses(scope);
   const { data: rawRows, error: recError } = await db
     .from('broadcast_recipients')
-    .select('id, template_params, contact:contacts(phone)')
+    .select(
+      'id, template_params, contact:contacts(phone, wa_id, wa_user_id, username, recipient_id)'
+    )
     .eq('broadcast_id', broadcastId)
     .in('status', statuses)
     // Oldest first, so repeated capped passes chew through the backlog
@@ -178,16 +213,22 @@ export async function planBroadcastResume(
   const sendable: RecipientRow[] = [];
   const unsendable: string[] = [];
   for (const row of rows) {
-    const sanitized = sanitizePhoneForMeta(contactPhone(row) ?? '');
-    if (isValidE164(sanitized)) sendable.push(row);
-    else unsendable.push(row.id);
+    // An empty address is the ONLY undeliverable case — the same rule the
+    // sender applies. `isValidE164` used to be the gate here, which threw
+    // away every BSUID and @handle recipient.
+    const resolved = resolveRowAddress(row);
+    if (resolved && recipientAddressVariants(resolved.to).length > 0) {
+      sendable.push(row);
+    } else {
+      unsendable.push(row.id);
+    }
   }
   if (unsendable.length > 0) {
     await db
       .from('broadcast_recipients')
       .update({
         status: 'failed',
-        error_message: 'No valid phone number on contact',
+        error_message: 'No deliverable address on contact',
       })
       .in('id', unsendable);
   }
@@ -241,7 +282,11 @@ export async function planBroadcastResume(
     templateRow: resolvedTemplate.row,
     planned: slice.map((row) => ({
       recipientRowId: row.id,
-      phone: sanitizePhoneForMeta(contactPhone(row) ?? ''),
+      // Forwarded verbatim. `sanitizePhoneForMeta` used to be applied here,
+      // which stripped a BSUID to bare digits and an @handle to whatever few
+      // digits it contained — addressing a different recipient than the one
+      // resolved, or an invalid parameter to Meta.
+      phone: resolveRowAddress(row)?.to ?? '',
       params: Array.isArray(row.template_params)
         ? row.template_params.filter((p): p is string => typeof p === 'string')
         : [],

@@ -184,7 +184,97 @@ function recipient(
   };
 }
 
+/** A recipient identified by an opaque Meta id rather than a number. */
+function identifierRecipient(
+  id: string,
+  contact: Record<string, string>,
+  params: unknown = ['A123'],
+) {
+  return { id, template_params: params, contact };
+}
+
 describe('planBroadcastResume', () => {
+  it('resumes a BSUID recipient instead of failing it as unphoneable', async () => {
+    // The gap this closes: resume read only contacts.phone and gated it on
+    // isValidE164, so a campaign could deliver on the first pass and then
+    // stamp every identifier recipient failed on resume.
+    const writes: PlanWrites = {};
+    const { plan, unsendable } = await planBroadcastResume(
+      planDb(
+        {
+          broadcast: BROADCAST,
+          config: CONFIG,
+          recipients: [
+            identifierRecipient('r1', {
+              phone: 'unknown',
+              wa_user_id: 'CO.1008477715690681',
+            }),
+          ],
+        },
+        writes,
+      ),
+      'acct-1',
+      'bc-1',
+      'pending',
+    );
+
+    expect(unsendable).toBe(0);
+    expect(plan.planned).toEqual([
+      {
+        recipientRowId: 'r1',
+        phone: 'CO.1008477715690681',
+        params: ['A123'],
+      },
+    ]);
+  });
+
+  it('forwards the identifier verbatim, never digit-stripped', async () => {
+    const writes: PlanWrites = {};
+    const { plan } = await planBroadcastResume(
+      planDb(
+        {
+          broadcast: BROADCAST,
+          config: CONFIG,
+          recipients: [
+            identifierRecipient('r1', { wa_id: '1486998326437295' }),
+          ],
+        },
+        writes,
+      ),
+      'acct-1',
+      'bc-1',
+      'pending',
+    );
+
+    // Not '1486998326437295' with a 'CO.' invented, and not a number.
+    expect(plan.planned[0].phone).toBe('1486998326437295');
+  });
+
+  it('still fails a recipient with no deliverable address', async () => {
+    const writes: PlanWrites = {};
+    // Paired with a reachable recipient: an ALL-unsendable plan throws
+    // `nothing_to_resume` before it can report, which is intended.
+    const { plan, unsendable } = await planBroadcastResume(
+      planDb(
+        {
+          broadcast: BROADCAST,
+          config: CONFIG,
+          recipients: [
+            identifierRecipient('r1', { phone: 'unknown' }),
+            recipient('r2', '+15551234567'),
+          ],
+        },
+        writes,
+      ),
+      'acct-1',
+      'bc-1',
+      'pending',
+    );
+
+    expect(unsendable).toBe(1);
+    expect(plan.planned.map((p) => p.recipientRowId)).toEqual(['r2']);
+  });
+
   it('plans the outstanding recipients with their frozen params', async () => {
     const writes: PlanWrites = {};
     const { plan, remaining, unsendable } = await planBroadcastResume(

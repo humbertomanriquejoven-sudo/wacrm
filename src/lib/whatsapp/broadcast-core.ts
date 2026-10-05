@@ -23,7 +23,7 @@ import { decrypt } from '@/lib/whatsapp/encryption';
 import {
   sanitizePhoneForMeta,
   isValidE164,
-  phoneVariants,
+  recipientAddressVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils';
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
@@ -260,7 +260,12 @@ export async function deliverBroadcast(
   plan: BroadcastPlan
 ): Promise<void> {
   for (const recipient of plan.planned) {
-    const variants = phoneVariants(recipient.phone);
+    // NOT `phoneVariants`: that helper assumes a bare number and, fed an
+    // opaque id, manufactures neighbours like 'CO.01008477715690681' by
+    // injecting trunk zeros. An id has exactly one form and must be sent
+    // verbatim.
+    const variants = recipientAddressVariants(recipient.phone);
+    if (variants.length === 0) continue;
     let sentMessageId: string | null = null;
     let lastError: string | null = null;
 
