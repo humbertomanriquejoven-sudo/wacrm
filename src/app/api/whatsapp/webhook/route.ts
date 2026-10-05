@@ -2526,6 +2526,18 @@ async function findOrCreateContact(
     if (metaIdentity?.identity_type && !existingContact.identity_type) updates.identity_type = metaIdentity.identity_type
     if (metaIdentity?.display_name && !existingContact.display_name) updates.display_name = metaIdentity.display_name
 
+    // Same hydration rule as the insert path: an existing row that already
+    // knows the BSUID but is missing `wa_id` / `recipient_id` gets them
+    // filled the first time a later message proves the id. These were the two
+    // columns the broadcast resolver checks first, so leaving them empty is
+    // what made a contact look undeliverable on the first attempt and fine
+    // after the next inbound filled them in — the "works after a refresh"
+    // symptom. Never overwrites an existing value.
+    if (waUserId) {
+      if (!existingContact.wa_id) updates.wa_id = metaIdentity?.wa_id ?? waUserId
+      if (!existingContact.recipient_id) updates.recipient_id = waUserId
+    }
+
     if (Object.keys(updates).length > 0) {
       await db
         .from('contacts')
@@ -2556,10 +2568,34 @@ async function findOrCreateContact(
       name: name || username || phoneForRow || waUserId || 'unknown',
       username: username ?? undefined,
       wa_user_id: waUserId ?? undefined,
+      // Hydrate ALL THREE numerical-identity columns from the BSUID we are
+      // holding right now, not just `wa_user_id`.
+      //
+      // This row used to be born with `wa_user_id` set but `wa_id` and
+      // `recipient_id` NULL, because `metaIdentity.wa_id` is only populated
+      // when Meta discloses `contacts[0].wa_id` — and for a sender with a
+      // hidden number that field is the literal string 'unknown'. So the
+      // BSUID was known and already being stored, one column over, while the
+      // two columns every address resolver checks FIRST stayed empty.
+      //
+      // `recipient_id` was never written on insert at all, at any version.
+      //
+      // Delivery still happened, because resolveBroadcastAddress falls
+      // through to `wa_user_id` — that is why this looked like a flaky or
+      // "works after a refresh" bug rather than a hard failure. But it left
+      // every freshly created contact under-filled, dependent on a fallback
+      // tier, and dependent on migration 059 to catch up later. Writing the
+      // three columns together means the row is complete the moment it
+      // exists: no migration, no second pass, and nothing to re-read.
+      recipient_id: waUserId ?? undefined,
+      // OUTSIDE the metaIdentity spread on purpose: the BSUID fallback must
+      // apply even when there is no metaIdentity object at all, which is the
+      // common case for a hidden-number sender.
+      wa_id: metaIdentity?.wa_id ?? waUserId ?? undefined,
+      identity_type:
+        metaIdentity?.identity_type ?? (waUserId ? 'BSUID' : undefined),
       ...(metaIdentity && {
-        wa_id: metaIdentity.wa_id,
         phone_number_id: metaIdentity.phone_number_id,
-        identity_type: metaIdentity.identity_type,
         display_name: metaIdentity.display_name,
       }),
     })

@@ -1,7 +1,11 @@
 import { NextResponse } from 'next/server'
 import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
-import { NO_DELIVERABLE_ADDRESS } from '@/lib/whatsapp/broadcast-address'
+import {
+  NO_DELIVERABLE_ADDRESS,
+  resolveBroadcastAddress,
+} from '@/lib/whatsapp/broadcast-address'
+import type { BroadcastIdentity } from '@/lib/whatsapp/broadcast-address'
 import {
   recipientAddressVariants,
   isRecipientNotAllowedError,
@@ -22,6 +26,18 @@ interface BroadcastResult {
   status: 'sent' | 'failed'
   whatsapp_message_id?: string
   error?: string
+  /**
+   * Echoed back so the caller can match this result to a recipient row
+   * without going through the address.
+   *
+   * Matching by address string cannot work once the SERVER resolves the
+   * destination: the address the client sent is only a hint, and for a
+   * contact with phone = 'unknown' the value that was actually delivered to
+   * is a BSUID the client never saw. Keying on `contact_id` also collapses
+   * two contacts that happen to share a number into one result, which the
+   * previous phone-keyed lookup silently did.
+   */
+  contact_id?: string
 }
 
 /**
@@ -170,33 +186,120 @@ export async function POST(request: Request) {
     }
     const templateRow = resolvedTemplate.row
 
+    // --- Server-side address hydration (first attempt, no refresh needed) ---
+    //
+    // This endpoint used to derive every destination from the `phone` STRING
+    // the client sent, via `recipientAddressVariants(recipient.phone)`, and to
+    // never read `contacts` at all. For a contact whose row says
+    // phone = 'unknown' — which is what the webhook writes when Meta discloses
+    // no number — that produced no usable variant, the recipient was rejected
+    // as NO_DELIVERABLE_ADDRESS, and the campaign lost a person it could
+    // actually reach: the numerical Meta id (wa_id / recipient_id / wa_user_id)
+    // was sitting on the same row the request had just named by contact_id.
+    //
+    // Worse, it made the send depend on whatever the browser happened to hold:
+    // the first attempt used whatever identity columns the client's list had at
+    // that moment, and a refresh or retry re-read the row and got a different
+    // answer for the same contact. Destination resolution has no business
+    // depending on client-side cache state, so the row is read HERE, at send
+    // time, and resolved with the same `resolveBroadcastAddress` the Inbox
+    // uses — one code path, so Broadcasts cannot drift from Inbox again.
+    //
+    // One batched query for the whole campaign. A per-recipient SELECT would be
+    // an N+1 against Supabase for every send, which is the opposite of what
+    // this endpoint is for.
+    const identityByContactId = new Map<string, BroadcastIdentity>()
+    {
+      const contactIds = [
+        ...new Set(
+          recipients
+            .map((r) => r.contact_id)
+            .filter((id): id is string => typeof id === 'string' && id.length > 0),
+        ),
+      ]
+
+      if (contactIds.length > 0) {
+        const { data: identityRows, error: identityError } = await supabase
+          .from('contacts')
+          .select(
+            'id, account_id, phone, wa_id, recipient_id, wa_user_id, username',
+          )
+          .eq('account_id', accountId)
+          .in('id', contactIds)
+
+        if (identityError) {
+          // Fail loudly rather than silently degrading to phone-only
+          // resolution, which is the failure this whole block exists to fix.
+          console.error(
+            'Failed to hydrate broadcast recipient identities:',
+            identityError,
+          )
+          return NextResponse.json(
+            {
+              error:
+                'Could not load recipient delivery addresses from the contact records. Nothing was sent.',
+            },
+            { status: 500 },
+          )
+        }
+
+        for (const row of identityRows ?? []) {
+          // The account_id filter above is the tenant boundary. A caller cannot
+          // name a contact from another account to borrow its address.
+          if (row.account_id !== accountId) continue
+          identityByContactId.set(row.id, row)
+        }
+      }
+    }
+
     const results: BroadcastResult[] = []
     let sentCount = 0
     let failedCount = 0
 
     for (const recipient of recipients) {
+      // Preferred destination: the authoritative contact row, resolved
+      // server-side. `resolveBroadcastAddress` walks phone -> wa_id ->
+      // recipient_id -> wa_user_id -> history-derived id, so a visible number
+      // and a hidden number are both handled by the same call and a visible
+      // number still wins outright.
+      const identity = recipient.contact_id
+        ? identityByContactId.get(recipient.contact_id)
+        : undefined
+      const resolvedAddress = identity
+        ? resolveBroadcastAddress(identity)
+        : null
+
+      // Fallback for callers with no contact_id (legacy CSV upload, raw
+      // phone_numbers), which have no row to consult.
+      const variants = resolvedAddress
+        ? [resolvedAddress.to]
+        : recipientAddressVariants(recipient.phone)
+
       // Only a dialable number or an opaque Meta id is a destination. This
       // used to additionally demand `isValidE164(...)`, which rejected every
       // BSUID recipient — the exact addresses the Inbox delivers to
       // successfully.
-      const variants = recipientAddressVariants(recipient.phone)
-
+      //
       // A bare @handle is rejected here even though it produces a non-empty
       // variant list. Meta answers `(#100) Invalid parameter` for a text
       // handle in `to`, and `context.message_id` does not change that:
       // quoting makes the send a reply, it does not make the handle
       // addressable. Failing here keeps the local reason instead of risking a
-      // 200 with the message silently dropped. The dashboard resolves these
-      // contacts to their numerical Meta id before calling this endpoint.
+      // 200 with the message silently dropped.
       const addressable =
         variants.length > 0 &&
         (isDialablePhone(variants[0]) || isOpaqueMetaId(variants[0]))
 
       if (!addressable) {
         results.push({
+          contact_id: recipient.contact_id,
           phone: recipient.phone,
           status: 'failed',
-          error: NO_DELIVERABLE_ADDRESS,
+          // Name the missing column so the operator knows which id to fix,
+          // instead of a bare "no address" that reads like bad luck.
+          error: identity
+            ? `${NO_DELIVERABLE_ADDRESS} (contact ${identity.phone ?? 'no phone'} / wa_id=${identity.wa_id ?? 'null'} / recipient_id=${identity.recipient_id ?? 'null'} / wa_user_id=${identity.wa_user_id ?? 'null'})`
+            : NO_DELIVERABLE_ADDRESS,
         })
         failedCount++
         continue
@@ -234,6 +337,7 @@ export async function POST(request: Request) {
 
       if (sentMessageId) {
         results.push({
+          contact_id: recipient.contact_id,
           phone: recipient.phone,
           status: 'sent',
           whatsapp_message_id: sentMessageId,
@@ -245,6 +349,7 @@ export async function POST(request: Request) {
           lastError
         )
         results.push({
+          contact_id: recipient.contact_id,
           phone: recipient.phone,
           status: 'failed',
           error: lastError || 'Unknown error',

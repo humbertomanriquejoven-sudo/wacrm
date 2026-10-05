@@ -461,7 +461,19 @@ export interface Deal {
 }
 
 export type BroadcastStatus =
-  'draft' | 'scheduled' | 'sending' | 'sent' | 'failed';
+  | 'draft'
+  | 'scheduled'
+  | 'sending'
+  | 'sent'
+  /**
+   * At least one recipient was sent and at least one failed.
+   *
+   * This used to be reported as plain `sent`, which is how a campaign that
+   * silently dropped a recipient read as a clean success on the dashboard
+   * while nobody received that message. `partial` is the honest answer.
+   */
+  | 'partial'
+  | 'failed';
 export type RecipientStatus =
   'pending' | 'sent' | 'delivered' | 'read' | 'replied' | 'failed';
 

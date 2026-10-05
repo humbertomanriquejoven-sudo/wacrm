@@ -13,7 +13,7 @@ import {
   recoverAddressesFromHistory,
   resolveBroadcastAddress,
 } from '@/lib/whatsapp/broadcast-address';
-import { Contact, MessageTemplate } from '@/types';
+import { BroadcastStatus, Contact, MessageTemplate } from '@/types';
 
 export type CustomFieldOperator = 'is' | 'is_not' | 'contains';
 
@@ -89,6 +89,8 @@ interface BroadcastApiResult {
   status: 'sent' | 'failed';
   whatsapp_message_id?: string;
   error?: string;
+  /** Echoed by the server; the key results are matched on. */
+  contact_id?: string;
 }
 
 /**
@@ -537,24 +539,49 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
             continue;
           }
 
-          const address = resolveBroadcastAddress(contact, recovered.get(contact.id));
-          if (!address) {
-            // Tier D: no number on the row and no numerical Meta id on the row
-            // or in this contact's own inbound history. `contacts.username` is
-            // not used — Meta rejects a text @handle in `to` with (#100).
-            // Failing here keeps the local reason instead of Meta's opaque one.
+          // Local resolution is a FALLBACK now, not the authority.
+          //
+          // It used to be the gate: when `resolveBroadcastAddress` returned
+          // null the recipient was pushed onto `undeliverable`, marked
+          // 'failed' in the database, and NEVER sent — the fetch to
+          // /api/whatsapp/broadcast was not made for it at all. That is the
+          // "first attempt never reaches Meta" symptom, and it was decided by
+          // whatever columns this in-memory `contact` happened to carry. A
+          // list rendered before the webhook hydrated the row has no `wa_id`
+          // / `recipient_id` / `wa_user_id`, so a contact that is perfectly
+          // reachable looks undeliverable; re-render or hit retry and the same
+          // contact resolves, which is exactly the reported "works on the
+          // second try".
+          //
+          // The server now re-resolves from the authoritative `contacts` row
+          // for any recipient that carries a `contact_id`, so the browser's
+          // copy of the row cannot decide who gets dropped. Send it and let
+          // the server decide; only a recipient with no contact to consult is
+          // failed here.
+          const address = resolveBroadcastAddress(
+            contact,
+            recovered.get(contact.id),
+          );
+
+          if (address) {
+            addressByRecipient.set(row.id, address.to);
+          } else if (!contact.id) {
+            // No contact row to re-resolve against. Nothing can be sent, so
+            // this is the only case that can be failed locally.
             undeliverable.push({
               id: row.id,
-              error: `${NO_DELIVERABLE_ADDRESS} (contact ${contact.id})`,
+              error: `${NO_DELIVERABLE_ADDRESS} (contact ${row.id} has no linked contact row)`,
             });
             continue;
           }
 
-          addressByRecipient.set(row.id, address.to);
+          // When the local copy resolved nothing, `phone` goes out as whatever
+          // the row holds ('unknown'). The server ignores it in favour of the
+          // hydrated record and only falls back to this string if the contact
+          // cannot be loaded — which is the correct order, because a
+          // placeholder must never be sent while a usable id is one query away.
           apiRecipients.push({
-            phone: address.to,
-            // Carried so the server can re-resolve against this contact's own
-            // history; `address.to` above is already the resolved destination.
+            phone: address?.to ?? contact.phone ?? '',
             contact_id: contact.id,
             params: Array.isArray(row.template_params)
               ? row.template_params.filter((p): p is string => typeof p === 'string')
@@ -633,24 +660,33 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
             await sleep(retryIn);
           }
 
+          // Match on `contact_id`, not on the address string.
+          //
+          // The server resolves the destination, so the address this browser
+          // holds is not necessarily the one that was delivered to — and for a
+          // contact with phone = 'unknown' it is not even a valid address. A
+          // phone-keyed lookup therefore either missed the result entirely
+          // (recording a real delivery as `failed`) or, once the local copy
+          // could not resolve at all, skipped the row and left it 'pending'.
+          // The contact id is the one key both sides agree on.
+          const resultsByContactId = new Map<string, BroadcastApiResult>();
           const resultsByPhone = new Map<string, BroadcastApiResult>();
           for (const r of (data.results ?? []) as BroadcastApiResult[]) {
-            resultsByPhone.set(r.phone, r);
+            if (r.contact_id) resultsByContactId.set(r.contact_id, r);
+            if (r.phone) resultsByPhone.set(r.phone, r);
           }
 
           for (const recipient of batch) {
-            // Key on the address we SENT, not on the contact's raw
-            // `phone` column. Those differ for every recovered address
-            // (contact.phone null, address from message history) and for
-            // every national number that gained its country code here —
-            // so the old lookup missed, and a delivered template was
-            // recorded as `failed: 'No phone number on contact'`.
+            const contactId = recipient.contact?.id;
             const address = addressByRecipient.get(recipient.id);
-            const result = address ? resultsByPhone.get(address) : undefined;
+            const result = contactId
+              ? resultsByContactId.get(contactId)
+              : address
+                ? resultsByPhone.get(address)
+                : undefined;
 
-            // No address → already accounted for as undeliverable above.
-            if (!address) continue;
-
+            // No result row at all. Sent to the server and simply absent from
+            // the reply, so the outcome is unknown rather than failed.
             if (!result) {
               failedCount++;
               await supabase
@@ -717,7 +753,20 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
       // Aggregate counts are maintained by the DB trigger (migration
       // 003); we only flip the final status here.
       setProgress(95);
-      const finalStatus = failedCount === totalRecipients ? 'failed' : 'sent';
+      // Stop reporting a campaign with failed recipients as `sent`.
+      //
+      // This was `failedCount === totalRecipients ? 'failed' : 'sent'`, so a
+      // campaign where one recipient out of a thousand was undeliverable was
+      // published as a clean success. That is precisely the signal the
+      // "first attempt never reaches Meta" bug hid behind: the dashboard said
+      // Sent, the recipient row said failed, and nobody looked twice. Now only
+      // a campaign with nothing left is `sent`.
+      const finalStatus: BroadcastStatus =
+        failedCount === 0
+          ? 'sent'
+          : failedCount >= totalRecipients
+            ? 'failed'
+            : 'partial';
       await supabase
         .from('broadcasts')
         .update({ status: finalStatus })

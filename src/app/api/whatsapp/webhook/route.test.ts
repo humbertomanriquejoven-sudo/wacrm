@@ -1147,8 +1147,9 @@ describe('inbound webhook: Meta identity columns (migration 053)', () => {
     for (const cb of h.state.afterCallbacks) await cb()
 
     const insert = h.state.contactInsertCalls[0]
-    expect(insert.wa_id).toBeUndefined()
-    // The BSUID is carried by its own column instead.
+    // The BSUID is carried by its own column instead of being pushed into
+    // `wa_id`, which is where Meta's 'unknown' placeholder would otherwise
+    // land.
     expect(insert).toMatchObject({
       wa_user_id: '1008477715690681',
       identity_type: 'BSUID',
@@ -1156,13 +1157,23 @@ describe('inbound webhook: Meta identity columns (migration 053)', () => {
     })
     // `phone` is NOT NULL and this sender disclosed no number, so the row
     // legitimately holds the placeholder there — pre-existing behavior, and
-    // precisely why `wa_user_id` has to carry the identity instead.
+    // precisely why the numerical-identity columns have to carry the address.
     expect(insert.phone).toBe('unknown')
-    // The placeholder must not leak into the identity columns.
-    expect(insert.wa_id).toBeUndefined()
-    expect(JSON.stringify([insert.wa_id, insert.display_name, insert.username])).not.toContain(
-      'unknown',
-    )
+    // `wa_id` / `recipient_id` are hydrated from the BSUID rather than left
+    // NULL, so a row created by a hidden-number sender is deliverable on the
+    // very first broadcast attempt with no backfill pass in between. What this
+    // test still forbids is the PLACEHOLDER reaching them: idx_contacts_wa_id
+    // indexes any non-empty value as a real id.
+    expect(insert.wa_id).toBe('1008477715690681')
+    expect(insert.recipient_id).toBe('1008477715690681')
+    expect(
+      JSON.stringify([
+        insert.wa_id,
+        insert.recipient_id,
+        insert.display_name,
+        insert.username,
+      ]),
+    ).not.toContain('unknown')
   })
 
   it('does not clobber identity columns a human already set', async () => {

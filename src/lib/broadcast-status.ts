@@ -41,6 +41,10 @@ export const broadcastStatusConfig: Record<BroadcastStatus, StatusDisplay> = {
     label: "sent",
     classes: "bg-primary/10 text-primary border-primary/20",
   },
+  partial: {
+    label: "partial",
+    classes: "bg-amber-500/10 text-amber-400 border-amber-500/20",
+  },
   failed: {
     label: "failed",
     classes: "bg-red-500/10 text-red-400 border-red-500/20",
