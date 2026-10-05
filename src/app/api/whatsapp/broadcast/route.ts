@@ -3,9 +3,10 @@ import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
 import {
   NO_DELIVERABLE_ADDRESS,
+  recoverAddressesFromHistory,
   resolveBroadcastAddress,
 } from '@/lib/whatsapp/broadcast-address'
-import type { BroadcastIdentity } from '@/lib/whatsapp/broadcast-address'
+import type { RecoverableContact } from '@/lib/whatsapp/broadcast-address'
 import {
   recipientAddressVariants,
   isRecipientNotAllowedError,
@@ -208,7 +209,7 @@ export async function POST(request: Request) {
     // One batched query for the whole campaign. A per-recipient SELECT would be
     // an N+1 against Supabase for every send, which is the opposite of what
     // this endpoint is for.
-    const identityByContactId = new Map<string, BroadcastIdentity>()
+    const identityByContactId = new Map<string, RecoverableContact>()
     {
       const contactIds = [
         ...new Set(
@@ -252,6 +253,25 @@ export async function POST(request: Request) {
       }
     }
 
+    // Second pass, mirroring `planBroadcastResume`: for any contact whose
+    // identity COLUMNS yielded nothing, dig the numerical id out of that
+    // contact's own inbound thread.
+    //
+    // This is the asymmetry behind "it only ever works on Retry". The resume
+    // endpoint calls `recoverAddressesFromHistory` and re-resolves with the
+    // result; this route used to resolve from the row alone. So a contact
+    // whose BSUID lives only in `messages.sender_phone` / `raw_meta_payload`
+    // — never copied into `contacts` — failed here and succeeded there,
+    // because the two passes disagreed about the same person.
+    //
+    // One batched read for the whole campaign, and `recoverAddressesFromHistory`
+    // filters internally to contacts with no usable phone, so a campaign that is
+    // fully dialable does not touch `messages` at all.
+    const recoveredByContactId = await recoverAddressesFromHistory(
+      supabase,
+      [...identityByContactId.values()],
+    )
+
     const results: BroadcastResult[] = []
     let sentCount = 0
     let failedCount = 0
@@ -266,7 +286,10 @@ export async function POST(request: Request) {
         ? identityByContactId.get(recipient.contact_id)
         : undefined
       const resolvedAddress = identity
-        ? resolveBroadcastAddress(identity)
+        ? resolveBroadcastAddress(
+            identity,
+            recoveredByContactId.get(identity.id),
+          )
         : null
 
       // Fallback for callers with no contact_id (legacy CSV upload, raw
