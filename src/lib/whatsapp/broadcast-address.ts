@@ -20,8 +20,10 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   isDialablePhone,
   passthroughMetaId,
+  recipientAddressVariants,
   toDialable,
 } from './phone-utils'
+import { isOpaqueMetaId } from './meta-api'
 
 /**
  * Country code assumed for a bare national number.
@@ -564,4 +566,89 @@ export async function persistRecoveredAddress(
     return false;
   }
   return true;
+}
+
+/**
+ * Is this string something Meta will accept as a `to`?
+ *
+ * The single deliverability gate. An E.164 number qualifies; so does an opaque
+ * id (a BSUID, or a namespaced id such as `CO.*`). A bare `@handle` does NOT:
+ * Meta rejects handles on the send endpoint, so admitting one here is how a
+ * broadcast ends up marked `sent` for a message that was never sent.
+ */
+export function isDeliverableAddress(to: string): boolean {
+  return (
+    recipientAddressVariants(to).length > 0 &&
+    (isDialablePhone(to) || isOpaqueMetaId(to))
+  );
+}
+
+/**
+ * The one and only address pipeline for a broadcast recipient.
+ *
+ * Both entry points call this: the creation endpoint
+ * (`POST /api/whatsapp/broadcast`) and the retry endpoint
+ * (`POST /api/whatsapp/broadcast/[id]/resume`). They used to carry separate
+ * copies of this logic, which is how they came to disagree about the same
+ * contact - creation resolved from the identity columns alone while retry
+ * added a message-history fallback, so a contact whose id lived only in
+ * `messages` failed on the first attempt and delivered on every retry.
+ *
+ * The ordered phases, per contact:
+ *
+ *   1. read the contact profile - supplied by the caller, already scoped to
+ *      the account;
+ *   2. resolve the primary address from its identity columns;
+ *   3. fall back to the contact's own inbound message history when phase 2
+ *      came back empty. Awaited here, never fire-and-forget, so no payload
+ *      can be dispatched to Meta before this finishes;
+ *   4. validate that the result is something Meta will accept, yielding `null`
+ *      when it is not, so the caller can persist `failed` with a reason
+ *      WITHOUT calling the external API;
+ *   5-6. the send and the status write live in the caller, which consumes the
+ *      address this returns and writes `sent` only after a wamid comes back.
+ *
+ * Returns a map keyed by contact id holding the approved destination, or
+ * `null` for a contact that must be failed without attempting a send.
+ * Contacts with no id are skipped: without one there is no history to scope
+ * the lookup to, and an unscoped lookup would risk reading a stranger's thread.
+ */
+export async function resolveRecipientAddresses(
+  db: SupabaseClient,
+  contacts: ReadonlyArray<RecoverableContact | null | undefined>,
+): Promise<Map<string, BroadcastAddress | null>> {
+  const resolved = new Map<string, BroadcastAddress | null>();
+  const unresolved: RecoverableContact[] = [];
+
+  // Phase 2 - identity columns only, deliberately without the history tier, so
+  // this asks strictly "can this row resolve on its own?".
+  for (const contact of contacts) {
+    if (!contact?.id) continue;
+    const direct = resolveBroadcastAddress(contact);
+    if (!direct) {
+      unresolved.push(contact);
+      continue;
+    }
+    // Phase 4.
+    resolved.set(contact.id, isDeliverableAddress(direct.to) ? direct : null);
+  }
+
+  // Phase 3 - one batched read covering every contact on this page. Runs only
+  // for the rows phase 2 could not settle, so a fully dialable campaign never
+  // touches `messages`.
+  const recovered = await recoverAddressesFromHistory(db, unresolved);
+
+  // Phases 2-4 again, this time seeded with the recovered id.
+  for (const contact of unresolved) {
+    const recoveredId = recovered.get(contact.id);
+    const address = recoveredId
+      ? resolveBroadcastAddress(contact, recoveredId)
+      : null;
+    resolved.set(
+      contact.id,
+      address && isDeliverableAddress(address.to) ? address : null,
+    );
+  }
+
+  return resolved;
 }

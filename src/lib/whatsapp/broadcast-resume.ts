@@ -21,17 +21,13 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { BroadcastError, type BroadcastPlan } from '@/lib/whatsapp/broadcast-core';
 import { decrypt } from '@/lib/whatsapp/encryption';
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
-import { recipientAddressVariants } from '@/lib/whatsapp/phone-utils';
 import {
   NO_DELIVERABLE_ADDRESS,
-  recoverAddressesFromHistory,
+  resolveRecipientAddresses,
   recoverContextMessageIds,
-  resolveBroadcastAddress,
-  type BroadcastAddress,
   type BroadcastIdentity,
+  type RecoverableContact,
 } from '@/lib/whatsapp/broadcast-address';
-import { isOpaqueMetaId } from '@/lib/whatsapp/meta-api';
-import { isDialablePhone } from '@/lib/whatsapp/phone-utils';
 
 /** Which recipients a resume pass picks up. */
 export type ResumeScope = 'pending' | 'failed' | 'all';
@@ -179,12 +175,6 @@ function contactIdentity(
  * and then failed on every resume — the two passes disagreed about the same
  * contact. Mirrors `use-broadcast-sending`, which already passed it.
  */
-function resolveRowAddress(
-  row: RecipientRow,
-  recovered: Map<string, string>,
-): BroadcastAddress | null {
-  return resolveBroadcastAddress(contactIdentity(row), recovered.get(row.contact_id));
-}
 
 /**
  * Build a {@link BroadcastPlan} for the recipients of an existing
@@ -300,23 +290,25 @@ export async function planBroadcastResume(
   /** Recipient row id -> the exact destination approved for it. */
   const addressByRowId = new Map<string, string>();
 
-  // One batched history lookup for every contact on this page, run ONLY for
-  // the rows the columns alone could not resolve. Recovering first would add
-  // two extra round trips (contacts + messages) to the common case where the
-  // row already carries a usable number.
-  const unresolved: Array<{ id: string } & BroadcastIdentity> = [];
-  for (const row of rows) {
-    const identity = contactIdentity(row);
-    // Deliberately omits the history tier, so this asks only "can the row
-    // resolve on its own?".
-    if (identity?.id && !resolveBroadcastAddress(identity)) {
-      unresolved.push({ ...identity, id: identity.id });
-    }
-    // Rows with no projected contact are NOT judged here: the loop below is
-    // the single authority on sendable vs unsendable, so recording a verdict
-    // in both places would stamp a recipient failed twice.
-  }
-  const recovered = await recoverAddressesFromHistory(db, unresolved);
+  // The single resolution pipeline, shared verbatim with the creation
+  // endpoint. Phases: identity columns, then a batched fallback to each
+  // contact's own inbound history, then the deliverability check - awaited
+  // before any recipient is dispatched.
+  const addressByContactId = await resolveRecipientAddresses(
+    db,
+    rows
+      .map((row): RecoverableContact | null => {
+        const c = contactIdentity(row);
+        // `id` is taken from the RECIPIENT's own `contact_id`, not from the
+        // projected contact. The history fallback scopes its read by contact
+        // id, so that is the key it must be handed; relying on the projection
+        // to carry a matching `id` silently dropped every recipient whose
+        // contact object arrived without one, which reads as "no address"
+        // and fails the whole campaign.
+        return c ? { ...c, id: row.contact_id } : null;
+      })
+      .filter((c): c is RecoverableContact => Boolean(c?.id)),
+  );
 
   // Newest inbound wamid per contact on this page, for the same per-recipient
   // quote anchor a fresh broadcast uses. A wamid belongs to one conversation,
@@ -329,16 +321,14 @@ export async function planBroadcastResume(
   ).catch(() => new Map<string, string>());
 
   for (const row of rows) {
-    const resolved = resolveRowAddress(row, recovered);
-    const addressable =
-      resolved !== null &&
-      recipientAddressVariants(resolved.to).length > 0 &&
-      (isDialablePhone(resolved.to) || isOpaqueMetaId(resolved.to));
-    if (addressable) {
+    const address = row.contact_id
+      ? addressByContactId.get(row.contact_id) ?? null
+      : null;
+    if (address) {
       sendable.push(row);
       // Kept so the plan below cannot resolve a different destination than
       // the one this gate approved.
-      addressByRowId.set(row.id, resolved.to);
+      addressByRowId.set(row.id, address.to);
     } else unsendable.push(row.id);
   }
   if (unsendable.length > 0) {

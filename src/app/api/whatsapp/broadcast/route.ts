@@ -3,8 +3,7 @@ import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
 import {
   NO_DELIVERABLE_ADDRESS,
-  recoverAddressesFromHistory,
-  resolveBroadcastAddress,
+  resolveRecipientAddresses,
 } from '@/lib/whatsapp/broadcast-address'
 import type { RecoverableContact } from '@/lib/whatsapp/broadcast-address'
 import {
@@ -253,21 +252,11 @@ export async function POST(request: Request) {
       }
     }
 
-    // Second pass, mirroring `planBroadcastResume`: for any contact whose
-    // identity COLUMNS yielded nothing, dig the numerical id out of that
-    // contact's own inbound thread.
-    //
-    // This is the asymmetry behind "it only ever works on Retry". The resume
-    // endpoint calls `recoverAddressesFromHistory` and re-resolves with the
-    // result; this route used to resolve from the row alone. So a contact
-    // whose BSUID lives only in `messages.sender_phone` / `raw_meta_payload`
-    // — never copied into `contacts` — failed here and succeeded there,
-    // because the two passes disagreed about the same person.
-    //
-    // One batched read for the whole campaign, and `recoverAddressesFromHistory`
-    // filters internally to contacts with no usable phone, so a campaign that is
-    // fully dialable does not touch `messages` at all.
-    const recoveredByContactId = await recoverAddressesFromHistory(
+    // The same pipeline the retry endpoint runs, in one call, so creation and
+    // retry can no longer disagree about who is deliverable. Resolves from the
+    // identity columns, then falls back to each contact's own inbound history,
+    // then validates - all awaited before the first send below.
+    const addressByContactId = await resolveRecipientAddresses(
       supabase,
       [...identityByContactId.values()],
     )
@@ -286,10 +275,7 @@ export async function POST(request: Request) {
         ? identityByContactId.get(recipient.contact_id)
         : undefined
       const resolvedAddress = identity
-        ? resolveBroadcastAddress(
-            identity,
-            recoveredByContactId.get(identity.id),
-          )
+        ? addressByContactId.get(identity.id) ?? null
         : null
 
       // Fallback for callers with no contact_id (legacy CSV upload, raw

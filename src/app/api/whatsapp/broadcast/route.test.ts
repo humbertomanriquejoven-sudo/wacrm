@@ -35,21 +35,67 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
 }))
 
 /**
- * Stands in for the second resolution pass the resume endpoint performs
- * (`recoverAddressesFromHistory`). Mocked so each test can state whether the
- * id is discoverable from `messages` or not, without standing up a database.
+ * Stands in for the shared address pipeline the route delegates to. It is
+ * stubbed here on purpose: this file is about what the ROUTE does with an
+ * address (dispatch or refuse, then persist), not about how an address is
+ * found. The pipeline's own phases - columns, history fallback, deliverability
+ * - are covered in `broadcast-address.test.ts` against the real function.
+ *
+ * The stub runs the real resolver over the contacts it is handed, so a test
+ * cannot accidentally pass because the stub is more generous than production.
+ * `recoveredByContactId` injects a history-recovered id for the cases that
+ * need one.
  */
-const recoverAddressesFromHistory = vi.fn(async () => new Map<string, string>())
+const recoveredByContactId = new Map<string, string>()
+const resolveRecipientAddresses = vi.fn(
+  async (
+    _db: unknown,
+    contacts: ReadonlyArray<
+      ({ id: string } & Record<string, unknown>) | null | undefined
+    >,
+  ) => {
+    const map = new Map<string, unknown>()
+    for (const contact of contacts) {
+      if (!contact?.id) continue
+      const direct = actualBroadcastAddress.resolveBroadcastAddress(
+        contact as never,
+      )
+      const recovered = recoveredByContactId.get(contact.id)
+      const address =
+        direct ??
+        (recovered
+          ? actualBroadcastAddress.resolveBroadcastAddress(
+              contact as never,
+              recovered,
+            )
+          : null)
+      map.set(
+        contact.id,
+        address && actualBroadcastAddress.isDeliverableAddress(address.to)
+          ? address
+          : null,
+      )
+    }
+    return map
+  },
+)
 
 vi.mock('@/lib/whatsapp/broadcast-address', async (importOriginal) => {
   const actual =
     await importOriginal<typeof import('@/lib/whatsapp/broadcast-address')>()
+  actualBroadcastAddress = actual
   return {
     ...actual,
-    recoverAddressesFromHistory: (...args: unknown[]) =>
-      recoverAddressesFromHistory(...(args as [])),
+    resolveRecipientAddresses: (
+      db: unknown,
+      contacts: ReadonlyArray<unknown>,
+    ) => resolveRecipientAddresses(db, contacts as Parameters<
+      typeof resolveRecipientAddresses
+    >[1]),
   }
 })
+
+let actualBroadcastAddress: typeof import('@/lib/whatsapp/broadcast-address')
 
 vi.mock('@/lib/whatsapp/template-body', () => ({
   resolveTemplateRow: async () => ({
@@ -133,7 +179,7 @@ async function run(recipients: unknown[], rows: unknown[] | null) {
 beforeEach(() => {
   vi.clearAllMocks()
   sendTemplateMessage.mockResolvedValue({ messageId: 'wamid.OK' })
-  recoverAddressesFromHistory.mockResolvedValue(new Map())
+  recoveredByContactId.clear()
 })
 
 describe('broadcast route — address hydration on the first attempt', () => {
@@ -354,9 +400,7 @@ describe('broadcast route — address hydration on the first attempt', () => {
     // alone and reported NO_DELIVERABLE_ADDRESS. Same person, same contact_id,
     // two different answers — which is why a manual Retry appeared to be the
     // thing that fixed it.
-    recoverAddressesFromHistory.mockResolvedValue(
-      new Map([['c', '1486998326437295']]),
-    )
+    recoveredByContactId.set('c', '1486998326437295')
 
     const { body } = await run(
       [{ phone: 'unknown', contact_id: 'c', params: [] }],
@@ -372,14 +416,12 @@ describe('broadcast route — address hydration on the first attempt', () => {
       ],
     )
 
-    expect(recoverAddressesFromHistory).toHaveBeenCalledTimes(1)
+    expect(resolveRecipientAddresses).toHaveBeenCalledTimes(1)
     expect(sendTemplateMessage.mock.calls[0][0].to).toBe('1486998326437295')
     expect(body.sent).toBe(1)
   })
 
-  it('consults history recovery for the whole campaign in one call', async () => {
-    recoverAddressesFromHistory.mockResolvedValue(new Map())
-
+  it('resolves the whole campaign in one call', async () => {
     await run(
       [
         { phone: 'unknown', contact_id: 'c1', params: [] },
@@ -393,14 +435,12 @@ describe('broadcast route — address hydration on the first attempt', () => {
       ],
     )
 
-    expect(recoverAddressesFromHistory).toHaveBeenCalledTimes(1)
+    expect(resolveRecipientAddresses).toHaveBeenCalledTimes(1)
   })
 
   it('does not let a stored id be overridden by a recovered one', async () => {
     // Same precedence rule as the resolver: the row beats the history.
-    recoverAddressesFromHistory.mockResolvedValue(
-      new Map([['c', '999999999999999']]),
-    )
+    recoveredByContactId.set('c', '999999999999999')
 
     await run(
       [{ phone: 'unknown', contact_id: 'c', params: [] }],

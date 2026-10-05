@@ -8,6 +8,8 @@ import {
   persistRecoveredAddress,
   recoverAddressesFromHistory,
   resolveBroadcastAddress,
+  resolveRecipientAddresses,
+  isDeliverableAddress,
 } from './broadcast-address'
 import { isOpaqueMetaId } from './meta-api'
 import type { Contact } from '@/types'
@@ -35,7 +37,7 @@ describe('normalizeToE164', () => {
   it('keeps a stored E.164 number intact', () => {
     // THE primary bug: the old helper returned '' for anything that was
     // not exactly 10 or 11 digits, so a correctly-stored 12-digit
-    // Colombian E.164 — the format every real contact has — was thrown
+    // Colombian E.164 � the format every real contact has � was thrown
     // away and the recipient was reported undeliverable.
     expect(normalizeToE164('573121828949')).toBe('573121828949')
     expect(normalizeToE164('+57 312 182 8949')).toBe('573121828949')
@@ -103,7 +105,7 @@ describe('contactPhone', () => {
 
   it('does not read a bare-digit wa_id back as a phone number', () => {
     // `contactPhone` also reads `contact.wa_id`, so a BSUID stored there as a
-    // bare 15-digit run would otherwise be reported as a dialable number —
+    // bare 15-digit run would otherwise be reported as a dialable number �
     // and `isPhone: true` is what lets the sender write the value back into
     // `contacts.phone`, a number column with a UNIQUE index on it. The
     // 13-digit E.164 ceiling is what prevents that mislabelling; this pins
@@ -114,7 +116,7 @@ describe('contactPhone', () => {
   })
 })
 
-describe('resolveBroadcastAddress — the exact row that failed in production', () => {
+describe('resolveBroadcastAddress � the exact row that failed in production', () => {
   // Read back from the live database, not invented:
   //
   //   id          d116e7c4-6cb3-44d5-a7d2-88a50bf0a827
@@ -125,7 +127,7 @@ describe('resolveBroadcastAddress — the exact row that failed in production', 
   //   username    '@juanpablo22222'
   //
   // The broadcast marked this recipient `failed`. The row carried a usable
-  // numerical id the whole time, in a column the resolver did reach — so the
+  // numerical id the whole time, in a column the resolver did reach � so the
   // send was lost to an ordering/lookup problem, not to missing data.
   const JOSE = {
     phone: 'unknown',
@@ -214,9 +216,9 @@ interface QueryLog {
 
 /** Fake covering the chains `recoverAddressesFromHistory` and
  *  `persistRecoveredAddress` use:
- *  conversations: from().select().in()  → { data, error }
- *  messages:     from().select().in().order().limit() → { data, error }
- *  contacts:     from().update().eq()  → { error } */
+ *  conversations: from().select().in()  ? { data, error }
+ *  messages:     from().select().in().order().limit() ? { data, error }
+ *  contacts:     from().update().eq()  ? { error } */
 function fakeDb(
   log: QueryLog,
   conversations: Array<{ id: string; contact_id: string }>,
@@ -392,7 +394,7 @@ describe('recoverAddressesFromHistory', () => {
 
     expect(recovered.get('contact-1')).toBe('1486998326437295')
   })
-  it('reads sender_phone — the only address column messages has', async () => {
+  it('reads sender_phone � the only address column messages has', async () => {
     // The bug: the query selected `address`, `whatsapp_id` and `from`,
     // none of which exist on `messages`. PostgREST 400s the whole request,
     // `data` is null, and every @user recipient silently resolved to
@@ -605,7 +607,7 @@ it('never uses a bare @handle as the destination', () => {
   it('sends to the numerical Meta id recovered from the inbound message', () => {
     // Tier C, done correctly. For a contact known only by @handle, Meta's
     // webhook still carried a numerical id on the message they wrote. That
-    // id — not the handle — is what belongs in `to`.
+    // id � not the handle � is what belongs in `to`.
     expect(
       resolveBroadcastAddress(
         contact({ phone: 'unknown', username: '@jjuanpablo22222' }),
@@ -890,7 +892,7 @@ describe('persistRecoveredAddress', () => {
     warn.mockRestore()
   })
 
-  it('tolerates a rejected write — the send must still proceed', async () => {
+  it('tolerates a rejected write � the send must still proceed', async () => {
     // Persistence is an optimisation. A 23505 (the number already belongs to
     // another contact in the account) or an RLS denial must not fail the send.
     const log = newLog()
@@ -908,3 +910,116 @@ describe('persistRecoveredAddress', () => {
   })
 })
 
+describe('resolveRecipientAddresses - the pipeline shared by creation and retry', () => {
+  function log(): QueryLog {
+    return newLog()
+  }
+
+  it('resolves from the identity columns without reading message history', async () => {
+    const l = log()
+
+    const out = await resolveRecipientAddresses(
+      fakeDb(l, [], []),
+      [{ id: 'c1', phone: '573001234567' }],
+    )
+
+    // Dialable form, no leading '+' - what Meta is actually handed.
+    expect(out.get('c1')?.to).toBe('573001234567')
+    expect(l.selects).toEqual([])
+  })
+
+  it('falls back to the inbound history when the columns yield nothing', async () => {
+    // The exact case that made the first attempt fail and every retry work:
+    // no id on the contact row, but the BSUID sits in the inbound payload.
+    const l = log()
+
+    const out = await resolveRecipientAddresses(
+      fakeDb(
+        l,
+        [{ id: 'cv1', contact_id: 'c1' }],
+        [
+          {
+            conversation_id: 'cv1',
+            sender_phone: 'unknown',
+            sender_type: 'customer',
+            raw_meta_payload: { contact: { user_id: '1486998326437295' } },
+          },
+        ],
+      ),
+      [{ id: 'c1', phone: 'unknown' }],
+    )
+
+    expect(out.get('c1')?.to).toBe('1486998326437295')
+    expect(l.selects).toEqual([
+      'id, contact_id',
+      'conversation_id, sender_phone, raw_meta_payload',
+    ])
+  })
+
+  it('returns null rather than an undeliverable address', async () => {
+    const l = log()
+
+    const out = await resolveRecipientAddresses(
+      fakeDb(
+        l,
+        [{ id: 'cv1', contact_id: 'c1' }],
+        [
+          {
+            conversation_id: 'cv1',
+            sender_phone: '@juanpablo',
+            sender_type: 'customer',
+          },
+        ],
+      ),
+      [{ id: 'c1', phone: '@juanpablo' }],
+    )
+
+    // null is what makes the caller persist `failed` WITHOUT calling Meta.
+    expect(out.get('c1')).toBeNull()
+  })
+
+  it('prefers a stored id over a recovered one', async () => {
+    const l = log()
+
+    const out = await resolveRecipientAddresses(
+      fakeDb(
+        l,
+        [{ id: 'cv1', contact_id: 'c1' }],
+        [
+          {
+            conversation_id: 'cv1',
+            sender_phone: '999999999999999',
+            sender_type: 'customer',
+          },
+        ],
+      ),
+      [{ id: 'c1', phone: 'unknown', wa_user_id: '1486998326437295' }],
+    )
+
+    expect(out.get('c1')?.to).toBe('1486998326437295')
+    // Nothing unreadable, so history is not consulted at all.
+    expect(l.selects).toEqual([])
+  })
+
+  it('skips contacts with no id instead of reading an unscoped thread', async () => {
+    const l = log()
+
+    const out = await resolveRecipientAddresses(fakeDb(l, [], []), [
+      { phone: 'unknown' } as never,
+      null,
+      undefined,
+    ])
+
+    expect(out.size).toBe(0)
+    expect(l.selects).toEqual([])
+  })
+
+  it('classifies destinations: numbers and opaque ids yes, handles no', () => {
+    expect(isDeliverableAddress('573001234567')).toBe(true)
+    expect(isDeliverableAddress('1486998326437295')).toBe(true)
+    expect(isDeliverableAddress('CO.01008477715690681')).toBe(true)
+    expect(isDeliverableAddress('@juanpablo')).toBe(false)
+    expect(isDeliverableAddress('unknown')).toBe(false)
+    expect(isDeliverableAddress('')).toBe(false)
+  })
+})
