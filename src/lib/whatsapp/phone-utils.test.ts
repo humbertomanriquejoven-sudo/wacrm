@@ -5,6 +5,7 @@ import {
   normalizePhone,
   phoneVariants,
   phonesMatch,
+  recipientAddressVariants,
   sanitizePhoneForMeta,
 } from "./phone-utils";
 
@@ -160,5 +161,55 @@ describe("isRecipientNotAllowedError", () => {
       false,
     );
     expect(isRecipientNotAllowedError("")).toBe(false);
+  });
+});
+
+describe("recipientAddressVariants", () => {
+  // The broadcast sender used to gate on
+  // `isValidE164(sanitizePhoneForMeta(address))`, rejecting every opaque id
+  // with "Invalid phone number format" � while the Inbox delivered to those
+  // same contacts successfully.
+  it("forwards a namespaced BSUID verbatim", () => {
+    expect(recipientAddressVariants("CO.1008477715690681")).toEqual([
+      "CO.1008477715690681",
+    ]);
+  });
+
+  it("forwards a bare numeric Meta id verbatim", () => {
+    expect(recipientAddressVariants("1486998326437295")).toEqual([
+      "1486998326437295",
+    ]);
+  });
+
+  it("forwards an @handle verbatim instead of digit-stripping it", () => {
+    // Digit-stripping this handle yields "1234567" � a well-formed 7-digit
+    // number that PASSED the old E.164 gate and would have aimed a
+    // campaign at a stranger.
+    expect(recipientAddressVariants("@user1234567")).toEqual(["@user1234567"]);
+    expect(recipientAddressVariants("@jjuanpablo22222")).toEqual([
+      "@jjuanpablo22222",
+    ]);
+  });
+
+  it("never reduces an id to its digits", () => {
+    // "CO.1008477715690681" sanitized is "1008477715690681", which is a
+    // DIFFERENT recipient as far as Meta is concerned.
+    expect(recipientAddressVariants("CO.1008477715690681")).not.toContain(
+      "1008477715690681",
+    );
+  });
+
+  it("still expands a real number into its trunk-prefix variants", () => {
+    const variants = recipientAddressVariants("573121828949");
+    expect(variants).toContain("573121828949");
+    expect(variants.length).toBeGreaterThan(1);
+  });
+
+  it("returns nothing to send for an empty address", () => {
+    // The only condition under which a recipient is undeliverable.
+    expect(recipientAddressVariants("")).toEqual([]);
+    expect(recipientAddressVariants("   ")).toEqual([]);
+    expect(recipientAddressVariants(null)).toEqual([]);
+    expect(recipientAddressVariants(undefined)).toEqual([]);
   });
 });

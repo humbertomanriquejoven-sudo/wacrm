@@ -5,9 +5,7 @@ import { decrypt } from '@/lib/whatsapp/encryption'
 import type { SendTimeParams } from '@/lib/whatsapp/template-send-builder'
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body'
 import {
-  sanitizePhoneForMeta,
-  isValidE164,
-  phoneVariants,
+  recipientAddressVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
 import {
@@ -165,21 +163,21 @@ export async function POST(request: Request) {
     let failedCount = 0
 
     for (const recipient of recipients) {
-      const sanitized = sanitizePhoneForMeta(recipient.phone)
+      // Only an EMPTY address is undeliverable. This used to additionally
+      // demand `isValidE164(...)`, which rejected every BSUID and @handle —
+      // the exact addresses the Inbox delivers to successfully.
+      const variants = recipientAddressVariants(recipient.phone)
 
-      if (!isValidE164(sanitized)) {
+      if (variants.length === 0) {
         results.push({
           phone: recipient.phone,
           status: 'failed',
-          error: 'Invalid phone number format',
+          error: 'Missing recipient address',
         })
         failedCount++
         continue
       }
 
-      // Retry with phone variants on "not in allowed list" so numbers
-      // that differ only in a trunk-prefix 0 still reach recipients.
-      const variants = phoneVariants(sanitized)
       let sentMessageId: string | null = null
       let lastError: string | null = null
 

@@ -317,3 +317,31 @@ export function passthroughMetaId(
   if (/^\+?\d{6,}$/.test(trimmed)) return trimmed.replace(/\D/g, '')
   return null
 }
+
+/**
+ * The address forms to try for one recipient, in order.
+ *
+ * A dialable number is sanitized and expanded into its trunk-prefix variants
+ * (the sandbox's `#131030` quirk). An opaque Meta identifier — a BSUID, a
+ * `WAID.`/`LID.` id, or an `@handle` — has exactly ONE form and must be
+ * forwarded byte-for-byte.
+ *
+ * This mirrors the decision in the Inbox send core (`send-message.ts`).
+ * Having it here as a tested function is what keeps the two from drifting:
+ * the broadcast sender once gated on `isValidE164(sanitizePhoneForMeta(x))`
+ * and so rejected every opaque id, while the Inbox delivered to the same
+ * contacts fine. Worse, judging the SANITIZED value meant `CO.1008477715690681`
+ * was assessed as `1008477715690681` and `@user1234567` as `1234567` — a
+ * well-formed 7-digit number that passed the gate and would have aimed a
+ * campaign at a stranger.
+ *
+ * An empty/blank address yields `[]`: there is nothing to send to, and that
+ * is the ONLY condition under which a recipient is undeliverable.
+ */
+export function recipientAddressVariants(address: string | null | undefined): string[] {
+  const trimmed = (address ?? '').trim()
+  if (!trimmed) return []
+  return isDialablePhone(trimmed)
+    ? phoneVariants(sanitizePhoneForMeta(trimmed))
+    : [trimmed]
+}
