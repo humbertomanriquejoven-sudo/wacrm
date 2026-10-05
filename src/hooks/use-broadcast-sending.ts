@@ -10,6 +10,7 @@ import {
 import {
   contactPhone,
   recoverAddressesFromHistory,
+        persistRecoveredAddress,
 } from '@/lib/whatsapp/broadcast-address';
 import { Contact, MessageTemplate } from '@/types';
 
@@ -554,6 +555,16 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
               : [],
             ...(messageParams ? { messageParams } : {}),
           });
+        }
+
+        // Persist every address recovered above onto its contact row, so the
+        // next send reads it straight off `contacts.phone` instead of
+        // re-deriving it. `recoverAddressesFromHistory` only ever returns
+        // contacts that had no deliverable number, so this cannot overwrite
+        // a good value. Awaited here rather than inside the loop above to
+        // keep it to one sequential pass per batch.
+        for (const [contactId, address] of recovered) {
+          await persistRecoveredAddress(supabase, contactId, address);
         }
 
         // Record the recipients we cannot address BEFORE deciding whether

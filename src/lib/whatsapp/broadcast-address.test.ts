@@ -1,8 +1,9 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import {
   contactPhone,
   normalizeToE164,
+  persistRecoveredAddress,
   recoverAddressesFromHistory,
 } from './broadcast-address'
 import type { Contact } from '@/types'
@@ -101,15 +102,23 @@ describe('contactPhone', () => {
 interface QueryLog {
   selects: string[]
   messagesFilters: { column: string; value: string }[]
+  contactUpdates: { id: string; patch: Record<string, unknown> }[]
 }
 
-/** Fake covering the two chains `recoverAddressesFromHistory` uses:
- *  conversations: from().select().in()  → { data }
- *  messages:     from().select().in().not().order().limit() → { data } */
+/** Fake covering the chains `recoverAddressesFromHistory` and
+ *  `persistRecoveredAddress` use:
+ *  conversations: from().select().in()  → { data, error }
+ *  messages:     from().select().in().not().order().limit() → { data, error }
+ *  contacts:     from().update().eq()  → { error } */
 function fakeDb(
   log: QueryLog,
   conversations: Array<{ id: string; contact_id: string }>,
   messages: Array<{ conversation_id: string; sender_phone: string | null }>,
+  opts: {
+    convError?: string
+    msgError?: string
+    updateError?: string
+  } = {},
 ): SupabaseClient {
   const chain: Record<string, (...args: never[]) => unknown> = {
     from: (table: string) => {
@@ -118,9 +127,26 @@ function fakeDb(
           select: (cols: string) => {
             log.selects.push(cols)
             return {
-              in: () => Promise.resolve({ data: conversations, error: null }),
+              in: () =>
+                Promise.resolve({
+                  data: opts.convError ? null : conversations,
+                  error: opts.convError ? { message: opts.convError } : null,
+                }),
             }
           },
+        }
+      }
+      if (table === 'contacts') {
+        return {
+          update: (patch: Record<string, unknown>) => ({
+            eq: (column: string, value: string) => {
+              log.contactUpdates.push({ id: value, patch })
+              void column
+              return Promise.resolve({
+                error: opts.updateError ? { message: opts.updateError } : null,
+              })
+            },
+          }),
         }
       }
       return {
@@ -134,7 +160,11 @@ function fakeDb(
               return builder
             },
             order: () => builder,
-            limit: () => Promise.resolve({ data: messages, error: null }),
+            limit: () =>
+              Promise.resolve({
+                data: opts.msgError ? null : messages,
+                error: opts.msgError ? { message: opts.msgError } : null,
+              }),
           }
           return builder
         },
@@ -144,13 +174,17 @@ function fakeDb(
   return chain as unknown as SupabaseClient
 }
 
+function newLog(): QueryLog {
+  return { selects: [], messagesFilters: [], contactUpdates: [] }
+}
+
 describe('recoverAddressesFromHistory', () => {
   it('reads sender_phone — the only address column messages has', async () => {
     // The bug: the query selected `address`, `whatsapp_id` and `from`,
     // none of which exist on `messages`. PostgREST 400s the whole request,
     // `data` is null, and every @user recipient silently resolved to
     // nothing. Asserting the column list fails here, at the source.
-    const log: QueryLog = { selects: [], messagesFilters: [] }
+    const log = newLog()
     await recoverAddressesFromHistory(
       fakeDb(log, [{ id: 'conv-1', contact_id: 'contact-1' }], []),
       [contact({ username: '@usuario' })],
@@ -166,7 +200,7 @@ describe('recoverAddressesFromHistory', () => {
   })
 
   it('recovers the number an @user contact actually wrote from', async () => {
-    const log: QueryLog = { selects: [], messagesFilters: [] }
+    const log = newLog()
     const recovered = await recoverAddressesFromHistory(
       fakeDb(
         log,
@@ -182,7 +216,7 @@ describe('recoverAddressesFromHistory', () => {
   it('skips conversations belonging to a different contact', async () => {
     // Isolation boundary: another contact's thread must never supply the
     // address, or the campaign goes to a different person.
-    const log: QueryLog = { selects: [], messagesFilters: [] }
+    const log = newLog()
     const recovered = await recoverAddressesFromHistory(
       fakeDb(
         log,
@@ -198,7 +232,7 @@ describe('recoverAddressesFromHistory', () => {
   it('skips a BSUID recorded in sender_phone', async () => {
     // sender_phone snapshots whatever Meta disclosed, which for an
     // unregistered sender is an identifier — not a dialable number.
-    const log: QueryLog = { selects: [], messagesFilters: [] }
+    const log = newLog()
     const recovered = await recoverAddressesFromHistory(
       fakeDb(
         log,
@@ -212,7 +246,7 @@ describe('recoverAddressesFromHistory', () => {
   })
 
   it('does not query messages for a contact that already has a number', async () => {
-    const log: QueryLog = { selects: [], messagesFilters: [] }
+    const log = newLog()
     const recovered = await recoverAddressesFromHistory(
       fakeDb(log, [], []),
       [contact({ phone: '573121828949' })],
@@ -220,5 +254,83 @@ describe('recoverAddressesFromHistory', () => {
 
     expect(recovered.size).toBe(0)
     expect(log.selects).toHaveLength(0)
+  })
+
+  it('reports a failed conversation query instead of pretending history is empty', async () => {
+    // A rejected query and a genuinely empty history look identical when the
+    // error is discarded. That is what let a lookup failure present as a
+    // data problem for five patch attempts.
+    const log = newLog()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const recovered = await recoverAddressesFromHistory(
+      fakeDb(log, [], [], { convError: 'permission denied' }),
+      [contact({ username: '@usuario' })],
+    )
+
+    expect(recovered.size).toBe(0)
+    expect(warn).toHaveBeenCalled()
+    warn.mockRestore()
+  })
+
+  it('reports a failed message query instead of returning nothing quietly', async () => {
+    const log = newLog()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const recovered = await recoverAddressesFromHistory(
+      fakeDb(
+        log,
+        [{ id: 'conv-1', contact_id: 'contact-1' }],
+        [],
+        { msgError: '400 bad request' },
+      ),
+      [contact({ username: '@usuario' })],
+    )
+
+    expect(recovered.size).toBe(0)
+    expect(warn).toHaveBeenCalled()
+    warn.mockRestore()
+  })
+})
+
+describe('persistRecoveredAddress', () => {
+  it('writes the recovered number onto contacts.phone', async () => {
+    const log = newLog()
+    const ok = await persistRecoveredAddress(
+      fakeDb(log, [], []),
+      'contact-1',
+      '573121828949',
+    )
+
+    expect(ok).toBe(true)
+    expect(log.contactUpdates).toEqual([
+      { id: 'contact-1', patch: { phone: '573121828949' } },
+    ])
+  })
+
+  it('never writes phone_normalized, which Postgres generates', async () => {
+    // phone_normalized is GENERATED ALWAYS (migration 022); including it in
+    // an update is rejected outright, so the write-back would always fail.
+    const log = newLog()
+    await persistRecoveredAddress(fakeDb(log, [], []), 'contact-1', '573121828949')
+
+    expect(Object.keys(log.contactUpdates[0].patch)).toEqual(['phone'])
+  })
+
+  it('tolerates a rejected write — the send must still proceed', async () => {
+    // Persistence is an optimisation. A 23505 (the number already belongs to
+    // another contact in the account) or an RLS denial must not fail the send.
+    const log = newLog()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const ok = await persistRecoveredAddress(
+      fakeDb(log, [], [], { updateError: 'duplicate key value violates unique constraint' }),
+      'contact-1',
+      '573121828949',
+    )
+
+    expect(ok).toBe(false)
+    expect(warn).toHaveBeenCalled()
+    warn.mockRestore()
   })
 })

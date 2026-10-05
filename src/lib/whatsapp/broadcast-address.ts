@@ -102,13 +102,25 @@ export async function recoverAddressesFromHistory(
   // through `conversations`. Scoping those ids to THIS contact is the
   // isolation boundary — another contact's thread must never be consulted,
   // or a number belonging to a different person receives the campaign.
-  const { data: convRows } = await db
+  const { data: convRows, error: convError } = await db
     .from('conversations')
     .select('id, contact_id')
     .in(
       'contact_id',
       pending.map((c) => c.id),
     );
+
+  // Surfaced rather than swallowed. The previous version destructured only
+  // `data`, so a rejected query and a legitimately empty result were
+  // indistinguishable: both looked like "no history exists". That is how a
+  // whole class of lookup failure presented as a data problem.
+  if (convError) {
+    console.warn(
+      '[broadcast] conversation lookup failed; addresses cannot be recovered',
+      convError.message,
+    );
+    return recovered;
+  }
 
   const convIdsByContact = new Map<string, string[]>();
   for (const row of (convRows ?? []) as Array<{
@@ -130,13 +142,21 @@ export async function recoverAddressesFromHistory(
   // null, and the lookup silently resolved to nothing. That is why @user
   // recipients were reported undeliverable no matter how the number
   // formatting was tuned.
-  const { data: msgRows } = await db
+  const { data: msgRows, error: msgError } = await db
     .from('messages')
     .select('conversation_id, sender_phone')
     .in('conversation_id', conversationIds)
     .not('sender_phone', 'is', null)
     .order('created_at', { ascending: false })
     .limit(HISTORY_SCAN_LIMIT);
+
+  if (msgError) {
+    console.warn(
+      '[broadcast] message-history lookup failed; addresses cannot be recovered',
+      msgError.message,
+    );
+    return recovered;
+  }
 
   // Newest-first from the query, so the first dialable hit per thread wins.
   const phoneByConversation = new Map<string, string>();
@@ -159,4 +179,37 @@ export async function recoverAddressesFromHistory(
     }
   }
   return recovered;
+}
+
+/**
+ * Write a recovered address back to `contacts.phone` so the lookup above is
+ * a one-time repair instead of a per-send cost.
+ *
+ * Best-effort by design: persistence is an optimisation, never a gate on
+ * sending. A failure here (RLS, or a 23505 unique violation because another
+ * contact in the account already owns that number) is logged and reported,
+ * but the address still goes out on this send.
+ *
+ * Only `phone` is written. `phone_normalized` is a GENERATED column
+ * (migration 022) that Postgres derives from `phone`; including it would
+ * make every write fail.
+ */
+export async function persistRecoveredAddress(
+  db: SupabaseClient,
+  contactId: string,
+  phone: string,
+): Promise<boolean> {
+  const { error } = await db
+    .from('contacts')
+    .update({ phone })
+    .eq('id', contactId);
+
+  if (error) {
+    console.warn(
+      `[broadcast] recovered address ${phone} for contact ${contactId} could not be persisted`,
+      error.message,
+    );
+    return false;
+  }
+  return true;
 }
