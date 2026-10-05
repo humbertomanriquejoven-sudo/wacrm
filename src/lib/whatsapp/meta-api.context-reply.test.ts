@@ -100,6 +100,28 @@ describe('isOpaqueMetaId', () => {
   it('rejects an empty address', () => {
     expect(isOpaqueMetaId('')).toBe(false)
   })
+
+  it('rejects every non-addressable placeholder and handle', () => {
+    // This predicate is the broadcast route's gate
+    // (`isDialablePhone(v) || isOpaqueMetaId(v)`) — a `true` here on a handle
+    // would let `@jjuanpablo22222` reach Meta in `to`, which answers
+    // `(#100) Invalid parameter`. The Inbox gets away with a handle because
+    // it also quotes the inbound wamid; the broadcast path deliberately does
+    // not rely on that, so this must stay false.
+    for (const value of [
+      '@jjuanpablo22222',
+      'jjuanpablo22222',
+      'unknown',
+      'UNKNOWN',
+      'undefined',
+      'null',
+      'none',
+      'n/a',
+      '@',
+    ]) {
+      expect(isOpaqueMetaId(value)).toBe(false)
+    }
+  })
 })
 
 describe('sendTextMessage recipient shapes', () => {
