@@ -22,7 +22,6 @@ import {
   passthroughMetaId,
   toDialable,
 } from './phone-utils'
-import type { Contact } from '@/types';
 
 /**
  * Country code assumed for a bare national number.
@@ -317,14 +316,21 @@ export function resolveBroadcastAddress(
  * Batched: two queries per send batch rather than two per recipient. A
  * campaign is 1 000 recipients, so the per-contact shape was the slow path
  * as well as the broken one.
+ *
+ * Typed to what it actually reads — `id` plus the identity columns — so a
+ * caller holding a projected row (a broadcast recipient's nested `contacts`
+ * object, for instance) does not have to widen it to a full `Contact`. A full
+ * `Contact` still satisfies this structurally.
  */
+export type RecoverableContact = { id: string } & BroadcastIdentity;
+
 export async function recoverAddressesFromHistory(
   db: SupabaseClient,
-  contacts: Contact[],
+  contacts: ReadonlyArray<RecoverableContact | null | undefined>,
 ): Promise<Map<string, string>> {
   const recovered = new Map<string, string>();
   const pending = contacts.filter(
-    (c): c is Contact => Boolean(c) && !contactPhone(c),
+    (c): c is RecoverableContact => Boolean(c?.id) && !contactPhone(c),
   );
   if (pending.length === 0) return recovered;
 

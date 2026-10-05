@@ -11,6 +11,7 @@
 
 import {
   isDialablePhone,
+  isPlaceholderValue,
   isValidE164,
   normalizePhone,
 } from './phone-utils'
@@ -256,8 +257,16 @@ export function recipientAddressField(destination: string): Record<string, strin
  * deliverable is the accompanying `context` quoting a message they wrote.
  */
 export function templateRecipientField(destination: string): Record<string, string> {
-  const bare = cleanRecipientAddress(destination)
-  if (!bare) return { to: '' }
+  const bare = cleanRecipientAddress(destination);
+  if (!bare) return { to: '' };
+  // A placeholder is refused outright rather than forwarded. `contacts.phone`
+  // is NOT NULL, so the webhook wrote the literal string 'unknown' for every
+  // sender Meta could not identify, and any path that skipped the resolver's
+  // own placeholder guard would put that literal in `to` — a request Meta
+  // rejects with an opaque (#100) that reads like a bad API call rather than
+  // "this contact has no address yet". Empty is equally undeliverable but
+  // fails identically here and at the caller's own guard.
+  if (isPlaceholderValue(bare)) return { to: '' };
   // A real number in any formatting, or an opaque Meta id (namespaced, or a
   // pure digit run). Both go through the Inbox's canonical form.
   if (
@@ -265,9 +274,9 @@ export function templateRecipientField(destination: string): Record<string, stri
     /^[A-Za-z]+\.[\w.-]+$/.test(bare) ||
     /^\+?\d+$/.test(bare)
   ) {
-    return { to: toMetaTargetId(bare) }
+    return { to: toMetaTargetId(bare) };
   }
-  return { to: bare }
+  return { to: bare };
 }
 
 /**

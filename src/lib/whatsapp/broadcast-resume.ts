@@ -24,6 +24,7 @@ import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
 import { recipientAddressVariants } from '@/lib/whatsapp/phone-utils';
 import {
   NO_DELIVERABLE_ADDRESS,
+  recoverAddressesFromHistory,
   resolveBroadcastAddress,
   type BroadcastAddress,
   type BroadcastIdentity,
@@ -130,6 +131,7 @@ interface RecipientRow {
   contact_id: string;
   contact:
     | {
+        id?: string;
         phone?: string | null;
         wa_id?: string | null;
         wa_user_id?: string | null;
@@ -137,6 +139,7 @@ interface RecipientRow {
         recipient_id?: string | null;
       }
     | Array<{
+        id?: string;
         phone?: string | null;
         wa_id?: string | null;
         wa_user_id?: string | null;
@@ -146,8 +149,15 @@ interface RecipientRow {
     | null;
 }
 
-/** Supabase renders an embedded to-one join as an object or a 1-array. */
-function contactIdentity(row: RecipientRow): BroadcastIdentity | null {
+/**
+ * Supabase renders an embedded to-one join as an object or a 1-array.
+ *
+ * `id` is kept: the history fallback keys recovered addresses by contact id,
+ * so a projected row without it could not be recovered.
+ */
+function contactIdentity(
+  row: RecipientRow,
+): (BroadcastIdentity & { id?: string }) | null {
   const c = Array.isArray(row.contact) ? row.contact[0] : row.contact;
   return c ?? null;
 }
@@ -160,9 +170,19 @@ function contactIdentity(row: RecipientRow): BroadcastIdentity | null {
  * so a BSUID or @handle recipient was stamped failed with 'No valid phone
  * number on contact' — a campaign could go out on the first pass and then
  * silently lose every identifier recipient on resume.
+ *
+ * `recovered` carries the id dug out of the recipient's own inbound thread
+ * (see {@link recoverAddressesFromHistory}). Without it resume could only
+ * see the identity COLUMNS, so a contact whose id exists solely in
+ * `messages.sender_phone` / `raw_meta_payload` resolved on the first pass
+ * and then failed on every resume — the two passes disagreed about the same
+ * contact. Mirrors `use-broadcast-sending`, which already passed it.
  */
-function resolveRowAddress(row: RecipientRow): BroadcastAddress | null {
-  return resolveBroadcastAddress(contactIdentity(row));
+function resolveRowAddress(
+  row: RecipientRow,
+  recovered: Map<string, string>,
+): BroadcastAddress | null {
+  return resolveBroadcastAddress(contactIdentity(row), recovered.get(row.contact_id));
 }
 
 /**
@@ -178,11 +198,11 @@ function resolveRowAddress(row: RecipientRow): BroadcastAddress | null {
  */
 /** Columns needed to resolve a destination, newest-schema-first. */
 const RECIPIENT_SELECT_FULL =
-  'id, template_params, contact_id, contact:contacts(phone, wa_id, wa_user_id, username, recipient_id)';
+  'id, template_params, contact_id, contact:contacts(id, phone, wa_id, wa_user_id, username, recipient_id)';
 
 /** Same projection without `recipient_id` (migration 057), for older databases. */
 const RECIPIENT_SELECT_LEGACY =
-  'id, template_params, contact_id, contact:contacts(phone, wa_id, wa_user_id, username)';
+  'id, template_params, contact_id, contact:contacts(id, phone, wa_id, wa_user_id, username)';
 
 /**
  * PostgREST rejects the WHOLE query with `42703 column ... does not exist` when
@@ -272,18 +292,43 @@ export async function planBroadcastResume(
   const rows = (rawRows ?? []) as RecipientRow[];
 
 // A recipient with nothing to send to can never send. Stamp it failed now:
-  // leaving it 'pending' would keep the broadcast in 'sending' forever, which
-  // is the very symptom being fixed.
+// leaving it 'pending' would keep the broadcast in 'sending' forever, which
+// is the very symptom being fixed.
   const sendable: RecipientRow[] = [];
   const unsendable: string[] = [];
+  /** Recipient row id -> the exact destination approved for it. */
+  const addressByRowId = new Map<string, string>();
+
+  // One batched history lookup for every contact on this page, run ONLY for
+  // the rows the columns alone could not resolve. Recovering first would add
+  // two extra round trips (contacts + messages) to the common case where the
+  // row already carries a usable number.
+  const unresolved: Array<{ id: string } & BroadcastIdentity> = [];
   for (const row of rows) {
-    const resolved = resolveRowAddress(row);
+    const identity = contactIdentity(row);
+    // Deliberately omits the history tier, so this asks only "can the row
+    // resolve on its own?".
+    if (identity?.id && !resolveBroadcastAddress(identity)) {
+      unresolved.push({ ...identity, id: identity.id });
+    }
+    // Rows with no projected contact are NOT judged here: the loop below is
+    // the single authority on sendable vs unsendable, so recording a verdict
+    // in both places would stamp a recipient failed twice.
+  }
+  const recovered = await recoverAddressesFromHistory(db, unresolved);
+
+  for (const row of rows) {
+    const resolved = resolveRowAddress(row, recovered);
     const addressable =
       resolved !== null &&
       recipientAddressVariants(resolved.to).length > 0 &&
       (isDialablePhone(resolved.to) || isOpaqueMetaId(resolved.to));
-    if (addressable) sendable.push(row);
-    else unsendable.push(row.id);
+    if (addressable) {
+      sendable.push(row);
+      // Kept so the plan below cannot resolve a different destination than
+      // the one this gate approved.
+      addressByRowId.set(row.id, resolved.to);
+    } else unsendable.push(row.id);
   }
   if (unsendable.length > 0) {
     await db
@@ -350,7 +395,12 @@ export async function planBroadcastResume(
       // which stripped a BSUID to bare digits and an @handle to whatever few
       // digits it contained — addressing a different recipient than the one
       // resolved, or an invalid parameter to Meta.
-      phone: resolveRowAddress(row)?.to ?? '',
+      //
+      // Read back from the map computed during the sendable gate instead of
+      // re-resolving: this call had no `recovered`, so a recipient admitted by
+      // the history tier was then handed an EMPTY destination here and the
+      // send targeted nobody while still being marked sent.
+      phone: addressByRowId.get(row.id) ?? '',
       params: Array.isArray(row.template_params)
         ? row.template_params.filter((p): p is string => typeof p === 'string')
         : [],

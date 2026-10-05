@@ -233,7 +233,7 @@ return {
 /** A recipient identified by an opaque Meta id rather than a number. */
 function identifierRecipient(
   id: string,
-  contact: Record<string, string>,
+  contact: Record<string, string | null>,
   params: unknown = ['A123'],
 ) {
   return {
@@ -302,6 +302,94 @@ describe('planBroadcastResume', () => {
 
     // Not '1486998326437295' with a 'CO.' invented, and not a number.
     expect(plan.planned[0].phone).toBe('1486998326437295');
+  });
+
+  it('recovers a number from the recipient history when no column holds one', async () => {
+    // The exact shape of a pre-053/057 contact row: every identity column
+    // NULL, and the only address anywhere in the database sitting in
+    // `messages.sender_phone`. Resume never consulted history, so this
+    // recipient was stamped failed with NO_DELIVERABLE_ADDRESS even though
+    // the dashboard resolved the very same contact from its thread.
+    const writes: PlanWrites = {};
+    const { plan, unsendable } = await planBroadcastResume(
+      planDb(
+        {
+          broadcast: BROADCAST,
+          config: CONFIG,
+          recipients: [
+            identifierRecipient('r1', {
+              id: 'c-r1',
+              phone: null,
+              wa_id: null,
+              wa_user_id: null,
+              username: null,
+            }),
+          ],
+          conversations: [{ id: 'cv-1', contact_id: 'c-r1' }],
+          messages: [
+            {
+              conversation_id: 'cv-1',
+              sender_phone: '573121828949',
+              raw_meta_payload: null,
+            },
+          ],
+        },
+        writes,
+      ),
+      'acct-1',
+      'bc-1',
+      'pending',
+    );
+
+    expect(unsendable).toBe(0);
+    // The plan must carry the RECOVERED address, not an empty string — the
+    // sendable gate approved it, so the destination has to agree.
+    expect(plan.planned).toEqual([
+      {
+        recipientRowId: 'r1',
+        phone: '573121828949',
+        params: ['A123'],
+        contactId: 'c-r1',
+      },
+    ]);
+  });
+
+  it('recovers a BSUID from the recipient history payload', async () => {
+    // Same row, but the address only exists inside the stored Meta payload
+    // because Meta disclosed no number on the inbound message.
+    const writes: PlanWrites = {};
+    const { plan, unsendable } = await planBroadcastResume(
+      planDb(
+        {
+          broadcast: BROADCAST,
+          config: CONFIG,
+          recipients: [
+            identifierRecipient('r1', { id: 'c-r1', phone: 'unknown' }),
+          ],
+          conversations: [{ id: 'cv-1', contact_id: 'c-r1' }],
+          messages: [
+            {
+              conversation_id: 'cv-1',
+              sender_phone: null,
+              raw_meta_payload: {
+                message: { from: 'unknown', from_user_id: 'CO.1008477715690681' },
+                contact: { wa_id: '' },
+              },
+            },
+          ],
+        },
+        writes,
+      ),
+      'acct-1',
+      'bc-1',
+      'pending',
+    );
+
+    expect(unsendable).toBe(0);
+    // Namespaced form is kept verbatim: 	oMetaTargetId strips the 'CO.'
+    // at the payload boundary, and stripping it here would lose the
+    // namespace that distinguishes a BSUID from a phone number.
+    expect(plan.planned[0].phone).toBe('CO.1008477715690681');
   });
 
   it('still fails a recipient with no deliverable address', async () => {

@@ -49,6 +49,24 @@ describe('templateRecipientField', () => {
       expect(templateRecipientField(value).to).toBeTruthy()
     }
   })
+
+  it('refuses a placeholder instead of sending it to Meta', () => {
+    // `contacts.phone` is NOT NULL, so the webhook writes the literal string
+    // 'unknown' for any sender Meta could not identify. Forwarding it puts
+    // "unknown" in `to` and Meta answers with an opaque (#100) that looks
+    // like a malformed API call rather than "no address on this contact".
+    for (const value of ['unknown', 'UNKNOWN', ' undefined ', 'null', 'none', 'n/a']) {
+      expect(templateRecipientField(value)).toEqual({ to: '' })
+    }
+  })
+
+  it('reduces a BSUID to its digits whatever namespace it carries', () => {
+    // The exact forms `resolveBroadcastAddress` can return, and the shape
+    // Meta requires in `to`.
+    expect(templateRecipientField('CO.1486098326437295').to).toBe('1486098326437295')
+    expect(templateRecipientField('1486098326437295').to).toBe('1486098326437295')
+    expect(templateRecipientField('1486098326437295@lid').to).toBe('1486098326437295')
+  })
 })
 
 describe('recipientAddressField', () => {
