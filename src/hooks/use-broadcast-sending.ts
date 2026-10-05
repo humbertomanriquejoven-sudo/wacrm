@@ -11,7 +11,6 @@ import {
   NO_DELIVERABLE_ADDRESS,
   persistRecoveredAddress,
   recoverAddressesFromHistory,
-  recoverInboundWamids,
   resolveBroadcastAddress,
 } from '@/lib/whatsapp/broadcast-address';
 import { Contact, MessageTemplate } from '@/types';
@@ -511,16 +510,6 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
           batchContacts,
         );
 
-        // Tier C anchors: one batched lookup for every contact that resolved
-        // to a bare @handle. A handle is deliverable only as a quoted reply,
-        // so a contact with no inbound history is undeliverable — decided
-        // here, before any request goes to Meta, so the local reason stands
-        // instead of Meta's opaque "(#100)".
-        const quoteCandidates = batchContacts
-          .filter((c) => resolveBroadcastAddress(c, recovered.get(c.id))?.needsQuote)
-          .map((c) => c.id);
-        const wamids = await recoverInboundWamids(supabase, quoteCandidates);
-
         /**
          * recipientRowId → the address actually handed to Meta. Kept so
          * the result lookup below matches on the SAME value that went
@@ -550,20 +539,10 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
 
           const address = resolveBroadcastAddress(contact, recovered.get(contact.id));
           if (!address) {
-            // Tier D: no number, no Meta id, no handle. Nothing here can ever
-            // be delivered to, so it is failed locally rather than fired at
-            // Meta to produce an opaque error.
-            undeliverable.push({
-              id: row.id,
-              error: `${NO_DELIVERABLE_ADDRESS} (contact ${contact.id})`,
-            });
-            continue;
-          }
-
-          // Tier C: the handle is the destination, but only as a quote
-          // anchored on a message this contact actually wrote. Without one
-          // there is no way to reach them.
-          if (address.needsQuote && !wamids.get(contact.id)) {
+            // Tier D: no number on the row and no numerical Meta id on the row
+            // or in this contact's own inbound history. `contacts.username` is
+            // not used — Meta rejects a text @handle in `to` with (#100).
+            // Failing here keeps the local reason instead of Meta's opaque one.
             undeliverable.push({
               id: row.id,
               error: `${NO_DELIVERABLE_ADDRESS} (contact ${contact.id})`,
@@ -574,9 +553,8 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
           addressByRecipient.set(row.id, address.to);
           apiRecipients.push({
             phone: address.to,
-            // Sent so the API can anchor a quoted reply on one of this
-            // contact's own inbound messages when the address is a bare
-            // @handle, which Meta cannot deliver to on its own.
+            // Carried so the server can re-resolve against this contact's own
+            // history; `address.to` above is already the resolved destination.
             contact_id: contact.id,
             params: Array.isArray(row.template_params)
               ? row.template_params.filter((p): p is string => typeof p === 'string')

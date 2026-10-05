@@ -2,11 +2,9 @@ import { describe, it, expect, vi } from 'vitest'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import {
   contactPhone,
-  needsQuotedAnchor,
   normalizeToE164,
   persistRecoveredAddress,
   recoverAddressesFromHistory,
-  recoverInboundWamids,
   resolveBroadcastAddress,
 } from './broadcast-address'
 import type { Contact } from '@/types'
@@ -235,6 +233,59 @@ describe('recoverAddressesFromHistory', () => {
 
     expect(recovered.has('c-1')).toBe(false)
   })
+
+  it('extracts a BSUID from sender_phone on an inbound message from a handle contact', async () => {
+    // The tier-C path end to end. The contact row holds only a handle; the
+    // numerical id lives on the message they wrote.
+    const log = newLog()
+    const contactRow = contact({ phone: 'unknown', username: '@jjuanpablo22222' })
+    const recovered = await recoverAddressesFromHistory(
+      fakeDb(
+        log,
+        [{ id: 'cv-1', contact_id: 'contact-1' }],
+        [
+          {
+            conversation_id: 'cv-1',
+            sender_phone: '1486998326437295',
+            sender_type: 'customer',
+          },
+        ],
+      ),
+      [contactRow],
+    )
+
+    const resolved = resolveBroadcastAddress(
+      contactRow,
+      recovered.get('contact-1'),
+    )
+    expect(resolved).toEqual({ to: '1486998326437295', isPhone: false })
+  })
+
+  it('falls back to the raw webhook payload when sender_phone is null', async () => {
+    // Meta sometimes sends the id only inside the message payload. Without
+    // this the handle contact stays undeliverable.
+    const log = newLog()
+    const contactRow = contact({ phone: 'unknown', username: '@jjuanpablo22222' })
+    const recovered = await recoverAddressesFromHistory(
+      fakeDb(
+        log,
+        [{ id: 'cv-1', contact_id: 'contact-1' }],
+        [
+          {
+            conversation_id: 'cv-1',
+            sender_phone: null,
+            sender_type: 'customer',
+            raw_meta_payload: {
+              entry: [{ changes: [{ value: { messages: [{ from: '1486998326437295' }] } }] }],
+            },
+          },
+        ],
+      ),
+      [contactRow],
+    )
+
+    expect(recovered.get('contact-1')).toBe('1486998326437295')
+  })
   it('reads sender_phone — the only address column messages has', async () => {
     // The bug: the query selected `address`, `whatsapp_id` and `from`,
     // none of which exist on `messages`. PostgREST 400s the whole request,
@@ -422,31 +473,61 @@ describe('resolveBroadcastAddress', () => {
         wa_user_id: 'CO.1008477715690681',
       }),
     )
-    expect(resolved).toEqual({ to: 'CO.1008477715690681', isPhone: false, needsQuote: false })
+    expect(resolved).toEqual({ to: 'CO.1008477715690681', isPhone: false })
   })
 
   it('falls back to a bare numeric Meta id', () => {
     const resolved = resolveBroadcastAddress(
       contact({ phone: 'unknown', wa_id: '1486998326437295' }),
     )
-    expect(resolved).toEqual({ to: '1486998326437295', isPhone: false, needsQuote: false })
+    expect(resolved).toEqual({ to: '1486998326437295', isPhone: false })
   })
 
-it('falls back to a bare @handle, flagged as needing a quoted anchor', () => {
-    // Tier C. Campaign 3 sent the handle to Meta bare and got "(#100)
-    // Invalid parameter"; campaign 4 refused it outright and lost the
-    // recipient. Both were wrong: the handle IS a valid destination, but
-    // only quoted against a message the contact wrote. The flag is what
-    // tells the caller to resolve that anchor instead of firing the send.
+it('never uses a bare @handle as the destination', () => {
+    // Meta rejects a text handle in `to` with "(#100) Invalid parameter",
+    // and adding `context.message_id` does NOT change that: quoting makes the
+    // send a reply, it does not make the handle addressable. Campaign 3 sent
+    // it bare and failed; campaign 4 shipped it as a quoted reply and it
+    // still failed. The handle is a display detail only.
     expect(
       resolveBroadcastAddress(
         contact({ phone: 'unknown', username: '@jjuanpablo22222' }),
       ),
-    ).toEqual({ to: '@jjuanpablo22222', isPhone: false, needsQuote: true })
+    ).toBeNull()
   })
 
-  it('is null only when a handle is absent too (tier D)', () => {
-    // No number, no Meta id, no handle. Nothing here can ever reach them.
+  it('sends to the numerical Meta id recovered from the inbound message', () => {
+    // Tier C, done correctly. For a contact known only by @handle, Meta's
+    // webhook still carried a numerical id on the message they wrote. That
+    // id — not the handle — is what belongs in `to`.
+    expect(
+      resolveBroadcastAddress(
+        contact({ phone: 'unknown', username: '@jjuanpablo22222' }),
+        '1486998326437295',
+      ),
+    ).toEqual({ to: '1486998326437295', isPhone: false })
+  })
+
+  it('accepts a namespaced id recovered from the inbound message', () => {
+    expect(
+      resolveBroadcastAddress(
+        contact({ phone: 'unknown', username: '@jjuanpablo22222' }),
+        'CO.1008477715690681',
+      ),
+    ).toEqual({ to: 'CO.1008477715690681', isPhone: false })
+  })
+
+  it('prefers a real number recovered over the contact row identifiers', () => {
+    // A recovered dialable number is still the strongest signal.
+    expect(
+      resolveBroadcastAddress(
+        contact({ phone: 'unknown', wa_user_id: 'CO.1008477715690681' }),
+        '573121828949',
+      ),
+    ).toEqual({ to: '573121828949', isPhone: true })
+  })
+
+  it('is null when neither the row nor the history yields a number (tier D)', () => {
     expect(
       resolveBroadcastAddress(contact({ phone: 'unknown' })),
     ).toBeNull()
@@ -468,7 +549,7 @@ it('falls back to a bare @handle, flagged as needing a quoted anchor', () => {
     const resolved = resolveBroadcastAddress(
       contact({ phone: '573121828949', wa_user_id: 'CO.1008477715690681' }),
     )
-    expect(resolved).toEqual({ to: '573121828949', isPhone: true, needsQuote: false })
+    expect(resolved).toEqual({ to: '573121828949', isPhone: true })
   })
 
   it('prefers wa_id over the BSUID', () => {
@@ -487,179 +568,12 @@ it('falls back to a bare @handle, flagged as needing a quoted anchor', () => {
       contact({ phone: 'unknown', username: '@usuario' }),
       '573121828949',
     )
-    expect(resolved).toEqual({ to: '573121828949', isPhone: true, needsQuote: false })
+    expect(resolved).toEqual({ to: '573121828949', isPhone: true })
   })
 
   it('reports no address when the row holds nothing usable', () => {
     expect(resolveBroadcastAddress(contact({ phone: 'unknown' }))).toBeNull()
     expect(resolveBroadcastAddress(null)).toBeNull()
-  })
-})
-
-/** Fake covering the chains `recoverInboundWamids` uses:
- *  conversations: from().select().in()[.eq()] → { data, error }
- *  messages:     from().select().in().eq().not().order().limit() → { data } */
-function wamidDb(
-  conversations: Array<{ id: string; contact_id: string; account_id?: string }>,
-  messages: Array<{ conversation_id: string; message_id: string | null }>,
-): SupabaseClient {
-  const chain: Record<string, (...args: never[]) => unknown> = {
-    from: (table: string) => {
-      if (table === 'conversations') {
-        const convBuilder: Record<string, unknown> = {
-          in: () => convBuilder,
-          eq: (eqCol: string, eqVal: string) => {
-            void eqCol
-            // The tenant boundary is applied here, exactly as PostgREST
-            // would, so a foreign account yields no conversations.
-            conversations = conversations.filter(
-              (c) => c.account_id === undefined || c.account_id === eqVal,
-            )
-            return convBuilder
-          },
-          // Awaitable, so the lookup resolves with or without an account
-          // filter applied.
-          then: (resolve: (r: { data: unknown[]; error: null }) => unknown) =>
-            resolve({ data: conversations, error: null }),
-        }
-        return { select: () => convBuilder }
-      }
-      const filters: Record<string, string> = {}
-      const builder: Record<string, unknown> = {
-        in: () => builder,
-        eq: (column: string, value: string) => {
-          filters[column] = value
-          return builder
-        },
-        not: () => builder,
-        order: () => builder,
-        limit: () => Promise.resolve({ data: messages, error: null }),
-      }
-      void filters
-      return { select: () => builder }
-    },
-  }
-  return chain as unknown as SupabaseClient
-}
-
-describe('recoverInboundWamids account scoping', () => {
-  it('yields no anchor for a contact owned by another tenant', async () => {
-    // `contact_id` reaches this function from the request body, so the account
-    // filter is the only thing standing between a caller and another tenant's
-    // inbound message.
-    const wamids = await recoverInboundWamids(
-      wamidDb(
-        [{ id: 'cv-1', contact_id: 'c-1', account_id: 'acct-other' }],
-        [{ conversation_id: 'cv-1', message_id: 'wamid-secret' }],
-      ),
-      ['c-1'],
-      'acct-1',
-    )
-
-    expect(wamids.has('c-1')).toBe(false)
-  })
-
-  it('still resolves when the conversation belongs to this account', async () => {
-    const wamids = await recoverInboundWamids(
-      wamidDb(
-        [{ id: 'cv-1', contact_id: 'c-1', account_id: 'acct-1' }],
-        [{ conversation_id: 'cv-1', message_id: 'wamid-ok' }],
-      ),
-      ['c-1'],
-      'acct-1',
-    )
-
-    expect(wamids.get('c-1')).toBe('wamid-ok')
-  })
-})
-
-describe('needsQuotedAnchor', () => {
-  it('is false for an address Meta can already deliver to', () => {
-    // A real number and an opaque Meta id are both destinations in their
-    // own right; quoting them would turn a plain send into a reply.
-    expect(needsQuotedAnchor('573121828949')).toBe(false)
-    expect(needsQuotedAnchor('CO.1008477715690681')).toBe(false)
-    expect(needsQuotedAnchor('1486998326437295')).toBe(false)
-    expect(needsQuotedAnchor('WAID.987654321')).toBe(false)
-  })
-
-  it('is true for a bare handle, which Meta cannot address', () => {
-    expect(needsQuotedAnchor('@jjuanpablo22222')).toBe(true)
-    expect(needsQuotedAnchor('jjuanpablo22222')).toBe(true)
-  })
-
-  it('is false when there is no address to quote towards', () => {
-    expect(needsQuotedAnchor('')).toBe(false)
-    expect(needsQuotedAnchor(null)).toBe(false)
-  })
-})
-
-describe('recoverInboundWamids', () => {
-  it('anchors on the newest inbound message of the contact own thread', async () => {
-    const wamids = await recoverInboundWamids(
-      wamidDb(
-        [{ id: 'conv-1', contact_id: 'contact-1' }],
-        [{ conversation_id: 'conv-1', message_id: 'wamid.NEWEST' }],
-      ),
-      ['contact-1'],
-    )
-    expect(wamids.get('contact-1')).toBe('wamid.NEWEST')
-  })
-
-  it('only considers inbound messages, and only ones with a wamid', async () => {
-    // `messages` has no `direction` column: inbound is sender_type
-    // 'customer'. A null message_id cannot anchor a quote.
-    const log = { filters: [] as Array<{ column: string; value: string }> };
-    const chain = wamidDb(
-      [{ id: 'conv-1', contact_id: 'contact-1' }],
-      [{ conversation_id: 'conv-1', message_id: null }],
-    );
-    const spied = new Proxy(chain as object, {
-      get(target, prop) {
-        if (prop === 'from') {
-          return (table: string) => {
-            const base = (target as { from: (t: string) => unknown }).from(table);
-            if (table !== 'messages') return base;
-            return {
-              select: () => {
-                const b: Record<string, unknown> = {
-                  in: () => b,
-                  eq: (column: string, value: string) => {
-                    log.filters.push({ column, value })
-                    return b
-                  },
-                  not: () => b,
-                  order: () => b,
-                  limit: () => Promise.resolve({ data: [], error: null }),
-                };
-                return b
-              },
-            };
-          };
-        }
-        return (target as Record<string | symbol, unknown>)[prop];
-      },
-    }) as SupabaseClient;
-
-    const wamids = await recoverInboundWamids(spied, ['contact-1']);
-    expect(log.filters).toEqual([{ column: 'sender_type', value: 'customer' }]);
-    expect(wamids.size).toBe(0);
-  });
-
-  it('never quotes a message belonging to another contact', async () => {
-    const wamids = await recoverInboundWamids(
-      wamidDb(
-        [{ id: 'conv-other', contact_id: 'contact-2' }],
-        [{ conversation_id: 'conv-other', message_id: 'wamid.SOMEONE_ELSE' }],
-      ),
-      ['contact-1'],
-    )
-    expect(wamids.size).toBe(0);
-  })
-
-  it('returns nothing for a contact that has no conversation', async () => {
-    const wamids = await recoverInboundWamids(wamidDb([], []), ['contact-1'])
-    expect(wamids.size).toBe(0)
   })
 })
 

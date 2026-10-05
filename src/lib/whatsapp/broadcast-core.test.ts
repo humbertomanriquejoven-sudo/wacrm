@@ -355,15 +355,7 @@ function mirrorPlan(
     accessToken: 'token',
     accountId: 'acct-1',
     templateRow: TEMPLATE_ROW,
-    planned: [
-      {
-        recipientRowId: 'r-1',
-        phone,
-        params,
-        contactId,
-        contextMessageId: null,
-      },
-    ],
+    planned: [{ recipientRowId: 'r-1', phone, params, contactId }],
     rejected: 0,
   };
 }

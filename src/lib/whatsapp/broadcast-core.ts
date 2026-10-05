@@ -69,15 +69,6 @@ interface PlannedRecipient {
    * history lookup stays scoped to the recipient's own thread.
    */
   contactId: string;
-  /**
-   * The `context.message_id` to quote for a tier-C recipient (a bare
-   * `@handle`, which Meta accepts only as a reply). Null for tiers A and B,
-   * which need no anchor.
-   *
-   * Resolved during planning, not during the send loop, so a handle with no
-   * inbound history is stamped failed before any request goes out.
-   */
-  contextMessageId: string | null;
 }
 
 export interface BroadcastPlan {
@@ -305,12 +296,6 @@ const variants = recipientAddressVariants(recipient.phone);
             language: plan.templateLanguage,
             template: plan.templateRow ?? undefined,
             params: recipient.params,
-            // Tier C only: Meta delivers a text handle exclusively as a
-            // quoted reply. Omitting this is what produced "(#100) Invalid
-            // parameter" for @user recipients.
-            ...(recipient.contextMessageId
-              ? { contextMessageId: recipient.contextMessageId }
-              : {}),
           });
         sentMessageId = result.messageId;
         lastError = null;

@@ -17,10 +17,8 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-import { isOpaqueMetaId } from './meta-api';
 import {
   isDialablePhone,
-  normalizeUsername,
   passthroughMetaId,
   toDialable,
 } from './phone-utils'
@@ -86,7 +84,19 @@ export const NO_DELIVERABLE_ADDRESS =
  * directory-scoped id. All are validated by `passthroughMetaId`, so a
  * display name or `phone_number_id` can never be mistaken for one of them.
  */
-const RAW_PAYLOAD_ID_KEYS = ['wa_id', 'from', 'user_id', 'lid'] as const;
+const RAW_PAYLOAD_ID_KEYS = ['wa_id', 'wa_user_id', 'from', 'user_id', 'lid'] as const;
+
+/**
+ * How deep to walk a stored webhook payload.
+ *
+ * A Cloud API entry nests as
+ * `entry[] . changes[] . value . messages[] . { from }`, so the id-bearing
+ * node sits at depth 5. The previous cap of 4 stopped one level short, which
+ * meant a real payload never yielded anything and a handle contact stayed
+ * undeliverable — while the flat-shape unit tests, which reach the id at
+ * depth 1, kept passing.
+ */
+const MAX_PAYLOAD_DEPTH = 8;
 
 /**
  * Pull a deliverable numeric identifier out of a stored webhook payload.
@@ -104,7 +114,7 @@ export function metaIdFromRawPayload(payload: unknown): string | null {
   if (!payload || typeof payload !== 'object') return null;
 
   const visit = (node: unknown, depth: number): string | null => {
-    if (!node || typeof node !== 'object' || depth > 4) return null;
+    if (!node || typeof node !== 'object' || depth > MAX_PAYLOAD_DEPTH) return null;
     if (Array.isArray(node)) {
       for (const item of node) {
         const hit = visit(item, depth + 1);
@@ -183,21 +193,6 @@ export interface BroadcastAddress {
    * UNIQUE index on its normalized form.
    */
   isPhone: boolean;
-  /**
-   * True when this destination is only reachable as a quoted reply.
-   *
-   * Set for tier C (a bare `@handle`). Meta will not accept a text handle in
-   * `to` on its own — it answers `(#100) Invalid parameter`, or returns 200
-   * and silently drops the message, which would mark the recipient sent
-   * while nobody received it. The only supported route is a quote anchored
-   * on a message the contact actually wrote, so the caller MUST resolve a
-   * `contextMessageId` or mark the recipient undeliverable.
-   *
-   * Carried on the result rather than recomputed from the string so the
-   * dashboard path and the server-side resume path cannot disagree about
-   * whether a send needs an anchor.
-   */
-  needsQuote: boolean;
 }
 
 /**
@@ -216,9 +211,12 @@ export interface BroadcastAddress {
  *   number *anywhere* in the database — Meta discloses an identifier instead.
  *   Deliverable on its own.
  *
- * Tier C — a bare `@handle`, flagged `needsQuote`. Deliverable ONLY as a
- *   quoted reply anchored on a message the contact wrote; Meta rejects a text
- *   handle in `to` with `(#100)`.
+ * Tier C — the numerical Meta id carried by the contact's OWN inbound
+ *   message (`sender_phone`, or `wa_id`/`wa_user_id` inside
+ *   `raw_meta_payload`), passed in as `recovered`. This is how a contact who
+ *   is publicly `@somehandle` but has never messaged from a registered number
+ *   gets reached: Meta will not accept the text handle in `to`, but it does
+ *   accept the id it attached to their message.
  *
  * Tier D — nothing at all. Returned as null so the caller can record
  *   `NO_DELIVERABLE_ADDRESS` locally instead of firing a request Meta will
@@ -248,39 +246,51 @@ export function resolveBroadcastAddress(
   // 1 + 2. A real number always wins, whether already on the row or dug out
   // of this contact's own thread.
   const phone = contactPhone(contact) ?? normalizeToE164(recovered);
-  if (phone) return { to: phone, isPhone: true, needsQuote: false };
+  if (phone) return { to: phone, isPhone: true };
+
+  // The id recovered from the inbound history, tried as a Meta id.
+  //
+  // This is the tier-C destination. For a contact known only by
+  // `@handle`, Meta's webhook still carried a numerical identifier on the
+  // message they wrote (`sender_phone`, or `wa_id`/`wa_user_id` inside
+  // `raw_meta_payload`). That identifier — NOT the handle — is what Meta
+  // accepts in `to`.
+  //
+  // `recovered` used to be fed only through `normalizeToE164`, which
+  // discards a 15-digit BSUID as "not a phone number". So the recovered id
+  // was thrown away and resolution fell through to the handle, which is
+  // precisely the value Meta rejects.
+  const recoveredId = passthroughMetaId(recovered);
+  if (recoveredId) return { to: recoveredId, isPhone: false };
 
   // 3. wa_id — checked before the BSUID because it is the address Meta
   //    actually used to reach this contact.
   const waId = passthroughMetaId(contact.wa_id);
-  if (waId) return { to: waId, isPhone: false, needsQuote: false };
+  if (waId) return { to: waId, isPhone: false };
 
   // 4. BSUID, including the legacy case of one written into `phone`.
   const bsuid =
     passthroughMetaId(contact.wa_user_id) ?? passthroughMetaId(contact.phone);
-  if (bsuid) return { to: bsuid, isPhone: false, needsQuote: false };
+  if (bsuid) return { to: bsuid, isPhone: false };
 
   // 5. recipient_id — the alternative Meta identifier.
   const recipientId = passthroughMetaId(contact.recipient_id);
-  if (recipientId) return { to: recipientId, isPhone: false, needsQuote: false };
+  if (recipientId) return { to: recipientId, isPhone: false };
 
-  // 6. Tier C — a bare `@handle`, the last resort.
+  // 6. Tier D — nothing numerical anywhere.
   //
-  //   The handle IS returned, flagged `needsQuote`. It is a real destination
-  //   for a quoted reply, but not on its own: Meta rejects a text handle in
-  //   `to` with `(#100) Invalid parameter`, or worse, answers 200 and drops
-  //   the message silently — which would mark the recipient sent while nobody
-  //   received it.
+  //   `contacts.username` is deliberately NOT used as a fallback. Meta rejects
+  //   a text `@handle` in `to` with `(#100) Invalid parameter`, and adding
+  //   `context.message_id` does not change that: quoting makes the send a
+  //   reply, it does not make the handle addressable. Sending one risks a
+  //   200 with the message silently dropped, which marks the recipient sent
+  //   while nobody received it.
   //
-  //   So the caller must resolve a `contextMessageId` from this contact's own
-  //   inbound history before sending, and mark the recipient undeliverable
-  //   when there is none. Tier D (truly nothing) is decided there, with the
-  //   WAMID lookup in hand — it cannot be decided from the contact row alone.
-  const handle = normalizeUsername(contact.username);
-  if (handle) return { to: handle, isPhone: false, needsQuote: true };
-
-  // Tier D: no number, no Meta id, no handle. Nothing here can ever be
-  // delivered to, and no amount of retrying will change that.
+  //   A handle contact is therefore only reachable through the numerical
+  //   identifier Meta put on their inbound message — handled above, via
+  //   `recovered`. If that is missing too, there is no address at all and the
+  //   caller records NO_DELIVERABLE_ADDRESS rather than firing a request that
+  //   cannot succeed.
   return null;
 }
 
@@ -415,145 +425,6 @@ export async function recoverAddressesFromHistory(
   return recovered;
 }
 
-/**
- * True when `address` is only deliverable as a quoted reply.
- *
- * Buckets, per the classification in `meta-api.ts`:
- *   - a dialable number — addressable, no anchor needed;
- *   - an opaque Meta id (`CO.…`, `WAID.…`, or a >14-digit run) — addressable
- *     on its own, no anchor needed;
- *   - anything else (a bare `@handle`, a short digit run scraped out of an
- *     `@lid`, the literal `unknown`) — NOT a destination. Meta answers
- *     `(#100) Invalid parameter`, or 200 with the message silently dropped.
- *     The only supported route is a quote anchored on a message they wrote.
- */
-export function needsQuotedAnchor(address: string | null | undefined): boolean {
-  const value = (address ?? '').trim();
-  if (!value) return false;
-  return !isDialablePhone(value) && !isOpaqueMetaId(value);
-}
-
-/**
- * The newest inbound WhatsApp message id (`wamid`) per contact, for use as
- * a quoted-reply anchor.
- *
- * Meta does not treat a public @handle as a destination: `to`/`recipient`
- * carrying one is either rejected with `(#100) Invalid parameter` or
- * silently dropped (HTTP 200, nothing delivered). The one supported way to
- * reach such a contact is a QUOTED REPLY anchored on a message they
- * actually wrote — see the classification in `meta-api.ts`.
- *
- * `messages` has no `direction` column: an inbound message is
- * `sender_type = 'customer'` ('agent'/'bot' are ours). `message_id` holds
- * the wamid and is nullable, so rows without one are excluded rather than
- * sent as a null anchor.
- *
- * Scoped to each contact's OWN conversations, newest first — the isolation
- * boundary is the same one `recoverAddressesFromHistory` uses, so a wamid
- * belonging to a different customer is never quoted at this one.
- *
- * `accountId` is applied as a second boundary. `contactId` usually arrives
- * from the dashboard, but the public send endpoint accepts it from the
- * request body — without the account filter a caller could quote another
- * tenant's inbound message and have their template land in that thread.
- *
- * Batched: two queries for the whole send, not two per recipient.
- */
-export async function recoverInboundWamids(
-  db: SupabaseClient,
-  contactIds: string[],
-  accountId?: string,
-): Promise<Map<string, string>> {
-  const result = new Map<string, string>();
-  const ids = [...new Set(contactIds.filter((id) => typeof id === 'string' && id.length > 0))];
-  if (ids.length === 0) return result;
-
-  let convQuery = db
-    .from('conversations')
-    .select('id, contact_id')
-    .in('contact_id', ids);
-
-  if (accountId) convQuery = convQuery.eq('account_id', accountId);
-
-  const { data: convRows, error: convError } = await convQuery;
-
-  if (convError) {
-    console.warn(
-      '[broadcast] conversation lookup failed; no wamid can be anchored',
-      convError.message,
-    );
-    return result;
-  }
-
-  const convIdsByContact = new Map<string, string[]>();
-  for (const row of (convRows ?? []) as Array<{
-    id: string;
-    contact_id: string;
-  }>) {
-    const list = convIdsByContact.get(row.contact_id) ?? [];
-    list.push(row.id);
-    convIdsByContact.set(row.contact_id, list);
-  }
-
-  const conversationIds = [...new Set([...convIdsByContact.values()].flat())];
-  if (conversationIds.length === 0) return result;
-
-  const { data: msgRows, error: msgError } = await db
-    .from('messages')
-    .select('conversation_id, message_id')
-    .in('conversation_id', conversationIds)
-    .eq('sender_type', 'customer')
-    .not('message_id', 'is', null)
-    .order('created_at', { ascending: false })
-    .limit(HISTORY_SCAN_LIMIT);
-
-  if (msgError) {
-    console.warn(
-      '[broadcast] inbound-message lookup failed; no wamid can be anchored',
-      msgError.message,
-    );
-    return result;
-  }
-
-  // Newest-first from the query, so the first wamid seen per thread wins.
-  const wamidByConversation = new Map<string, string>();
-  for (const row of (msgRows ?? []) as Array<{
-    conversation_id: string;
-    message_id: string | null;
-  }>) {
-    if (!row.message_id) continue;
-    if (!wamidByConversation.has(row.conversation_id)) {
-      wamidByConversation.set(row.conversation_id, row.message_id);
-    }
-  }
-
-  for (const contactId of ids) {
-    for (const conversationId of convIdsByContact.get(contactId) ?? []) {
-      const wamid = wamidByConversation.get(conversationId);
-      if (wamid) {
-        result.set(contactId, wamid);
-        break;
-      }
-    }
-  }
-  return result;
-}
-
-/**
- * Write a recovered address back to `contacts.phone` so the lookup above is
- * a one-time repair instead of a per-send cost.
- *
- * Best-effort by design: persistence is an optimisation, never a gate on
- * sending. A failure here (RLS, or a 23505 unique violation because another
- * contact in the account already owns that number) is logged and reported,
- * but the address still goes out on this send.
- *
- * Only `phone` is written, and only for a real number: `contacts.phone` is a
- * number column with a UNIQUE index on its normalized form (migration 022),
- * so persisting a BSUID there would both corrupt the column and collide with
- * the next contact that owns that id. `phone_normalized` is itself a
- * GENERATED column, so including it would make every write fail.
- */
 export async function persistRecoveredAddress(
   db: SupabaseClient,
   contactId: string,

@@ -1,15 +1,13 @@
 import { NextResponse } from 'next/server'
 import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
-import {
-  needsQuotedAnchor,
-  NO_DELIVERABLE_ADDRESS,
-  recoverInboundWamids,
-} from '@/lib/whatsapp/broadcast-address'
+import { NO_DELIVERABLE_ADDRESS } from '@/lib/whatsapp/broadcast-address'
 import {
   recipientAddressVariants,
   isRecipientNotAllowedError,
+  isDialablePhone,
 } from '@/lib/whatsapp/phone-utils'
+import { isOpaqueMetaId } from '@/lib/whatsapp/meta-api'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import type { SendTimeParams } from '@/lib/whatsapp/template-send-builder'
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body'
@@ -176,31 +174,25 @@ export async function POST(request: Request) {
     let sentCount = 0
     let failedCount = 0
 
-    // One batched lookup for the whole campaign, and only when some
-    // recipient actually needs an anchor — a broadcast of plain numbers
-    // pays nothing for this.
-    const needsAnyQuote = recipients.some((r) =>
-      needsQuotedAnchor(typeof r?.phone === 'string' ? r.phone : ''),
-    )
-    const wamidsByContact = needsAnyQuote
-      ? await recoverInboundWamids(
-          supabase,
-          recipients
-            .map((r) => (typeof r?.contact_id === 'string' ? r.contact_id : ''))
-            .filter((id) => id.length > 0),
-          // `contact_id` came off the request body, so the tenant boundary is
-          // enforced here rather than assumed.
-          accountId,
-        )
-      : new Map<string, string>()
-
     for (const recipient of recipients) {
-      // Only an EMPTY address is undeliverable. This used to additionally
-      // demand `isValidE164(...)`, which rejected every BSUID and @handle —
-      // the exact addresses the Inbox delivers to successfully.
+      // Only a dialable number or an opaque Meta id is a destination. This
+      // used to additionally demand `isValidE164(...)`, which rejected every
+      // BSUID recipient — the exact addresses the Inbox delivers to
+      // successfully.
       const variants = recipientAddressVariants(recipient.phone)
 
-      if (variants.length === 0) {
+      // A bare @handle is rejected here even though it produces a non-empty
+      // variant list. Meta answers `(#100) Invalid parameter` for a text
+      // handle in `to`, and `context.message_id` does not change that:
+      // quoting makes the send a reply, it does not make the handle
+      // addressable. Failing here keeps the local reason instead of risking a
+      // 200 with the message silently dropped. The dashboard resolves these
+      // contacts to their numerical Meta id before calling this endpoint.
+      const addressable =
+        variants.length > 0 &&
+        (isDialablePhone(variants[0]) || isOpaqueMetaId(variants[0]))
+
+      if (!addressable) {
         results.push({
           phone: recipient.phone,
           status: 'failed',
@@ -213,34 +205,6 @@ export async function POST(request: Request) {
       let sentMessageId: string | null = null
       let lastError: string | null = null
 
-      // A bare @handle is not a destination Meta accepts: it answers
-      // (#100) Invalid parameter, or 200 with the message silently dropped.
-      // The one supported route to such a contact is a quoted reply anchored
-      // on a message they actually wrote, so resolve that anchor here.
-      //
-      // Only for the handle bucket. A dialable number needs nothing, and an
-      // opaque Meta id (BSUID / WAID) is addressable on its own — quoting it
-      // would turn an ordinary send into a reply for no reason.
-      const needsQuote = needsQuotedAnchor(recipient.phone)
-
-      let contextMessageId: string | undefined
-      if (needsQuote) {
-        const contactId =
-          typeof recipient.contact_id === 'string' ? recipient.contact_id : ''
-        const wamid = contactId ? wamidsByContact.get(contactId) : undefined
-        if (!wamid) {
-          // Refuse locally rather than fire a request that cannot deliver.
-          results.push({
-            phone: recipient.phone,
-            status: 'failed',
-            error: NO_DELIVERABLE_ADDRESS,
-          })
-          failedCount++
-          continue
-        }
-        contextMessageId = wamid
-      }
-
       for (const variant of variants) {
         try {
           const result = await sendTemplateMessage({
@@ -252,7 +216,6 @@ export async function POST(request: Request) {
             template: templateRow ?? undefined,
             messageParams: recipient.messageParams,
             params: recipient.params ?? [],
-            ...(contextMessageId ? { contextMessageId } : {}),
           })
           sentMessageId = result.messageId
           lastError = null

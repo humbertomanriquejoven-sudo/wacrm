@@ -24,11 +24,12 @@ import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
 import { recipientAddressVariants } from '@/lib/whatsapp/phone-utils';
 import {
   NO_DELIVERABLE_ADDRESS,
-  recoverInboundWamids,
   resolveBroadcastAddress,
   type BroadcastAddress,
   type BroadcastIdentity,
 } from '@/lib/whatsapp/broadcast-address';
+import { isOpaqueMetaId } from '@/lib/whatsapp/meta-api';
+import { isDialablePhone } from '@/lib/whatsapp/phone-utils';
 
 /** Which recipients a resume pass picks up. */
 export type ResumeScope = 'pending' | 'failed' | 'all';
@@ -175,6 +176,70 @@ function resolveRowAddress(row: RecipientRow): BroadcastAddress | null {
  *
  * Throws {@link BroadcastError}; the route maps it.
  */
+/** Columns needed to resolve a destination, newest-schema-first. */
+const RECIPIENT_SELECT_FULL =
+  'id, template_params, contact_id, contact:contacts(phone, wa_id, wa_user_id, username, recipient_id)';
+
+/** Same projection without `recipient_id` (migration 057), for older databases. */
+const RECIPIENT_SELECT_LEGACY =
+  'id, template_params, contact_id, contact:contacts(phone, wa_id, wa_user_id, username)';
+
+/**
+ * PostgREST rejects the WHOLE query with `42703 column ... does not exist` when
+ * any selected column is missing, so an unapplied migration 057 turned every
+ * resume into `500 Failed to load recipients` — the endpoint looked broken
+ * rather than un-migrated.
+ *
+ * Retried once without `recipient_id`. Resolution then falls back to
+ * `wa_id` / `wa_user_id` / history, so the pass still delivers; the only loss
+ * is the alternative-identifier tier.
+ *
+ * The retry is gated on the error actually being a missing-column error, so a
+ * genuine failure (bad filter, network, RLS) is still reported rather than
+ * silently retried and re-reported as the same 500.
+ */
+async function loadRecipients(
+  db: SupabaseClient,
+  broadcastId: string,
+  statuses: readonly string[],
+): Promise<{
+  data: unknown[] | null;
+  error: { message: string } | null;
+}> {
+  const query = (select: string) =>
+    db
+      .from('broadcast_recipients')
+      .select(select)
+      .eq('broadcast_id', broadcastId)
+      .in('status', statuses as string[])
+      // Oldest first, so repeated capped passes chew through the backlog
+      // in a stable order instead of re-picking the same slice.
+      .order('created_at', { ascending: true });
+
+  const first = await query(RECIPIENT_SELECT_FULL);
+
+  const isMissingColumn = (message: string) =>
+    /column .* does not exist|42703|PGRST204|schema cache/i.test(message);
+
+  if (!first.error || !isMissingColumn(first.error.message)) {
+    return {
+      data: (first.data ?? null) as unknown[] | null,
+      error: first.error ? { message: first.error.message } : null,
+    };
+  }
+
+  console.warn(
+    '[broadcast-resume] contacts.recipient_id is absent; retrying without it. Apply migration 057.',
+    first.error.message,
+  );
+
+  const retry = await query(RECIPIENT_SELECT_LEGACY);
+  return {
+    data: (retry.data ?? null) as unknown[] | null,
+    error: retry.error ? { message: retry.error.message } : null,
+  };
+}
+
 export async function planBroadcastResume(
   db: SupabaseClient,
   accountId: string,
@@ -193,16 +258,11 @@ export async function planBroadcastResume(
   }
 
   const statuses = scopeStatuses(scope);
-  const { data: rawRows, error: recError } = await db
-    .from('broadcast_recipients')
-    .select(
-      'id, template_params, contact_id, contact:contacts(phone, wa_id, wa_user_id, username, recipient_id)'
-    )
-    .eq('broadcast_id', broadcastId)
-    .in('status', statuses)
-    // Oldest first, so repeated capped passes chew through the backlog
-    // in a stable order instead of re-picking the same slice.
-    .order('created_at', { ascending: true });
+  const { data: rawRows, error: recError } = await loadRecipients(
+    db,
+    broadcastId,
+    statuses,
+  );
 
   if (recError) {
     console.error('[broadcast-resume] recipient load failed:', recError.message);
@@ -211,42 +271,18 @@ export async function planBroadcastResume(
 
   const rows = (rawRows ?? []) as RecipientRow[];
 
-  // Resolve each row once: the result decides both deliverability and
-  // whether the send needs a quoted anchor.
-  const resolvedById = new Map<string, BroadcastAddress>();
-  for (const row of rows) {
-    const resolved = resolveRowAddress(row);
-    if (resolved) resolvedById.set(row.id, resolved);
-  }
-
-  // Tier C anchors, one batched lookup for the whole pass. A bare @handle is
-  // deliverable only as a quoted reply, so without an inbound message from
-  // this contact there is no way to reach them. Resolved here rather than in
-  // the send loop so an unanchorable handle is stamped failed up front
-  // instead of firing a request Meta answers with "(#100) Invalid parameter".
-  const quoteIds = rows
-    .filter((row) => resolvedById.get(row.id)?.needsQuote)
-    .map((row) => row.contact_id);
-  const wamids = await recoverInboundWamids(db, quoteIds, accountId);
-  const contextByRow = new Map<string, string>();
-  for (const row of rows) {
-    if (!resolvedById.get(row.id)?.needsQuote) continue;
-    const wamid = wamids.get(row.contact_id);
-    if (wamid) contextByRow.set(row.id, wamid);
-  }
-
-  // A recipient with nothing to send to can never send. Stamp it failed now:
+// A recipient with nothing to send to can never send. Stamp it failed now:
   // leaving it 'pending' would keep the broadcast in 'sending' forever, which
   // is the very symptom being fixed.
   const sendable: RecipientRow[] = [];
   const unsendable: string[] = [];
   for (const row of rows) {
-    const resolved = resolvedById.get(row.id);
-    const deliverable =
-      resolved !== undefined &&
+    const resolved = resolveRowAddress(row);
+    const addressable =
+      resolved !== null &&
       recipientAddressVariants(resolved.to).length > 0 &&
-      (!resolved.needsQuote || contextByRow.has(row.id));
-    if (deliverable) sendable.push(row);
+      (isDialablePhone(resolved.to) || isOpaqueMetaId(resolved.to));
+    if (addressable) sendable.push(row);
     else unsendable.push(row.id);
   }
   if (unsendable.length > 0) {
@@ -310,8 +346,6 @@ export async function planBroadcastResume(
     planned: slice.map((row) => ({
       recipientRowId: row.id,
       contactId: row.contact_id,
-      // null for tiers A and B; the anchor for a tier-C handle.
-      contextMessageId: contextByRow.get(row.id) ?? null,
       // Forwarded verbatim. `sanitizePhoneForMeta` used to be applied here,
       // which stripped a BSUID to bare digits and an @handle to whatever few
       // digits it contained — addressing a different recipient than the one

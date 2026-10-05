@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { BroadcastError } from './broadcast-core';
-import { NO_DELIVERABLE_ADDRESS } from './broadcast-address';
 import {
   claimBroadcastDelivery,
   planBroadcastResume,
@@ -122,12 +121,15 @@ interface PlanFixture {
   conversations?: Record<string, unknown>[];
   /** Inbound messages; `message_id` must be set to be usable as an anchor. */
   messages?: Record<string, unknown>[];
+  /** Simulate a database without `contacts.recipient_id` (migration 057). */
+  missingRecipientId?: boolean;
 }
 
 interface PlanWrites {
   statusFilter?: unknown;
   failedIds?: unknown;
   failedUpdate?: Record<string, unknown>;
+  selects?: string[];
 }
 
 /**
@@ -140,10 +142,28 @@ const DEFAULT_INBOUND: Record<string, unknown> = {
 };
 
 function planDb(fx: PlanFixture, writes: PlanWrites = {}): SupabaseClient {
+  writes.selects ??= [];
   return {
     from(table: string) {
+      // Set by `select` and honoured by `then`, so the whole chain stays on
+      // one builder. Returning a second object from `select` would lose the
+      // error: `.eq()` on it hands back the original builder, and the await
+      // would then resolve with data instead of the 42703.
+      let pendingError: { code: string; message: string } | null = null;
       const b: Record<string, unknown> = {
-        select: () => b,
+        select: (cols: string) => {
+          writes.selects!.push(cols);
+          // Simulates a database where migration 057 has not been applied:
+          // PostgREST rejects the whole request rather than nulling one
+          // column, which is what produced "500 Failed to load recipients".
+          if (fx.missingRecipientId && cols.includes('recipient_id')) {
+            pendingError = {
+              code: '42703',
+              message: 'column contacts.recipient_id does not exist',
+            };
+          }
+          return b;
+        },
         eq: () => b,
         not: () => b,
         limit: () => b,
@@ -165,7 +185,10 @@ function planDb(fx: PlanFixture, writes: PlanWrites = {}): SupabaseClient {
           data: fx.config === undefined ? null : fx.config,
           error: null,
         }),
-then: (resolve: (r: { data: unknown[]; error: null }) => unknown) => {
+        then: (resolve: (r: { data: unknown[]; error: null }) => unknown) => {
+          if (pendingError) {
+            return resolve({ data: null, error: pendingError } as never);
+          }
           if (table === 'broadcast_recipients') {
             return resolve({ data: fx.recipients ?? [], error: null });
           }
@@ -223,21 +246,6 @@ function identifierRecipient(
   };
 }
 
-/** A recipient whose only address is a bare @handle (tier C). */
-function handleRecipient(
-  id: string,
-  username: string,
-  contactId: string,
-  params: unknown = ['A123'],
-) {
-  return {
-    id,
-    template_params: params,
-    contact_id: contactId,
-    contact: { phone: 'unknown', username },
-  };
-}
-
 describe('planBroadcastResume', () => {
   it('resumes a BSUID recipient instead of failing it as unphoneable', async () => {
     // The gap this closes: resume read only contacts.phone and gated it on
@@ -270,7 +278,6 @@ describe('planBroadcastResume', () => {
         phone: 'CO.1008477715690681',
         params: ['A123'],
         contactId: 'c-r1',
-        contextMessageId: null,
       },
     ]);
   });
@@ -351,82 +358,17 @@ expect(plan.planned).toEqual([
         phone: '15551234567',
         params: ['A123', 'Friday'],
         contactId: 'c-r1',
-        contextMessageId: null,
       },
       {
         recipientRowId: 'r2',
         phone: '15559876543',
         params: ['B456', 'Monday'],
         contactId: 'c-r2',
-        contextMessageId: null,
       },
     ]);
     expect(plan.accessToken).toBe('decrypted:tok');
     expect(remaining).toBe(0);
     expect(unsendable).toBe(0);
-  });
-
-  it('plans a handle recipient with the WAMID to quote it against', async () => {
-    // Tier C on resume. Without this the handle was either refused (campaign
-    // 4) or sent bare (campaign 3, "(#100)"). The anchor comes from the
-    // contact's own inbound history, resolved during planning so the send
-    // loop has nothing left to decide.
-    const writes: PlanWrites = {};
-    const { plan, unsendable } = await planBroadcastResume(
-      planDb(
-        {
-          broadcast: BROADCAST,
-          config: CONFIG,
-          recipients: [
-            handleRecipient('h1', '@jjuanpablo22222', 'c-h1'),
-          ],
-          conversations: [{ id: 'cv-1', contact_id: 'c-h1' }],
-        },
-        writes,
-      ),
-      'acct-1',
-      'bc-1',
-      'pending',
-    );
-
-    expect(unsendable).toBe(0);
-    expect(plan.planned[0].phone).toBe('@jjuanpablo22222');
-    expect(plan.planned[0].contextMessageId).toBe('wamid-anchor');
-  });
-
-  it('fails a handle recipient with no inbound message to quote', async () => {
-    // Nothing to anchor on means nothing to deliver, so it must be stamped
-    // failed here — NOT sent bare and left to Meta's opaque error, which
-    // either rejects or 200s and silently drops it.
-    const writes: PlanWrites = {};
-    const { plan, unsendable } = await planBroadcastResume(
-      planDb(
-        {
-          broadcast: BROADCAST,
-          config: CONFIG,
-          recipients: [
-            handleRecipient('h2', '@nohistory', 'c-h2'),
-            // A deliverable phone row so the pass itself is still valid.
-            recipient('ok', '15551234567'),
-          ],
-          // A conversation exists, but the contact never wrote in it.
-          conversations: [{ id: 'cv-2', contact_id: 'c-h2' }],
-          messages: [],
-        },
-        writes,
-      ),
-      'acct-1',
-      'bc-1',
-      'pending',
-    );
-
-    expect(unsendable).toBe(1);
-    expect(plan.planned.map((r) => r.recipientRowId)).toEqual(['ok']);
-    expect(writes.failedIds).toEqual(['h2']);
-    expect(writes.failedUpdate).toMatchObject({
-      status: 'failed',
-      error_message: NO_DELIVERABLE_ADDRESS,
-    });
   });
 
   it('scopes to failed rows when retrying, and to both for "all"', async () => {
@@ -522,6 +464,75 @@ expect(plan.planned).toEqual([
     expect(plan.planned).toHaveLength(RESUME_MAX_PER_REQUEST);
     // Surfaced to the caller rather than silently dropped.
     expect(remaining).toBe(25);
+  });
+
+  it('retries without recipient_id when the column is missing', async () => {
+    // PostgREST 42703s the whole projection, so an unapplied migration 057
+    // turned every resume into "500 Failed to load recipients". The pass must
+    // still plan using the remaining identity columns.
+    const writes: PlanWrites = {};
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const { plan, unsendable } = await planBroadcastResume(
+      planDb(
+        {
+          broadcast: BROADCAST,
+          config: CONFIG,
+          missingRecipientId: true,
+          recipients: [
+            identifierRecipient('r1', { phone: 'unknown', wa_id: '1486998326437295' }),
+          ],
+        },
+        writes,
+      ),
+      'acct-1',
+      'bc-1',
+      'pending',
+    );
+
+    expect(unsendable).toBe(0);
+    expect(plan.planned[0].phone).toBe('1486998326437295');
+    // Recipient projections only: full first, then the legacy fallback.
+    const projections = writes.selects!.filter((s) => s.includes('contacts('));
+    expect(projections[0]).toContain('recipient_id');
+    expect(projections[1]).not.toContain('recipient_id');
+    warn.mockRestore();
+  });
+
+  it('does not retry on an unrelated query failure', async () => {
+    // A blanket retry would mask a real error (RLS, bad filter) behind a
+    // second identical failure, so only a missing column triggers the fallback.
+    const writes: PlanWrites = {};
+    const base = planDb(
+      { broadcast: BROADCAST, config: CONFIG, recipients: [recipient('r1', '15551234567')] },
+      writes,
+    );
+    const realFrom = (base as unknown as { from: (t: string) => unknown }).from.bind(base);
+
+    const failing = {
+      from: (table: string) => {
+        if (table !== 'broadcast_recipients') return realFrom(table);
+        const b: Record<string, unknown> = {
+          select: (cols: string) => {
+            writes.selects!.push(cols);
+            return b;
+          },
+          eq: () => b,
+          in: () => b,
+          order: () =>
+            Promise.resolve({ data: null, error: { message: 'permission denied' } }),
+          then: (resolve: (r: unknown) => unknown) =>
+            resolve({ data: null, error: { message: 'permission denied' } }),
+        };
+        return b;
+      },
+    } as unknown as SupabaseClient;
+
+    await expect(
+      planBroadcastResume(failing, 'acct-1', 'bc-1', 'pending'),
+    ).rejects.toThrow('Failed to load recipients');
+    // Exactly one projection attempted: no fallback was requested.
+    expect(writes.selects!.filter((s) => s.includes('contacts('))).toHaveLength(1);
   });
 
   it('404s a broadcast that is not on this account', async () => {
