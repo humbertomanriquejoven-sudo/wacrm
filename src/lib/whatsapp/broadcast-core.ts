@@ -69,6 +69,15 @@ interface PlannedRecipient {
    * history lookup stays scoped to the recipient's own thread.
    */
   contactId: string;
+  /**
+   * The `context.message_id` to quote for a tier-C recipient (a bare
+   * `@handle`, which Meta accepts only as a reply). Null for tiers A and B,
+   * which need no anchor.
+   *
+   * Resolved during planning, not during the send loop, so a handle with no
+   * inbound history is stamped failed before any request goes out.
+   */
+  contextMessageId: string | null;
 }
 
 export interface BroadcastPlan {
@@ -281,22 +290,28 @@ export async function deliverBroadcast(
     // opaque id, manufactures neighbours like 'CO.01008477715690681' by
     // injecting trunk zeros. An id has exactly one form and must be sent
     // verbatim.
-    const variants = recipientAddressVariants(recipient.phone);
-    if (variants.length === 0) continue;
-    let sentMessageId: string | null = null;
-    let lastError: string | null = null;
+const variants = recipientAddressVariants(recipient.phone);
+      if (variants.length === 0) continue;
+      let sentMessageId: string | null = null;
+      let lastError: string | null = null;
 
-    for (const variant of variants) {
-      try {
-        const result = await sendTemplateMessage({
-          phoneNumberId: plan.phoneNumberId,
-          accessToken: plan.accessToken,
-          to: variant,
-          templateName: plan.templateName,
-          language: plan.templateLanguage,
-          template: plan.templateRow ?? undefined,
-          params: recipient.params,
-        });
+      for (const variant of variants) {
+        try {
+          const result = await sendTemplateMessage({
+            phoneNumberId: plan.phoneNumberId,
+            accessToken: plan.accessToken,
+            to: variant,
+            templateName: plan.templateName,
+            language: plan.templateLanguage,
+            template: plan.templateRow ?? undefined,
+            params: recipient.params,
+            // Tier C only: Meta delivers a text handle exclusively as a
+            // quoted reply. Omitting this is what produced "(#100) Invalid
+            // parameter" for @user recipients.
+            ...(recipient.contextMessageId
+              ? { contextMessageId: recipient.contextMessageId }
+              : {}),
+          });
         sentMessageId = result.messageId;
         lastError = null;
         break;

@@ -24,6 +24,7 @@ import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
 import { recipientAddressVariants } from '@/lib/whatsapp/phone-utils';
 import {
   NO_DELIVERABLE_ADDRESS,
+  recoverInboundWamids,
   resolveBroadcastAddress,
   type BroadcastAddress,
   type BroadcastIdentity,
@@ -210,21 +211,43 @@ export async function planBroadcastResume(
 
   const rows = (rawRows ?? []) as RecipientRow[];
 
-  // A recipient whose contact has no usable phone can never send. Stamp
-  // it failed now: leaving it 'pending' would keep the broadcast in
-  // 'sending' forever, which is the very symptom being fixed.
+  // Resolve each row once: the result decides both deliverability and
+  // whether the send needs a quoted anchor.
+  const resolvedById = new Map<string, BroadcastAddress>();
+  for (const row of rows) {
+    const resolved = resolveRowAddress(row);
+    if (resolved) resolvedById.set(row.id, resolved);
+  }
+
+  // Tier C anchors, one batched lookup for the whole pass. A bare @handle is
+  // deliverable only as a quoted reply, so without an inbound message from
+  // this contact there is no way to reach them. Resolved here rather than in
+  // the send loop so an unanchorable handle is stamped failed up front
+  // instead of firing a request Meta answers with "(#100) Invalid parameter".
+  const quoteIds = rows
+    .filter((row) => resolvedById.get(row.id)?.needsQuote)
+    .map((row) => row.contact_id);
+  const wamids = await recoverInboundWamids(db, quoteIds, accountId);
+  const contextByRow = new Map<string, string>();
+  for (const row of rows) {
+    if (!resolvedById.get(row.id)?.needsQuote) continue;
+    const wamid = wamids.get(row.contact_id);
+    if (wamid) contextByRow.set(row.id, wamid);
+  }
+
+  // A recipient with nothing to send to can never send. Stamp it failed now:
+  // leaving it 'pending' would keep the broadcast in 'sending' forever, which
+  // is the very symptom being fixed.
   const sendable: RecipientRow[] = [];
   const unsendable: string[] = [];
   for (const row of rows) {
-    // An empty address is the ONLY undeliverable case — the same rule the
-    // sender applies. `isValidE164` used to be the gate here, which threw
-    // away every BSUID and @handle recipient.
-    const resolved = resolveRowAddress(row);
-    if (resolved && recipientAddressVariants(resolved.to).length > 0) {
-      sendable.push(row);
-    } else {
-      unsendable.push(row.id);
-    }
+    const resolved = resolvedById.get(row.id);
+    const deliverable =
+      resolved !== undefined &&
+      recipientAddressVariants(resolved.to).length > 0 &&
+      (!resolved.needsQuote || contextByRow.has(row.id));
+    if (deliverable) sendable.push(row);
+    else unsendable.push(row.id);
   }
   if (unsendable.length > 0) {
     await db
@@ -287,6 +310,8 @@ export async function planBroadcastResume(
     planned: slice.map((row) => ({
       recipientRowId: row.id,
       contactId: row.contact_id,
+      // null for tiers A and B; the anchor for a tier-C handle.
+      contextMessageId: contextByRow.get(row.id) ?? null,
       // Forwarded verbatim. `sanitizePhoneForMeta` used to be applied here,
       // which stripped a BSUID to bare digits and an @handle to whatever few
       // digits it contained — addressing a different recipient than the one

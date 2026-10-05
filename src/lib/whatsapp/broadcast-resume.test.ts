@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { BroadcastError } from './broadcast-core';
+import { NO_DELIVERABLE_ADDRESS } from './broadcast-address';
 import {
   claimBroadcastDelivery,
   planBroadcastResume,
@@ -117,6 +118,10 @@ interface PlanFixture {
   recipients?: Record<string, unknown>[];
   config?: Record<string, unknown> | null;
   templates?: Record<string, unknown>[];
+  /** Inbound thread rows, for the tier-C WAMID lookup. */
+  conversations?: Record<string, unknown>[];
+  /** Inbound messages; `message_id` must be set to be usable as an anchor. */
+  messages?: Record<string, unknown>[];
 }
 
 interface PlanWrites {
@@ -125,12 +130,23 @@ interface PlanWrites {
   failedUpdate?: Record<string, unknown>;
 }
 
+/**
+ * WAMID lookup defaults to one inbound message in `cv-1`, so a tier-C
+ * recipient resolves an anchor without every fixture spelling it out.
+ */
+const DEFAULT_INBOUND: Record<string, unknown> = {
+  conversation_id: 'cv-1',
+  message_id: 'wamid-anchor',
+};
+
 function planDb(fx: PlanFixture, writes: PlanWrites = {}): SupabaseClient {
   return {
     from(table: string) {
       const b: Record<string, unknown> = {
         select: () => b,
         eq: () => b,
+        not: () => b,
+        limit: () => b,
         order: () => b,
         in: (col: string, vals: unknown) => {
           if (col === 'status') writes.statusFilter = vals;
@@ -149,12 +165,18 @@ function planDb(fx: PlanFixture, writes: PlanWrites = {}): SupabaseClient {
           data: fx.config === undefined ? null : fx.config,
           error: null,
         }),
-        then: (resolve: (r: { data: unknown[]; error: null }) => unknown) => {
+then: (resolve: (r: { data: unknown[]; error: null }) => unknown) => {
           if (table === 'broadcast_recipients') {
             return resolve({ data: fx.recipients ?? [], error: null });
           }
           if (table === 'message_templates') {
             return resolve({ data: fx.templates ?? [], error: null });
+          }
+          if (table === 'conversations') {
+            return resolve({ data: fx.conversations ?? [], error: null });
+          }
+          if (table === 'messages') {
+            return resolve({ data: fx.messages ?? [DEFAULT_INBOUND], error: null });
           }
           return resolve({ data: [], error: null });
         },
@@ -177,9 +199,10 @@ function recipient(
   phone: string | null,
   params: unknown = ['A123'],
 ) {
-  return {
+return {
     id,
     template_params: params,
+    contact_id: `c-${id}`,
     contact: phone ? { phone } : null,
   };
 }
@@ -190,7 +213,29 @@ function identifierRecipient(
   contact: Record<string, string>,
   params: unknown = ['A123'],
 ) {
-  return { id, template_params: params, contact };
+  return {
+    id,
+    template_params: params,
+    // Real rows always carry this; it is what scopes the tier-C WAMID
+    // lookup, so it cannot be undefined here.
+    contact_id: contact.id ?? `c-${id}`,
+    contact,
+  };
+}
+
+/** A recipient whose only address is a bare @handle (tier C). */
+function handleRecipient(
+  id: string,
+  username: string,
+  contactId: string,
+  params: unknown = ['A123'],
+) {
+  return {
+    id,
+    template_params: params,
+    contact_id: contactId,
+    contact: { phone: 'unknown', username },
+  };
 }
 
 describe('planBroadcastResume', () => {
@@ -224,6 +269,8 @@ describe('planBroadcastResume', () => {
         recipientRowId: 'r1',
         phone: 'CO.1008477715690681',
         params: ['A123'],
+        contactId: 'c-r1',
+        contextMessageId: null,
       },
     ]);
   });
@@ -298,21 +345,88 @@ describe('planBroadcastResume', () => {
     // Phones are stored sanitized (no leading '+'), same as the shape
     // createBroadcast plans — deliverBroadcast feeds them to
     // phoneVariants from here.
-    expect(plan.planned).toEqual([
+expect(plan.planned).toEqual([
       {
         recipientRowId: 'r1',
         phone: '15551234567',
         params: ['A123', 'Friday'],
+        contactId: 'c-r1',
+        contextMessageId: null,
       },
       {
         recipientRowId: 'r2',
         phone: '15559876543',
         params: ['B456', 'Monday'],
+        contactId: 'c-r2',
+        contextMessageId: null,
       },
     ]);
     expect(plan.accessToken).toBe('decrypted:tok');
     expect(remaining).toBe(0);
     expect(unsendable).toBe(0);
+  });
+
+  it('plans a handle recipient with the WAMID to quote it against', async () => {
+    // Tier C on resume. Without this the handle was either refused (campaign
+    // 4) or sent bare (campaign 3, "(#100)"). The anchor comes from the
+    // contact's own inbound history, resolved during planning so the send
+    // loop has nothing left to decide.
+    const writes: PlanWrites = {};
+    const { plan, unsendable } = await planBroadcastResume(
+      planDb(
+        {
+          broadcast: BROADCAST,
+          config: CONFIG,
+          recipients: [
+            handleRecipient('h1', '@jjuanpablo22222', 'c-h1'),
+          ],
+          conversations: [{ id: 'cv-1', contact_id: 'c-h1' }],
+        },
+        writes,
+      ),
+      'acct-1',
+      'bc-1',
+      'pending',
+    );
+
+    expect(unsendable).toBe(0);
+    expect(plan.planned[0].phone).toBe('@jjuanpablo22222');
+    expect(plan.planned[0].contextMessageId).toBe('wamid-anchor');
+  });
+
+  it('fails a handle recipient with no inbound message to quote', async () => {
+    // Nothing to anchor on means nothing to deliver, so it must be stamped
+    // failed here — NOT sent bare and left to Meta's opaque error, which
+    // either rejects or 200s and silently drops it.
+    const writes: PlanWrites = {};
+    const { plan, unsendable } = await planBroadcastResume(
+      planDb(
+        {
+          broadcast: BROADCAST,
+          config: CONFIG,
+          recipients: [
+            handleRecipient('h2', '@nohistory', 'c-h2'),
+            // A deliverable phone row so the pass itself is still valid.
+            recipient('ok', '15551234567'),
+          ],
+          // A conversation exists, but the contact never wrote in it.
+          conversations: [{ id: 'cv-2', contact_id: 'c-h2' }],
+          messages: [],
+        },
+        writes,
+      ),
+      'acct-1',
+      'bc-1',
+      'pending',
+    );
+
+    expect(unsendable).toBe(1);
+    expect(plan.planned.map((r) => r.recipientRowId)).toEqual(['ok']);
+    expect(writes.failedIds).toEqual(['h2']);
+    expect(writes.failedUpdate).toMatchObject({
+      status: 'failed',
+      error_message: NO_DELIVERABLE_ADDRESS,
+    });
   });
 
   it('scopes to failed rows when retrying, and to both for "all"', async () => {
@@ -456,3 +570,6 @@ describe('planBroadcastResume', () => {
     expect(plan.templateRow?.language).toBe('en');
   });
 });
+
+
+

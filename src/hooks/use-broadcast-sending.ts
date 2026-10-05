@@ -11,6 +11,7 @@ import {
   NO_DELIVERABLE_ADDRESS,
   persistRecoveredAddress,
   recoverAddressesFromHistory,
+  recoverInboundWamids,
   resolveBroadcastAddress,
 } from '@/lib/whatsapp/broadcast-address';
 import { Contact, MessageTemplate } from '@/types';
@@ -510,6 +511,16 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
           batchContacts,
         );
 
+        // Tier C anchors: one batched lookup for every contact that resolved
+        // to a bare @handle. A handle is deliverable only as a quoted reply,
+        // so a contact with no inbound history is undeliverable — decided
+        // here, before any request goes to Meta, so the local reason stands
+        // instead of Meta's opaque "(#100)".
+        const quoteCandidates = batchContacts
+          .filter((c) => resolveBroadcastAddress(c, recovered.get(c.id))?.needsQuote)
+          .map((c) => c.id);
+        const wamids = await recoverInboundWamids(supabase, quoteCandidates);
+
         /**
          * recipientRowId → the address actually handed to Meta. Kept so
          * the result lookup below matches on the SAME value that went
@@ -539,11 +550,20 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
 
           const address = resolveBroadcastAddress(contact, recovered.get(contact.id));
           if (!address) {
-            // The contact carries nothing numeric: no dialable phone and no
-            // Meta id on the row or anywhere in its own history. A text
-            // @username is deliberately NOT used as a fallback here — Meta
-            // cannot deliver a template to one, which is what produced
-            // campaign 3's "(#100) Invalid parameter".
+            // Tier D: no number, no Meta id, no handle. Nothing here can ever
+            // be delivered to, so it is failed locally rather than fired at
+            // Meta to produce an opaque error.
+            undeliverable.push({
+              id: row.id,
+              error: `${NO_DELIVERABLE_ADDRESS} (contact ${contact.id})`,
+            });
+            continue;
+          }
+
+          // Tier C: the handle is the destination, but only as a quote
+          // anchored on a message this contact actually wrote. Without one
+          // there is no way to reach them.
+          if (address.needsQuote && !wamids.get(contact.id)) {
             undeliverable.push({
               id: row.id,
               error: `${NO_DELIVERABLE_ADDRESS} (contact ${contact.id})`,

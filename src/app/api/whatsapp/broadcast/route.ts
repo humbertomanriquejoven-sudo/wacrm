@@ -188,6 +188,9 @@ export async function POST(request: Request) {
           recipients
             .map((r) => (typeof r?.contact_id === 'string' ? r.contact_id : ''))
             .filter((id) => id.length > 0),
+          // `contact_id` came off the request body, so the tenant boundary is
+          // enforced here rather than assumed.
+          accountId,
         )
       : new Map<string, string>()
 
