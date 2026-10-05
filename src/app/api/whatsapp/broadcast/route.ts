@@ -3,6 +3,7 @@ import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
 import {
   needsQuotedAnchor,
+  NO_DELIVERABLE_ADDRESS,
   recoverInboundWamids,
 } from '@/lib/whatsapp/broadcast-address'
 import {
@@ -200,7 +201,7 @@ export async function POST(request: Request) {
         results.push({
           phone: recipient.phone,
           status: 'failed',
-          error: 'Missing recipient address',
+          error: NO_DELIVERABLE_ADDRESS,
         })
         failedCount++
         continue
@@ -229,7 +230,7 @@ export async function POST(request: Request) {
           results.push({
             phone: recipient.phone,
             status: 'failed',
-            error: 'Requires phone number or previous inbound message',
+            error: NO_DELIVERABLE_ADDRESS,
           })
           failedCount++
           continue

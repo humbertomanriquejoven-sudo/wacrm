@@ -20,7 +20,6 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { isOpaqueMetaId } from './meta-api';
 import {
   isDialablePhone,
-  normalizeUsername,
   passthroughMetaId,
   toDialable,
 } from './phone-utils'
@@ -65,6 +64,73 @@ export function normalizeToE164(raw: string | null | undefined): string | null {
     return `${DEFAULT_COUNTRY_CODE}${digits}`;
   }
   return digits;
+}
+
+/**
+ * The one reason a recipient cannot be sent to, stated in full.
+ *
+ * Meta answers a non-numeric destination with `(#100) Invalid parameter` -
+ * or worse, HTTP 200 with the message silently dropped, which marks the
+ * recipient sent while nobody received it. Naming both possibilities locally
+ * is what makes a failed campaign diagnosable without guessing at Meta's
+ * error.
+ */
+export const NO_DELIVERABLE_ADDRESS =
+  'No valid phone or BSUID in contact history';
+
+/**
+ * Keys Meta uses to disclose a sender's own identifier in a webhook entry.
+ *
+ * `wa_id`/`from`/`user_id` are the sender's address; `lid` is the
+ * directory-scoped id. All are validated by `passthroughMetaId`, so a
+ * display name or `phone_number_id` can never be mistaken for one of them.
+ */
+const RAW_PAYLOAD_ID_KEYS = ['wa_id', 'from', 'user_id', 'lid'] as const;
+
+/**
+ * Pull a deliverable numeric identifier out of a stored webhook payload.
+ *
+ * `messages.raw_meta_payload` (migration 052) holds the entry Meta delivered.
+ * The identifiers we care about live at a handful of known keys, and the
+ * depth varies by Cloud API version, so each candidate is read defensively
+ * and validated through `passthroughMetaId`.
+ *
+ * No key is hardcoded to a specific WABA, number or account — these are the
+ * documented field names Meta uses for every sender — and a payload that
+ * holds nothing usable returns null rather than a guess.
+ */
+export function metaIdFromRawPayload(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object') return null;
+
+  const visit = (node: unknown, depth: number): string | null => {
+    if (!node || typeof node !== 'object' || depth > 4) return null;
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const hit = visit(item, depth + 1);
+        if (hit) return hit;
+      }
+      return null;
+    }
+    const record = node as Record<string, unknown>;
+    for (const key of RAW_PAYLOAD_ID_KEYS) {
+      const value = record[key];
+      if (typeof value === 'string') {
+        const id = passthroughMetaId(value);
+        if (id) return id;
+      }
+    }
+    // `contacts[0]` is where Meta nests the sender identity; recursing covers
+    // both the flat and the nested shape.
+    for (const value of Object.values(record)) {
+      if (value && typeof value === 'object') {
+        const hit = visit(value, depth + 1);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  };
+
+  return visit(payload, 0);
 }
 
 /**
@@ -125,11 +191,18 @@ export interface BroadcastAddress {
  * (`recipient-resolver.ts`) step for step, in the same priority order:
  *
  *   1. a dialable number on the contact row;
- *   2. a real number recovered from the contact's OWN message history;
+ *   2. a real number OR a numeric BSUID recovered from the contact's OWN
+ *      message history (`sender_phone`, then `raw_meta_payload`);
  *   3. `wa_id` — the id Meta used as the inbound `from`;
  *   4. `wa_user_id`, or a legacy `phone` that still holds a BSUID;
  *   5. `recipient_id`;
- *   6. `username` as `@handle`.
+ *
+ * A bare `@username` is NOT a destination. `contacts.username` is kept as a
+ * display detail only: a template cannot be delivered to a text handle, so
+ * returning one made every such recipient a guaranteed `(#100)`. Only
+ * something numeric — a phone in E.164 form, or a real Meta id — is a valid
+ * `to`, which is what keeps this generic: the test is the shape of the
+ * value, never which contact produced it.
  *
  * Steps 3-6 exist because a sender who has never messaged from a registered
  * number has no phone number *anywhere* in the database — Meta discloses a
@@ -167,10 +240,12 @@ export function resolveBroadcastAddress(
   const recipientId = passthroughMetaId(contact.recipient_id);
   if (recipientId) return { to: recipientId, isPhone: false };
 
-  // 6. The public handle, as `@user`.
-  const handle = normalizeUsername(contact.username);
-  if (handle) return { to: handle, isPhone: false };
-
+  // 6. Nothing numeric is left. A bare `@handle` is deliberately NOT
+  //    returned: a template cannot be delivered to a text handle, so sending
+  //    one only produces Meta's `(#100) Invalid parameter` — or worse, a
+  //    200 with the message silently dropped, which would mark the recipient
+  //    sent while nobody received it. Failing here keeps the local reason
+  //    instead of Meta's opaque one.
   return null;
 }
 
@@ -243,9 +318,8 @@ export async function recoverAddressesFromHistory(
   // formatting was tuned.
   const { data: msgRows, error: msgError } = await db
     .from('messages')
-    .select('conversation_id, sender_phone')
+    .select('conversation_id, sender_phone, raw_meta_payload')
     .in('conversation_id', conversationIds)
-    .not('sender_phone', 'is', null)
     .order('created_at', { ascending: false })
     .limit(HISTORY_SCAN_LIMIT);
 
@@ -257,20 +331,42 @@ export async function recoverAddressesFromHistory(
     return recovered;
   }
 
-  // Newest-first from the query, so the first dialable hit per thread wins.
-  const phoneByConversation = new Map<string, string>();
+  // Newest-first from the query, so the first usable hit per thread wins.
+  //
+  // A thread yields EITHER a dialable number or a numeric BSUID, and the two
+  // are not interchangeable: a BSUID is not a phone number, so
+  // `toDialable` alone dropped every BSUID-only thread on the floor, which
+  // is exactly the contact shape this function exists to rescue. Both go
+  // through `passthroughMetaId` (which demands an all-digit run of at least
+  // 6 characters or a namespaced id, and returns `null` for the literal
+  // 'unknown'), so no invented or truncated address can enter here.
+  const addressByConversation = new Map<string, string>();
   for (const row of (msgRows ?? []) as Array<{
     conversation_id: string;
     sender_phone: string | null;
+    raw_meta_payload?: unknown;
   }>) {
-    if (phoneByConversation.has(row.conversation_id)) continue;
-    const dialable = toDialable(row.sender_phone);
-    if (dialable) phoneByConversation.set(row.conversation_id, dialable);
+    if (addressByConversation.has(row.conversation_id)) continue;
+
+    // `sender_phone` snapshots whatever Meta disclosed as the inbound
+    // `from`. It is a real number for a registered sender and the BSUID for
+    // an unregistered one, so both classifications are attempted.
+    const fromColumn = toDialable(row.sender_phone) ?? passthroughMetaId(row.sender_phone);
+    if (fromColumn) {
+      addressByConversation.set(row.conversation_id, fromColumn);
+      continue;
+    }
+
+    // Last resort: the ids Meta recorded inside the stored webhook payload.
+    // Only consulted once the dedicated columns came up empty, so it cannot
+    // pre-empt a cleaner value.
+    const fromPayload = metaIdFromRawPayload(row.raw_meta_payload);
+    if (fromPayload) addressByConversation.set(row.conversation_id, fromPayload);
   }
 
   for (const contact of pending) {
     for (const conversationId of convIdsByContact.get(contact.id) ?? []) {
-      const found = phoneByConversation.get(conversationId);
+      const found = addressByConversation.get(conversationId);
       if (found) {
         recovered.set(contact.id, found);
         break;

@@ -23,6 +23,7 @@ import { decrypt } from '@/lib/whatsapp/encryption';
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
 import { recipientAddressVariants } from '@/lib/whatsapp/phone-utils';
 import {
+  NO_DELIVERABLE_ADDRESS,
   resolveBroadcastAddress,
   type BroadcastAddress,
   type BroadcastIdentity,
@@ -230,7 +231,7 @@ export async function planBroadcastResume(
       .from('broadcast_recipients')
       .update({
         status: 'failed',
-        error_message: 'No deliverable address on contact',
+        error_message: NO_DELIVERABLE_ADDRESS,
       })
       .in('id', unsendable);
   }

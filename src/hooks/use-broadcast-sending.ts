@@ -8,6 +8,7 @@ import {
   batchRetryDelayMs,
 } from '@/lib/broadcast-retry';
 import {
+  NO_DELIVERABLE_ADDRESS,
   persistRecoveredAddress,
   recoverAddressesFromHistory,
   resolveBroadcastAddress,
@@ -538,13 +539,14 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
 
           const address = resolveBroadcastAddress(contact, recovered.get(contact.id));
           if (!address) {
+            // The contact carries nothing numeric: no dialable phone and no
+            // Meta id on the row or anywhere in its own history. A text
+            // @username is deliberately NOT used as a fallback here — Meta
+            // cannot deliver a template to one, which is what produced
+            // campaign 3's "(#100) Invalid parameter".
             undeliverable.push({
               id: row.id,
-              error:
-                `No deliverable address for contact ${contact.id} ` +
-                `(phone="${contact.phone ?? ''}", wa_id="${contact.wa_id ?? ''}", ` +
-                `username="${contact.username ?? ''}", ` +
-                `wa_user_id="${contact.wa_user_id ?? ''}") and no sender_phone in its message history`,
+              error: `${NO_DELIVERABLE_ADDRESS} (contact ${contact.id})`,
             });
             continue;
           }

@@ -111,12 +111,16 @@ interface QueryLog {
 /** Fake covering the chains `recoverAddressesFromHistory` and
  *  `persistRecoveredAddress` use:
  *  conversations: from().select().in()  → { data, error }
- *  messages:     from().select().in().not().order().limit() → { data, error }
+ *  messages:     from().select().in().order().limit() → { data, error }
  *  contacts:     from().update().eq()  → { error } */
 function fakeDb(
   log: QueryLog,
   conversations: Array<{ id: string; contact_id: string }>,
-  messages: Array<{ conversation_id: string; sender_phone: string | null }>,
+  messages: Array<{
+    conversation_id: string
+    sender_phone: string | null
+    raw_meta_payload?: unknown
+  }>,
   opts: {
     convError?: string
     msgError?: string
@@ -155,13 +159,8 @@ function fakeDb(
       return {
         select: (cols: string) => {
           log.selects.push(cols)
-          const filters = log.messagesFilters
           const builder = {
             in: () => builder,
-            not: (column: string) => {
-              filters.push({ column, value: 'not-null' })
-              return builder
-            },
             order: () => builder,
             limit: () =>
               Promise.resolve({
@@ -193,13 +192,15 @@ describe('recoverAddressesFromHistory', () => {
       [contact({ username: '@usuario' })],
     )
 
+    // `raw_meta_payload` (migration 052) is real and is consulted as a last
+    // resort, so it is the only addition to the original two columns. The
+    // NULL rows are no longer filtered out in SQL because a row with a null
+    // `sender_phone` can still carry the identifier in its payload.
     const messagesSelect = log.selects.find((s) => s.includes('sender_phone'))
-    expect(messagesSelect).toBe('conversation_id, sender_phone')
-    expect(log.selects.join(' ')).not.toMatch(/whatsapp_id|\baddress\b|\bfrom\b/)
-    // And it must exclude the NULL rows rather than trusting them.
-    expect(log.messagesFilters).toEqual([
-      { column: 'sender_phone', value: 'not-null' },
-    ])
+    expect(messagesSelect).toBe(
+      'conversation_id, sender_phone, raw_meta_payload',
+    )
+    expect(log.selects.join(' ')).not.toMatch(/whatsapp_id|\baddress\b/)
   })
 
   it('recovers the number an @user contact actually wrote from', async () => {
@@ -232,17 +233,74 @@ describe('recoverAddressesFromHistory', () => {
     expect(recovered.size).toBe(0)
   })
 
-  it('skips a BSUID recorded in sender_phone', async () => {
-    // sender_phone snapshots whatever Meta disclosed, which for an
-    // unregistered sender is an identifier — not a dialable number.
+it('recovers a BSUID recorded in sender_phone', async () => {
+    // Previously this was skipped: `toDialable` alone rejected every
+    // identifier, so a contact whose only address is a BSUID resolved to
+    // nothing and was stamped undeliverable. A BSUID is a real `to` value
+    // for Meta, so it is now recovered like a number.
     const log = newLog()
     const recovered = await recoverAddressesFromHistory(
       fakeDb(
         log,
         [{ id: 'conv-1', contact_id: 'contact-1' }],
-        [{ conversation_id: 'conv-1', sender_phone: 'CO.1008477715690681' }],
+        [{ conversation_id: 'conv-1', sender_phone: '1486998326437295' }],
       ),
       [contact({ username: '@usuario' })],
+    )
+
+    expect(recovered.get('contact-1')).toBe('1486998326437295')
+  })
+
+  it('recovers the BSUID nested in a stored webhook payload', async () => {
+    // sender_phone was null for this sender, but migration 052 kept the raw
+    // entry, which is where Meta discloses the id.
+    const log = newLog()
+    const recovered = await recoverAddressesFromHistory(
+      fakeDb(
+        log,
+        [{ id: 'conv-1', contact_id: 'contact-1' }],
+        [
+          {
+            conversation_id: 'conv-1',
+            sender_phone: null,
+            raw_meta_payload: {
+              messages: [
+                {
+                  from: '1486998326437295',
+                  contacts: [{ profile: { name: 'Juan' } }],
+                },
+              ],
+            },
+          },
+        ],
+      ),
+      [contact({ phone: 'unknown', username: '@usuario' })],
+    )
+
+    expect(recovered.get('contact-1')).toBe('1486998326437295')
+  })
+
+  it('never invents an address from a payload holding no identifier', async () => {
+    // A display name and a phone_number_id are not destinations. Returning
+    // one would aim the campaign at an arbitrary number.
+    const log = newLog()
+    const recovered = await recoverAddressesFromHistory(
+      fakeDb(
+        log,
+        [{ id: 'conv-1', contact_id: 'contact-1' }],
+        [
+          {
+            conversation_id: 'conv-1',
+            sender_phone: null,
+            raw_meta_payload: {
+              display_phone: '593123456789',
+              profile: { name: 'Juan Pablo' },
+              metadata: { display_phone_number: '593123456789' },
+            },
+          },
+        ],
+      ),
+      [contact({ phone: 'unknown', username: '@usuario' })],
     )
 
     expect(recovered.size).toBe(0)
@@ -320,11 +378,17 @@ describe('resolveBroadcastAddress', () => {
     expect(resolved).toEqual({ to: '1486998326437295', isPhone: false })
   })
 
-  it('falls back to the @handle last', () => {
-    const resolved = resolveBroadcastAddress(
-      contact({ phone: 'unknown', username: '@jjuanpablo22222' }),
-    )
-    expect(resolved).toEqual({ to: '@jjuanpablo22222', isPhone: false })
+  it('refuses a bare @handle, which no template can be delivered to', () => {
+    // Campaign 3: a text handle was handed to Meta as `to`, which answered
+    // "(#100) Invalid parameter" - or worse, returned 200 and dropped the
+    // message, marking the recipient sent while nobody received it.
+    // A username is a display detail, not a destination, so the resolver
+    // returns null and the caller records the real local reason.
+    expect(
+      resolveBroadcastAddress(
+        contact({ phone: 'unknown', username: '@jjuanpablo22222' }),
+      ),
+    ).toBeNull()
   })
 
   it('never sends to a placeholder', () => {
