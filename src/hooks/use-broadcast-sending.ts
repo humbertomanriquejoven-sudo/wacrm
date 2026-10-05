@@ -7,6 +7,10 @@ import {
   BATCH_SEND_ATTEMPTS,
   batchRetryDelayMs,
 } from '@/lib/broadcast-retry';
+import {
+  contactPhone,
+  recoverAddressesFromHistory,
+} from '@/lib/whatsapp/broadcast-address';
 import { Contact, MessageTemplate } from '@/types';
 
 export type CustomFieldOperator = 'is' | 'is_not' | 'contains';
@@ -85,6 +89,19 @@ interface BroadcastApiResult {
   error?: string;
 }
 
+/**
+ * A `broadcast_recipients` row joined to its contact, as selected in
+ * step 4. Spelled out because the Supabase client is untyped here and
+ * `template_params` / the nested `contact` would otherwise be `any`.
+ */
+interface BroadcastRecipientRow {
+  id: string;
+  contact_id: string;
+  template_params?: string[] | null;
+  /** `null` when the contact row was deleted after the campaign was built. */
+  contact: Contact | null;
+}
+
 /** contactId → (customFieldId → value). */
 type CustomValueIndex = Map<string, Map<string, string>>;
 
@@ -124,62 +141,6 @@ export function resolveVariables(
     // custom_field
     return customValues?.get(v.value) ?? '';
 });
-}
-
-
-/** Extract a valid E.164 phone from a contact, trying the standard fields in order. */
-function extractContactPhone(contact: Contact): string | null {
-  const phone = contact.phone ?? contact.username ?? contact.wa_user_id ?? contact.wa_id ?? null;
-  return phone ? cleanAndNormalizePhone(phone) : null;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Helper functions for broadcast phone normalisation                      */
-/* -------------------------------------------------------------------------- */
-/** Clean a raw phone string: keep only digits, then ensure E.164 with Colombia default. */
-function cleanAndNormalizePhone(raw: string | undefined): string {
-  if (!raw) return '';
-  const digits = raw.replace(/\D/g, '');
-  if (digits.length === 10 || digits.length === 11) return `57${digits}`;
-  return '';
-}
-
-/* -------------------------------------------------------------------------- */
-
-/* -------------------------------------------------------------------------- */
-/* Function to resolve a delivery address for a contact that has no direct phone number.
- * If the contact only has a username/ID, searches the message history
- * in the associated conversation to find the last WhatsApp address used.
- * Returns the cleaned digits or null if nothing found. */
-async function resolveDeliveryAddress(
-  supabase: ReturnType<typeof createClient>,
-  contactId: string,
-  conversationId?: string
-): Promise<string | null> {
-  // 1) If contact has a phone-like field already checked, return it
-  // (caller should have already tried extractContactPhone)
-  // 2) If we have a conversation ID, search the last message's address
-  if (conversationId) {
-    const { data: messages, error } = await supabase
-      .from('messages')
-      .select('address, whatsapp_id, from')
-      .eq('conversation_id', conversationId)
-      .order('created_at', { ascending: false })
-      .limit(1);
-    if (!error && messages && messages.length > 0) {
-      const msg = messages[0];
-      // Prefer whatsapp_id, then from (sender), fallback to address
-      const addr = msg.whatsapp_id ?? msg.from ?? msg.address;
-      if (addr) {
-        const cleaned = addr.replace(/\D/g, '');
-        if (cleaned.length === 10 || cleaned.length === 11) return `57${cleaned}`;
-        if (cleaned.length > 0) return cleaned;
-      }
-    }
-  }
-
-  // 3) No deliverable address found in conversation history
-  return null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -506,12 +467,14 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
 
       // ── Step 4: Fetch recipients back (joined contact) ────────────
       setProgress(30);
-      const { data: recipients, error: recipientsFetchError } = await supabase
+      const { data: recipientData, error: recipientsFetchError } = await supabase
         .from('broadcast_recipients')
         .select('*, contact:contacts(*)')
         .eq('broadcast_id', broadcast.id);
 
-      if (recipientsFetchError || !recipients) {
+      const recipients = (recipientData ?? []) as unknown as BroadcastRecipientRow[];
+
+      if (recipientsFetchError || !recipientData) {
         throw new Error('Failed to fetch broadcast recipients');
       }
 
@@ -534,90 +497,94 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
 for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
         const batch = recipients.slice(i, i + SEND_BATCH_SIZE);
 
-        // Build the Meta recipient list, extracting phone from the contact's
-        // real phone fields (phone / whatsapp_number / mobile) rather than
-        // usernames, chat IDs, or '@' tags.  Invalid phones are resolved
-        // via conversation history and marked 'invalid_phone' in the DB so the
-        // broadcast can continue with only valid numbers.
-        const apiRecipients = batch
-          .filter((r) => r.contact)
-          .flatMap(async (r) => {
-            // 1) Try direct phone fields first
-            let phone = extractContactPhone(r.contact as Contact);
-            
-            // 2) If no phone found, resolve from conversation history or message store
-            if (!phone) {
-              if (r.contact?.conversation_id) {
-                phone = await resolveDeliveryAddress(supabase, r.contact.id, r.contact.conversation_id);
-              }
-              if (!phone) {
-                const { data: latestMessages } = await supabase
-                  .from('messages')
-                  .select('address, whatsapp_id, from')
-                  .eq('contact_id', r.contact.id)
-                  .order('created_at', { ascending: false })
-                  .limit(1);
-                if (latestMessages && latestMessages.length > 0) {
-                  const msg = latestMessages[0] as {
-                    whatsapp_id?: string | null;
-                    from?: string | null;
-                    address?: string | null;
-                  };
-                  const addr = msg.whatsapp_id ?? msg.from ?? msg.address;
-                  if (addr) {
-                    const cleaned = addr.replace(/\D/g, '');
-                    if (cleaned.length === 10 || cleaned.length === 11) phone = `57${cleaned}`;
-                    else if (cleaned.length > 0) phone = cleaned;
-                  }
-                }
-              }
-            }
-            
-            if (!phone) return []; // invalid_phone - skip this recipient
-            
-            return {
-              phone,
-              params: Array.isArray(r.template_params) ? r.template_params : [],
-              ...(messageParams ? { messageParams } : {}),
-            };
-          });
+        // Contacts whose row carries no usable number — the @user / BSUID
+        // case this whole path exists for. Recovered in one batched
+        // lookup per send batch (two queries), not two per recipient.
+        const batchContacts = batch
+          .map((r) => r.contact)
+          .filter((c): c is Contact => Boolean(c));
+        const recovered = await recoverAddressesFromHistory(
+          supabase,
+          batchContacts,
+        );
 
-        // Resolve all promises in the flatMap
-        const resolvedRecipients = await Promise.all(apiRecipients);
-        const apiRecipientsFlat = resolvedRecipients.flat();
+        /**
+         * recipientRowId → the address actually handed to Meta. Kept so
+         * the result lookup below matches on the SAME value that went
+         * into the payload. It used to key on `contact.phone`, which is
+         * null for every recovered address — so a tap that really was
+         * delivered came back unmatched and was written to the DB as
+         * `failed: 'No phone number on contact'`.
+         */
+        const addressByRecipient = new Map<string, string>();
+        const undeliverable: Array<{ id: string; error: string }> = [];
+        const apiRecipients: Array<{
+          phone: string;
+          params: string[];
+          messageParams?: { headerMediaUrl: string };
+        }> = [];
 
-        if (apiRecipientsFlat.length === 0) continue;
-
-      // Mark recipients with no valid phone as 'invalid_phone' in the DB
-      // so the broadcast can continue with only valid numbers.
-      // A recipient is "invalid" only if extractContactPhone returned null
-      // AND resolveDeliveryAddress also returned null.
-      const invalidPhoneIds = recipients
-        .filter((r) => {
-          // Check if the recipient had a contact and we tried to resolve it
-          if (!r.contact) return false;
-          // If extractContactPhone gave us a phone, it's not invalid
-          const directPhone = extractContactPhone(r.contact as Contact);
-          if (directPhone) return false;
-          // If resolveDeliveryAddress was attempted (conversation_id exists) 
-          // and returned null, it's invalid
-          if (r.contact.conversation_id) {
-            // We can't easily check the async result here, so we mark
-            // recipients as invalid_phone if they have a conversation_id
-            // but no phone was ultimately resolved. This is a conservative
-            // approach to ensure no recipient is left without a phone.
-            return true;
+        for (const row of batch) {
+          const contact = row.contact;
+          if (!contact) {
+            undeliverable.push({
+              id: row.id,
+              error: 'Broadcast recipient has no linked contact',
+            });
+            continue;
           }
-          // No conversation_id and no direct phone = invalid
-          return true;
-        })
-        .map((r) => r.id);
-      if (invalidPhoneIds.length > 0) {
-        await supabase
-          .from('broadcast_recipients')
-          .update({ status: 'invalid_phone' })
-          .in('id', invalidPhoneIds);
-      }
+
+          const address = contactPhone(contact) ?? recovered.get(contact.id);
+          if (!address) {
+            undeliverable.push({
+              id: row.id,
+              error:
+                `No deliverable address for contact ${contact.id} ` +
+                `(phone="${contact.phone ?? ''}", username="${contact.username ?? ''}", ` +
+                `wa_user_id="${contact.wa_user_id ?? ''}") and no sender_phone in its message history`,
+            });
+            continue;
+          }
+
+          addressByRecipient.set(row.id, address);
+          apiRecipients.push({
+            phone: address,
+            params: Array.isArray(row.template_params)
+              ? row.template_params.filter((p): p is string => typeof p === 'string')
+              : [],
+            ...(messageParams ? { messageParams } : {}),
+          });
+        }
+
+        // Record the recipients we cannot address BEFORE deciding whether
+        // to send, so they are accounted for even when the whole batch
+        // turns out to be undeliverable.
+        //
+        // Status is 'failed', NOT 'invalid_phone': broadcast_recipients'
+        // CHECK constraint (migration 001) allows only
+        // pending/sent/delivered/read/replied/failed, so 'invalid_phone'
+        // was rejected with a 23514 the code discarded. The rows stayed
+        // 'pending' forever, and since finalizeBroadcastStatus bails out
+        // while any recipient is pending, the campaign hung in 'sending'
+        // indefinitely. 'failed' is both constraint-valid and counted
+        // into failed_count by the aggregate trigger.
+        if (undeliverable.length > 0) {
+          failedCount += undeliverable.length;
+          for (const { id, error } of undeliverable) {
+            const { error: markErr } = await supabase
+              .from('broadcast_recipients')
+              .update({ status: 'failed', error_message: error })
+              .eq('id', id);
+            if (markErr) {
+              console.error(
+                `[broadcast] could not mark recipient ${id} undeliverable:`,
+                markErr.message,
+              );
+            }
+          }
+        }
+
+        if (apiRecipients.length === 0) continue;
 
       try {
           // Send the batch, waiting out a 429 rather than writing the
@@ -654,8 +621,17 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
           }
 
           for (const recipient of batch) {
-            const phone = recipient.contact?.phone;
-            const result = phone ? resultsByPhone.get(phone) : undefined;
+            // Key on the address we SENT, not on the contact's raw
+            // `phone` column. Those differ for every recovered address
+            // (contact.phone null, address from message history) and for
+            // every national number that gained its country code here —
+            // so the old lookup missed, and a delivered template was
+            // recorded as `failed: 'No phone number on contact'`.
+            const address = addressByRecipient.get(recipient.id);
+            const result = address ? resultsByPhone.get(address) : undefined;
+
+            // No address → already accounted for as undeliverable above.
+            if (!address) continue;
 
             if (!result) {
               failedCount++;
@@ -663,7 +639,8 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
                 .from('broadcast_recipients')
                 .update({
                   status: 'failed',
-                  error_message: 'No phone number on contact',
+                  error_message:
+                    'Broadcast API returned no result for this recipient',
                 })
                 .eq('id', recipient.id);
               continue;
@@ -691,7 +668,13 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
             }
           }
         } catch (err) {
+          // Only the recipients that were actually part of this send
+          // attempt. The undeliverable ones were already written as
+          // 'failed' above, and counting them twice would inflate
+          // failedCount past totalRecipients and finalize the campaign
+          // as 'failed' even when every real send went out.
           for (const recipient of batch) {
+            if (!addressByRecipient.has(recipient.id)) continue;
             failedCount++;
             await supabase
               .from('broadcast_recipients')

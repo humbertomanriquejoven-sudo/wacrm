@@ -1,0 +1,162 @@
+/**
+ * Delivery-address resolution for broadcast recipients.
+ *
+ * The dashboard broadcast wizard runs in the browser, so it cannot import
+ * the Inbox's own resolver (`recipient-resolver.ts` pulls in the
+ * service-role client). This module is that same resolution, expressed
+ * against the browser client: the identical query shape, the identical
+ * column, and the identical phone-vs-identifier boundary — both sides
+ * classify through `phone-utils`, so they cannot drift apart again.
+ *
+ * Kept as a standalone module (like `broadcast-retry`) rather than inline
+ * in the hook so it can be unit-tested. That is not incidental: this logic
+ * sat untested inside the hook through five consecutive patch attempts,
+ * each of which changed the number-formatting and left the actual defect —
+ * a query against columns that do not exist — untouched.
+ */
+
+import type { SupabaseClient } from '@supabase/supabase-js';
+
+import { isDialablePhone, toDialable } from './phone-utils';
+import type { Contact } from '@/types';
+
+/**
+ * Country code assumed for a bare national number.
+ *
+ * Applied ONLY to a value that is already phone-shaped and exactly
+ * {@link NATIONAL_NUMBER_DIGITS} long, so it can never be applied to a
+ * value that already carries its own country code.
+ */
+export const DEFAULT_COUNTRY_CODE = '57';
+
+/** Length of a national number with no country code (e.g. a Colombian mobile). */
+export const NATIONAL_NUMBER_DIGITS = 10;
+
+/** How many recent messages to scan when recovering an address. */
+const HISTORY_SCAN_LIMIT = 200;
+
+/**
+ * Normalize a value to the digits-only address Meta expects, or null when
+ * it is not a phone number at all.
+ *
+ * The phone-shape check runs on the WHOLE value before any digit is
+ * inspected, and that ordering is the whole point: `isDialablePhone`
+ * rejects anything that is not `+` / digits / spacing, so an @username
+ * (`@usuario`) and a BSUID (`CO.1008477715690681`) can never be
+ * digit-stripped into a plausible-looking number. Stripping first is what
+ * turned a handle into 10 stray digits and aimed a campaign at a stranger.
+ *
+ * A value that already carries a country code is passed through untouched.
+ * Returns null — never a guess — when nothing dialable is present.
+ */
+export function normalizeToE164(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const value = raw.trim();
+  if (!isDialablePhone(value)) return null;
+
+  const digits = value.replace(/\D/g, '');
+  if (digits.length === NATIONAL_NUMBER_DIGITS) {
+    return `${DEFAULT_COUNTRY_CODE}${digits}`;
+  }
+  return digits;
+}
+
+/**
+ * The address already stored on the contact row, or null.
+ *
+ * Only genuinely numeric fields are consulted. `username` (an @handle) and
+ * `wa_user_id` (an opaque BSUID) are deliberately NOT candidates: a
+ * broadcast `to` field takes a phone number, and handing Meta an
+ * identifier either fails outright or — worse — returns HTTP 200 and
+ * silently drops the message.
+ */
+export function contactPhone(contact: Contact | null | undefined): string | null {
+  if (!contact) return null;
+  return normalizeToE164(contact.phone) ?? normalizeToE164(contact.wa_id);
+}
+
+/**
+ * Recover a real phone number for contacts whose row carries none, from
+ * the address those contacts actually wrote from.
+ *
+ * Mirrors the Inbox's resolver (`recipient-resolver.ts` →
+ * `findPhoneInMessageHistory`) so a broadcast goes to exactly the address
+ * the inbox would reply to: the newest `messages.sender_phone`, restricted
+ * to the contact's own conversations.
+ *
+ * Batched: two queries per send batch rather than two per recipient. A
+ * campaign is 1 000 recipients, so the per-contact shape was the slow path
+ * as well as the broken one.
+ */
+export async function recoverAddressesFromHistory(
+  db: SupabaseClient,
+  contacts: Contact[],
+): Promise<Map<string, string>> {
+  const recovered = new Map<string, string>();
+  const pending = contacts.filter(
+    (c): c is Contact => Boolean(c) && !contactPhone(c),
+  );
+  if (pending.length === 0) return recovered;
+
+  // `messages` has neither contact_id nor account_id: it is reached
+  // through `conversations`. Scoping those ids to THIS contact is the
+  // isolation boundary — another contact's thread must never be consulted,
+  // or a number belonging to a different person receives the campaign.
+  const { data: convRows } = await db
+    .from('conversations')
+    .select('id, contact_id')
+    .in(
+      'contact_id',
+      pending.map((c) => c.id),
+    );
+
+  const convIdsByContact = new Map<string, string[]>();
+  for (const row of (convRows ?? []) as Array<{
+    id: string;
+    contact_id: string;
+  }>) {
+    const list = convIdsByContact.get(row.contact_id) ?? [];
+    list.push(row.id);
+    convIdsByContact.set(row.contact_id, list);
+  }
+
+  const conversationIds = [...new Set([...convIdsByContact.values()].flat())];
+  if (conversationIds.length === 0) return recovered;
+
+  // `sender_phone` (migration 050) is the ONLY column on `messages` that
+  // holds the address Meta used. This query previously selected `address`,
+  // `whatsapp_id` and `from` — none of which exist on the table — so
+  // PostgREST rejected every one of them with a 400, `data` came back
+  // null, and the lookup silently resolved to nothing. That is why @user
+  // recipients were reported undeliverable no matter how the number
+  // formatting was tuned.
+  const { data: msgRows } = await db
+    .from('messages')
+    .select('conversation_id, sender_phone')
+    .in('conversation_id', conversationIds)
+    .not('sender_phone', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(HISTORY_SCAN_LIMIT);
+
+  // Newest-first from the query, so the first dialable hit per thread wins.
+  const phoneByConversation = new Map<string, string>();
+  for (const row of (msgRows ?? []) as Array<{
+    conversation_id: string;
+    sender_phone: string | null;
+  }>) {
+    if (phoneByConversation.has(row.conversation_id)) continue;
+    const dialable = toDialable(row.sender_phone);
+    if (dialable) phoneByConversation.set(row.conversation_id, dialable);
+  }
+
+  for (const contact of pending) {
+    for (const conversationId of convIdsByContact.get(contact.id) ?? []) {
+      const found = phoneByConversation.get(conversationId);
+      if (found) {
+        recovered.set(contact.id, found);
+        break;
+      }
+    }
+  }
+  return recovered;
+}
