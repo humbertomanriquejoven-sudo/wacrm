@@ -2,17 +2,43 @@ import { describe, it, expect, vi } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   createBroadcast,
+  deliverBroadcast,
   finalizeBroadcastStatus,
   BroadcastError,
+  type BroadcastPlan,
 } from './broadcast-core';
+import type { MessageTemplate } from '@/types';
 
 // Contact resolution and token decryption are exercised elsewhere — stub
 // them so these tests focus on the persistence boundary.
 vi.mock('@/lib/whatsapp/encryption', () => ({
   decrypt: () => 'plain-access-token',
 }));
+
+// The Inbox mirror renders the template body with each recipient's frozen
+// params, so record what it was handed.
+vi.mock('@/lib/whatsapp/template-body', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('@/lib/whatsapp/template-body')>();
+  return {
+    ...actual,
+    templateContentText: (
+      row: Parameters<typeof actual.templateContentText>[0],
+      params: string[],
+    ) => actual.templateContentText(row, params) ?? `fallback:${params.join(',')}`,
+  };
+});
 vi.mock('@/lib/api/v1/contacts', () => ({
   findOrCreateContact: vi.fn(async () => ({ id: 'c1' })),
+}));
+
+// deliverBroadcast fans out through this; stub the transport so the
+// mirroring assertions are about the DB side only.
+const sendTemplateMessageMock = vi.hoisted(() =>
+  vi.fn(async () => ({ messageId: 'wamid.OUT1' })),
+);
+vi.mock('@/lib/whatsapp/meta-api', () => ({
+  sendTemplateMessage: sendTemplateMessageMock,
 }));
 
 // These assertions all fire in the pure validation prologue, before
@@ -118,8 +144,15 @@ describe('createBroadcast atomicity (#370)', () => {
     expect(calls.rpc[0].name).toBe('create_broadcast_with_recipients');
     expect(calls.usedDirectInsert).toBe(0);
     expect(plan.broadcastId).toBe('b-1');
+    // `contactId` rides along so deliverBroadcast can mirror each send into
+    // that recipient's own Inbox thread.
     expect(plan.planned).toEqual([
-      { recipientRowId: 'r-1', phone: '14155550123', params: [] },
+      {
+        recipientRowId: 'r-1',
+        contactId: 'c1',
+        phone: '14155550123',
+        params: [],
+      },
     ]);
   });
 
@@ -216,5 +249,186 @@ describe('finalizeBroadcastStatus', () => {
       'b-1',
     );
     expect(writes.update?.status).toBe('sent');
+  });
+});
+
+// ============================================================
+// Inbox mirroring — every recipient shape, no per-contact special cases.
+// ============================================================
+
+// `body_text` is the column `templateContentText` renders.
+const TEMPLATE_ROW = {
+  body_text: 'Hola {{1}}, tu cita es {{2}}',
+} as unknown as MessageTemplate;
+
+/** Records every messages/conversations write, and the conversation lookup. */
+function mirrorDb(opts: {
+  conversationId?: string | null;
+  insertError?: { message: string } | null;
+}) {
+  const log = {
+    messagesInserts: [] as Record<string, unknown>[],
+    conversationUpdates: [] as Record<string, unknown>[],
+    recipientUpdates: [] as Record<string, unknown>[],
+    lookups: [] as Array<Record<string, unknown>>,
+  };
+
+  const db = {
+    from: (table: string) => {
+      if (table === 'conversations') {
+        return {
+          select: () => {
+            // select -> eq(account_id) -> eq(contact_id) -> order -> limit
+            // -> maybeSingle; each filter logs and returns the same builder.
+            const done = () => ({
+              maybeSingle: () =>
+                Promise.resolve({
+                  data:
+                    opts.conversationId === null
+                      ? null
+                      : { id: opts.conversationId ?? 'conv-1' },
+                  error: null,
+                }),
+            });
+            const b: Record<string, unknown> = {
+              eq: (c: string, v: unknown) => {
+                log.lookups.push({ [c]: v });
+                return b;
+              },
+              order: () => ({ limit: () => done() }),
+              limit: () => done(),
+              maybeSingle: () => done(),
+            };
+            return b;
+          },
+          update: (row: Record<string, unknown>) => {
+            log.conversationUpdates.push(row);
+            return { eq: () => Promise.resolve({ data: null, error: null }) };
+          },
+        };
+      }
+      if (table === 'messages') {
+        return {
+          insert: (row: Record<string, unknown>) => {
+            log.messagesInserts.push(row);
+            return Promise.resolve({ data: null, error: opts.insertError ?? null });
+          },
+        };
+      }
+      // broadcast_recipients status stamping, and the pending-count probe
+      // finalizeBroadcastStatus runs at the end of the pass.
+      // broadcast_recipients status stamping, plus the exact-count probes
+      // finalizeBroadcastStatus runs to close the campaign out.
+      return {
+        update: (row: Record<string, unknown>) => {
+          log.recipientUpdates.push(row);
+          const b: Record<string, unknown> = {
+            eq: () => Promise.resolve({ data: null, error: null }),
+            in: () => Promise.resolve({ data: null, error: null }),
+          };
+          return b;
+        },
+        select: () => {
+          const b: Record<string, unknown> = {
+            eq: () => b,
+            in: () => Promise.resolve({ count: 0, error: null, data: null }),
+          };
+          return b;
+        },
+      };
+    },
+  } as unknown as SupabaseClient;
+
+  return { db, log };
+}
+
+function mirrorPlan(
+  phone: string,
+  params: string[],
+  contactId = 'c-generic'
+): BroadcastPlan {
+  return {
+    broadcastId: 'b-1',
+    templateName: 'promo',
+    templateLanguage: 'es',
+    phoneNumberId: 'pn-1',
+    accessToken: 'token',
+    accountId: 'acct-1',
+    templateRow: TEMPLATE_ROW,
+    planned: [{ recipientRowId: 'r-1', phone, params, contactId }],
+    rejected: 0,
+  };
+}
+
+describe('deliverBroadcast Inbox mirroring', () => {
+  it('mirrors a send for an E.164 recipient into that contact thread', async () => {
+    const { db, log } = mirrorDb({});
+
+    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana', 'mar 10']));
+
+    // No `direction` / `metadata` columns exist on `messages`; naming
+    // either makes PostgREST reject the insert with 42703.
+    expect(log.messagesInserts[0]).toMatchObject({
+      conversation_id: 'conv-1',
+      sender_type: 'agent',
+      content_type: 'template',
+      content_text: 'Hola Ana, tu cita es mar 10',
+      template_name: 'promo',
+      message_id: 'wamid.OUT1',
+      status: 'sent',
+    });
+    expect(log.messagesInserts[0]).not.toHaveProperty('direction');
+    expect(log.messagesInserts[0]).not.toHaveProperty('metadata');
+  });
+
+  it('mirrors a BSUID recipient identically, resolved by contact only', async () => {
+    // The point of the requirement: no branch on the address shape. An
+    // opaque id and a number differ only in the string sent to Meta.
+    const { db, log } = mirrorDb({});
+
+    await deliverBroadcast(db, mirrorPlan('CO.1008477715690681', ['Ana']));
+
+    // The thread is located by contact identity alone, never by the
+    // address string, so no BSUID/phone special case can creep in here.
+    expect(log.lookups).toEqual([
+      { account_id: 'acct-1' },
+      { contact_id: 'c-generic' },
+    ]);
+    // Under-supplied params leave later placeholders untouched — a faithful
+    // mirror of what was sent, not a crash or a blank row.
+    expect(log.messagesInserts[0]).toMatchObject({
+      conversation_id: 'conv-1',
+      content_text: 'Hola Ana, tu cita es {{2}}',
+      message_id: 'wamid.OUT1',
+    });
+  });
+
+  it('never stamps a recipient sent when Meta rejected it', async () => {
+    const { db, log } = mirrorDb({});
+    sendTemplateMessageMock.mockRejectedValueOnce(new Error('(#100) Invalid parameter'));
+
+    await deliverBroadcast(db, mirrorPlan('bad-address', ['Ana']));
+
+    expect(log.messagesInserts).toHaveLength(0);
+    expect(log.recipientUpdates[0]).toMatchObject({ status: 'failed' });
+  });
+
+  it('keeps the send successful when the Inbox insert fails', async () => {
+    // Meta already accepted the message. Reporting a send failure here
+    // would re-queue it and deliver twice.
+    const { db, log } = mirrorDb({ insertError: { message: 'boom' } });
+
+    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana']));
+
+    expect(log.recipientUpdates[0]).toMatchObject({ status: 'sent' });
+  });
+
+  it('skips mirroring when the recipient has no conversation yet', async () => {
+    const { db, log } = mirrorDb({ conversationId: null });
+
+    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana']));
+
+    expect(log.messagesInserts).toHaveLength(0);
+    expect(log.recipientUpdates[0]).toMatchObject({ status: 'sent' });
   });
 });

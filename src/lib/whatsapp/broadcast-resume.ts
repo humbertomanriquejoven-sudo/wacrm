@@ -123,6 +123,8 @@ export interface ResumePlan {
 interface RecipientRow {
   id: string;
   template_params: unknown;
+  /** Needed to mirror each send into the right Inbox thread. */
+  contact_id: string;
   contact:
     | {
         phone?: string | null;
@@ -192,7 +194,7 @@ export async function planBroadcastResume(
   const { data: rawRows, error: recError } = await db
     .from('broadcast_recipients')
     .select(
-      'id, template_params, contact:contacts(phone, wa_id, wa_user_id, username, recipient_id)'
+      'id, template_params, contact_id, contact:contacts(phone, wa_id, wa_user_id, username, recipient_id)'
     )
     .eq('broadcast_id', broadcastId)
     .in('status', statuses)
@@ -279,9 +281,11 @@ export async function planBroadcastResume(
     templateLanguage: resolvedTemplate.language,
     phoneNumberId: config.phone_number_id,
     accessToken: decrypt(config.access_token),
+    accountId,
     templateRow: resolvedTemplate.row,
     planned: slice.map((row) => ({
       recipientRowId: row.id,
+      contactId: row.contact_id,
       // Forwarded verbatim. `sanitizePhoneForMeta` used to be applied here,
       // which stripped a BSUID to bare digits and an @handle to whatever few
       // digits it contained — addressing a different recipient than the one

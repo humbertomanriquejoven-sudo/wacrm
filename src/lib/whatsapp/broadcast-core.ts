@@ -26,7 +26,10 @@ import {
   recipientAddressVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils';
-import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
+import {
+  resolveTemplateRow,
+  templateContentText,
+} from '@/lib/whatsapp/template-body';
 import type { MessageTemplate } from '@/types';
 import { findOrCreateContact } from '@/lib/api/v1/contacts';
 
@@ -60,6 +63,12 @@ interface PlannedRecipient {
   recipientRowId: string;
   phone: string;
   params: string[];
+  /**
+   * The contact this recipient row belongs to. Carried so the fan-out can
+   * mirror each send into that contact's conversation in the Inbox, and so a
+   * history lookup stays scoped to the recipient's own thread.
+   */
+  contactId: string;
 }
 
 export interface BroadcastPlan {
@@ -68,6 +77,8 @@ export interface BroadcastPlan {
   templateLanguage: string;
   phoneNumberId: string;
   accessToken: string;
+  /** Owning account. Used to scope the Inbox mirror to the right thread. */
+  accountId: string;
   templateRow: MessageTemplate | null;
   planned: PlannedRecipient[];
   /** Phones rejected up front (invalid E.164) — counted as failed. */
@@ -226,7 +237,12 @@ export async function createBroadcast(
   const planned: PlannedRecipient[] = createdRows.map(
     (row: { recipient_id: string; contact_id: string }) => {
       const r = byContact.get(row.contact_id)!;
-      return { recipientRowId: row.recipient_id, phone: r.phone, params: r.params };
+      return {
+        recipientRowId: row.recipient_id,
+        phone: r.phone,
+        params: r.params,
+        contactId: row.contact_id,
+      };
     }
   );
 
@@ -236,6 +252,7 @@ export async function createBroadcast(
     templateLanguage: resolvedTemplate.language,
     phoneNumberId: config.phone_number_id,
     accessToken,
+    accountId,
     templateRow,
     planned,
     rejected,
@@ -301,6 +318,8 @@ export async function deliverBroadcast(
           error_message: null,
         })
         .eq('id', recipient.recipientRowId);
+
+      await mirrorBroadcastSendToInbox(db, plan, recipient, sentMessageId);
     } else {
       await db
         .from('broadcast_recipients')
@@ -313,6 +332,96 @@ export async function deliverBroadcast(
   }
 
   await finalizeBroadcastStatus(db, plan.broadcastId);
+}
+
+/**
+ * Mirror one successful broadcast send into the recipient's own conversation,
+ * so the campaign shows up in the Inbox like any other message.
+ *
+ * Generic by construction: nothing here is keyed to a particular contact,
+ * number or identifier. The conversation is located by `contact_id`, which
+ * is what makes it work for a BSUID recipient and an E.164 recipient alike —
+ * their only difference is the string handed to Meta, already resolved by
+ * `resolveBroadcastAddress` before this runs.
+ *
+ * Best-effort, like the rest of the fan-out: Meta already accepted the
+ * message, so a DB failure here must never be reported as a send failure or
+ * re-queued for a duplicate send. The row is written under the campaign's
+ * own (account_id, contact_id) pairing, so a replayed resume cannot write a
+ * second copy into another account's thread.
+ */
+async function mirrorBroadcastSendToInbox(
+  db: SupabaseClient,
+  plan: BroadcastPlan,
+  recipient: PlannedRecipient,
+  sentMessageId: string
+): Promise<void> {
+  try {
+    // `maybeSingle` on a multi-row match is an error, so the newest thread
+    // is picked with an explicit limit rather than a bare single().
+    const { data: conversation } = await db
+      .from('conversations')
+      .select('id')
+      .eq('account_id', plan.accountId)
+      .eq('contact_id', recipient.contactId)
+      .order('last_message_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!conversation) {
+      // No thread yet: there is nowhere to mirror to, and opening one for an
+      // outbound-only campaign would show an empty conversation per recipient.
+      console.warn(
+        `[broadcast] no conversation for contact ${recipient.contactId}; ` +
+          'send not mirrored to the Inbox',
+      );
+      return;
+    }
+
+    const conversationId = (conversation as { id: string }).id;
+
+    // The template body is rendered with THIS recipient's frozen params, so
+    // the Inbox shows the message the contact actually received.
+    const contentText =
+      templateContentText(plan.templateRow, recipient.params) ??
+      `[template:${plan.templateName}]`;
+
+    // `direction` and `metadata` are NOT columns on `messages`: inbound vs
+    // outbound is `sender_type`, and the template's components have no
+    // column of their own. Naming either here would make PostgREST reject
+    // the insert with 42703 and silently unmirror every send.
+    const { error } = await db.from('messages').insert({
+      conversation_id: conversationId,
+      sender_type: 'agent',
+      content_type: 'template',
+      content_text: contentText,
+      template_name: plan.templateName,
+      message_id: sentMessageId,
+      status: 'sent',
+    });
+
+    if (error) {
+      console.error(
+        `[broadcast] sent to Meta but Inbox insert failed for contact ${recipient.contactId}:`,
+        error.message,
+      );
+      return;
+    }
+
+    await db
+      .from('conversations')
+      .update({
+        last_message_text: contentText,
+        last_message_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', conversationId);
+  } catch (error) {
+    console.error(
+      '[broadcast] Inbox mirror threw after a successful send:',
+      error instanceof Error ? error.message : error,
+    );
+  }
 }
 
 /**
