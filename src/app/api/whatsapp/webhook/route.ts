@@ -935,14 +935,45 @@ async function processMessage(
     })
   }
 
-  // Find or create contact. Resolves on BSUID → phone → username → name,
+  // Find or create contact. Resolves on BSUID -> phone -> username -> name,
   // so a sender we've already seen never gets a second row.
-  const contactOutcome = await findOrCreateContact(accountId, configOwnerUserId, {
-    phone: rawPhone,
-    waUserId: senderUserId,
-    username: senderUsername,
-    name: senderName ?? contact.profile.name,
-  })
+  //
+  // The 4th argument carries the Meta Cloud API v26.0 identity columns
+  // (migration 053). Passing them is what makes `contacts.wa_id` a real
+  // value instead of a permanently NULL column: `resolveBroadcastAddress`
+  // reads that column as a destination tier, so a contact whose only usable
+  // address is a Meta id was undeliverable in broadcasts until this was wired
+  // up. Every field is omitted when the payload doesn't carry a real value —
+  // `wa_id` is literally the string 'unknown' for an unregistered sender, and
+  // persisting THAT would poison the destination tier it feeds and pollute
+  // `idx_contacts_wa_id`, which treats any non-empty value as a real id.
+  const metaIdentity = {
+    // Meta's own id for this contact, verbatim — including the phone-shaped
+    // case, where it merely duplicates `phone`. A phone-shaped `wa_id` is
+    // inert as a destination (`contactPhone` wins first) but it is still the
+    // id Meta used to reach this contact, so that is what the column records.
+    wa_id: trimmedWaId && trimmedWaId !== 'unknown' ? trimmedWaId : undefined,
+    // Our business line that received the message, not the sender's id.
+    phone_number_id: phoneNumberId || undefined,
+    identity_type: classifyIdentityType({
+      phone: rawPhone,
+      opaqueId: senderUserId,
+      waId: trimmedWaId,
+      username: senderUsername,
+    }),
+    display_name: senderName ?? undefined,
+  }
+  const contactOutcome = await findOrCreateContact(
+    accountId,
+    configOwnerUserId,
+    {
+      phone: rawPhone,
+      waUserId: senderUserId,
+      username: senderUsername,
+      name: senderName ?? contact.profile.name,
+    },
+    metaIdentity,
+  )
   if (!contactOutcome) {
     console.error(
       `[webhook] could not resolve or create a contact for ${senderPhone} — dropping message ${message.id} before it reaches the AI.`
@@ -1811,6 +1842,42 @@ function firstOpaqueId(...candidates: Array<string | null | undefined>): string 
     if (isBsuidLike(trimmed)) return trimmed
   }
   return null
+}
+
+/**
+ * Categorize which kind of identifier identifies this sender, for
+ * `contacts.identity_type` (migration 053).
+ *
+ * Ordered by how outbound sends actually route, so the value stored is the
+ * one that would be used as `to`:
+ *   1. a real number          -> PHONE_E164
+ *   2. a LID-shaped id        -> LID      ('123456@lid')
+ *   3. any other opaque id    -> BSUID    (CO.… / WAID.… / bare 16-digit)
+ *   4. a handle only          -> USERNAME
+ *
+ * Returns undefined when the payload identifies the sender by nothing we can
+ * categorize, so the column stays NULL rather than recording a guess.
+ */
+function classifyIdentityType(input: {
+  phone: string | null | undefined
+  opaqueId: string | null | undefined
+  waId: string | null | undefined
+  username: string | null | undefined
+}): 'PHONE_E164' | 'BSUID' | 'USERNAME' | 'LID' | undefined {
+  if (isPhoneLike(input.phone)) return 'PHONE_E164'
+  // Checked before BSUID: a LID is opaque but routes differently, and the two
+  // are indistinguishable once the namespace is stripped.
+  //
+  // The placeholder guard is load-bearing: Meta sends the literal string
+  // 'unknown' in `contacts[].wa_id` for a sender it could not identify, and
+  // that is truthy — classifying on it would record BSUID for a contact that
+  // has no id at all, which is precisely what this column exists to describe.
+  const opaque = [input.opaqueId, input.waId]
+    .map((v) => (v ?? '').trim())
+    .find((v) => v !== '' && v.toLowerCase() !== 'unknown')
+  if (!opaque) return input.username ? 'USERNAME' : undefined
+  if (/@lid\b/i.test(opaque)) return 'LID'
+  return 'BSUID'
 }
 
 /**

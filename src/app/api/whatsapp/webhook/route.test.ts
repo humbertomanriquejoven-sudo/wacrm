@@ -1094,6 +1094,153 @@ describe('inbound webhook: after() awaits automations (#368)', () => {
   })
 })
 
+describe('inbound webhook: Meta identity columns (migration 053)', () => {
+  // `resolveBroadcastAddress` reads `contacts.wa_id` / `recipient_id` as
+  // destination tiers. Those columns are only ever populated if the webhook
+  // hands `findOrCreateContact` the 4th argument — a permanently-NULL column
+  // made those tiers dead code and left id-only contacts undeliverable.
+  it('records the Meta identity columns on a newly created contact', async () => {
+    mockFindExistingContact.mockResolvedValue(null)
+
+    await runWebhook()
+
+    expect(h.state.contactInsertCalls[0]).toMatchObject({
+      // Our business line that received the message, not the sender's id.
+      phone_number_id: 'pn-1',
+      identity_type: 'PHONE_E164',
+      display_name: 'Ada',
+    })
+  })
+
+  it('backfills the identity columns onto an existing contact', async () => {
+    // The row predates migration 053, so every column is still NULL. Without
+    // this backfill the send stays undeliverable forever, because nothing
+    // else in the codebase writes them.
+    mockFindExistingContact.mockResolvedValue({
+      id: 'contact-1',
+      name: 'Ada',
+      phone: '15551230000',
+      wa_id: null,
+      phone_number_id: null,
+      identity_type: null,
+      display_name: null,
+    })
+
+    await runWebhook()
+
+    expect(h.state.contactUpdateCalls[0].patch).toMatchObject({
+      wa_id: '15551230000',
+      phone_number_id: 'pn-1',
+      identity_type: 'PHONE_E164',
+      display_name: 'Ada',
+    })
+  })
+
+  it('never persists the "unknown" placeholder as a wa_id', async () => {
+    // Meta sends the literal string 'unknown' in `contacts[].wa_id` for an
+    // unregistered sender. Storing it would (a) feed `passthroughMetaId` a
+    // non-id and (b) pollute idx_contacts_wa_id, which indexes any non-empty
+    // value as a real id.
+    mockFindExistingContact.mockResolvedValue(null)
+    h.state.existingContactResult = null
+    await POST(bsuidInboundRequest())
+    for (const cb of h.state.afterCallbacks) await cb()
+
+    const insert = h.state.contactInsertCalls[0]
+    expect(insert.wa_id).toBeUndefined()
+    // The BSUID is carried by its own column instead.
+    expect(insert).toMatchObject({
+      wa_user_id: '1008477715690681',
+      identity_type: 'BSUID',
+      phone_number_id: 'pn-1',
+    })
+    // `phone` is NOT NULL and this sender disclosed no number, so the row
+    // legitimately holds the placeholder there — pre-existing behavior, and
+    // precisely why `wa_user_id` has to carry the identity instead.
+    expect(insert.phone).toBe('unknown')
+    // The placeholder must not leak into the identity columns.
+    expect(insert.wa_id).toBeUndefined()
+    expect(JSON.stringify([insert.wa_id, insert.display_name, insert.username])).not.toContain(
+      'unknown',
+    )
+  })
+
+  it('does not clobber identity columns a human already set', async () => {
+    // Backfill only fills gaps. An operator who corrected `display_name` in
+    // the CRM must not see it overwritten by the next inbound message.
+    mockFindExistingContact.mockResolvedValue({
+      id: 'contact-1',
+      name: 'Ana',
+      phone: '15551230000',
+      wa_id: '111222333',
+      phone_number_id: 'pn-legacy',
+      identity_type: 'PHONE_E164',
+      display_name: 'Nombre Manual',
+    })
+
+    await runWebhook()
+
+    const patch = h.state.contactUpdateCalls[0]?.patch
+    for (const column of [
+      'wa_id',
+      'phone_number_id',
+      'identity_type',
+      'display_name',
+    ]) {
+      expect(patch ?? {}).not.toHaveProperty(column)
+    }
+  })
+
+  it('classifies a handle-only sender as USERNAME', async () => {
+    // No number and no opaque id at all: the handle is the only identity, so
+    // the column records that instead of guessing PHONE_E164.
+    const body = {
+      entry: [
+        {
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                metadata: { phone_number_id: 'pn-1' },
+                contacts: [
+                  { wa_id: 'unknown', profile: { name: 'Beto', username: 'beto' } },
+                ],
+                messages: [
+                  {
+                    id: 'wamid.HANDLE1',
+                    from: 'unknown',
+                    timestamp: '1700000000',
+                    type: 'text',
+                    text: { body: 'hola' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    }
+    const req = {
+      text: async () => JSON.stringify(body),
+      headers: { get: () => 'sha256=stub' },
+    } as unknown as Request
+
+    h.state.existingContactResult = null
+    mockFindExistingContact.mockResolvedValue(null)
+    await POST(req)
+    for (const cb of h.state.afterCallbacks) await cb()
+
+    const insert = h.state.contactInsertCalls[0]
+    expect(insert).toMatchObject({
+      username: '@beto',
+      identity_type: 'USERNAME',
+    })
+    expect(insert.wa_id).toBeUndefined()
+    // The handle is never promoted into an address column.
+    expect(insert.wa_user_id).toBeUndefined()
+  })
+})
+
 describe('inbound webhook: contact auto-creation / backfill', () => {
   it('creates a new contact with the WhatsApp profile name and number', async () => {
     mockFindExistingContact.mockResolvedValue(null)
