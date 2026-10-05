@@ -258,36 +258,43 @@ export function resolveBroadcastAddress(
   const phone = contactPhone(contact) ?? normalizeToE164(recovered);
   if (phone) return { to: phone, isPhone: true };
 
-  // The id recovered from the inbound history, tried as a Meta id.
+  // 3. The contact's OWN stored Meta identifiers, in a fixed order:
+  //    wa_id -> recipient_id -> wa_user_id.
   //
-  // This is the tier-C destination. For a contact known only by
-  // `@handle`, Meta's webhook still carried a numerical identifier on the
-  // message they wrote (`sender_phone`, or `wa_id`/`wa_user_id` inside
-  // `raw_meta_payload`). That identifier — NOT the handle — is what Meta
-  // accepts in `to`.
-  //
-  // `recovered` used to be fed only through `normalizeToE164`, which
-  // discards a 15-digit BSUID as "not a phone number". So the recovered id
-  // was thrown away and resolution fell through to the handle, which is
-  // precisely the value Meta rejects.
-  const recoveredId = passthroughMetaId(recovered);
-  if (recoveredId) return { to: recoveredId, isPhone: false };
-
-  // 3. wa_id — checked before the BSUID because it is the address Meta
-  //    actually used to reach this contact.
+  //    These are tried before the history tier on purpose. An id on the
+  //    contact row came from Meta addressing this contact directly, while an
+  //    id dug out of `messages` is inferred from a conversation that may be
+  //    stale, or may have been merged onto this contact from someone else.
+  //    Stored identity outranks inferred identity; when they disagree, the
+  //    row is the one Meta itself wrote.
   const waId = passthroughMetaId(contact.wa_id);
   if (waId) return { to: waId, isPhone: false };
 
-  // 4. BSUID, including the legacy case of one written into `phone`.
+  const recipientId = passthroughMetaId(contact.recipient_id);
+  if (recipientId) return { to: recipientId, isPhone: false };
+
+  // `wa_user_id` also covers the legacy case of a BSUID written into `phone`
+  // before migration 051 normalised that column.
   const bsuid =
     passthroughMetaId(contact.wa_user_id) ?? passthroughMetaId(contact.phone);
   if (bsuid) return { to: bsuid, isPhone: false };
 
-  // 5. recipient_id — the alternative Meta identifier.
-  const recipientId = passthroughMetaId(contact.recipient_id);
-  if (recipientId) return { to: recipientId, isPhone: false };
+  // 4. Last resort: the id recovered from this contact's own inbound history,
+  //    tried as a Meta id.
+  //
+  //    For a contact known only by `@handle`, Meta's webhook still carried a
+  //    numerical identifier on the message they wrote (`sender_phone`, or
+  //    `wa_id`/`wa_user_id` inside `raw_meta_payload`). That identifier — NOT
+  //    the handle — is what Meta accepts in `to`.
+  //
+  //    `recovered` used to be fed only through `normalizeToE164`, which
+  //    discards a 15-digit BSUID as "not a phone number". So the recovered id
+  //    was thrown away and resolution fell through to the handle, which is
+  //    precisely the value Meta rejects.
+  const recoveredId = passthroughMetaId(recovered);
+  if (recoveredId) return { to: recoveredId, isPhone: false };
 
-  // 6. Tier D — nothing numerical anywhere.
+  // 5. Tier D — nothing numerical anywhere.
   //
   //   `contacts.username` is deliberately NOT used as a fallback. Meta rejects
   //   a text `@handle` in `to` with `(#100) Invalid parameter`, and adding
@@ -303,7 +310,6 @@ export function resolveBroadcastAddress(
   //   cannot succeed.
   return null;
 }
-
 /**
  * Recover a real phone number for contacts whose row carries none, from
  * the address those contacts actually wrote from.

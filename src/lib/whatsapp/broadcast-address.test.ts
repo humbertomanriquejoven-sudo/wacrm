@@ -9,6 +9,7 @@ import {
   recoverAddressesFromHistory,
   resolveBroadcastAddress,
 } from './broadcast-address'
+import { isOpaqueMetaId } from './meta-api'
 import type { Contact } from '@/types'
 
 /**
@@ -98,6 +99,109 @@ describe('contactPhone', () => {
 
   it('tolerates a null contact', () => {
     expect(contactPhone(null)).toBeNull()
+  })
+
+  it('does not read a bare-digit wa_id back as a phone number', () => {
+    // `contactPhone` also reads `contact.wa_id`, so a BSUID stored there as a
+    // bare 15-digit run would otherwise be reported as a dialable number —
+    // and `isPhone: true` is what lets the sender write the value back into
+    // `contacts.phone`, a number column with a UNIQUE index on it. The
+    // 13-digit E.164 ceiling is what prevents that mislabelling; this pins
+    // the behaviour so a future bound change cannot reopen it silently.
+    expect(
+      contactPhone(contact({ phone: null, wa_id: '1486998326437295' })),
+    ).toBeNull()
+  })
+})
+
+describe('resolveBroadcastAddress — the exact row that failed in production', () => {
+  // Read back from the live database, not invented:
+  //
+  //   id          d116e7c4-6cb3-44d5-a7d2-88a50bf0a827
+  //   phone       'unknown'          <- literal placeholder, NOT NULL column
+  //   wa_id       NULL               <- what the failed send had
+  //   recipient_id NULL
+  //   wa_user_id  '1486998326437295' <- the BSUID WAS already on the row
+  //   username    '@juanpablo22222'
+  //
+  // The broadcast marked this recipient `failed`. The row carried a usable
+  // numerical id the whole time, in a column the resolver did reach — so the
+  // send was lost to an ordering/lookup problem, not to missing data.
+  const JOSE = {
+    phone: 'unknown',
+    wa_id: null,
+    recipient_id: null,
+    wa_user_id: '1486998326437295',
+    username: '@juanpablo22222',
+  }
+
+  it('resolves to the BSUID, never to "unknown" and never to the handle', () => {
+    const address = resolveBroadcastAddress(JOSE)
+    expect(address).toEqual({ to: '1486998326437295', isPhone: false })
+  })
+
+  it('never hands Meta the placeholder or the @handle', () => {
+    const { to } = resolveBroadcastAddress(JOSE)!
+    expect(to).not.toBe('unknown')
+    expect(to).not.toContain('@')
+    expect(isOpaqueMetaId(to)).toBe(true)
+  })
+
+  it('prefers the backfilled wa_id/recipient_id over the history id', () => {
+    // Same contact after the backfill filled the two id columns. All three
+    // hold the same value, so this also pins that the reorder is stable for
+    // the normal case rather than only for the degenerate one.
+    expect(
+      resolveBroadcastAddress(
+        {
+          ...JOSE,
+          wa_id: '1486998326437295',
+          recipient_id: '1486998326437295',
+        },
+        '1486998326437295',
+      ),
+    ).toEqual({ to: '1486998326437295', isPhone: false })
+  })
+
+  it('keeps a stored id when history disagrees with it', () => {
+    // The reorder this branch locks: stored identity outranks a value dug
+    // out of `messages`. A stale or merged conversation must not silently
+    // redirect the send to a different WhatsApp account.
+    expect(
+      resolveBroadcastAddress(
+        { ...JOSE, wa_id: 'CO.1486998326437295' },
+        '999999999999999',
+      ),
+    ).toEqual({ to: 'CO.1486998326437295', isPhone: false })
+  })
+
+  it('orders the id columns wa_id -> recipient_id -> wa_user_id', () => {
+    // Each value has to be a shape `passthroughMetaId` accepts: a namespaced
+    // id, or a bare digit run. A word like 'ccc' is rejected there and the
+    // test would be asserting nothing. Each case is spelled out in full
+    // rather than built by deleting keys, so there is no discarded binding
+    // for the linter to trip over.
+    expect(
+      resolveBroadcastAddress({
+        phone: null,
+        wa_id: 'CO.111',
+        recipient_id: 'CO.222',
+        wa_user_id: '333333333333333',
+      })?.to,
+    ).toBe('CO.111')
+
+    expect(
+      resolveBroadcastAddress({
+        phone: null,
+        recipient_id: 'CO.222',
+        wa_user_id: '333333333333333',
+      })?.to,
+    ).toBe('CO.222')
+
+    expect(
+      resolveBroadcastAddress({ phone: null, wa_user_id: '333333333333333' })
+        ?.to,
+    ).toBe('333333333333333')
   })
 })
 
