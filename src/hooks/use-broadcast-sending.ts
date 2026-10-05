@@ -1,18 +1,9 @@
 'use client';
 
 import { useState } from 'react';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
-import {
-  BATCH_SEND_ATTEMPTS,
-  batchRetryDelayMs,
-} from '@/lib/broadcast-retry';
-import {
-  NO_DELIVERABLE_ADDRESS,
-  persistRecoveredAddress,
-  recoverAddressesFromHistory,
-  resolveBroadcastAddress,
-} from '@/lib/whatsapp/broadcast-address';
 import { BroadcastStatus, Contact, MessageTemplate } from '@/types';
 
 export type CustomFieldOperator = 'is' | 'is_not' | 'contains';
@@ -65,48 +56,89 @@ interface UseBroadcastSendingReturn {
 }
 
 /**
- * Meta rate-limit buffer. 10 per batch + 1 s pause matches the spec
- * and keeps us comfortably under Meta's per-phone-number messaging
- * rate so a large broadcast never trips the upstream limiter.
+ * Statuses that mean the server is still working. Anything else is settled.
  *
- * Note this shape when touching `RATE_LIMITS.broadcast`: a campaign is
- * many calls to `/api/whatsapp/broadcast`, not one. A 1 000-recipient
- * send is ~100 calls over several minutes, and a bucket sized for
- * "one call per campaign" throttles most of it away (issue #472).
+ * `draft` is in flight on purpose: it is the state `persistBroadcast` writes
+ * before the delivery pass claims the campaign, so a poll that lands in that
+ * window must keep waiting rather than report an empty campaign as done.
  */
-const SEND_BATCH_SIZE = 10;
-const SEND_BATCH_DELAY_MS = 1000;
+const IN_FLIGHT_STATUSES: readonly BroadcastStatus[] = [
+  'draft',
+  'sending',
+  'scheduled',
+];
 
-/** `broadcast_recipients` inserts are independent of the send rate. */
-const INSERT_BATCH_SIZE = 200;
+const POLL_INTERVAL_MS = 2_000;
+const POLL_TIMEOUT_MS = 15 * 60 * 1000;
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-interface BroadcastApiResult {
-  phone: string;
-  status: 'sent' | 'failed';
-  whatsapp_message_id?: string;
-  error?: string;
-  /** Echoed by the server; the key results are matched on. */
-  contact_id?: string;
+interface SettledCounts {
+  status: BroadcastStatus;
+  sent: number;
+  failed: number;
+  total: number;
 }
 
 /**
- * A `broadcast_recipients` row joined to its contact, as selected in
- * step 4. Spelled out because the Supabase client is untyped here and
- * `template_params` / the nested `contact` would otherwise be `any`.
+ * Poll the campaign row until the server reports a settled outcome.
+ *
+ * This replaces the browser's own account of the send. It reads the
+ * `sent_count` / `failed_count` the recipients trigger maintains, so the
+ * progress bar cannot claim delivery the table does not record, and cannot
+ * lag behind it either.
+ *
+ * Bounded by `POLL_TIMEOUT_MS` rather than looping forever: a pass that dies
+ * server-side should leave the campaign visible for an operator to Resume, not
+ * hang the wizard. Whatever was last read is returned either way, so the UI
+ * never invents a terminal status it did not observe.
  */
-interface BroadcastRecipientRow {
-  id: string;
-  contact_id: string;
-  template_params?: string[] | null;
-  /** `null` when the contact row was deleted after the campaign was built. */
-  contact: Contact | null;
+async function pollUntilSettled(
+  supabase: SupabaseClient,
+  broadcastId: string,
+  onProgress: (pct: number) => void
+): Promise<SettledCounts> {
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  let last: SettledCounts = {
+    status: 'draft',
+    sent: 0,
+    failed: 0,
+    total: 0,
+  };
+
+  for (;;) {
+    const { data } = await supabase
+      .from('broadcasts')
+      .select('status, sent_count, failed_count, total_recipients')
+      .eq('id', broadcastId)
+      .maybeSingle();
+
+    const row = data as {
+      status: BroadcastStatus;
+      sent_count: number | null;
+      failed_count: number | null;
+      total_recipients: number | null;
+    } | null;
+
+    if (row) {
+      const sent = row.sent_count ?? 0;
+      const failed = row.failed_count ?? 0;
+      const total = row.total_recipients ?? 0;
+      last = { status: row.status, sent, failed, total };
+
+      if (total > 0) {
+        // 30 -> 99, so the bar tracks the server rather than the request.
+        onProgress(30 + Math.min(69, Math.round(((sent + failed) / total) * 69)));
+      }
+
+      if (!IN_FLIGHT_STATUSES.includes(row.status)) return last;
+    }
+
+    if (Date.now() >= deadline) return last;
+
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
 }
 
-/** contactId → (customFieldId → value). */
+/** contactId -> (customFieldId -> value). */
 type CustomValueIndex = Map<string, Map<string, string>>;
 
 /**
@@ -381,13 +413,40 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         throw new Error('No contacts found for this audience.');
       }
 
-      // ── Step 2: Create broadcast row ──────────────────────────────
-      setProgress(10);
-      const { data: broadcast, error: broadcastError } = await supabase
-        .from('broadcasts')
-        .insert({
-          user_id: user.id,
-          account_id: accountId,
+      // ── Step 2: hand the campaign to the server ─────────────────
+      //
+      // Everything below used to run in this tab: insert the campaign, insert
+      // the recipients, resolve each address, call Meta batch by batch, then
+      // write every outcome back. It is now one POST.
+      //
+      // Two failures came from doing it here. A closed tab stranded recipients
+      // in `pending` - which is what "Retry failed" existed to clean up. And
+      // this tab's copy of the addresses could disagree with the server's, so a
+      // first attempt could reject a recipient that every retry then delivered.
+      // Neither is possible when the tab only submits and watches.
+      setProgress(25);
+
+      // Template params are resolved HERE, before submitting, because
+      // `template_params` is the only record of what {{1}} should be for each
+      // contact: the server cannot derive them from an audience filter, and they
+      // are what makes the campaign resumable later.
+      const customValueIndex = await fetchCustomValueIndex(
+        supabase,
+        contacts.map((c) => c.id)
+      );
+      const recipients = contacts.map((contact) => ({
+        contact_id: contact.id,
+        params: resolveVariables(
+          payload.variables,
+          contact,
+          customValueIndex.get(contact.id)
+        ),
+      }));
+
+      const response = await fetch('/api/whatsapp/broadcast', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
           name: payload.name,
           template_name: payload.template.name,
           template_language: payload.template.language ?? 'en_US',
@@ -398,382 +457,40 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
             customField: payload.audience.customField,
             excludeTagIds: payload.audience.excludeTagIds,
           },
-          status: 'sending',
-          total_recipients: contacts.length,
-          sent_count: 0,
-          delivered_count: 0,
-          read_count: 0,
-          replied_count: 0,
-          failed_count: 0,
-        })
-        .select()
-        .single();
+          recipients,
+        }),
+      });
 
-      if (broadcastError || !broadcast) {
+      const result = (await response.json().catch(() => null)) as {
+        broadcast_id?: string;
+        error?: string;
+      } | null;
+
+      if (!response.ok || !result?.broadcast_id) {
         throw new Error(
-          `Failed to create broadcast: ${broadcastError?.message ?? 'unknown error'}`,
+          result?.error ?? `Could not start the broadcast (HTTP ${response.status})`
         );
       }
 
-      // ── Step 3: Insert recipient rows ─────────────────────────────
-      // Custom values are fetched BEFORE the insert so each row can
-      // carry its resolved template params. Those params are what makes
-      // the campaign resumable server-side (issue #472): the send loop
-      // below runs in this browser tab, and if the tab goes away the
-      // only record of what {{1}} should be for each contact is this
-      // column. Resolving once here also means the resume sends exactly
-      // what this pass would have.
-      setProgress(20);
-      const customValueIndex = await fetchCustomValueIndex(
-        supabase,
-        contacts.map((c) => c.id),
-      );
-      const paramsByContact = new Map(
-        contacts.map((contact) => [
-          contact.id,
-          resolveVariables(
-            payload.variables,
-            contact,
-            customValueIndex.get(contact.id),
-          ),
-        ]),
-      );
-      const recipientRows = contacts.map((contact) => ({
-        broadcast_id: broadcast.id,
-        contact_id: contact.id,
-        status: 'pending' as const,
-        template_params: paramsByContact.get(contact.id) ?? [],
-      }));
-
-      for (let i = 0; i < recipientRows.length; i += INSERT_BATCH_SIZE) {
-        const batch = recipientRows.slice(i, i + INSERT_BATCH_SIZE);
-        const { error: recipientError } = await supabase
-          .from('broadcast_recipients')
-          .insert(batch);
-        if (recipientError) {
-          // Previous impl logged and marched on — the broadcast then ran
-          // with an incomplete recipient set, so webhook status updates
-          // couldn't find some rows and the aggregate counts drifted.
-          // Flip the broadcast to failed so the user sees the problem
-          // immediately, then throw to abort the send loop.
-          await supabase
-            .from('broadcasts')
-            .update({
-              status: 'failed',
-              failed_count: contacts.length,
-            })
-            .eq('id', broadcast.id);
-          throw new Error(
-            `Failed to insert recipient batch ${i / INSERT_BATCH_SIZE + 1}: ${recipientError.message}`,
-          );
-        }
-      }
-
-      // ── Step 4: Fetch recipients back (joined contact) ────────────
+      const broadcastId = result.broadcast_id;
       setProgress(30);
-      const { data: recipientData, error: recipientsFetchError } = await supabase
-        .from('broadcast_recipients')
-        .select('*, contact:contacts(*)')
-        .eq('broadcast_id', broadcast.id);
 
-      const recipients = (recipientData ?? []) as unknown as BroadcastRecipientRow[];
-
-      if (recipientsFetchError || !recipientData) {
-        throw new Error('Failed to fetch broadcast recipients');
-      }
-
-      let failedCount = 0;
-      const totalRecipients = recipients.length;
-
-      // Media-header templates (image/video/document) require a media
-      // URL on every send. Collected in the personalize step and applied
-      // to all recipients; falls back to the template's stored URL on the
-      // server when omitted.
-      const headerType = payload.template.header_type;
-      const isMediaHeader =
-        headerType === 'image' ||
-        headerType === 'video' ||
-        headerType === 'document';
-      const headerMediaUrl = payload.headerMediaUrl?.trim();
-      const messageParams =
-        isMediaHeader && headerMediaUrl ? { headerMediaUrl } : undefined;
-
-for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
-        const batch = recipients.slice(i, i + SEND_BATCH_SIZE);
-
-        // Contacts whose row carries no usable number — the @user / BSUID
-        // case this whole path exists for. Recovered in one batched
-        // lookup per send batch (two queries), not two per recipient.
-        const batchContacts = batch
-          .map((r) => r.contact)
-          .filter((c): c is Contact => Boolean(c));
-        const recovered = await recoverAddressesFromHistory(
-          supabase,
-          batchContacts,
-        );
-
-        /**
-         * recipientRowId → the address actually handed to Meta. Kept so
-         * the result lookup below matches on the SAME value that went
-         * into the payload. It used to key on `contact.phone`, which is
-         * null for every recovered address — so a tap that really was
-         * delivered came back unmatched and was written to the DB as
-         * `failed: 'No phone number on contact'`.
-         */
-        const addressByRecipient = new Map<string, string>();
-        const undeliverable: Array<{ id: string; error: string }> = [];
-        const apiRecipients: Array<{
-          phone: string;
-          contact_id?: string;
-          params: string[];
-          messageParams?: { headerMediaUrl: string };
-        }> = [];
-
-        for (const row of batch) {
-          const contact = row.contact;
-          if (!contact) {
-            undeliverable.push({
-              id: row.id,
-              error: 'Broadcast recipient has no linked contact',
-            });
-            continue;
-          }
-
-          // Local resolution is a FALLBACK now, not the authority.
-          //
-          // It used to be the gate: when `resolveBroadcastAddress` returned
-          // null the recipient was pushed onto `undeliverable`, marked
-          // 'failed' in the database, and NEVER sent — the fetch to
-          // /api/whatsapp/broadcast was not made for it at all. That is the
-          // "first attempt never reaches Meta" symptom, and it was decided by
-          // whatever columns this in-memory `contact` happened to carry. A
-          // list rendered before the webhook hydrated the row has no `wa_id`
-          // / `recipient_id` / `wa_user_id`, so a contact that is perfectly
-          // reachable looks undeliverable; re-render or hit retry and the same
-          // contact resolves, which is exactly the reported "works on the
-          // second try".
-          //
-          // The server now re-resolves from the authoritative `contacts` row
-          // for any recipient that carries a `contact_id`, so the browser's
-          // copy of the row cannot decide who gets dropped. Send it and let
-          // the server decide; only a recipient with no contact to consult is
-          // failed here.
-          const address = resolveBroadcastAddress(
-            contact,
-            recovered.get(contact.id),
-          );
-
-          if (address) {
-            addressByRecipient.set(row.id, address.to);
-          } else if (!contact.id) {
-            // No contact row to re-resolve against. Nothing can be sent, so
-            // this is the only case that can be failed locally.
-            undeliverable.push({
-              id: row.id,
-              error: `${NO_DELIVERABLE_ADDRESS} (contact ${row.id} has no linked contact row)`,
-            });
-            continue;
-          }
-
-          // When the local copy resolved nothing, `phone` goes out as whatever
-          // the row holds ('unknown'). The server ignores it in favour of the
-          // hydrated record and only falls back to this string if the contact
-          // cannot be loaded — which is the correct order, because a
-          // placeholder must never be sent while a usable id is one query away.
-          apiRecipients.push({
-            phone: address?.to ?? contact.phone ?? '',
-            contact_id: contact.id,
-            params: Array.isArray(row.template_params)
-              ? row.template_params.filter((p): p is string => typeof p === 'string')
-              : [],
-            ...(messageParams ? { messageParams } : {}),
-          });
-        }
-
-        // Persist every real number recovered above onto its contact row, so the
-        // next send reads it straight off `contacts.phone` instead of
-        // re-deriving it. Only numbers are ever passed here: an address
-        // resolved from a BSUID or @handle is a valid `to`, but writing it
-        // into the number column would corrupt it (and
-        // `persistRecoveredAddress` rejects it). Awaited here rather than
-        // inside the loop above to keep it to one sequential pass per batch.
-        for (const [contactId, address] of recovered) {
-          await persistRecoveredAddress(supabase, contactId, address);
-        }
-
-        // Record the recipients we cannot address BEFORE deciding whether
-        // to send, so they are accounted for even when the whole batch
-        // turns out to be undeliverable.
-        //
-        // Status is 'failed', NOT 'invalid_phone': broadcast_recipients'
-        // CHECK constraint (migration 001) allows only
-        // pending/sent/delivered/read/replied/failed, so 'invalid_phone'
-        // was rejected with a 23514 the code discarded. The rows stayed
-        // 'pending' forever, and since finalizeBroadcastStatus bails out
-        // while any recipient is pending, the campaign hung in 'sending'
-        // indefinitely. 'failed' is both constraint-valid and counted
-        // into failed_count by the aggregate trigger.
-        if (undeliverable.length > 0) {
-          failedCount += undeliverable.length;
-          for (const { id, error } of undeliverable) {
-            const { error: markErr } = await supabase
-              .from('broadcast_recipients')
-              .update({ status: 'failed', error_message: error })
-              .eq('id', id);
-            if (markErr) {
-              console.error(
-                `[broadcast] could not mark recipient ${id} undeliverable:`,
-                markErr.message,
-              );
-            }
-          }
-        }
-
-        if (apiRecipients.length === 0) continue;
-
-      try {
-          // Send the batch, waiting out a 429 rather than writing the
-          // whole batch off as failed. Only 429 is replayed — see
-          // batchRetryDelayMs for why nothing else can be.
-          let data: { error?: string; results?: BroadcastApiResult[] } = {};
-          for (let attempt = 1; ; attempt++) {
-            const res = await fetch('/api/whatsapp/broadcast', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                recipients: apiRecipients,
-                template_name: payload.template.name,
-                template_language: payload.template.language ?? 'en_US',
-              }),
-            });
-
-            data = await res.json();
-            if (res.ok) break;
-
-            const retryIn =
-              attempt < BATCH_SEND_ATTEMPTS
-                ? batchRetryDelayMs(res.status, res.headers.get('Retry-After'))
-                : null;
-            if (retryIn === null) {
-              throw new Error(data.error || 'Broadcast API request failed');
-            }
-            await sleep(retryIn);
-          }
-
-          // Match on `contact_id`, not on the address string.
-          //
-          // The server resolves the destination, so the address this browser
-          // holds is not necessarily the one that was delivered to — and for a
-          // contact with phone = 'unknown' it is not even a valid address. A
-          // phone-keyed lookup therefore either missed the result entirely
-          // (recording a real delivery as `failed`) or, once the local copy
-          // could not resolve at all, skipped the row and left it 'pending'.
-          // The contact id is the one key both sides agree on.
-          const resultsByContactId = new Map<string, BroadcastApiResult>();
-          const resultsByPhone = new Map<string, BroadcastApiResult>();
-          for (const r of (data.results ?? []) as BroadcastApiResult[]) {
-            if (r.contact_id) resultsByContactId.set(r.contact_id, r);
-            if (r.phone) resultsByPhone.set(r.phone, r);
-          }
-
-          for (const recipient of batch) {
-            const contactId = recipient.contact?.id;
-            const address = addressByRecipient.get(recipient.id);
-            const result = contactId
-              ? resultsByContactId.get(contactId)
-              : address
-                ? resultsByPhone.get(address)
-                : undefined;
-
-            // No result row at all. Sent to the server and simply absent from
-            // the reply, so the outcome is unknown rather than failed.
-            if (!result) {
-              failedCount++;
-              await supabase
-                .from('broadcast_recipients')
-                .update({
-                  status: 'failed',
-                  error_message:
-                    'Broadcast API returned no result for this recipient',
-                })
-                .eq('id', recipient.id);
-              continue;
-            }
-
-            if (result.status === 'sent') {
-              await supabase
-                .from('broadcast_recipients')
-                .update({
-                  status: 'sent',
-                  sent_at: new Date().toISOString(),
-                  whatsapp_message_id: result.whatsapp_message_id ?? null,
-                  error_message: null,
-                })
-                .eq('id', recipient.id);
-            } else {
-              failedCount++;
-              await supabase
-                .from('broadcast_recipients')
-                .update({
-                  status: 'failed',
-                  error_message: result.error ?? 'Unknown error',
-                })
-                .eq('id', recipient.id);
-            }
-          }
-        } catch (err) {
-          // Only the recipients that were actually part of this send
-          // attempt. The undeliverable ones were already written as
-          // 'failed' above, and counting them twice would inflate
-          // failedCount past totalRecipients and finalize the campaign
-          // as 'failed' even when every real send went out.
-          for (const recipient of batch) {
-            if (!addressByRecipient.has(recipient.id)) continue;
-            failedCount++;
-            await supabase
-              .from('broadcast_recipients')
-              .update({
-                status: 'failed',
-                error_message: err instanceof Error ? err.message : 'Unknown error',
-              })
-              .eq('id', recipient.id);
-          }
-        }
-
-        const progressPct =
-          30 + Math.round(((i + batch.length) / totalRecipients) * 60);
-        setProgress(progressPct);
-
-        if (i + SEND_BATCH_SIZE < recipients.length) {
-          await sleep(SEND_BATCH_DELAY_MS);
-        }
-      }
-
-      // ── Step 5: Finalize status ───────────────────────────────────
-      // Aggregate counts are maintained by the DB trigger (migration
-      // 003); we only flip the final status here.
-      setProgress(95);
-      // Stop reporting a campaign with failed recipients as `sent`.
+      // ── Step 3: watch the server send ───────────────────────────
       //
-      // This was `failedCount === totalRecipients ? 'failed' : 'sent'`, so a
-      // campaign where one recipient out of a thousand was undeliverable was
-      // published as a clean success. That is precisely the signal the
-      // "first attempt never reaches Meta" bug hid behind: the dashboard said
-      // Sent, the recipient row said failed, and nobody looked twice. Now only
-      // a campaign with nothing left is `sent`.
-      const finalStatus: BroadcastStatus =
-        failedCount === 0
-          ? 'sent'
-          : failedCount >= totalRecipients
-            ? 'failed'
-            : 'partial';
-      await supabase
-        .from('broadcasts')
-        .update({ status: finalStatus })
-        .eq('id', broadcast.id);
+      // Progress is read from the campaign row rather than tallied here. The
+      // counts are trigger-maintained from `broadcast_recipients`, so this shows
+      // the same thing the recipients table and Meta agree on - there is no
+      // second browser-side opinion left to drift from reality.
+      const settled = await pollUntilSettled(supabase, broadcastId, setProgress);
+
+      if (settled.status === 'failed' && settled.total > 0 && settled.sent === 0) {
+        throw new Error(
+          'Every recipient failed. Open the campaign for the reason on each row.'
+        );
+      }
 
       setProgress(100);
-      return broadcast.id;
+      return broadcastId;
     } finally {
       setIsProcessing(false);
     }

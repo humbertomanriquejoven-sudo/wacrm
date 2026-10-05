@@ -196,6 +196,34 @@ export default function BroadcastDetailPage() {
     fetchData();
   }, [fetchData]);
 
+  /**
+   * Poll while the server still owns a delivery pass.
+   *
+   * The fan-out runs in `after()`, so the page that started it is not the page
+   * making progress - it can only observe. Refetching on an interval while the
+   * campaign is in flight is what turns "Sent" from a guess into something
+   * read back from `broadcast_recipients`.
+   *
+   * Stops as soon as the campaign settles, so a finished campaign costs
+   * nothing, and pauses while the tab is hidden: a campaign left open in a
+   * background tab should not keep hammering the database.
+   */
+  const isInFlight =
+    broadcast?.status === 'draft' ||
+    broadcast?.status === 'sending' ||
+    broadcast?.status === 'scheduled';
+
+  useEffect(() => {
+    if (!isInFlight) return;
+
+    const timer = setInterval(() => {
+      if (document.hidden) return;
+      fetchData();
+    }, 3000);
+
+    return () => clearInterval(timer);
+  }, [isInFlight, fetchData]);
+
   const filteredRecipients = useMemo(
     () =>
       statusFilter === 'all'

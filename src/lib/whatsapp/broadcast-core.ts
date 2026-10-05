@@ -494,3 +494,156 @@ export async function finalizeBroadcastStatus(
     })
     .eq('id', broadcastId);
 }
+
+/**
+ * Persist a campaign and its recipients WITHOUT sending anything.
+ *
+ * This is the wizard's new first phase. It exists because the previous flow
+ * drove the fan-out from the browser tab: the campaign rows were committed by
+ * the client and the sends ran in the same tab, so a closed tab left rows
+ * `pending` with no record of what should have been sent, and the only remedy
+ * was a manual "Retry failed".
+ *
+ * Recipients are keyed by `contact_id`, not by a phone number. `createBroadcast`
+ * above cannot be reused for this: it validates every `to` with `isValidE164`
+ * and drops anything else, which is exactly the population this wizard targets
+ * - contacts whose number is hidden behind a BSUID.
+ *
+ * Everything is written as `pending` (recipients) and `draft` (campaign). No
+ * status here claims any progress: `pending` is the honest state of a message
+ * nobody has asked Meta to send yet, and `deliverBroadcast` is what advances
+ * it to `sent`, and only after Meta returns a wamid.
+ */
+export async function persistBroadcast(
+  db: SupabaseClient,
+  accountId: string,
+  auditUserId: string,
+  params: PersistBroadcastParams
+): Promise<{ broadcastId: string; total: number; duplicates: number }> {
+  const {
+    name,
+    templateName,
+    templateLanguage,
+    templateVariables,
+    audienceFilter,
+    recipients,
+  } = params;
+
+  if (!templateName) {
+    throw new BroadcastError('bad_request', "'template_name' is required", 400);
+  }
+  if (!Array.isArray(recipients) || recipients.length === 0) {
+    throw new BroadcastError(
+      'bad_request',
+      "'recipients' must be a non-empty array of { contact_id, params? }",
+      400
+    );
+  }
+  if (recipients.length > MAX_RECIPIENTS) {
+    throw new BroadcastError(
+      'bad_request',
+      `A broadcast is capped at ${MAX_RECIPIENTS} recipients per request; split larger sends`,
+      400
+    );
+  }
+
+  // A contact repeated in the audience would be messaged twice, and a
+  // WhatsApp message cannot be recalled. Collapse on contact id, keeping the
+  // first occurrence so its params win.
+  const byContact = new Map<string, string[]>();
+  let duplicates = 0;
+  for (const r of recipients) {
+    const contactId =
+      typeof r?.contactId === 'string' ? r.contactId.trim() : '';
+    if (!contactId) {
+      throw new BroadcastError(
+        'bad_request',
+        'every recipient needs a contact_id',
+        400
+      );
+    }
+    if (byContact.has(contactId)) {
+      duplicates++;
+      continue;
+    }
+    byContact.set(
+      contactId,
+      Array.isArray(r.params)
+        ? r.params.filter((p): p is string => typeof p === 'string')
+        : []
+    );
+  }
+
+  const { data: broadcast, error: broadcastError } = await db
+    .from('broadcasts')
+    .insert({
+      user_id: auditUserId,
+      account_id: accountId,
+      name: name ?? null,
+      template_name: templateName,
+      template_language: templateLanguage ?? 'en_US',
+      // The mapping the wizard was built with. The resolved values live in
+      // each recipient's `template_params`; this keeps how they were derived.
+      template_variables: templateVariables ?? null,
+      audience_filter: audienceFilter ?? null,
+      // `draft`, not `sending`: nothing has been dispatched yet, and the
+      // dispatch pass moves this to `sending` once it holds the lock.
+      status: 'draft',
+      total_recipients: byContact.size,
+      sent_count: 0,
+      delivered_count: 0,
+      read_count: 0,
+      replied_count: 0,
+      failed_count: 0,
+    })
+    .select('id')
+    .single();
+
+  if (broadcastError || !broadcast) {
+    throw new BroadcastError(
+      'persist_failed',
+      `Could not create the broadcast: ${broadcastError?.message ?? 'unknown error'}`,
+      500
+    );
+  }
+
+  const broadcastId = broadcast.id as string;
+  const rows = [...byContact.entries()].map(([contactId, params]) => ({
+    broadcast_id: broadcastId,
+    contact_id: contactId,
+    status: 'pending' as const,
+    template_params: params,
+  }));
+
+  for (let i = 0; i < rows.length; i += MAX_RECIPIENTS) {
+    const { error } = await db
+      .from('broadcast_recipients')
+      .insert(rows.slice(i, i + MAX_RECIPIENTS));
+    if (error) {
+      // Do not leave a campaign with no recipients behind: it would render as
+      // an empty campaign and be resumable forever.
+      await db
+        .from('broadcasts')
+        .delete()
+        .eq('id', broadcastId)
+        .eq('account_id', accountId);
+      throw new BroadcastError(
+        'persist_failed',
+        `Could not save the recipient list: ${error.message}`,
+        500
+      );
+    }
+  }
+
+  return { broadcastId, total: byContact.size, duplicates };
+}
+
+export interface PersistBroadcastParams {
+  name?: string | null;
+  templateName: string;
+  templateLanguage?: string | null;
+  /** The wizard's placeholder mapping, kept for the record. */
+  templateVariables?: Record<string, unknown> | null;
+  audienceFilter?: Record<string, unknown> | null;
+  recipients: Array<{ contactId: string; params?: string[] }>;
+}
