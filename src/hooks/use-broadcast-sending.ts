@@ -8,9 +8,9 @@ import {
   batchRetryDelayMs,
 } from '@/lib/broadcast-retry';
 import {
-  contactPhone,
+  persistRecoveredAddress,
   recoverAddressesFromHistory,
-        persistRecoveredAddress,
+  resolveBroadcastAddress,
 } from '@/lib/whatsapp/broadcast-address';
 import { Contact, MessageTemplate } from '@/types';
 
@@ -535,21 +535,22 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
             continue;
           }
 
-          const address = contactPhone(contact) ?? recovered.get(contact.id);
+          const address = resolveBroadcastAddress(contact, recovered.get(contact.id));
           if (!address) {
             undeliverable.push({
               id: row.id,
               error:
                 `No deliverable address for contact ${contact.id} ` +
-                `(phone="${contact.phone ?? ''}", username="${contact.username ?? ''}", ` +
+                `(phone="${contact.phone ?? ''}", wa_id="${contact.wa_id ?? ''}", ` +
+                `username="${contact.username ?? ''}", ` +
                 `wa_user_id="${contact.wa_user_id ?? ''}") and no sender_phone in its message history`,
             });
             continue;
           }
 
-          addressByRecipient.set(row.id, address);
+          addressByRecipient.set(row.id, address.to);
           apiRecipients.push({
-            phone: address,
+            phone: address.to,
             params: Array.isArray(row.template_params)
               ? row.template_params.filter((p): p is string => typeof p === 'string')
               : [],
@@ -557,12 +558,13 @@ for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
           });
         }
 
-        // Persist every address recovered above onto its contact row, so the
+        // Persist every real number recovered above onto its contact row, so the
         // next send reads it straight off `contacts.phone` instead of
-        // re-deriving it. `recoverAddressesFromHistory` only ever returns
-        // contacts that had no deliverable number, so this cannot overwrite
-        // a good value. Awaited here rather than inside the loop above to
-        // keep it to one sequential pass per batch.
+        // re-deriving it. Only numbers are ever passed here: an address
+        // resolved from a BSUID or @handle is a valid `to`, but writing it
+        // into the number column would corrupt it (and
+        // `persistRecoveredAddress` rejects it). Awaited here rather than
+        // inside the loop above to keep it to one sequential pass per batch.
         for (const [contactId, address] of recovered) {
           await persistRecoveredAddress(supabase, contactId, address);
         }

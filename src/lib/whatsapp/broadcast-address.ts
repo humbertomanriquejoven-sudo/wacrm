@@ -17,7 +17,12 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-import { isDialablePhone, toDialable } from './phone-utils';
+import {
+  isDialablePhone,
+  normalizeUsername,
+  passthroughMetaId,
+  toDialable,
+} from './phone-utils'
 import type { Contact } from '@/types';
 
 /**
@@ -62,17 +67,94 @@ export function normalizeToE164(raw: string | null | undefined): string | null {
 }
 
 /**
- * The address already stored on the contact row, or null.
+ * The real phone number already stored on the contact row, or null.
  *
- * Only genuinely numeric fields are consulted. `username` (an @handle) and
- * `wa_user_id` (an opaque BSUID) are deliberately NOT candidates: a
- * broadcast `to` field takes a phone number, and handing Meta an
- * identifier either fails outright or — worse — returns HTTP 200 and
- * silently drops the message.
+ * Only genuinely numeric values are consulted, and the `'unknown'`
+ * placeholder is rejected: `contacts.phone` is `NOT NULL`, so the webhook
+ * writes that literal string when Meta disclosed no number, and it must
+ * never read back as a number.
+ *
+ * This returns NUMBERS ONLY. BSUIDs and @handles are valid `to` values for
+ * Meta — but they are a lower-priority fallback, so they are handled by
+ * {@link resolveBroadcastAddress} rather than here. Folding them in here
+ * would let an opaque id pre-empt a real number sitting further down the
+ * priority list.
  */
 export function contactPhone(contact: Contact | null | undefined): string | null {
   if (!contact) return null;
   return normalizeToE164(contact.phone) ?? normalizeToE164(contact.wa_id);
+}
+
+/** A resolved broadcast destination, and what kind of address it is. */
+export interface BroadcastAddress {
+  /** Value for Meta's `to` field. */
+  to: string;
+  /**
+   * True only for a dialable E.164 number.
+   *
+   * Gates persistence: a BSUID or handle that Meta accepted must NOT be
+   * written back into `contacts.phone`, which is a number column with a
+   * UNIQUE index on its normalized form.
+   */
+  isPhone: boolean;
+}
+
+/**
+ * Resolve the `to` value for one broadcast recipient.
+ *
+ * Mirrors the Inbox's `resolveBestRecipient`
+ * (`recipient-resolver.ts`) step for step, in the same priority order:
+ *
+ *   1. a dialable number on the contact row;
+ *   2. a real number recovered from the contact's OWN message history;
+ *   3. `wa_id` — the id Meta used as the inbound `from`;
+ *   4. `wa_user_id`, or a legacy `phone` that still holds a BSUID;
+ *   5. `recipient_id`;
+ *   6. `username` as `@handle`.
+ *
+ * Steps 3-6 exist because a sender who has never messaged from a registered
+ * number has no phone number *anywhere* in the database — Meta discloses a
+ * BSUID instead. A previous version of this module returned null for those
+ * contacts and reported them undeliverable, while the Inbox delivered to
+ * the exact same contact successfully via its BSUID. `send-message.ts`
+ * passes a non-dialable address straight to Meta (`variants = [address]`),
+ * so the broadcast path must accept one too.
+ *
+ * Every branch is decided by the data present at call time: no
+ * WABA-, number- or account-specific knowledge.
+ */
+export function resolveBroadcastAddress(
+  contact: Contact | null | undefined,
+  recovered?: string | null,
+): BroadcastAddress | null {
+  if (!contact) return null;
+
+  // 1 + 2. A real number always wins, whether already on the row or dug out
+  // of this contact's own thread.
+  const phone = contactPhone(contact) ?? normalizeToE164(recovered);
+  if (phone) return { to: phone, isPhone: true };
+
+  // 3. wa_id — checked before the BSUID because it is the address Meta
+  //    actually used to reach this contact.
+  const waId = passthroughMetaId(contact.wa_id);
+  if (waId) return { to: waId, isPhone: false };
+
+  // 4. BSUID, including the legacy case of one written into `phone`.
+  const bsuid =
+    passthroughMetaId(contact.wa_user_id) ?? passthroughMetaId(contact.phone);
+  if (bsuid) return { to: bsuid, isPhone: false };
+
+  // 5. recipient_id — the alternative Meta identifier.
+  const recipientId = passthroughMetaId(
+    (contact as { recipient_id?: string | null }).recipient_id,
+  );
+  if (recipientId) return { to: recipientId, isPhone: false };
+
+  // 6. The public handle, as `@user`.
+  const handle = normalizeUsername(contact.username);
+  if (handle) return { to: handle, isPhone: false };
+
+  return null;
 }
 
 /**
@@ -190,23 +272,33 @@ export async function recoverAddressesFromHistory(
  * contact in the account already owns that number) is logged and reported,
  * but the address still goes out on this send.
  *
- * Only `phone` is written. `phone_normalized` is a GENERATED column
- * (migration 022) that Postgres derives from `phone`; including it would
- * make every write fail.
+ * Only `phone` is written, and only for a real number: `contacts.phone` is a
+ * number column with a UNIQUE index on its normalized form (migration 022),
+ * so persisting a BSUID there would both corrupt the column and collide with
+ * the next contact that owns that id. `phone_normalized` is itself a
+ * GENERATED column, so including it would make every write fail.
  */
 export async function persistRecoveredAddress(
   db: SupabaseClient,
   contactId: string,
   phone: string,
 ): Promise<boolean> {
+  const dialable = normalizeToE164(phone);
+  if (!dialable) {
+    console.warn(
+      `[broadcast] refusing to persist non-number address "${phone}" for contact ${contactId}`,
+    );
+    return false;
+  }
+
   const { error } = await db
     .from('contacts')
-    .update({ phone })
+    .update({ phone: dialable })
     .eq('id', contactId);
 
   if (error) {
     console.warn(
-      `[broadcast] recovered address ${phone} for contact ${contactId} could not be persisted`,
+      `[broadcast] recovered address ${dialable} for contact ${contactId} could not be persisted`,
       error.message,
     );
     return false;

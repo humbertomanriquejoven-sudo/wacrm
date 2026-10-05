@@ -1,6 +1,7 @@
 import {
-  isMetaIdentifier,
   normalizeMetaIdentifier,
+  normalizeUsername,
+  passthroughMetaId,
   toDialable,
 } from './phone-utils'
 import { MetaApiError } from './meta-api'
@@ -15,6 +16,8 @@ export {
   toDialable,
   isMetaIdentifier,
   normalizeMetaIdentifier,
+  normalizeUsername,
+  passthroughMetaId,
 } from './phone-utils'
 
 /**
@@ -64,19 +67,6 @@ export interface ResolvedRecipient {
    * from. Callers persist this back so the stale value stops recurring.
    */
   recoveredFrom?: { contactId?: string | null; field?: 'phone' | 'wa_user_id' }
-}
-
-/** Canonical form of a public handle: leading '@', no duplicate '@'. */
-export function normalizeUsername(value: string | null | undefined): string | null {
-  if (!value) return null
-  const trimmed = value.trim().replace(/^@+/, '')
-  if (!trimmed) return null
-  if (isMetaIdentifier(trimmed)) return null
-  // Handles are letters/digits/dot/underscore/hyphen. A bare digit run is
-  // a number in disguise and must never be written to `username`.
-  if (!/^[A-Za-z0-9._-]+$/.test(trimmed)) return null
-  if (/^\d+$/.test(trimmed)) return null
-  return `@${trimmed}`
 }
 
 /**
@@ -352,38 +342,6 @@ export async function sendWithRecipientFallback<T>(args: {
     }
     throw lastError
   }
-}
-
-/**
- * The value to hand Meta for a NON-PHONE identifier, or null when unusable.
- *
- * Deliberately a PASS-THROUGH, unlike `normalizeMetaIdentifier`. That
- * function is a storage/comparison normalizer: it strips the `CO.` / `WAID.`
- * prefix and rejects anything not longer than 14 digits. That is correct for
- * comparing two rows and wrong for addressing a send — `CO.999` would come
- * back as `999`, and `999` is indistinguishable from a malformed phone
- * number, so the send would either fail or (worse) fabricate a number.
- *
- * Accepts exactly the shapes Meta reads as an identifier:
- *   - a namespaced id (`CO.…`, `WAID.…`, `LID.…`) — prefix preserved;
- *   - an all-digit run long enough not to be a truncated phone.
- *
- * A bare handle is rejected so it falls through to the `username` branch,
- * where the leading `@` is restored.
- */
-function passthroughMetaId(value: string | null | undefined): string | null {
-  if (!value) return null
-  const trimmed = value.trim()
-  if (!trimmed) return null
-  // Placeholders that older rows / webhook defaults have been known to carry.
-  if (/^(unknown|null|undefined|none|n\/a)$/i.test(trimmed)) return null
-  // Namespaced id — keep the prefix and dot intact.
-  if (/^[A-Za-z]+\.[\w.-]+$/.test(trimmed)) return trimmed
-  // Bare digit run. The 6-digit floor keeps a stray fragment from being
-  // mistaken for an id; there is no upper bound because a BSUID/LID is
-  // routinely far longer than E.164.
-  if (/^\+?\d{6,}$/.test(trimmed)) return trimmed.replace(/\D/g, '')
-  return null
 }
 
 /**

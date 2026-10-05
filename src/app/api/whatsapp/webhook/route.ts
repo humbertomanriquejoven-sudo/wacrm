@@ -1016,7 +1016,14 @@ async function processMessage(
         // recover a deliverable destination for a contact whose `phone`
         // still holds an identifier, so writing the BSUID here would
         // perpetuate exactly the undeliverable state we're fixing.
-        sender_phone: rawPhone || message.from || null,
+        //
+        // The placeholder guard is load-bearing: `rawPhone` is the literal
+        // string 'unknown' when Meta disclosed no number, and 'unknown' is
+        // truthy, so `rawPhone || message.from` used to store the placeholder
+        // and never reach `message.from`. `sender_phone` is nullable, so the
+        // honest value is NULL — which also keeps the placeholder out of the
+        // `.not('sender_phone','is',null)` history scans entirely.
+        sender_phone: rawPhone === 'unknown' ? null : rawPhone,
         message_id: message.id,
         status: 'delivered',
         created_at: new Date(parseInt(message.timestamp) * 1000).toISOString(),

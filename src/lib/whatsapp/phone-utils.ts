@@ -253,3 +253,67 @@ export function phoneVariants(sanitized: string): string[] {
 export function isRecipientNotAllowedError(message: string): boolean {
   return /131030|not in allowed list|not in the allowed list/i.test(message)
 }
+
+/**
+ * Placeholder values that older rows and webhook defaults are known to carry.
+ *
+ * `contacts.phone` is `NOT NULL` (migration 001), so a contact whose sender
+ * never disclosed a number cannot store null — the webhook writes the literal
+ * string `'unknown'` instead. Every reader must therefore treat it as the
+ * absence of a value, never as a phone number.
+ *
+ * The phone path already rejects these structurally (`isDialablePhone` only
+ * admits digits and punctuation), but the identifier paths do not: `'unknown'`
+ * is an all-letter string that would sail past a naive shape check.
+ */
+export function isPlaceholderValue(value: string | null | undefined): boolean {
+  if (!value) return true
+  return /^(unknown|null|undefined|none|n\/?a)$/i.test(value.trim())
+}
+
+/** Canonical form of a public handle: leading '@', no duplicate '@'. */
+export function normalizeUsername(value: string | null | undefined): string | null {
+  if (!value) return null
+  if (isPlaceholderValue(value)) return null
+  const trimmed = value.trim().replace(/^@+/, '')
+  if (!trimmed) return null
+  if (isMetaIdentifier(trimmed)) return null
+  // Handles are letters/digits/dot/underscore/hyphen. A bare digit run is
+  // a number in disguise and must never be written to `username`.
+  if (!/^[A-Za-z0-9._-]+$/.test(trimmed)) return null
+  if (/^\d+$/.test(trimmed)) return null
+  return `@${trimmed}`
+}
+
+/**
+ * The value to hand Meta for a NON-PHONE identifier, or null when unusable.
+ *
+ * Deliberately a PASS-THROUGH, unlike `normalizeMetaIdentifier`. That
+ * function is a storage/comparison normalizer: it strips the `CO.` / `WAID.`
+ * prefix and rejects anything not longer than 14 digits. That is correct for
+ * comparing two rows and wrong for addressing a send — `CO.999` would come
+ * back as `999`, and `999` is indistinguishable from a malformed phone
+ * number, so the send would either fail or (worse) fabricate a number.
+ *
+ * Accepts exactly the shapes Meta reads as an identifier:
+ *   - a namespaced id (`CO.…`, `WAID.…`, `LID.…`) — prefix preserved;
+ *   - an all-digit run long enough not to be a truncated phone.
+ *
+ * A bare handle is rejected so it falls through to the `username` branch,
+ * where the leading `@` is restored.
+ */
+export function passthroughMetaId(
+  value: string | null | undefined,
+): string | null {
+  if (!value) return null
+  if (isPlaceholderValue(value)) return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  // Namespaced id — keep the prefix and dot intact.
+  if (/^[A-Za-z]+\.[\w.-]+$/.test(trimmed)) return trimmed
+  // Bare digit run. The 6-digit floor keeps a stray fragment from being
+  // mistaken for an id; there is no upper bound because a BSUID/LID is
+  // routinely far longer than E.164.
+  if (/^\+?\d{6,}$/.test(trimmed)) return trimmed.replace(/\D/g, '')
+  return null
+}

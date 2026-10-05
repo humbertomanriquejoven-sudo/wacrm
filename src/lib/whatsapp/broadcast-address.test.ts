@@ -5,6 +5,7 @@ import {
   normalizeToE164,
   persistRecoveredAddress,
   recoverAddressesFromHistory,
+  resolveBroadcastAddress,
 } from './broadcast-address'
 import type { Contact } from '@/types'
 
@@ -293,6 +294,81 @@ describe('recoverAddressesFromHistory', () => {
   })
 })
 
+describe('resolveBroadcastAddress', () => {
+  // THE bug that produced "No deliverable address for contact
+  // (phone: 'unknown', username: '@jjuanpablo22222')": this module used to
+  // accept numbers ONLY. The Inbox delivers to that same contact by handing
+  // Meta its BSUID, so the contact was reachable all along and the broadcast
+  // path was simply refusing to use the address that works.
+  it('falls back to the BSUID when no number exists anywhere', () => {
+    const resolved = resolveBroadcastAddress(
+      contact({
+        phone: 'unknown',
+        username: '@jjuanpablo22222',
+        wa_user_id: 'CO.1008477715690681',
+      }),
+    )
+    expect(resolved).toEqual({ to: 'CO.1008477715690681', isPhone: false })
+  })
+
+  it('falls back to a bare numeric Meta id', () => {
+    const resolved = resolveBroadcastAddress(
+      contact({ phone: 'unknown', wa_id: '1486998326437295' }),
+    )
+    expect(resolved).toEqual({ to: '1486998326437295', isPhone: false })
+  })
+
+  it('falls back to the @handle last', () => {
+    const resolved = resolveBroadcastAddress(
+      contact({ phone: 'unknown', username: '@jjuanpablo22222' }),
+    )
+    expect(resolved).toEqual({ to: '@jjuanpablo22222', isPhone: false })
+  })
+
+  it('never sends to a placeholder', () => {
+    // 'unknown' is truthy. Treating it as a phone would aim the campaign at
+    // the literal string; treating it as an id would aim it at a stranger.
+    expect(resolveBroadcastAddress(contact({ phone: 'unknown' }))).toBeNull()
+    expect(resolveBroadcastAddress(contact({ phone: 'null' }))).toBeNull()
+    expect(resolveBroadcastAddress(contact({ wa_id: 'unknown' }))).toBeNull()
+    expect(
+      resolveBroadcastAddress(contact({ wa_user_id: 'undefined' })),
+    ).toBeNull()
+  })
+
+  it('prefers a real number over an identifier on the same row', () => {
+    // An opaque id must not pre-empt a number sitting further down the list.
+    const resolved = resolveBroadcastAddress(
+      contact({ phone: '573121828949', wa_user_id: 'CO.1008477715690681' }),
+    )
+    expect(resolved).toEqual({ to: '573121828949', isPhone: true })
+  })
+
+  it('prefers wa_id over the BSUID', () => {
+    const resolved = resolveBroadcastAddress(
+      contact({
+        phone: 'unknown',
+        wa_id: '1486998326437295',
+        wa_user_id: 'CO.1008477715690681',
+      }),
+    )
+    expect(resolved?.to).toBe('1486998326437295')
+  })
+
+  it('uses a number recovered from the contact own history', () => {
+    const resolved = resolveBroadcastAddress(
+      contact({ phone: 'unknown', username: '@usuario' }),
+      '573121828949',
+    )
+    expect(resolved).toEqual({ to: '573121828949', isPhone: true })
+  })
+
+  it('reports no address when the row holds nothing usable', () => {
+    expect(resolveBroadcastAddress(contact({ phone: 'unknown' }))).toBeNull()
+    expect(resolveBroadcastAddress(null)).toBeNull()
+  })
+})
+
 describe('persistRecoveredAddress', () => {
   it('writes the recovered number onto contacts.phone', async () => {
     const log = newLog()
@@ -315,6 +391,24 @@ describe('persistRecoveredAddress', () => {
     await persistRecoveredAddress(fakeDb(log, [], []), 'contact-1', '573121828949')
 
     expect(Object.keys(log.contactUpdates[0].patch)).toEqual(['phone'])
+  })
+
+  it('refuses to persist a BSUID into the number column', async () => {
+    // A BSUID is a valid `to`, but `contacts.phone` is a number column with
+    // a UNIQUE index on its normalized form. Writing an id there corrupts
+    // the row and collides with the next contact owning that id.
+    const log = newLog()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const ok = await persistRecoveredAddress(
+      fakeDb(log, [], []),
+      'contact-1',
+      'CO.1008477715690681',
+    )
+
+    expect(ok).toBe(false)
+    expect(log.contactUpdates).toHaveLength(0)
+    warn.mockRestore()
   })
 
   it('tolerates a rejected write — the send must still proceed', async () => {
