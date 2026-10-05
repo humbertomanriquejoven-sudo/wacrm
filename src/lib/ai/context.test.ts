@@ -50,16 +50,24 @@ describe('buildConversationContext', () => {
   })
 
   it('drops empty / whitespace-only messages', async () => {
-    const out = await buildConversationContext(
-      fakeDb([
-        { sender_type: 'customer', content_text: '   ' },
-        { sender_type: 'customer', content_text: null },
-        { sender_type: 'customer', content_text: 'real' },
-      ]),
-      'conv-1',
-    )
-    expect(out).toEqual([{ role: 'user', content: 'real' }])
-  })
+      const out = await buildConversationContext(
+        fakeDb([
+          { sender_type: 'customer', content_text: '   ' },
+          { sender_type: 'customer', content_text: null },
+          { sender_type: 'customer', content_text: 'real' },
+        ]),
+        'conv-1',
+      )
+      // A row that arrived with nothing to say still happened. It used to be
+      // dropped here, which is how an uncaptioned photo left the model with no
+      // idea the customer had sent anything. Rows are reversed into
+      // chronological order by the builder, hence `real` first.
+      expect(out).toEqual([
+        { role: 'user', content: 'real' },
+        { role: 'user', content: '[El usuario envió un mensaje de texto]' },
+        { role: 'user', content: '[El usuario envió un mensaje de texto]' },
+      ])
+    })
 
   it('includes transcribed audio rows (voice notes) in the context', async () => {
     // The webhook stores the transcript on content_type='audio' rows.

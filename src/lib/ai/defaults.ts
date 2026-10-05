@@ -254,6 +254,27 @@ export function buildSystemPrompt(args: {
         'Si una herramienta falla, NO te quedes en silencio: explica brevemente el inconveniente y ofrece el siguiente paso.'
     );
     parts.push(
+      'REGLA DE COBERTURA TOTAL DE TIPOS DE MENSAJE (inviolable): el cliente puede enviar TEXTO O CUALQUIER otro tipo de contenido ' +
+        '—una foto, un video, un GIF, un sticker, una nota de voz, un audio, un documento (PDF, imagen, archivo), una encuesta, ' +
+        'un botón o menú de lista, una ubicación o una tarjeta de contacto—. ' +
+        'NUNCA dejes sin responder cualquiera de ellos, y NUNCA respondas como si no hubiera llegado nada. ' +
+        'Cuando el historial del cliente muestre un marcador entre corchetes como "[El usuario envió una foto]" o ' +
+        '"[El usuario envió un mensaje de voz]", eso significa que el contenido llegó pero NO fue interpretable para ti: ' +
+        'ESE MARCADOR ES LA ÚNICA INFORMACIÓN QUE TIENES, y en ningún momento debes inventar su contenido, adivinarlo ni afirmar que ' +
+        'viste o escuchaste algo que no puedes ver. ' +
+        'Tu tarea es reconocer lo que llegó con naturalidad y amenable, decir con honesty qué no pudiste interpretar y pedirle al cliente ' +
+        'que te lo cuente o te lo escriba —de inmediato, en el mismo turno, sin dejar la conversación congelada ni en visto—. ' +
+        'Reglas de tono por tipo: ' +
+        '• Foto, video, GIF o sticker → acúsalo con empatía o con un toque de humor acorde al contexto comercial, y retoma la conversación de inmediato. ' +
+        '• Nota de voz o audio → agradécelo y pídele un breve resumen o que lo escriba si no pudiste transcribirlo. ' +
+        '• Documento → menciona el nombre del archivo que se te da y pide el dato que necesitas de él. ' +
+        '• Encuesta, botón o respuesta interactiva → reconoce la opción elegida y continúa el flujo de atención. ' +
+        '• Ubicación → confirma que la recibiste. ' +
+        '• Contacto compartido → confirma que lo recibiste por su nombre. ' +
+        '• Tipo desconocido o elemento interactivo → reconoce que llegó algo y pide que te lo describan. ' +
+        'En todos los casos: breve, humano, en español, y terminar siempre con una pregunta o siguiente paso claro.'
+    );
+    parts.push(
       'REGLA OBLIGATORIA DE CONFIRMACIÓN DE CITA: ' +
         'Cada vez que confirmes un agendamiento por WhatsApp, DEBES incluir OBLIGATORIAMENTE la URL de Google Meet que te devuelve la herramienta `agendar_cita`. ' +
         'La herramienta `agendar_cita` comienza su resultado con la línea "ÉXITO: Cita creada para {nombre} el {fecha} a las {hora}. Enlace de Google Meet OBLIGATORIO: {url}" — ' +

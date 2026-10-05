@@ -24,6 +24,10 @@ import {
   clearStaleFlowRuns,
 } from '@/lib/ai/unblock'
 import { transcribeAudio } from '@/lib/ai/transcribe'
+import {
+  describeInboundContent,
+  normalizeContentType,
+} from '@/lib/ai/inbound-content'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
 import {
   handleTemplateWebhookChange,
@@ -184,6 +188,28 @@ interface WhatsAppMessage {
   button?: { text?: string; payload?: string }
   /** Present when the customer swipe-replies to one of our messages. */
   context?: { id: string }
+  /**
+   * Shared contact card(s). Not part of Meta's documented inbound set for
+   * every gateway, but it does arrive on some providers and the parser has to
+   * be able to name who was shared instead of storing an empty row.
+   */
+  contacts?: Array<{
+    name?: { first_name?: string; last_name?: string; formatted_name?: string }
+    phones?: Array<{ phone?: string; wa_id?: string; type?: string }>
+    emails?: Array<{ email?: string; type?: string }>
+  }>
+  /** Customer poll / poll-vote payloads. */
+  poll?: { name?: string; options?: Array<{ title?: string }> }
+  poll_response?: {
+    poll_name?: string
+    selected_options?: Array<{ title?: string }>
+  }
+  /** Customer order payload. */
+  order?: {
+    catalog_id?: string
+    text?: string
+    product_items?: Array<{ product_retailer_id?: string; quantity?: string }>
+  }
   /**
    * BSUID (Business-Scoped User ID) of the sender. Meta sends this
    * instead of / alongside `from` when the message arrives from a
@@ -1042,12 +1068,17 @@ async function processMessage(
     })
   }
 
-  // Reactions short-circuit here — they aren't messages. We never insert
-  // into `messages`, never bump unread_count, never update last_message_text.
-  // Done before parseMessageContent so the media-URL fetch is skipped.
+  // Reactions are acknowledged into `message_reactions` AND fall through to
+  // the normal pipeline as a stored message.
+  //
+  // This used to `return` here, which meant a reaction was invisible to the
+  // agent: it could not tell the customer had approved a quote or reacted to a
+  // photo it had just sent, so it would sometimes re-raise the same topic.
+  // The row is persisted and enters the model's context; `suppressReply` below
+  // keeps the actual send out of it, because a bare 👍 is an acknowledgement
+  // and answering "thanks for the like!" to every reaction would be spam.
   if (message.type === 'reaction') {
     await handleReaction(message, conversation.id, contactRecord.id)
-    return
   }
 
   // Parse message content based on type
@@ -1059,6 +1090,23 @@ async function processMessage(
   const { mediaUrl, mediaType, interactiveReplyId, pendingAudio } = parsed
   // Reassigned below when a voice-note transcript lands after the insert.
   let contentText = parsed.contentText
+
+  // Every inbound message gets a sentence the agent can work with.
+  //
+  // `parseMessageContent` can legitimately come back with nothing to say: an
+  // uncaptioned photo, a sticker (its case never set text), a document with
+  // neither caption nor filename, a location with no coordinates, or any Meta
+  // type this build has not seen. That emptiness used to end the exchange -
+  // the auto-reply gate skipped anything with no text, so the customer sent a
+  // sticker and got silence back.
+  //
+  // Filling it here rather than inside each case means a type added to WhatsApp
+  // next year is covered by default instead of by a patch someone has to
+  // remember. The real content still wins whenever the parser found any.
+  const contentType = normalizeContentType(message.type)
+  if (!contentText?.trim()) {
+    contentText = describeInboundContent({ contentType })
+  }
 
   // Resolve swipe-reply context if present. A missing parent is fine —
   // we just store NULL and the UI renders the message without a quote.
@@ -1084,22 +1132,9 @@ async function processMessage(
 
   // The messages.content_type CHECK constraint (widened in migration 010
   // to add 'interactive' for button/list taps) allows:
-  //   text, image, document, audio, video, location, template, interactive
-  // Map incoming WhatsApp types that aren't in that list to the closest
-  // allowed value so the INSERT doesn't fail with a constraint error.
-  const ALLOWED_CONTENT_TYPES = new Set([
-    'text', 'image', 'document', 'audio', 'video',
-    'location', 'template', 'interactive',
-  ])
-  const contentType = ALLOWED_CONTENT_TYPES.has(message.type)
-    ? message.type
-    : message.type === 'sticker'
-      ? 'image'         // stickers are images
-      : message.type === 'button'
-        ? 'interactive' // template quick-reply tap (issue #478)
-        : message.type === 'voice'
-          ? 'audio'     // non-Meta gateways deliver voice notes as "voice"
-          : 'text'      // reaction, unknown → text fallback
+  // `contentType` was resolved above, by the shared `normalizeContentType`,
+  // so the INSERT and the agent's placeholder can never disagree about what
+  // this message is.
 
   // Determine whether this is the contact's very first inbound message
   // BEFORE we insert, so the count is accurate. Covers the case where
@@ -1237,33 +1272,14 @@ async function processMessage(
   // immediately (content_text null) so the inbox update is real-time —
   // transcription latency no longer gates the insert. Here, after the
   // insert, the transcript is written back onto the row and treated as
-  // the message payload for flows / automations / the AI.
+  // The payload for flows / automations / the AI.
   const isVoiceNote = message.type === 'audio' || message.type === 'voice'
 
-  // Shared "please write instead" reply for voice notes with no
-  // transcript: either the media fetch failed before we could download
-  // the bytes, or every transcription provider failed.
-  const sendVoiceFallback = async () => {
-    try {
-      await engineSendText({
-        accountId,
-        userId: configOwnerUserId,
-        conversationId: conversation.id,
-        contactId: contactRecord.id,
-        text: 'No pude procesar tu nota de voz. ¿Me la escribes con texto, por favor?',
-      })
-    } catch (err) {
-      console.error('[webhook] audio fallback reply failed:', err)
-    }
-
-    await dispatchWebhookEvent(supabaseAdmin(), accountId, 'message.received', {
-      conversation_id: conversation.id,
-      contact_id: contactRecord.id,
-      whatsapp_message_id: message.id,
-      content_type: contentType,
-      text: null,
-    })
-  }
+  // Note the absence of a "please write instead" direct send here. There used
+  // to be one: on a failed transcription it messaged the customer from this
+  // handler and then let the agent answer as well, so a single voice note
+  // produced two WhatsApp messages. The agent now owns the reply, once, and
+  // this layer only records what arrived.
 
   if (isVoiceNote) {
     if (pendingAudio) {
@@ -1273,41 +1289,53 @@ async function processMessage(
       )
       if (!transcript) {
         console.error(
-          '[webhook][audio] transcription failed across all providers — sending text fallback:',
+          '[webhook][audio] transcription failed across all providers:',
           {
             messageId: message.id,
             mimeType: pendingAudio.mimeType,
             audioBytes: pendingAudio.buffer.byteLength,
-          },
+          }
         )
-        await sendVoiceFallback()
-        return
-      }
-
-      // Transcription succeeded: persist the transcript back onto the row
-      // (fires a second realtime event that swaps the audio bubble for
-      // readable text) and refresh the conversation-list summary, which
-      // the unread bump stamped with `[audio]` a moment ago.
-      contentText = transcript
-      const { error: transcriptError } = await supabaseAdmin()
-        .from('messages')
-        .update({ content_text: transcript })
-        .eq(
-          'id',
+        // No `return` here. The customer still spoke and still expects an
+        // answer, so the note is described rather than swallowed and the
+        // exchange continues below into Flow, automations and the AI - which
+        // will ask them to repeat it in writing. Returning ended the
+        // conversation on a technical failure the customer did not cause.
+        contentText = describeInboundContent({ contentType: 'audio' })
+        await persistVoiceFallbackText(
           (insertedRows[0] as { id: string }).id,
+          contentText,
         )
-      if (transcriptError) {
-        console.error('[webhook][audio] failed to persist transcript:', transcriptError)
+      } else {
+        // Transcription succeeded: persist the transcript back onto the row
+        // (fires a second realtime event that swaps the audio bubble for
+        // readable text) and refresh the conversation-list summary, which
+        // the unread bump stamped with `[audio]` a moment ago.
+        contentText = transcript
+        const { error: transcriptError } = await supabaseAdmin()
+          .from('messages')
+          .update({ content_text: transcript })
+          .eq(
+            'id',
+            (insertedRows[0] as { id: string }).id,
+          )
+        if (transcriptError) {
+          console.error('[webhook][audio] failed to persist transcript:', transcriptError)
+        }
+        await supabaseAdmin()
+          .from('conversations')
+          .update({ last_message_text: transcript })
+          .eq('id', conversation.id)
       }
-      await supabaseAdmin()
-        .from('conversations')
-        .update({ last_message_text: transcript })
-        .eq('id', conversation.id)
     } else if (!contentText) {
       // Media fetch/download failed in parseMessageContent — no bytes to
-      // transcribe or mirror reliably.
-      await sendVoiceFallback()
-      return
+      // transcribe or mirror reliably. Same rule as above: record it and let
+      // the agent ask them to write it out.
+      contentText = describeInboundContent({ contentType: 'audio' })
+      await persistVoiceFallbackText(
+        (insertedRows[0] as { id: string }).id,
+        contentText,
+      )
     }
   }
 
@@ -1431,32 +1459,34 @@ async function processMessage(
   // design. The flow gate above already covers the real conflict, so a tap
   // that no Flow took reaches the AI like any other message.
   if (flowConsumed) {
+    // The Flow already answered, so nothing goes on the wire — but the model
+    // still hears about it. It used to be skipped entirely, which left the
+    // agent blind to messages it had helped author: asked "confirmas la cita?" →
+    // "sí" → the agent saw nothing, and could contradict a booking the Flow
+    // had just made.
     console.log(
-      `[webhook] message ${message.id}: a Flow consumed it — AI auto-reply skipped by design.`
+      `[webhook] message ${message.id}: a Flow consumed it — recorded as AI context, auto-reply suppressed.`
     )
-  } else if (!inboundText.trim()) {
-    console.log(
-      `[webhook] message ${message.id}: no text content after parsing (type=${message.type}) — AI auto-reply skipped (nothing to answer).`
-    )
-  } else {
-    console.log(
-      `[webhook] message ${message.id}: dispatching to AI auto-reply${
-        interactiveReplyId ? ` (button tap "${inboundText.trim().slice(0, 80)}")` : ` (${inboundText.trim().slice(0, 80)})`
-      }`
-    )
-await dispatchInboundToAiReply({
-      accountId,
-      conversationId: conversation.id,
-      contactId: contactRecord.id,
-      configOwnerUserId,
-      // The inbound wamid - lets the bot keep WhatsApp's typing
-      // indicator alive while it streams a multi-part reply.
-      composeMessageId: message.id,
-      // Meta disclosed no number for this sender: tell the model to ask for
-      // one, since nothing can be delivered until it arrives.
-      missingPhone,
-    })
   }
+  console.log(
+    `[webhook] message ${message.id}: dispatching to AI auto-reply (type=${message.type}, text="${inboundText.trim().slice(0, 80)}")`
+  )
+  await dispatchInboundToAiReply({
+    accountId,
+    conversationId: conversation.id,
+    contactId: contactRecord.id,
+    configOwnerUserId,
+    // The inbound wamid - lets the bot keep WhatsApp's typing
+    // indicator alive while it streams a multi-part reply.
+    composeMessageId: message.id,
+    // Meta disclosed no number for this sender: tell the model to ask for
+    // one, since nothing can be delivered until it arrives.
+    missingPhone,
+    // Already answered upstream (by a Flow, or it's a reaction): the agent
+    // learns about it without putting a second message on the wire.
+    suppressReply: flowConsumed || message.type === 'reaction',
+  })
+
 
   // message.received webhook (public API). Awaited — not fire-and-forget
   // — because we're inside the route's `after()` block, which only keeps
@@ -1739,11 +1769,89 @@ async function parseMessageContent(
       }
     }
 
+    case 'contacts': {
+      // Shared contact card. Name + phone when we can read them, which is what
+      // the agent needs to recognise ("te mandaron el contacto de Ana") instead
+      // of receiving a blank row.
+      const cards = (message.contacts ?? [])
+        .map((c) => {
+          const name =
+            c.name?.formatted_name ||
+            [c.name?.first_name, c.name?.last_name].filter(Boolean).join(' ')
+          const phone = c.phones?.map((p) => p.phone || p.wa_id).find(Boolean)
+          return [name, phone].filter(Boolean).join(' - ')
+        })
+        .filter(Boolean)
+      return { ...empty, contentText: cards.length ? cards.join(', ') : null }
+    }
+
+    case 'poll':
+      return {
+        ...empty,
+        contentText:
+          message.poll?.name ||
+          message.poll?.options?.map((o) => o.title).filter(Boolean).join(', ') ||
+          null,
+      }
+
+    case 'poll_response':
+      return {
+        ...empty,
+        contentText:
+          message.poll_response?.selected_options
+            ?.map((o) => o.title)
+            .filter(Boolean)
+            .join(', ') ||
+          message.poll_response?.poll_name ||
+          null,
+      }
+
+    case 'order': {
+      const items = (message.order?.product_items ?? [])
+        .map((i) =>
+          [i.product_retailer_id, i.quantity && `x${i.quantity}`]
+            .filter(Boolean)
+            .join(' ')
+        )
+        .filter(Boolean)
+      return {
+        ...empty,
+        contentText: [message.order?.text, items.join(', ')]
+          .filter(Boolean)
+          .join(' - ') || null,
+      }
+    }
+
     default:
       return {
         ...empty,
         contentText: `[Unsupported message type: ${message.type}]`,
       }
+  }
+}
+
+/**
+ * Write the description of an untranscribable voice note onto its row.
+ *
+ * Best-effort like the rest of the fan-out: the customer has already been sent
+ * a fallback message, so a failed write must not throw. The agent still gets
+ * the description in `contentText` for this turn either way; this only makes
+ * the transcript field honest for later turns and for the inbox summary.
+ */
+async function persistVoiceFallbackText(
+  messageRowId: string,
+  text: string
+): Promise<void> {
+  try {
+    await supabaseAdmin()
+      .from('messages')
+      .update({ content_text: text })
+      .eq('id', messageRowId)
+  } catch (error) {
+    console.error(
+      '[webhook][audio] failed to persist the voice-note description:',
+      error
+    )
   }
 }
 

@@ -1,6 +1,10 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import type { ChatMessage } from './types'
 import { aiContextMessageLimit } from './defaults'
+import {
+  AI_CONTEXT_CONTENT_TYPES,
+  describeInboundContent,
+} from './inbound-content'
 
 interface DbMessage {
   sender_type: 'customer' | 'agent' | 'bot'
@@ -28,13 +32,6 @@ interface DbMessage {
  * substituted body is in `content_text`, so the model knows what we
  * actually sent them.
  */
-const AI_CONTEXT_CONTENT_TYPES = [
-  'text',
-  'image',
-  'audio',
-  'interactive',
-  'template',
-] as const
 
 /**
  * Fetch the last N messages of a conversation and map them to the
@@ -42,8 +39,15 @@ const AI_CONTEXT_CONTENT_TYPES = [
  * image messages carry a placeholder and their media_url for the
  * vision pipeline. Audio rows carry the voice-note transcript in
  * content_text, so they read like text. Button / list taps read as the
- * label the customer chose. Other media types (video, document, audio
- * with no transcription) are skipped.
+ * label the customer chose.
+ *
+ * Every other type reads as a sentence naming what arrived
+ * (`describeInboundContent`). They used to be filtered out here entirely:
+ * the allowlist above omitted `location`, `video` and `document`, so a
+ * customer who shared their address and then asked "is that the right
+ * place?" was answered by a model that had never seen the address. A
+ * message the agent cannot interpret is still context it should reason
+ * about.
  *
  * Ordered oldest-first (chronological) so the transcript reads
  * naturally and the most recent customer message lands last.
@@ -69,18 +73,24 @@ export async function buildConversationContext(
   for (const m of rows) {
     const role = m.sender_type === 'customer' ? 'user' : 'assistant'
 
+    // Never emit an empty turn. A turn with no text tells the model nothing and
+    // can read as the customer "saying nothing", which is a different
+    // conversation than the one that happened.
+    const described = describeInboundContent({
+      contentType: m.content_type,
+      contentText: m.content_text,
+    })
+
     if (m.content_type === 'image' && m.media_url) {
       messages.push({
         role,
-        content: m.content_text?.trim() || '[Image]',
+        content: m.content_text?.trim() || described,
         images: [m.media_url],
       })
       continue
     }
 
-    if (m.content_text && m.content_text.trim()) {
-      messages.push({ role, content: m.content_text.trim() })
-    }
+    messages.push({ role, content: described })
   }
 
   return messages

@@ -565,8 +565,21 @@ interface DispatchArgs {
    * sender (BSUID / @username only). Adds the "ask for your number" rule to
    * the system prompt — see `buildSystemPrompt`.
    */
-  missingPhone?: boolean;
-}
+    missingPhone?: boolean;
+    /**
+     * Record the inbound in the model's context but do not put anything on the
+     * wire.
+     *
+     * Used for messages where silence is the correct answer but ignorance is
+     * not: a WhatsApp reaction (a bare 👍 is an acknowledgement of something we
+     * already said, not a question) and any message a Flow has already
+     * answered. Previously the webhook `return`ed before dispatch, so these
+     * messages were invisible to the LLM forever - it could not tell the
+     * customer had approved a quote or reacted to a photo, and would sometimes
+     * re-raise the same topic.
+     */
+    suppressReply?: boolean;
+  }
 
 /**
  * Re-resolve the recipient and retry the reply once.
@@ -686,6 +699,17 @@ export async function dispatchInboundToAiReply(
   // override a decision to deliberately stay silent.
   let replyDispatched = false;
   let entitledToReply = false;
+
+  // A suppressed dispatch still walks every gate above (config, assignment,
+  // rate limit) purely to keep the logs honest, but never reaches the wire.
+  // `entitledToReply` stays false so the catch block's fallback send cannot
+  // override the decision.
+  if (args.suppressReply) {
+    console.log(
+      `[ai auto-reply] dispatch requested for conversation ${conversationId} with suppressReply=true — ` +
+        `the message is recorded as context but no reply will be sent.`
+    );
+  }
 
   try {
     const db = supabaseAdmin();
@@ -827,6 +851,16 @@ export async function dispatchInboundToAiReply(
     // Every gate that deliberately stays silent has now passed. From here
     // on, ANY failure must still reach the customer.
     entitledToReply = true;
+
+    // ...unless this particular inbound was context-only. Placed after the
+    // gates so the logs still show how the account was configured, and before
+    // any provider call so a suppressed reaction costs nothing.
+    if (args.suppressReply) {
+      console.log(
+        `[ai auto-reply] conversation ${conversationId}: message recorded as context only (suppressReply) — no model call, no outbound send.`
+      );
+      return;
+    }
 
     // Pre-LLM context is fetched in parallel (knowledge retrieval and
     // the contact profile/citas are independent) so the reply isn't held

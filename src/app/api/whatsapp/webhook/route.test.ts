@@ -727,6 +727,142 @@ describe('inbound webhook: typing indicator', () => {
     expect(h.state.upsertCalls).toHaveLength(1)
     expect(h.dispatchInboundToFlows).toHaveBeenCalledTimes(1)
   })
+
+  // ============================================================
+  // Reactions: context yes, reply no.
+  //
+  // These used to `return` before parseMessageContent, so a 👍 never became a
+  // message row. The agent could not tell the customer had approved a quote or
+  // reacted to a photo, and would re-raise the same topic.
+  // ============================================================
+  describe('reactions', () => {
+    it('records the reaction as a message the agent can read', async () => {
+      await runWebhook({
+        id: 'wamid.REACT1',
+        from: '15551230000',
+        timestamp: '1700000000',
+        type: 'reaction',
+        reaction: { message_id: 'wamid.PREV1', emoji: '👍' },
+      })
+
+      expect(h.state.upsertCalls).toHaveLength(1)
+      expect(h.state.upsertCalls[0].row.content_text).toBe('👍')
+    })
+
+    it('does not answer the reaction', async () => {
+      await runWebhook({
+        id: 'wamid.REACT2',
+        from: '15551230000',
+        timestamp: '1700000000',
+        type: 'reaction',
+        reaction: { message_id: 'wamid.PREV2', emoji: '❤️' },
+      })
+
+      // Notified, but silent: answering "thanks for the like!" to every
+      // reaction would be spam.
+      expect(h.dispatchInboundToAiReply).toHaveBeenCalledWith(
+        expect.objectContaining({ suppressReply: true }),
+      )
+    })
+  });
+
+  // ============================================================
+  // Every inbound type must reach the agent.
+  //
+  // These used to be silently dropped: the parser could not extract text from a
+  // sticker or an uncaptioned photo, and the gate then read
+  // `else if (!inboundText.trim())` and skipped the auto-reply. The customer
+  // sent something and got nothing back.
+  // ============================================================
+  const NON_TEXT_TYPES: Array<{
+    label: string;
+    message: Record<string, unknown>;
+    storedType: string;
+    described: string;
+  }> = [
+    {
+      label: 'a sticker',
+      message: { type: 'sticker', sticker: { id: 'stk-1' } },
+      storedType: 'image',
+      described: '[El usuario envió una foto]',
+    },
+    {
+      label: 'a GIF',
+      message: { type: 'animation', animation: { id: 'gif-1' } },
+      storedType: 'image',
+      described: '[El usuario envió una foto]',
+    },
+    {
+      label: 'an uncaptioned photo',
+      message: { type: 'image', image: { id: 'img-1' } },
+      storedType: 'image',
+      described: '[El usuario envió una foto]',
+    },
+    {
+      label: 'a video',
+      message: { type: 'video', video: { id: 'vid-1' } },
+      storedType: 'video',
+      described: '[El usuario envió un video]',
+    },
+    {
+      label: 'a document',
+      message: {
+        type: 'document',
+        document: { id: 'doc-1', filename: 'contrato.pdf' },
+      },
+      storedType: 'document',
+      described: '[El usuario envió un documento]',
+    },
+    {
+      label: 'a location',
+      message: {
+        type: 'location',
+        location: { latitude: 4.7, longitude: -74.1 },
+      },
+      storedType: 'location',
+      described: '[El usuario compartió su ubicación]',
+    },
+    {
+      label: 'a shared contact',
+      message: {
+        type: 'contacts',
+        contacts: [{ name: { first_name: 'Ana' }, phones: ['3001234567'] }],
+      },
+      storedType: 'text',
+      described: '[El usuario envió un mensaje de texto]',
+    },
+    {
+      label: 'a type this build has never seen',
+      message: { type: 'brand_new_meta_type', payload: {} },
+      storedType: 'text',
+      described: '[El usuario envió un mensaje de texto]',
+    },
+  ];
+
+  for (const c of NON_TEXT_TYPES) {
+    it(`still reaches the agent when the customer sends ${c.label}`, async () => {
+      await runWebhook({
+        id: `wamid.NONTEXT_${c.storedType}`,
+        from: '15551230000',
+        timestamp: '1700000000',
+        ...c.message,
+      });
+
+      // Persisted, with a type inside the CHECK and text the agent can read.
+      expect(h.state.upsertCalls).toHaveLength(1);
+      expect(h.state.upsertCalls[0].row).toMatchObject({
+        content_type: c.storedType,
+      });
+      expect(
+        String(h.state.upsertCalls[0].row.content_text ?? '').trim(),
+      ).not.toBe('');
+
+      // And this is the regression that mattered: not dropped.
+      expect(h.dispatchInboundToFlows).toHaveBeenCalled();
+      expect(h.runAutomationsForTrigger).toHaveBeenCalled();
+      expect(h.dispatchInboundToAiReply).toHaveBeenCalled();
+    });
+  }
 })
 
 describe('inbound webhook: template quick-reply buttons (#478)', () => {
@@ -793,14 +929,17 @@ describe('inbound webhook: template quick-reply buttons (#478)', () => {
   })
 
   it('still stands down when a Flow consumed the tap', async () => {
-    // Flows win over the LLM — that's the gate that actually protects a
-    // menu a Flow owns, and it must keep working now that the separate
-    // interactive-tap skip is gone.
+    // Flows own the menu a Flow owns, so nothing goes on the wire. But the
+    // model is no longer left blind: it is told the Flow answered, so it
+    // cannot later contradict a booking the Flow just made.
     h.dispatchInboundToFlows.mockResolvedValue({ consumed: true })
 
     await runWebhook(templateButtonTap)
 
-    expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
+    expect(h.dispatchInboundToAiReply).toHaveBeenCalledTimes(1)
+    expect(h.dispatchInboundToAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ suppressReply: true }),
+    )
   })
 
   it('shows the typing indicator while the bot answers a tap', async () => {
@@ -852,7 +991,7 @@ describe('inbound webhook: voice notes', () => {
     // the transcription, so the inbox realtime event fires at once.
     expect(h.state.upsertCalls[0].row).toMatchObject({
       content_type: 'audio',
-      content_text: null,
+      content_text: '[El usuario envió un mensaje de voz]',
     })
     // The transcript is then written back onto the row and the
     // conversation-list summary the unread bump stamped as `[audio]`.
@@ -880,31 +1019,33 @@ describe('inbound webhook: voice notes', () => {
 
     await runWebhook(AUDIO_MESSAGE)
 
-    // The note is still persisted for the record — with null_ content
-    // text, immediately (not after transcription).
+    // The note is persisted for the record — with null content text,
+    // immediately (not after transcription).
     expect(h.state.upsertCalls).toHaveLength(1)
     expect(h.state.upsertCalls[0].row).toMatchObject({
       content_type: 'audio',
-      content_text: null,
+      content_text: '[El usuario envió un mensaje de voz]',
       media_type: 'audio/ogg; codecs=opus',
     })
-    // Nothing is written back since there is no transcript.
-    expect(h.state.messageTranscriptUpdates).toHaveLength(0)
-    expect(h.state.conversationSummaryUpdates).toHaveLength(0)
-    // Friendly ask-it-in-text reply goes out.
-    expect(mockEngineSendText).toHaveBeenCalledWith(
-      expect.objectContaining({
-        text: expect.stringContaining('nota de voz'),
-        contactId: 'contact-1',
-        conversationId: 'conv-1',
-      }),
-    )
-    // With nothing to act on, flows / automations / AI stay out.
-    expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
-    expect(h.runAutomationsForTrigger).not.toHaveBeenCalled()
-    expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
+    // Exactly ONE message goes out, and it is the agent's. This handler used
+    // to send a hardcoded "please write instead" text itself and then let the
+    // agent answer too, so a single voice note produced two WhatsApp messages.
+    expect(mockEngineSendText).not.toHaveBeenCalled()
+    // The row is corrected to describe the note, so later turns and the
+    // inbox summary are not blank.
+    expect(
+      h.state.messageTranscriptUpdates.filter((u) =>
+        u.patch &&
+        typeof u.patch.content_text === 'string' &&
+        u.patch.content_text.includes('mensaje de voz')
+      ).length,
+    ).toBeGreaterThanOrEqual(1)
+    // A transcription failure is OUR problem, not a reason to go silent: the
+    // exchange continues into the agent, which asks them to repeat it.
+    expect(h.dispatchInboundToFlows).toHaveBeenCalled()
+    expect(h.dispatchInboundToAiReply).toHaveBeenCalled()
     // message.received still fires so external listeners know it arrived.
-    expect(h.dispatchWebhookEvent).toHaveBeenCalledTimes(1)
+    expect(h.dispatchWebhookEvent).toHaveBeenCalled()
   })
 
   it('treats a non-Meta "voice" envelope like an audio note', async () => {
@@ -931,7 +1072,7 @@ describe('inbound webhook: voice notes', () => {
     // back in the background.
     expect(h.state.upsertCalls[0].row).toMatchObject({
       content_type: 'audio',
-      content_text: null,
+      content_text: '[El usuario envió un mensaje de voz]',
       media_type: 'audio/ogg; codecs=opus',
     })
     expect(h.state.messageTranscriptUpdates).toEqual([
