@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
+/** Row shape `handleStatusUpdate` reads back from `broadcast_recipients`. */
+type BroadcastRecipientStub = { id: string; status: string } | null
+
 // Shared, hoisted state the module mocks close over. Reset per test.
 const h = vi.hoisted(() => ({
   runAutomationsForTrigger: vi.fn(),
@@ -63,6 +66,21 @@ const h = vi.hoisted(() => ({
       id: unknown
       patch: Record<string, unknown>
     }[],
+    /** `handleStatusUpdate` writes, on both sides of the correlation. */
+    messageStatusUpdates: [] as {
+      column: string
+      value: unknown
+      patch: Record<string, unknown>
+    }[],
+    broadcastStatusUpdates: [] as {
+      column: string
+      value: unknown
+      patch: Record<string, unknown>
+    }[],
+    /** Row returned when correlating a status event to a campaign recipient. */
+    broadcastRecipientForStatus: null as BroadcastRecipientStub,
+    /** Account the wamid resolves to for the status fan-out, or null. */
+    statusMessageAccountId: null as string | null,
   },
 }))
 
@@ -122,19 +140,39 @@ vi.mock('@supabase/supabase-js', () => ({
             }),
           }
         case 'broadcast_recipients':
-          // flagBroadcastReplyIfAny: select().eq().eq().in().order().limit()
+          // Two shapes land here:
+          //  - flagBroadcastReplyIfAny: select().eq().eq().in().order().limit()
+          //  - handleStatusUpdate:      select().eq().maybeSingle() and update().eq()
           return {
             select: () => ({
-              eq: () => ({
-                eq: () => ({
-                  in: () => ({
-                    order: () => ({
-                      limit: () =>
-                        Promise.resolve({ data: [], error: null }),
+              eq: (col: string) => {
+                // The status handler filters on whatsapp_message_id.
+                if (col === 'whatsapp_message_id') {
+                  return {
+                    maybeSingle: () =>
+                      Promise.resolve({
+                        data: h.state.broadcastRecipientForStatus,
+                        error: null,
+                      }),
+                  };
+                }
+                return {
+                  eq: () => ({
+                    in: () => ({
+                      order: () => ({
+                        limit: () =>
+                          Promise.resolve({ data: [], error: null }),
+                      }),
                     }),
                   }),
-                }),
-              }),
+                };
+              },
+            }),
+            update: (patch: Record<string, unknown>) => ({
+              eq: (col: string, val: unknown) => {
+                h.state.broadcastStatusUpdates.push({ column: col, value: val, patch });
+                return Promise.resolve({ data: null, error: null });
+              },
             }),
           }
         case 'contacts':
@@ -262,33 +300,65 @@ vi.mock('@supabase/supabase-js', () => ({
           }
         case 'messages':
           return {
-            // Two different chains land here, told apart by the count
-            // option: the prior-message count (head request) and the
-            // reply-context parent lookup.
-            select: (_columns: string, options?: { head?: boolean }) =>
-              options?.head
-                ? // priorCustomerMsgCount: select('id',{count,head}).eq().eq()
-                  {
-                    eq: () => ({
-                      eq: () =>
-                        Promise.resolve({
-                          count: h.state.priorCustomerMsgCount,
-                          error: null,
-                        }),
-                    }),
-                  }
-                : // lookupInternalIdByMetaId: select('id').eq().eq().maybeSingle()
-                  {
-                    eq: () => ({
-                      eq: () => ({
-                        maybeSingle: () =>
-                          Promise.resolve({
-                            data: h.state.replyContextParent,
-                            error: null,
-                          }),
+            // Three different read chains land here, told apart by the count
+            // option and by WHICH column is filtered:
+            //   - priorCustomerMsgCount (head request)
+            //   - lookupInternalIdByMetaId  → eq('message_id').eq('conversation_id')
+            //   - status fan-out lookup     → eq('message_id').limit()
+            select: (_columns: string, options?: { head?: boolean }) => {
+              if (options?.head) {
+                // priorCustomerMsgCount: select('id',{count,head}).eq().eq()
+                return {
+                  eq: () => ({
+                    eq: () =>
+                      Promise.resolve({
+                        count: h.state.priorCustomerMsgCount,
+                        error: null,
                       }),
-                    }),
-                  },
+                  }),
+                }
+              }
+
+              const filters: Record<string, unknown> = {}
+              const chain: Record<string, unknown> = {
+                eq: (col: string, val: unknown) => {
+                  filters[col] = val
+                  return chain
+                },
+                limit: () => chain,
+                maybeSingle: () => {
+                  if ('conversation_id' in filters) {
+                    return Promise.resolve({
+                      data: h.state.replyContextParent,
+                      error: null,
+                    })
+                  }
+                  // The status fan-out asks which account a wamid belongs to.
+                  return Promise.resolve({
+                    data: h.state.statusMessageAccountId
+                      ? {
+                          conversation_id: 'conv-1',
+                          conversations: { account_id: h.state.statusMessageAccountId },
+                        }
+                      : null,
+                    error: null,
+                  })
+                },
+              }
+              return chain
+            },
+            // Two writers share this: the transcript/description writers filter
+            // on `id`, handleStatusUpdate filters on `message_id`.
+            update: (patch: Record<string, unknown>) => ({
+              eq: (col: string, value: unknown) => {
+                if (col === 'message_id') {
+                  h.state.messageStatusUpdates.push({ column: col, value, patch })
+                } else {
+                  h.state.messageTranscriptUpdates.push({ id: value, patch })
+                }
+                return Promise.resolve({ data: null, error: null })
+              },
+            }),
             // Idempotent insert: upsert(...).select('id')
             upsert: (row: Record<string, unknown>, options: unknown) => {
               h.state.upsertCalls.push({ row, options })
@@ -327,13 +397,6 @@ vi.mock('@supabase/supabase-js', () => ({
                   }),
               }
             },
-            // Background transcription writes the transcript back onto the row.
-            update: (patch: Record<string, unknown>) => ({
-              eq: (_col: string, value: unknown) => {
-                h.state.messageTranscriptUpdates.push({ id: value, patch })
-                return Promise.resolve({ data: null, error: null })
-              },
-            }),
           }
         default:
           throw new Error(`unexpected table: ${table}`)
@@ -500,6 +563,31 @@ async function runWebhook(message?: Record<string, unknown>) {
   return res
 }
 
+/** Drives a `value.statuses[]` delivery, which carries no inbound message. */
+async function runStatusWebhook(status: Record<string, unknown>) {
+  const body = {
+    entry: [
+      {
+        changes: [
+          {
+            field: 'messages',
+            value: {
+              metadata: { phone_number_id: 'pn-1' },
+              statuses: [status],
+            },
+          },
+        ],
+      },
+    ],
+  }
+  const res = await POST({
+    text: async () => JSON.stringify(body),
+    headers: { get: () => 'sha256=stub' },
+  } as unknown as Request)
+  for (const cb of h.state.afterCallbacks) await cb()
+  return res
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   h.state.messageUpsertResult = [{ id: 'msg-1' }]
@@ -527,6 +615,10 @@ beforeEach(() => {
   h.state.contactInsertCalls = []
   h.state.messageTranscriptUpdates = []
   h.state.conversationSummaryUpdates = []
+  h.state.messageStatusUpdates = []
+  h.state.broadcastStatusUpdates = []
+  h.state.broadcastRecipientForStatus = null
+  h.state.statusMessageAccountId = null
   mockGetMediaUrl.mockResolvedValue({
     url: 'https://lookaside.fbsbx.com/whatsapp/abc',
     mimeType: 'image/jpeg',
@@ -673,6 +765,91 @@ describe('inbound webhook: atomic unread bump (#369)', () => {
     })
   })
 })
+
+// ============================================================
+// Campaign status <-> Inbox status.
+//
+// A broadcast mirror writes the same Meta wamid into two places —
+// `messages.message_id` and `broadcast_recipients.whatsapp_message_id` — and
+// the only link between them is that string. So a single delivery-status
+// webhook has to reach BOTH, or the campaign shows a delivery count the Inbox
+// bubble disagrees with.
+// ============================================================
+describe('inbound webhook: broadcast status sync', () => {
+  const WAMID = 'wamid.OUT1';
+
+  it('updates the Inbox message and the campaign recipient from one event', async () => {
+    h.state.broadcastRecipientForStatus = { id: 'rec-1', status: 'sent' };
+
+    await runStatusWebhook({
+      id: WAMID,
+      status: 'delivered',
+      timestamp: '1700000000',
+      recipient_id: '15551230000',
+    });
+
+    // The Inbox side: the mirrored bubble advances.
+    expect(h.state.messageStatusUpdates).toContainEqual({
+      column: 'message_id',
+      value: WAMID,
+      patch: { status: 'delivered' },
+    });
+    // The campaign side: the recipient row and its timestamp.
+    expect(h.state.broadcastStatusUpdates).toContainEqual({
+      column: 'id',
+      value: 'rec-1',
+      patch: { status: 'delivered', delivered_at: '2023-11-14T22:13:20.000Z' },
+    });
+  });
+
+  it('advances the recipient to read', async () => {
+    h.state.broadcastRecipientForStatus = { id: 'rec-1', status: 'delivered' };
+
+    await runStatusWebhook({
+      id: WAMID,
+      status: 'read',
+      timestamp: '1700000000',
+      recipient_id: '15551230000',
+    });
+
+    expect(h.state.messageStatusUpdates).toContainEqual({
+      column: 'message_id',
+      value: WAMID,
+      patch: { status: 'read' },
+    });
+    expect(h.state.broadcastStatusUpdates[0].patch).toMatchObject({ status: 'read' });
+  });
+
+  it('refuses to walk a recipient backwards', async () => {
+    // `read` is the top of the ladder; a late/replayed `sent` must not undo it.
+    h.state.broadcastRecipientForStatus = { id: 'rec-1', status: 'read' };
+
+    await runStatusWebhook({
+      id: WAMID,
+      status: 'sent',
+      timestamp: '1700000000',
+      recipient_id: '15551230000',
+    });
+
+    expect(h.state.broadcastStatusUpdates).toHaveLength(0);
+  });
+
+  it('still advances the Inbox bubble for a non-campaign message', async () => {
+    // No matching recipient row: the messages update must still happen, which
+    // is what every ordinary INBOX send relies on.
+    h.state.broadcastRecipientForStatus = null;
+
+    await runStatusWebhook({
+      id: WAMID,
+      status: 'delivered',
+      timestamp: '1700000000',
+      recipient_id: '15551230000',
+    });
+
+    expect(h.state.messageStatusUpdates).toHaveLength(1);
+    expect(h.state.broadcastStatusUpdates).toHaveLength(0);
+  });
+});
 
 describe('inbound webhook: typing indicator', () => {
   it('shows the WhatsApp typing indicator immediately for text inbound', async () => {

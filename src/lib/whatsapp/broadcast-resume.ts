@@ -259,7 +259,10 @@ export async function planBroadcastResume(
 ): Promise<ResumePlan> {
   const { data: broadcast, error: bcError } = await db
     .from('broadcasts')
-    .select('id, template_name, template_language')
+    // `user_id` is the campaign's creator. `conversations.user_id` is NOT NULL,
+    // so a thread opened by the Inbox mirror needs an audit user — the person
+    // who ran the campaign is the correct one, and it is already on this row.
+    .select('id, template_name, template_language, user_id')
     .eq('id', broadcastId)
     .eq('account_id', accountId)
     .maybeSingle();
@@ -381,14 +384,28 @@ export async function planBroadcastResume(
     );
   }
 
+  // `broadcasts.user_id` is NOT NULL (migration 001), so this is always a real
+  // owner. Coerced rather than defaulted: a missing one would have to become
+  // `conversations.user_id = NULL` on a thread this pass is about to open,
+  // and the mirror would then drop the delivered message.
+  const auditUserId = String(
+    (broadcast as { user_id?: string | null }).user_id ?? '',
+  );
+  if (!auditUserId) {
+    throw new Error(
+      `Broadcast ${broadcastId} has no user_id; cannot resume without a thread owner`,
+    );
+  }
+
   const plan: BroadcastPlan = {
-    broadcastId,
-    templateName: broadcast.template_name,
-    templateLanguage: resolvedTemplate.language,
-    phoneNumberId: config.phone_number_id,
-    accessToken: decrypt(config.access_token),
-    accountId,
-    templateRow: resolvedTemplate.row,
+      broadcastId,
+      templateName: broadcast.template_name,
+      templateLanguage: resolvedTemplate.language,
+      phoneNumberId: config.phone_number_id,
+      accessToken: decrypt(config.access_token),
+      accountId,
+      auditUserId,
+      templateRow: resolvedTemplate.row,
     planned: slice.map((row) => ({
       recipientRowId: row.id,
       contactId: row.contact_id,

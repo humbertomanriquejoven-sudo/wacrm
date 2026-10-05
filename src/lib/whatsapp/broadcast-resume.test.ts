@@ -211,6 +211,8 @@ function planDb(fx: PlanFixture, writes: PlanWrites = {}): SupabaseClient {
 
 const BROADCAST = {
   id: 'bc-1',
+  // NOT NULL in the schema; the plan needs it to open an Inbox thread.
+  user_id: 'u-owner',
   template_name: 'order_update',
   template_language: 'en_US',
 };

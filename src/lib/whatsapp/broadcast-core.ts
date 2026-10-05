@@ -33,6 +33,7 @@ import {
 } from '@/lib/whatsapp/template-body';
 import type { MessageTemplate } from '@/types';
 import { findOrCreateContact } from '@/lib/api/v1/contacts';
+import { findOrCreateConversation } from '@/lib/conversations/get-or-create';
 
 /** Thrown by createBroadcast on a caller-visible failure; route maps it. */
 export class BroadcastError extends Error {
@@ -86,6 +87,14 @@ export interface BroadcastPlan {
   accessToken: string;
   /** Owning account. Used to scope the Inbox mirror to the right thread. */
   accountId: string;
+  /**
+   * Creator of the campaign, stamped on any Inbox thread the mirror has to
+   * open (`conversations.user_id` is NOT NULL, so the row cannot be created
+   * without one). Required rather than optional so a plan that would open a
+   * thread anonymously is a compile error instead of a runtime insert
+   * failure that silently drops the delivered message.
+   */
+  auditUserId: string;
   templateRow: MessageTemplate | null;
   planned: PlannedRecipient[];
   /** Phones rejected up front (invalid E.164) — counted as failed. */
@@ -271,6 +280,8 @@ export async function createBroadcast(
     phoneNumberId: config.phone_number_id,
     accessToken,
     accountId,
+    // The campaign's creator owns any thread this campaign opens.
+    auditUserId,
     templateRow,
     planned,
     rejected,
@@ -383,28 +394,41 @@ async function mirrorBroadcastSendToInbox(
   sentMessageId: string
 ): Promise<void> {
   try {
-    // `maybeSingle` on a multi-row match is an error, so the newest thread
-    // is picked with an explicit limit rather than a bare single().
-    const { data: conversation } = await db
-      .from('conversations')
-      .select('id')
-      .eq('account_id', plan.accountId)
-      .eq('contact_id', recipient.contactId)
-      .order('last_message_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    // Find the thread, or OPEN one.
+    //
+    // This used to look the conversation up and, when there was none, log a
+    // warning and return without mirroring. That is exactly the cold-start
+    // case a campaign is made of: contacts who have never written in have no
+    // thread, so every one of them delivered successfully on WhatsApp and then
+    // vanished from the Inbox. The campaign was invisible in the product that
+    // manages it.
+    //
+    // Keyed by `contact_id`, so a contact known only by an `@user` handle or a
+    // BSUID gets a thread exactly like a dialable one - a missing phone number
+    // must never abort the mirror.
+    const found = await findOrCreateConversation(db, {
+      accountId: plan.accountId,
+      ownerUserId: plan.auditUserId,
+      contactId: recipient.contactId,
+    });
 
-    if (!conversation) {
-      // No thread yet: there is nowhere to mirror to, and opening one for an
-      // outbound-only campaign would show an empty conversation per recipient.
-      console.warn(
-        `[broadcast] no conversation for contact ${recipient.contactId}; ` +
-          'send not mirrored to the Inbox',
+    if (!found) {
+      // Only reachable when the thread can be neither found nor opened —
+      // `conversations.user_id` is NOT NULL, so a campaign with no resolvable
+      // audit user cannot create one. An existing thread always resolves.
+      console.error(
+        `[broadcast] sent to Meta but no conversation could be resolved or created for contact ${recipient.contactId}; not mirrored`,
       );
       return;
     }
 
-    const conversationId = (conversation as { id: string }).id;
+    if (found.created) {
+      console.log(
+        `[broadcast] opened a conversation for contact ${recipient.contactId} (campaign ${plan.broadcastId}) so the send appears in the Inbox`,
+      );
+    }
+
+    const conversationId = found.conversation.id;
 
     // The template body is rendered with THIS recipient's frozen params, so
     // the Inbox shows the message the contact actually received.
@@ -412,19 +436,36 @@ async function mirrorBroadcastSendToInbox(
       templateContentText(plan.templateRow, recipient.params) ??
       `[template:${plan.templateName}]`;
 
+    const sentAt = new Date().toISOString();
+
     // `direction` and `metadata` are NOT columns on `messages`: inbound vs
     // outbound is `sender_type`, and the template's components have no
     // column of their own. Naming either here would make PostgREST reject
     // the insert with 42703 and silently unmirror every send.
-    const { error } = await db.from('messages').insert({
-      conversation_id: conversationId,
-      sender_type: 'agent',
-      content_type: 'template',
-      content_text: contentText,
-      template_name: plan.templateName,
-      message_id: sentMessageId,
-      status: 'sent',
-    });
+    //
+    // Upserted on (conversation_id, message_id) - the same conflict target the
+    // inbound webhook uses. A plain insert violated
+    // `idx_messages_conversation_message_id` whenever a resumed campaign
+    // re-sent the same wamid, failing the whole mirror on a replay.
+    const { error } = await db
+      .from('messages')
+      .upsert(
+        {
+          conversation_id: conversationId,
+          sender_type: 'agent',
+          content_type: 'template',
+          content_text: contentText,
+          template_name: plan.templateName,
+          message_id: sentMessageId,
+          status: 'sent',
+          // The send instant, so the campaign bubble sorts against inbound
+          // messages by when it actually happened rather than by when this
+          // mirror row happened to be written. The inbound path does the same
+          // with Meta's timestamp.
+          created_at: sentAt,
+        },
+        { onConflict: 'conversation_id,message_id', ignoreDuplicates: true },
+      );
 
     if (error) {
       console.error(
@@ -438,8 +479,8 @@ async function mirrorBroadcastSendToInbox(
       .from('conversations')
       .update({
         last_message_text: contentText,
-        last_message_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        last_message_at: sentAt,
+        updated_at: sentAt,
       })
       .eq('id', conversationId);
   } catch (error) {

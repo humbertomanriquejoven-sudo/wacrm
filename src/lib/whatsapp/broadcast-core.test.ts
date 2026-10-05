@@ -144,6 +144,10 @@ describe('createBroadcast atomicity (#370)', () => {
     expect(calls.rpc[0].name).toBe('create_broadcast_with_recipients');
     expect(calls.usedDirectInsert).toBe(0);
     expect(plan.broadcastId).toBe('b-1');
+    // The plan carries the campaign owner so deliverBroadcast can open an
+    // Inbox thread on first contact — `conversations.user_id` is NOT NULL, so
+    // a plan without it would drop every cold-start recipient.
+    expect(plan.auditUserId).toBe('user');
     // `contactId` rides along so deliverBroadcast can mirror each send into
     // that recipient's own Inbox thread.
     expect(plan.planned).toEqual([
@@ -265,9 +269,14 @@ const TEMPLATE_ROW = {
 function mirrorDb(opts: {
   conversationId?: string | null;
   insertError?: { message: string } | null;
+  /** Simulates the unique index rejecting a duplicate thread. */
+  createConversationError?: { message: string; code?: string } | null;
 }) {
   const log = {
-    messagesInserts: [] as Record<string, unknown>[],
+    messagesUpserts: [] as Record<string, unknown>[],
+    /** onConflict/ignoreDuplicates on each upsert. */
+    messagesUpsertOptions: [] as Record<string, unknown>[],
+    conversationInserts: [] as Record<string, unknown>[],
     conversationUpdates: [] as Record<string, unknown>[],
     recipientUpdates: [] as Record<string, unknown>[],
     lookups: [] as Array<Record<string, unknown>>,
@@ -279,8 +288,22 @@ function mirrorDb(opts: {
         return {
           select: () => {
             // select -> eq(account_id) -> eq(contact_id) -> order -> limit
-            // -> maybeSingle; each filter logs and returns the same builder.
-            const done = () => ({
+            // (find-or-create) with no `maybeSingle`, since it is created.
+            const done = () =>
+              Promise.resolve({
+                data:
+                  opts.conversationId === null
+                    ? []
+                    : [{ id: opts.conversationId ?? 'conv-1' }],
+                error: null,
+              });
+            const b: Record<string, unknown> = {
+              eq: (c: string, v: unknown) => {
+                log.lookups.push({ [c]: v });
+                return b;
+              },
+              order: () => ({ limit: () => done() }),
+              limit: () => done(),
               maybeSingle: () =>
                 Promise.resolve({
                   data:
@@ -289,17 +312,22 @@ function mirrorDb(opts: {
                       : { id: opts.conversationId ?? 'conv-1' },
                   error: null,
                 }),
-            });
-            const b: Record<string, unknown> = {
-              eq: (c: string, v: unknown) => {
-                log.lookups.push({ [c]: v });
-                return b;
-              },
-              order: () => ({ limit: () => done() }),
-              limit: () => done(),
-              maybeSingle: () => done(),
             };
             return b;
+          },
+          insert: (row: Record<string, unknown>) => {
+            log.conversationInserts.push(row);
+            return {
+              select: () => ({
+                single: () =>
+                  Promise.resolve({
+                    data: opts.createConversationError
+                      ? null
+                      : { id: 'conv-new' },
+                    error: opts.createConversationError ?? null,
+                  }),
+              }),
+            };
           },
           update: (row: Record<string, unknown>) => {
             log.conversationUpdates.push(row);
@@ -309,8 +337,12 @@ function mirrorDb(opts: {
       }
       if (table === 'messages') {
         return {
-          insert: (row: Record<string, unknown>) => {
-            log.messagesInserts.push(row);
+          upsert: (
+            row: Record<string, unknown>,
+            upsertOpts?: Record<string, unknown>
+          ) => {
+            log.messagesUpserts.push(row);
+            log.messagesUpsertOptions.push(upsertOpts ?? {});
             return Promise.resolve({ data: null, error: opts.insertError ?? null });
           },
         };
@@ -354,6 +386,7 @@ function mirrorPlan(
     phoneNumberId: 'pn-1',
     accessToken: 'token',
     accountId: 'acct-1',
+    auditUserId: 'u-owner',
     templateRow: TEMPLATE_ROW,
     planned: [{ recipientRowId: 'r-1', phone, params, contactId }],
     rejected: 0,
@@ -368,7 +401,7 @@ describe('deliverBroadcast Inbox mirroring', () => {
 
     // No `direction` / `metadata` columns exist on `messages`; naming
     // either makes PostgREST reject the insert with 42703.
-    expect(log.messagesInserts[0]).toMatchObject({
+    expect(log.messagesUpserts[0]).toMatchObject({
       conversation_id: 'conv-1',
       sender_type: 'agent',
       content_type: 'template',
@@ -377,8 +410,8 @@ describe('deliverBroadcast Inbox mirroring', () => {
       message_id: 'wamid.OUT1',
       status: 'sent',
     });
-    expect(log.messagesInserts[0]).not.toHaveProperty('direction');
-    expect(log.messagesInserts[0]).not.toHaveProperty('metadata');
+    expect(log.messagesUpserts[0]).not.toHaveProperty('direction');
+    expect(log.messagesUpserts[0]).not.toHaveProperty('metadata');
   });
 
   it('mirrors a BSUID recipient identically, resolved by contact only', async () => {
@@ -396,7 +429,7 @@ describe('deliverBroadcast Inbox mirroring', () => {
     ]);
     // Under-supplied params leave later placeholders untouched — a faithful
     // mirror of what was sent, not a crash or a blank row.
-    expect(log.messagesInserts[0]).toMatchObject({
+    expect(log.messagesUpserts[0]).toMatchObject({
       conversation_id: 'conv-1',
       content_text: 'Hola Ana, tu cita es {{2}}',
       message_id: 'wamid.OUT1',
@@ -409,8 +442,94 @@ describe('deliverBroadcast Inbox mirroring', () => {
 
     await deliverBroadcast(db, mirrorPlan('bad-address', ['Ana']));
 
-    expect(log.messagesInserts).toHaveLength(0);
+    expect(log.messagesUpserts).toHaveLength(0);
     expect(log.recipientUpdates[0]).toMatchObject({ status: 'failed' });
+  });
+
+  it('opens the Inbox thread when the recipient has never written in', async () => {
+    // THE regression this whole change is about. A cold list is what a campaign
+    // is made of: contacts with no prior thread. This used to log a warning
+    // and give up, so every one of them delivered on WhatsApp and then vanished
+    // from the Inbox.
+    const { db, log } = mirrorDb({ conversationId: null });
+
+    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana', 'mar 10']));
+
+    // The send is still recorded as delivered...
+    expect(log.recipientUpdates[0]).toMatchObject({
+      status: 'sent',
+      whatsapp_message_id: 'wamid.OUT1',
+    });
+    // ...and a thread was opened for it, keyed by contact identity alone.
+    expect(log.conversationInserts[0]).toMatchObject({
+      account_id: 'acct-1',
+      contact_id: 'c-generic',
+    });
+    expect(log.messagesUpserts[0]).toMatchObject({
+      conversation_id: 'conv-new',
+      sender_type: 'agent',
+      content_type: 'template',
+      content_text: 'Hola Ana, tu cita es mar 10',
+      template_name: 'promo',
+      message_id: 'wamid.OUT1',
+      status: 'sent',
+    });
+  });
+
+  it('opens a thread for an opaque-id contact with no phone number', async () => {
+    // Keyed by contact_id, never by the address, so a BSUID/`@user` contact
+    // gets a thread exactly like a dialable one. A missing E.164 number must
+    // never abort the mirror.
+    const { db, log } = mirrorDb({ conversationId: null });
+
+    await deliverBroadcast(db, mirrorPlan('CO.1008477715690681', ['Ana']));
+
+    expect(log.conversationInserts[0]).toMatchObject({ contact_id: 'c-generic' });
+    expect(log.messagesUpserts[0]).toMatchObject({
+      conversation_id: 'conv-new',
+      message_id: 'wamid.OUT1',
+    });
+    expect(log.recipientUpdates[0]).toMatchObject({ status: 'sent' });
+  });
+
+  it('reuses the existing thread instead of opening a second one', async () => {
+    const { db, log } = mirrorDb({});
+
+    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana']));
+
+    expect(log.conversationInserts).toHaveLength(0);
+    expect(log.messagesUpserts[0]).toMatchObject({ conversation_id: 'conv-1' });
+  });
+
+  it('upserts the message so a replayed resume cannot duplicate the bubble', async () => {
+    // A plain insert violated idx_messages_conversation_message_id whenever a
+    // resumed campaign re-sent the same wamid.
+    const { db, log } = mirrorDb({});
+
+    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana']));
+
+    expect(log.messagesUpserts[0]).toMatchObject({
+      conversation_id: 'conv-1',
+      message_id: 'wamid.OUT1',
+    });
+    // The conflict target is what makes the replay a no-op rather than a
+    // constraint violation that would be swallowed as a mirror failure.
+    expect(log.messagesUpsertOptions[0]).toMatchObject({
+      onConflict: 'conversation_id,message_id',
+      ignoreDuplicates: true,
+    });
+  });
+
+  it('stamps the send time so the bubble sorts against inbound messages', async () => {
+    const { db, log } = mirrorDb({});
+
+    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana', 'mar 10']));
+
+    expect(log.messagesUpserts[0].created_at).toEqual(expect.any(String));
+    expect(log.conversationUpdates[0]).toMatchObject({
+      last_message_text: 'Hola Ana, tu cita es mar 10',
+      last_message_at: log.messagesUpserts[0].created_at,
+    });
   });
 
   it('keeps the send successful when the Inbox insert fails', async () => {
@@ -420,15 +539,6 @@ describe('deliverBroadcast Inbox mirroring', () => {
 
     await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana']));
 
-    expect(log.recipientUpdates[0]).toMatchObject({ status: 'sent' });
-  });
-
-  it('skips mirroring when the recipient has no conversation yet', async () => {
-    const { db, log } = mirrorDb({ conversationId: null });
-
-    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana']));
-
-    expect(log.messagesInserts).toHaveLength(0);
     expect(log.recipientUpdates[0]).toMatchObject({ status: 'sent' });
   });
 });
