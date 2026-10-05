@@ -811,14 +811,23 @@ async function processMessage(
   })
 
   // Show the WhatsApp typing indicator IMMEDIATELY so the customer sees
-  // the bot "is typing" while we process text / voice notes. Fire-and-
-  // forget and strictly best-effort: a failed indicator must never break
-  // inbound processing. Meta dismisses it automatically when the reply
-  // message is delivered, or after 25 seconds, whichever comes first.
+  // the bot "is typing" while we process text / voice notes / button
+  // taps. Fire-and-forget and strictly best-effort: a failed indicator
+  // must never break inbound processing. Meta dismisses it automatically
+  // when the reply message is delivered, or after 25 seconds, whichever
+  // comes first.
+  //
+  // `interactive` (reply button / list row) and `button` (quick reply on
+  // a template) are included because the AI answers them — see the
+  // auto-reply gate below. Without the indicator a tap looked identical
+  // to the bot ignoring the customer: the menu vanished, nothing was
+  // written back, and there was no sign anything was happening.
   if (
     message.type === 'text' ||
     message.type === 'audio' ||
-    message.type === 'voice'
+    message.type === 'voice' ||
+    message.type === 'interactive' ||
+    message.type === 'button'
   ) {
     sendTypingIndicator({
       phoneNumberId,
@@ -1254,23 +1263,31 @@ async function processMessage(
     }).catch((err) => console.error('[automations] dispatch failed:', err))
   }
 
-  // AI auto-reply. Runs only for plain-text inbound the deterministic
-  // flow runner did NOT consume (flows win over the LLM), and only when
-  // the account has enabled it. Awaited inside `after()` (same reason as
-  // the webhook dispatch below); `dispatchInboundToAiReply` owns its
-  // eligibility gates + try/catch and never throws.
+  // AI auto-reply. Runs for any inbound the deterministic flow runner did
+  // NOT consume (flows win over the LLM), and only when the account has
+  // enabled it. Awaited inside `after()` (same reason as the webhook
+  // dispatch below); `dispatchInboundToAiReply` owns its eligibility gates
+  // + try/catch and never throws.
   //
   // Every reason this block is skipped is logged explicitly: this gate
   // used to be the largest silent hole in the pipeline, where a message
   // would arrive, land in the inbox, and simply never reach the LLM with
   // nothing in the logs to say why.
+  //
+  // Button taps ARE answered by the AI. `inboundText` already carries the
+  // tapped label (parseMessageContent puts `button_reply.title` /
+  // `list_reply.title` / the template quick-reply's `button.text` there), so
+  // a tap reaches the model as one ordinary user turn. This used to be a
+  // hard skip on the assumption that "buttons/lists are answered by their
+  // own flow" — true only when a Flow is actually running. With no Flow
+  // configured (the common case), pressing "Quiero información" left the
+  // customer on a typing indicator forever: the tap landed in the inbox,
+  // the bot said nothing, and the log even claimed the silence was by
+  // design. The flow gate above already covers the real conflict, so a tap
+  // that no Flow took reaches the AI like any other message.
   if (flowConsumed) {
     console.log(
       `[webhook] message ${message.id}: a Flow consumed it — AI auto-reply skipped by design.`
-    )
-  } else if (interactiveReplyId) {
-    console.log(
-      `[webhook] message ${message.id}: interactive reply ${interactiveReplyId} — AI auto-reply skipped by design (buttons/lists are answered by their own flow).`
     )
   } else if (!inboundText.trim()) {
     console.log(
@@ -1278,7 +1295,9 @@ async function processMessage(
     )
   } else {
     console.log(
-      `[webhook] message ${message.id}: dispatching to AI auto-reply (${inboundText.trim().slice(0, 80)})`
+      `[webhook] message ${message.id}: dispatching to AI auto-reply${
+        interactiveReplyId ? ` (button tap "${inboundText.trim().slice(0, 80)}")` : ` (${inboundText.trim().slice(0, 80)})`
+      }`
     )
 await dispatchInboundToAiReply({
       accountId,

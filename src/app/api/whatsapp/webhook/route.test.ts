@@ -666,9 +666,45 @@ describe('inbound webhook: template quick-reply buttons (#478)', () => {
       (call) => (call[0] as { triggerType: string }).triggerType,
     )
     expect(triggers).toContain('interactive_reply')
-    // The AI auto-reply must stay out of it — a button tap is not a
-    // free-text question.
+  })
+
+  it('also dispatches the tap to the AI bot when no Flow consumes it', async () => {
+    // No Flow is running on this thread, so nothing else answers the
+    // customer. The tap must reach the LLM as an ordinary user turn —
+    // it used to be skipped outright, which left "Quiero información"
+    // pressing into silence.
+    await runWebhook(templateButtonTap)
+
+    expect(h.dispatchInboundToAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: 'acc-1',
+        conversationId: 'conv-1',
+        contactId: 'contact-1',
+        // Keeps WhatsApp's typing indicator alive for the follow-up.
+        composeMessageId: 'wamid.BTN1',
+      }),
+    )
+  })
+
+  it('still stands down when a Flow consumed the tap', async () => {
+    // Flows win over the LLM — that's the gate that actually protects a
+    // menu a Flow owns, and it must keep working now that the separate
+    // interactive-tap skip is gone.
+    h.dispatchInboundToFlows.mockResolvedValue({ consumed: true })
+
+    await runWebhook(templateButtonTap)
+
     expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
+  })
+
+  it('shows the typing indicator while the bot answers a tap', async () => {
+    await runWebhook(templateButtonTap)
+
+    expect(mockSendTypingIndicator).toHaveBeenCalledWith({
+      phoneNumberId: 'pn-1',
+      accessToken: 'plain-token',
+      messageId: 'wamid.BTN1',
+    })
   })
 
   it('falls back to the label when the template button carries no payload', async () => {
