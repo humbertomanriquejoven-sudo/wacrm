@@ -14,6 +14,7 @@ const h = vi.hoisted(() => {
     completed: [] as string[],
     noResponse: [] as string[],
     calls: [] as string[],
+    followUpsBroken: false,
   }
   return { state }
 })
@@ -22,6 +23,11 @@ vi.mock('@/lib/ai/admin-client', () => ({
   supabaseAdmin: () => ({
     from: (table: string) => {
       if (table === 'follow_ups') {
+        if (h.state.followUpsBroken) {
+          throw new Error(
+            'relation "public.follow_ups" does not exist'
+          )
+        }
         const filters: Array<{ op: 'eq' | 'in' | 'lte'; key: string; value: unknown }> = []
         const matches = (row: Record<string, unknown>) =>
           filters.every((f) => {
@@ -157,6 +163,7 @@ function resetState() {
   h.state.completed = []
   h.state.noResponse = []
   h.state.calls = []
+  h.state.followUpsBroken = false
   h.state.engineSendText.mockReset().mockResolvedValue({
     whatsapp_message_id: 'wamid-fu',
   })
@@ -257,6 +264,21 @@ describe('scheduleFollowUp', () => {
       scheduled: false,
       reason: 'duplicate_pending',
     })
+  })
+
+  it('never throws when the database is unavailable (missing follow_ups table)', async () => {
+    resetState()
+    h.state.followUpsBroken = true
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await scheduleFollowUp(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+    })
+
+    expect(res.scheduled).toBe(false)
+    expect(res.reason).toBe('error')
   })
 })
 
@@ -385,6 +407,16 @@ describe('runDueFollowUps', () => {
     const res = await runDueFollowUps(db, new Date())
 
     expect(res).toMatchObject({ scanned: 0, sent: 0, cancelled: 0 })
+    expect(h.state.engineSendText).not.toHaveBeenCalled()
+  })
+
+  it('never throws when the database is unavailable (missing follow_ups table)', async () => {
+    resetState()
+    h.state.followUpsBroken = true
+
+    const res = await runDueFollowUps(null, new Date())
+
+    expect(res).toMatchObject({ scanned: 0, sent: 0, cancelled: 0, noResponse: 0 })
     expect(h.state.engineSendText).not.toHaveBeenCalled()
   })
 })

@@ -44,7 +44,11 @@ const TERMINAL_NO_SCHEDULE: Array<'completed' | 'no_response'> = [
 
 export interface ScheduleFollowUpResult {
   scheduled: boolean
-  reason: 'scheduled' | 'already_followed_up' | 'duplicate_pending'
+  reason:
+    | 'scheduled'
+    | 'already_followed_up'
+    | 'duplicate_pending'
+    | 'error'
   id: string | null
 }
 
@@ -72,77 +76,88 @@ export async function scheduleFollowUp(
   const delayMs = params.delayMs ?? FOLLOW_UP_DELAY_MS
   const now = params.now ?? new Date()
 
-  // LA REGLA: a contact who already got their one follow-up is never
-  // chased again — regardless of which conversation it happened in.
-  const { data: historic, error: historicErr } = await db
-    .from('follow_ups')
-    .select('id')
-    .eq('contact_id', contactId)
-    .in('status', [...TERMINAL_NO_SCHEDULE])
-    .limit(1)
-    .maybeSingle()
-  if (historicErr) {
-    console.error(
-      `[follow-up] could not check the historic limit for contact ${contactId}:`,
-      historicErr.message,
-    )
-    return { scheduled: false, reason: 'already_followed_up', id: null }
-  }
-  if (historic) {
+  try {
+    // LA REGLA: a contact who already got their one follow-up is never
+    // chased again — regardless of which conversation it happened in.
+    const { data: historic, error: historicErr } = await db
+      .from('follow_ups')
+      .select('id')
+      .eq('contact_id', contactId)
+      .in('status', [...TERMINAL_NO_SCHEDULE])
+      .limit(1)
+      .maybeSingle()
+    if (historicErr) {
+      console.error(
+        `[follow-up] could not check the historic limit for contact ${contactId}:`,
+        historicErr.message,
+      )
+      return { scheduled: false, reason: 'already_followed_up', id: null }
+    }
+    if (historic) {
+      console.log(
+        `[follow-up] contact ${contactId} already had its one follow-up — refusing to schedule another.`,
+      )
+      return { scheduled: false, reason: 'already_followed_up', id: null }
+    }
+
+    // Don't stack: one PENDING per conversation. If the customer is being
+    // chased and types again meanwhile, the old pending is cancelled by
+    // the webhook and this fresh message schedules the next one.
+    const { data: pending, error: pendingErr } = await db
+      .from('follow_ups')
+      .select('id')
+      .eq('conversation_id', conversationId)
+      .eq('status', 'pending')
+      .limit(1)
+      .maybeSingle()
+    if (pendingErr) {
+      console.error(
+        `[follow-up] could not check for a pending follow-up in conversation ${conversationId}:`,
+        pendingErr.message,
+      )
+      return { scheduled: false, reason: 'duplicate_pending', id: null }
+    }
+    if (pending) {
+      console.log(
+        `[follow-up] conversation ${conversationId} already has a pending follow-up — not scheduling another.`,
+      )
+      return { scheduled: false, reason: 'duplicate_pending', id: null }
+    }
+
+    const { data, error } = await db
+      .from('follow_ups')
+      .insert({
+        conversation_id: conversationId,
+        contact_id: contactId,
+        account_id: accountId,
+        type: '10m',
+        status: 'pending',
+        execute_at: new Date(now.getTime() + delayMs).toISOString(),
+      })
+      .select('id')
+      .single()
+    if (error) {
+      console.error(
+        `[follow-up] could not schedule a follow-up for conversation ${conversationId}:`,
+        error.message,
+      )
+      return { scheduled: false, reason: 'duplicate_pending', id: null }
+    }
+
     console.log(
-      `[follow-up] contact ${contactId} already had its one follow-up — refusing to schedule another.`,
+      `[follow-up] scheduled follow-up ${data?.id} for conversation ${conversationId} in ${delayMs / 1000}s.`,
     )
-    return { scheduled: false, reason: 'already_followed_up', id: null }
-  }
-
-  // Don't stack: one PENDING per conversation. If the customer is being
-  // chased and types again meanwhile, the old pending is cancelled by
-  // the webhook and this fresh message schedules the next one.
-  const { data: pending, error: pendingErr } = await db
-    .from('follow_ups')
-    .select('id')
-    .eq('conversation_id', conversationId)
-    .eq('status', 'pending')
-    .limit(1)
-    .maybeSingle()
-  if (pendingErr) {
+    return { scheduled: true, reason: 'scheduled', id: data?.id ?? null }
+  } catch (err) {
+    // If the schema/database itself is unreachable (e.g. the follow_ups
+    // table is missing) the reply must survive: never throw to the
+    // auto-reply caller, and never treat a DB failure as a hard stop.
     console.error(
-      `[follow-up] could not check for a pending follow-up in conversation ${conversationId}:`,
-      pendingErr.message,
+      `[follow-up] scheduleFollowUp threw for conversation ${conversationId}:`,
+      err instanceof Error ? err.message : err,
     )
-    return { scheduled: false, reason: 'duplicate_pending', id: null }
+    return { scheduled: false, reason: 'error', id: null }
   }
-  if (pending) {
-    console.log(
-      `[follow-up] conversation ${conversationId} already has a pending follow-up — not scheduling another.`,
-    )
-    return { scheduled: false, reason: 'duplicate_pending', id: null }
-  }
-
-  const { data, error } = await db
-    .from('follow_ups')
-    .insert({
-      conversation_id: conversationId,
-      contact_id: contactId,
-      account_id: accountId,
-      type: '10m',
-      status: 'pending',
-      execute_at: new Date(now.getTime() + delayMs).toISOString(),
-    })
-    .select('id')
-    .single()
-  if (error) {
-    console.error(
-      `[follow-up] could not schedule a follow-up for conversation ${conversationId}:`,
-      error.message,
-    )
-    return { scheduled: false, reason: 'duplicate_pending', id: null }
-  }
-
-  console.log(
-    `[follow-up] scheduled follow-up ${data?.id} for conversation ${conversationId} in ${delayMs / 1000}s.`,
-  )
-  return { scheduled: true, reason: 'scheduled', id: data?.id ?? null }
 }
 
 /**
@@ -288,7 +303,7 @@ export interface RunFollowUpsResult {
  * overlapping invocation cannot double-process a row it already moved.
  */
 export async function runDueFollowUps(
-  db: SupabaseClient = supabaseAdmin(),
+  db: SupabaseClient | null = null,
   now: Date = new Date(),
 ): Promise<RunFollowUpsResult> {
   const result: RunFollowUpsResult = {
@@ -298,102 +313,118 @@ export async function runDueFollowUps(
     noResponse: 0,
   }
 
-  const { data: due, error } = await db
-    .from('follow_ups')
-    .select('id, conversation_id, contact_id, account_id')
-    .eq('status', 'pending')
-    .lte('execute_at', now.toISOString())
-    .order('execute_at', { ascending: true })
-    .limit(50)
+  try {
+    // Resolve the client INSIDE the try: `supabaseAdmin()` throws when
+    // the service-role env vars are missing, and that must be a logged
+    // no-op for the cron, never a 500.
+    const client = db ?? supabaseAdmin()
 
-  if (error) {
-    console.error('[follow-up] runner scan failed:', error.message)
-    return result
-  }
-  if (!due || due.length === 0) return result
-
-  for (const row of due) {
-    const id = row.id as string
-    const conversationId = row.conversation_id as string
-    const contactId = row.contact_id as string
-    const accountId = row.account_id as string
-    result.scanned++
-
-    const lastSender = await lastMessageSender(db, conversationId)
-
-    // ANTI-RACE: the customer replied within the window, so the
-    // "are you still there?" reminder is obsolete. Cancel — the
-    // webhook has already scheduled/cancelled through its own path, but
-    // a message that arrived between scans lands here.
-    if (lastSender === 'customer') {
-      const { error: cancelErr } = await db
-        .from('follow_ups')
-        .update({ status: 'cancelled' })
-        .eq('id', id)
-        .eq('status', 'pending')
-      if (cancelErr) {
-        console.error(`[follow-up] could not cancel ${id} (anti-race):`, cancelErr.message)
-      } else {
-        result.cancelled++
-        console.log(
-          `[follow-up] follow-up ${id} cancelled (customer replied before the 10-minute window closed).`,
-        )
-      }
-      continue
-    }
-
-    // Resolve the audit user for the outbound insert. `created_by` of the
-    // account's ai_configs is the natural owner; fall back to the account
-    // id itself (engineSendText only uses it for logs).
-    let userId = accountId
-    const { data: cfg } = await db
-      .from('ai_configs')
-      .select('created_by')
-      .eq('account_id', accountId)
-      .maybeSingle()
-    if (cfg?.created_by) userId = cfg.created_by as string
-
-    const text = await buildFollowUpMessage(db, accountId, conversationId)
-
-    try {
-      await engineSendText({
-        accountId,
-        userId,
-        conversationId,
-        contactId,
-        text,
-        aiGenerated: true,
-      })
-    } catch (err) {
-      console.error(
-        `[follow-up] could not send the follow-up for conversation ${conversationId}:`,
-        err instanceof Error ? err.message : err,
-      )
-      const { error: noRespErr } = await db
-        .from('follow_ups')
-        .update({ status: 'no_response' })
-        .eq('id', id)
-        .eq('status', 'pending')
-      if (noRespErr) {
-        console.error(`[follow-up] could not mark ${id} as no_response:`, noRespErr.message)
-      } else {
-        result.noResponse++
-      }
-      continue
-    }
-
-    const { error: doneErr } = await db
+    const { data: due, error } = await client
       .from('follow_ups')
-      .update({ status: 'completed' })
-      .eq('id', id)
+      .select('id, conversation_id, contact_id, account_id')
       .eq('status', 'pending')
-    if (doneErr) {
-      console.error(`[follow-up] could not mark ${id} as completed:`, doneErr.message)
-      continue
+      .lte('execute_at', now.toISOString())
+      .order('execute_at', { ascending: true })
+      .limit(50)
+
+    if (error) {
+      console.error('[follow-up] runner scan failed:', error.message)
+      return result
     }
-    result.sent++
-    console.log(
-      `[follow-up] follow-up ${id} completed — reminder delivered for conversation ${conversationId}.`,
+    if (!due || due.length === 0) return result
+
+    for (const row of due) {
+      const id = row.id as string
+      const conversationId = row.conversation_id as string
+      const contactId = row.contact_id as string
+      const accountId = row.account_id as string
+      result.scanned++
+
+      const lastSender = await lastMessageSender(client, conversationId)
+
+      // ANTI-RACE: the customer replied within the window, so the
+      // "are you still there?" reminder is obsolete. Cancel — the
+      // webhook has already scheduled/cancelled through its own path, but
+      // a message that arrived between scans lands here.
+      if (lastSender === 'customer') {
+        const { error: cancelErr } = await client
+          .from('follow_ups')
+          .update({ status: 'cancelled' })
+          .eq('id', id)
+          .eq('status', 'pending')
+        if (cancelErr) {
+          console.error(`[follow-up] could not cancel ${id} (anti-race):`, cancelErr.message)
+        } else {
+          result.cancelled++
+          console.log(
+            `[follow-up] follow-up ${id} cancelled (customer replied before the 10-minute window closed).`,
+          )
+        }
+        continue
+      }
+
+      // Resolve the audit user for the outbound insert. `created_by` of the
+      // account's ai_configs is the natural owner; fall back to the account
+      // id itself (engineSendText only uses it for logs).
+      let userId = accountId
+      const { data: cfg } = await client
+        .from('ai_configs')
+        .select('created_by')
+        .eq('account_id', accountId)
+        .maybeSingle()
+      if (cfg?.created_by) userId = cfg.created_by as string
+
+      const text = await buildFollowUpMessage(client, accountId, conversationId)
+
+      try {
+        await engineSendText({
+          accountId,
+          userId,
+          conversationId,
+          contactId,
+          text,
+          aiGenerated: true,
+        })
+      } catch (err) {
+        console.error(
+          `[follow-up] could not send the follow-up for conversation ${conversationId}:`,
+          err instanceof Error ? err.message : err,
+        )
+        const { error: noRespErr } = await client
+          .from('follow_ups')
+          .update({ status: 'no_response' })
+          .eq('id', id)
+          .eq('status', 'pending')
+        if (noRespErr) {
+          console.error(`[follow-up] could not mark ${id} as no_response:`, noRespErr.message)
+        } else {
+          result.noResponse++
+        }
+        continue
+      }
+
+      const { error: doneErr } = await client
+        .from('follow_ups')
+        .update({ status: 'completed' })
+        .eq('id', id)
+        .eq('status', 'pending')
+      if (doneErr) {
+        console.error(`[follow-up] could not mark ${id} as completed:`, doneErr.message)
+        continue
+      }
+      result.sent++
+      console.log(
+        `[follow-up] follow-up ${id} completed — reminder delivered for conversation ${conversationId}.`,
+      )
+    }
+  } catch (err) {
+    // Whole-sweep safety net: an unexpected exception (missing table,
+    // network error, a provider that threw outside its inner try/catch,
+    // …) must never reach the cron endpoint or the in-process worker and
+    // turn into a 500 / a crashed process.
+    console.error(
+      '[follow-up] runner threw while draining the queue:',
+      err instanceof Error ? err.message : err,
     )
   }
 
