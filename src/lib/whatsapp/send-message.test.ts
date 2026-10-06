@@ -6,6 +6,7 @@ import {
   SendMessageError,
   type SendMessageParams,
 } from './send-message';
+import { InvalidRecipientError, MetaApiError } from './meta-api';
 
 // A db that explodes if touched — these tests cover the param
 // validation that MUST short-circuit before any query runs.
@@ -163,6 +164,10 @@ describe('SendMessageError', () => {
 // ============================================================
 
 const sendTemplateMessage = vi.fn(async () => ({ messageId: 'wamid.1' }));
+// Referenced lazily from the mock factory below (same pattern as
+// sendTemplateMessage) so a test can swap in a rejecting implementation
+// without the factory reading it during hoisting.
+const sendMediaMessageMock = vi.fn(async () => ({ messageId: 'wamid.media' }));
 
 // Stub only the senders — the module also exports INTERACTIVE_LIMITS,
 // which `interactive.ts` needs for the payload validation covered above.
@@ -171,7 +176,8 @@ vi.mock('@/lib/whatsapp/meta-api', async (importOriginal) => ({
   sendTextMessage: vi.fn(async () => ({ messageId: 'wamid.text' })),
   sendTemplateMessage: (...args: unknown[]) =>
     (sendTemplateMessage as unknown as (...a: unknown[]) => unknown)(...args),
-  sendMediaMessage: vi.fn(async () => ({ messageId: 'wamid.media' })),
+  sendMediaMessage: (...args: unknown[]) =>
+    (sendMediaMessageMock as unknown as (...a: unknown[]) => unknown)(...args),
   sendInteractiveButtons: vi.fn(async () => ({ messageId: 'wamid.btn' })),
   sendInteractiveList: vi.fn(async () => ({ messageId: 'wamid.list' })),
 }));
@@ -483,5 +489,142 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
     expect(sendTextMessage).toHaveBeenCalledWith(
       expect.objectContaining({ contextMessageId: 'wamid.CHOSEN' })
     );
+  });
+});
+
+// ============================================================
+// MEDIA parity — attachments run through the same resolver and the
+// same inbound-wamid anchor as text, so an image to a `@user` contact
+// is addressed identically to a message the operator types by hand.
+// ============================================================
+describe('sendMessageToConversation - media recipients (same resolver as text)', () => {
+  const OPAQUE_CONTACT = {
+    id: 'ct-1',
+    phone: 'CO.1008477715690681',
+    wa_user_id: '1008477715690681',
+    username: null,
+  };
+
+  it('addresses a BSUID-only (@user) contact in `to`, anchored like text', async () => {
+    await sendMessageToConversation(
+      sendPathDb([], {}, {
+        contact: OPAQUE_CONTACT,
+        inboundRows: [{ message_id: 'wamid.INBOUND' }],
+      }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'image',
+        mediaUrl: 'https://cdn.example.com/pic.jpg',
+        contentText: 'caption',
+      }
+    );
+
+    expect(sendMediaMessageMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: '1008477715690681',
+        kind: 'image',
+        link: 'https://cdn.example.com/pic.jpg',
+        caption: 'caption',
+        contextMessageId: 'wamid.INBOUND',
+      })
+    );
+  });
+
+  it('leaves a dialable number untouched and adds no anchor for media', async () => {
+    await sendMessageToConversation(
+      sendPathDb([], {}, {
+        contact: { id: 'ct-1', phone: '+15551234567' },
+        inboundRows: [{ message_id: 'wamid.INBOUND' }],
+      }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'document',
+        mediaUrl: 'https://cdn.example.com/doc.pdf',
+        filename: 'doc.pdf',
+      }
+    );
+
+    const call = (
+      sendMediaMessageMock.mock.calls[0] as unknown as [
+        { to?: string; contextMessageId?: string },
+      ]
+    )[0];
+    expect(call.to).toBe('15551234567');
+    expect(call.contextMessageId).toBeUndefined();
+  });
+});
+
+// ============================================================
+// Failure mapping — a recipient problem must never surface as a 502
+// that reads like a Meta outage. 422 carries the typed cause; 502
+// stays reserved for Meta actually failing upstream.
+// ============================================================
+describe('sendMessageToConversation - Meta failure mapping', () => {
+  const restoreMediaSend = () =>
+    sendMediaMessageMock.mockImplementation(async () => ({
+      messageId: 'wamid.media',
+    }));
+
+  async function captureSendError(error: unknown): Promise<SendMessageError> {
+    sendMediaMessageMock.mockImplementation(async () => {
+      throw error;
+    });
+    try {
+      await sendMessageToConversation(sendPathDb([], {}, {}), 'acct-1', {
+        conversationId: 'cv-1',
+        messageType: 'image',
+        mediaUrl: 'https://cdn.example.com/pic.jpg',
+      });
+    } catch (err) {
+      return err as SendMessageError;
+    } finally {
+      restoreMediaSend();
+    }
+    throw new Error('expected the media send to fail');
+  }
+
+  it('maps an unresolvable recipient to 422 invalid_recipient', async () => {
+    const err = await captureSendError(
+      new InvalidRecipientError('', 'no destination is available for this contact')
+    );
+    expect(err).toBeInstanceOf(SendMessageError);
+    expect(err.status).toBe(422);
+    expect(err.code).toBe('invalid_recipient');
+    expect(err.message).toMatch(/no destination is available/);
+  });
+
+  it("maps Meta's recipient rejection to 422 invalid_recipient", async () => {
+    const err = await captureSendError(
+      new MetaApiError('Recipient phone number not in allowed list', {
+        status: 400,
+        code: 131009,
+      })
+    );
+    expect(err.status).toBe(422);
+    expect(err.code).toBe('invalid_recipient');
+    expect(err.message).toMatch(/not in allowed list/);
+  });
+
+  it('maps any other Meta 4xx to 422 with the verbatim cause', async () => {
+    const err = await captureSendError(
+      new MetaApiError('(#100) Invalid parameter: Invalid file', {
+        status: 400,
+        code: 100,
+      })
+    );
+    expect(err.status).toBe(422);
+    expect(err.code).toBe('meta_rejected');
+    expect(err.message).toMatch(/Invalid file/);
+  });
+
+  it('keeps 502 for a genuine Meta outage (5xx / network)', async () => {
+    const err = await captureSendError(
+      new MetaApiError('Service unavailable', { status: 503 })
+    );
+    expect(err.status).toBe(502);
+    expect(err.code).toBe('meta_error');
+    expect(err.message).toMatch(/Service unavailable/);
   });
 });

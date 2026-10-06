@@ -83,7 +83,10 @@ export async function POST(request: Request) {
       })
     } catch (err) {
       if (err instanceof SendMessageError) {
-        return NextResponse.json({ error: err.message }, { status: err.status })
+        return NextResponse.json(
+          { error: err.message, code: err.code },
+          { status: err.status }
+        )
       }
       throw err
     }
@@ -173,9 +176,14 @@ export async function POST(request: Request) {
         whatsapp_message_id: result.whatsappMessageId,
       })
     } catch (err) {
+      // `SendMessageError.status` is already the right answer for every
+      // failure mode: 400 for malformed params, 422 when no address could
+      // be resolved for the contact or Meta rejected the send, 502 only
+      // for a genuine Meta outage. The machine `code` rides along so the
+      // UI can branch on the cause instead of parsing the message.
       if (err instanceof SendMessageError) {
         return NextResponse.json(
-          { error: err.message },
+          { error: err.message, code: err.code },
           { status: err.status }
         )
       }

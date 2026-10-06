@@ -27,6 +27,8 @@ import {
   sendMediaMessage,
   sendInteractiveButtons,
   sendInteractiveList,
+  InvalidRecipientError,
+  MetaApiError,
   type MediaKind,
 } from '@/lib/whatsapp/meta-api';
 import {
@@ -480,6 +482,38 @@ export async function sendMessageToConversation(
     const message =
       err instanceof Error ? err.message : 'Unknown Meta API error';
     console.error('[send-message] Meta send failed:', message);
+
+    // Recipient problems are OUR data problem, not an upstream outage, and
+    // must never masquerade as one. Either the contact has no address we
+    // could resolve (`InvalidRecipientError`, raised before any HTTP call)
+    // or Meta rejected the destination / the payload — the operator can act
+    // on both (repair the contact's number, fix the caption/attachment), so
+    // they surface as a typed 422 carrying the verbatim cause instead of a
+    // generic 502 that reads like Meta is down. 502 stays reserved for what
+    // it actually means: Meta answered 5xx, timed out, or the network died.
+    if (err instanceof InvalidRecipientError) {
+      throw new SendMessageError(
+        'invalid_recipient',
+        `Cannot resolve a WhatsApp address for this contact: ${message}`,
+        422
+      );
+    }
+    if (err instanceof MetaApiError) {
+      if (err.recipientInvalid) {
+        throw new SendMessageError(
+          'invalid_recipient',
+          `WhatsApp rejected the recipient address: ${message}`,
+          422
+        );
+      }
+      if (err.status >= 400 && err.status < 500) {
+        throw new SendMessageError(
+          'meta_rejected',
+          `WhatsApp rejected the message: ${message}`,
+          422
+        );
+      }
+    }
     throw new SendMessageError('meta_error', `Meta API error: ${message}`, 502);
   }
 

@@ -151,16 +151,23 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
   isLegacyFormat: vi.fn(() => false),
 }))
 
-const { sendTemplateMessage } = vi.hoisted(() => ({
+const { sendTemplateMessage, sendMediaMessage } = vi.hoisted(() => ({
   sendTemplateMessage: vi.fn(async () => ({ messageId: 'wamid-1' })),
+  sendMediaMessage: vi.fn(async () => ({ messageId: 'wamid-1' })),
 }))
-vi.mock('@/lib/whatsapp/meta-api', () => ({
+// Spread the original module so `send-message.ts` (and the recipient
+// resolver it drives) still see the real error classes — the failure-
+// mapping tests below assert on `instanceof InvalidRecipientError` /
+// `MetaApiError`, which are undefined in a bare object mock.
+vi.mock('@/lib/whatsapp/meta-api', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   sendTemplateMessage,
   sendTextMessage: vi.fn(),
-  sendMediaMessage: vi.fn(),
+  sendMediaMessage,
 }))
 
 import { POST } from './route'
+import { InvalidRecipientError, MetaApiError } from '@/lib/whatsapp/meta-api'
 
 function postContactTemplate(overrides: Record<string, unknown> = {}) {
   return POST(
@@ -312,5 +319,112 @@ describe('POST /api/whatsapp/send — role enforcement', () => {
 
     expect(res.status).toBe(200)
     expect(sendTemplateMessage).toHaveBeenCalledTimes(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Media sends + failure mapping. An image to a `@user` contact used to die
+// with a blanket 502: the media payload addressed opaque ids differently
+// from text, and every failure collapsed into `meta_error`. Now the
+// recipient resolves exactly like text, and each failure mode carries a
+// typed status + machine code the inbox can explain to the operator.
+// ---------------------------------------------------------------------------
+function postMedia() {
+  return POST(
+    new Request('http://localhost/api/whatsapp/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversation_id: 'conv-existing',
+        message_type: 'image',
+        media_url: 'https://cdn.example.com/pic.jpg',
+        content_text: 'caption',
+      }),
+    }),
+  )
+}
+
+async function expectMediaFailure(error: unknown) {
+  sendMediaMessage.mockImplementation(async () => {
+    throw error
+  })
+  try {
+    const res = await postMedia()
+    return { status: res.status, json: (await res.json()) as Record<string, unknown> }
+  } finally {
+    sendMediaMessage.mockImplementation(async () => ({ messageId: 'wamid-1' }))
+  }
+}
+
+describe('POST /api/whatsapp/send — media recipient + failure mapping', () => {
+  beforeEach(() => {
+    conversationInserts.length = 0
+    messageInserts.length = 0
+    existingConversation = {
+      id: 'conv-existing',
+      account_id: 'acct-1',
+      contact_id: 'contact-1',
+      contact: CONTACT,
+    }
+    createdConversation = null
+    contactRow = CONTACT
+    callerRole = 'admin'
+    supabaseMock = makeSupabaseMock()
+    sendTemplateMessage.mockClear()
+    sendMediaMessage.mockClear()
+    sendMediaMessage.mockImplementation(async () => ({ messageId: 'wamid-1' }))
+  })
+
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('addresses media to the same resolved `to` as a text send', async () => {
+    const res = await postMedia()
+
+    expect(res.status).toBe(200)
+    const args = (
+      sendMediaMessage.mock.calls[0] as unknown as [
+        { to?: string; kind?: string; link?: string },
+      ]
+    )[0]
+    expect(args.to).toBe('15551234567')
+    expect(args.kind).toBe('image')
+    expect(args.link).toBe('https://cdn.example.com/pic.jpg')
+    expect(messageInserts).toHaveLength(1)
+  })
+
+  it('422s with invalid_recipient when no address could be resolved', async () => {
+    const { status, json } = await expectMediaFailure(
+      new InvalidRecipientError('', 'no destination is available for this contact'),
+    )
+
+    expect(status).toBe(422)
+    expect(json.code).toBe('invalid_recipient')
+    expect(json.error).toMatch(/no destination is available/)
+    // Nothing was delivered, so nothing may be recorded as sent.
+    expect(messageInserts).toHaveLength(0)
+  })
+
+  it('422s with meta_rejected when Meta refuses the payload (not 502)', async () => {
+    const { status, json } = await expectMediaFailure(
+      new MetaApiError('(#100) Invalid parameter: Invalid file', {
+        status: 400,
+        code: 100,
+      }),
+    )
+
+    expect(status).toBe(422)
+    expect(json.code).toBe('meta_rejected')
+    expect(json.error).toMatch(/Invalid file/)
+  })
+
+  it('still 502s when Meta itself fails upstream', async () => {
+    const { status, json } = await expectMediaFailure(
+      new MetaApiError('Service unavailable', { status: 503 }),
+    )
+
+    expect(status).toBe(502)
+    expect(json.code).toBe('meta_error')
   })
 })

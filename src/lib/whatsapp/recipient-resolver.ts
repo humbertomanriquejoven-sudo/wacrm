@@ -4,7 +4,7 @@ import {
   passthroughMetaId,
   toDialable,
 } from './phone-utils'
-import { MetaApiError } from './meta-api'
+import { InvalidRecipientError, MetaApiError } from './meta-api'
 import { supabaseAdmin } from '@/lib/flows/admin-client'
 import type { SupabaseClient } from '@supabase/supabase-js'
 
@@ -424,7 +424,19 @@ export async function sendWithRecipientFallback<T>(args: {
   const { contact, accountId, conversationId, send, onRecovered } = args
 
   const first = await resolveRecipient(contact, accountId, conversationId)
-  if (!first.to) throw new Error('contact not found for this account')
+  // A contact the ladder cannot resolve at all — no dialable number, no
+  // wa_id/BSUID/recipient_id, no handle. TYPED rather than a bare Error so
+  // the HTTP layer maps it to a 422 explaining the contact has no usable
+  // address, instead of collapsing into a generic 502 that looks like a
+  // Meta outage. Still `recipientInvalid`, so any retry/park machinery
+  // downstream treats it as "this address does not work".
+  if (!first.to) {
+    throw new InvalidRecipientError(
+      '',
+      'the contact has no dialable number, wa_id, wa_user_id, recipient_id ' +
+        'or username to address the message to. No HTTP request was sent.',
+    )
+  }
 
   if (first.source === 'recovered' && first.isPhone && onRecovered) {
     await Promise.resolve(onRecovered(first.to)).catch(() => undefined)

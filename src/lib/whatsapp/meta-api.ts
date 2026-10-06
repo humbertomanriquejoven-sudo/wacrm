@@ -237,13 +237,15 @@ export function recipientAddressField(destination: string): Record<string, strin
 }
 
 /**
- * The address field for a TEMPLATE send.
+ * The address field for a send that travels exclusively in Meta's `to`:
+ * TEMPLATE and MEDIA messages.
  *
- * Templates address the recipient through `to`, exactly as `sendTextMessage`
- * does — the proven Inbox path. `recipient` is not accepted for a template's
- * opaque id: Meta answers `(#100) Invalid parameter`. The other send
- * helpers still use {@link recipientAddressField}, which keeps `recipient`
- * for ids, because those message types accept it.
+ * Both message types address the recipient through `to`, exactly as
+ * `sendTextMessage` does — the proven Inbox path. `recipient` is not
+ * accepted for their opaque ids: Meta answers `(#100) Invalid parameter`.
+ * (Media is the case that proved it: it used to route BSUIDs through
+ * `recipient` while the text path for the very same contact used `to`, so
+ * a `@user` contact could receive texts but every image failed.)
  *
  * A number and an opaque Meta id therefore share one canonical form: `to`,
  * carrying the numeric id with any namespace removed
@@ -255,17 +257,16 @@ export function recipientAddressField(destination: string): Record<string, strin
  * `22222` — a number invented from a display name, aimed at whoever owns
  * it. The handle is forwarded as held; what actually makes such a send
  * deliverable is the accompanying `context` quoting a message they wrote.
+ *
+ * Returns `{ to: '' }` for an empty address and for the placeholder
+ * `contacts.phone` is NOT NULL forces the webhook to write (`'unknown'`) —
+ * both are undeliverable, and failing identically here lets the caller
+ * raise a typed `InvalidRecipientError` instead of sending Meta a request
+ * that reads like a malformed API call.
  */
-export function templateRecipientField(destination: string): Record<string, string> {
+export function canonicalToField(destination: string): Record<string, string> {
   const bare = cleanRecipientAddress(destination);
   if (!bare) return { to: '' };
-  // A placeholder is refused outright rather than forwarded. `contacts.phone`
-  // is NOT NULL, so the webhook wrote the literal string 'unknown' for every
-  // sender Meta could not identify, and any path that skipped the resolver's
-  // own placeholder guard would put that literal in `to` — a request Meta
-  // rejects with an opaque (#100) that reads like a bad API call rather than
-  // "this contact has no address yet". Empty is equally undeliverable but
-  // fails identically here and at the caller's own guard.
   if (isPlaceholderValue(bare)) return { to: '' };
   // A real number in any formatting, or an opaque Meta id (namespaced, or a
   // pure digit run). Both go through the Inbox's canonical form.
@@ -277,6 +278,16 @@ export function templateRecipientField(destination: string): Record<string, stri
     return { to: toMetaTargetId(bare) };
   }
   return { to: bare };
+}
+
+/**
+ * Template-flavoured name for {@link canonicalToField}, kept for existing
+ * callers and tests. Templates and media share one canonical `to` shape;
+ * the interactive / reaction senders still use
+ * {@link recipientAddressField}, which routes opaque ids to `recipient`.
+ */
+export function templateRecipientField(destination: string): Record<string, string> {
+  return canonicalToField(destination);
 }
 
 /**
@@ -737,6 +748,19 @@ export interface SendMediaMessageArgs {
  * agent-initiated media sends. Mirrors `sendTextMessage` — single fetch,
  * throws on non-2xx, returns Meta's message id.
  *
+ * The destination is built by the SAME resolver chain as every other
+ * outbound path (`resolveRecipient` upstream, then {@link canonicalToField}
+ * here), so a contact identified only by a BSUID or a `@user` handle is
+ * addressed exactly as its text messages are: the `@user` / `@lid`
+ * routing suffix is stripped and the numeric id lands in `to`.
+ *
+ * This used to be the one divergence in the send pipeline: media routed
+ * opaque ids through Meta's alternate `recipient` field while the text
+ * path put the same id in `to`. Meta rejects `recipient` for this message
+ * type with "(#100) Invalid parameter", which surfaced as HTTP 502 on
+ * every image/attachment sent to a `@user` contact — while text to the
+ * same contact worked. One canonical `to`, both paths.
+ *
  * Audio is special-cased: Meta rejects `caption` and `filename` on audio
  * messages, so we send `{ link }` only. WhatsApp auto-renders an
  * OGG/Opus file as a playable voice note (waveform) rather than a file
@@ -747,7 +771,24 @@ export async function sendMediaMessage(
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, kind, link, caption, filename, contextMessageId } = args
   if (!link) throw new Error('sendMediaMessage requires a link.')
-  const recipient = assertDialableRecipient(to)
+
+  // Refuse a destination we cannot address BEFORE any network call. The
+  // typed error carries the `invalid recipient` phrasing, so the senders'
+  // retry/park machinery treats it as a recipient rejection and the HTTP
+  // layer answers 422 instead of letting an unresolvable contact surface
+  // as a generic 502.
+  const addressField = canonicalToField(to)
+  if (!addressField.to) {
+    console.warn(
+      '[send] blocked: media recipient could not be resolved, no HTTP request was made to Meta.',
+    )
+    throw new InvalidRecipientError(
+      (to ?? '').trim(),
+      'no destination is available for this contact: the resolved address is ' +
+        'empty or a placeholder ("unknown"). No HTTP request was sent.',
+    )
+  }
+
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
 
   // Audio accepts neither caption nor filename per Meta's spec — adding
@@ -760,7 +801,7 @@ export async function sendMediaMessage(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    ...recipientFields(recipient),
+    ...addressField,
     type: kind,
     [kind]: media,
   }
