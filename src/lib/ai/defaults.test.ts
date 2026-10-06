@@ -236,7 +236,9 @@ describe('buildSystemPrompt', () => {
     // The duplicate-agenda bug: telling the model agendar_cita is forbidden
     // precisely when a cita already exists.
     expect(prompt).toContain('PROHIBIDO usar agendar_cita');
-    expect(prompt).toMatch(/nunca "compenses" un reagendamiento fallido.*agendar_cita/s);
+    expect(prompt).toMatch(
+      /nunca "compenses" un reagendamiento fallido[\s\S]*agendar_cita/
+    );
     expect(prompt).toContain('consultar_citas primero');
   });
 
@@ -267,12 +269,9 @@ describe('buildSystemPrompt', () => {
       userPrompt: null,
       mode: 'auto_reply',
       calendarEnabled: true,
-      contactContext: {
-        name: 'Ana',
-        email: null,
-        location: null,
-        citas: [{ id: 'cita-7', fecha_inicio: '2026-09-22T09:00:00-05:00' }],
-      },
+      citas: [
+        { id: 'cita-7', fecha_inicio: '2026-09-22T09:00:00.000Z', estado: 'confirmada' },
+      ],
     });
     expect(prompt).toContain('idCita="cita-7"');
     expect(prompt).toContain('El idCita es OPCIONAL');
