@@ -111,6 +111,23 @@ BEGIN
       'ai_knowledge_documents.storage_path is missing — migration 061 did not apply; stored originals could never be deleted';
   END IF;
 
+  -- The timed auto follow-ups (062). The worker queries this table from
+  -- service role only, so an unapplied 062 fails silently (the queue scan
+  -- finds nothing), which is exactly the "applies cleanly and does
+  -- nothing" failure this file exists to catch.
+  IF to_regclass('public.follow_ups') IS NULL THEN
+    RAISE EXCEPTION 'public.follow_ups is missing — migration 062 did not apply; auto follow-ups silently never fire';
+  END IF;
+  IF NOT EXISTS (
+       SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'follow_ups'
+          AND column_name = 'execute_at'
+     ) THEN
+    RAISE EXCEPTION
+      'follow_ups.execute_at is missing — migration 062 did not apply';
+  END IF;
+
   RAISE NOTICE 'schema verification passed';
 END
 $$;

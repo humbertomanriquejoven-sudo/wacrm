@@ -24,6 +24,7 @@ import {
   resolveOutboundAddressQueue,
 } from '@/lib/flows/meta-send';
 import { isRecipientRejection } from '@/lib/whatsapp/recipient-resolver';
+import { scheduleFollowUp } from '@/lib/whatsapp/follow-up-worker';
 import {
   autoUnblockConversation,
   autoUnblockEnabled,
@@ -1487,6 +1488,25 @@ export async function dispatchInboundToAiReply(
 
     console.log('[AUTO-REPLY] Mensaje enviado con éxito a WhatsApp:', enviado);
     replyDispatched = true;
+
+    // SISTEMA DE SEGUIMIENTOS: el bot acaba de responder — si el cliente
+    // no replica en 10 minutos, un runner enviará un recordatorio natural.
+    // Bandera explícita (igual que el auto-unblock) para que el operador
+    // pueda apagar los recordatorios sin tocar el auto-reply.
+    if (process.env.FOLLOW_UP_ENABLED !== 'false') {
+      await scheduleFollowUp(db, {
+        conversationId,
+        contactId,
+        accountId,
+      }).catch((err) => {
+        // Nunca deja caer el turno: un fallo al programar solo significa
+        // "esta vuelta no habrá recordatorio".
+        console.error(
+          `[ai auto-reply] could not schedule the 10-minute follow-up for conversation ${conversationId}:`,
+          err instanceof Error ? err.message : err,
+        );
+      });
+    }
   } catch (error) {
     // Global safety net around the ENTIRE reply block. Never throws, so the
     // webhook's 200 to Meta is unaffected — but a turn can no longer die

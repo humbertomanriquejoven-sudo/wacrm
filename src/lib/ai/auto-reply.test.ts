@@ -119,6 +119,32 @@ vi.mock('./admin-client', () => ({
         };
         return chain;
       }
+      if (table === 'follow_ups') {
+        // 10-minute auto follow-ups (migration 062). The auto-reply
+        // schedules a pending row after a successful send; a no-op chain
+        // keeps existing assertions intact while exercising the hook.
+        const chain = {
+          select: () => chain,
+          eq: () => chain,
+          in: () => chain,
+          limit: () => chain,
+          maybeSingle: () =>
+            Promise.resolve({ data: null, error: null }),
+          insert: (payload: Record<string, unknown>) => {
+            h.state.updatePayloads.push({ __follow_up: true, ...payload });
+            return {
+              select: () => ({
+                single: () =>
+                  Promise.resolve({
+                    data: { id: 'fu-mock', ...payload },
+                    error: null,
+                  }),
+              }),
+            };
+          },
+        };
+        return chain;
+      }
       // contacts (reads) + conversations (reads + writes)
       return {
         select: () => ({

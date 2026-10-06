@@ -398,6 +398,23 @@ vi.mock('@supabase/supabase-js', () => ({
               }
             },
           }
+        case 'follow_ups':
+          // 10-minute auto follow-ups (migration 062). The webhook only
+          // cancels PENDING rows on a real inbound; a no-op chain keeps
+          // every existing test's assertions intact.
+          return {
+            select: () => ({
+              eq: () => ({
+                maybeSingle: () =>
+                  Promise.resolve({ data: null, error: null }),
+              }),
+            }),
+            update: () => ({
+              eq: () => ({
+                eq: () => Promise.resolve({ data: null, error: null }),
+              }),
+            }),
+          }
         default:
           throw new Error(`unexpected table: ${table}`)
       }
