@@ -7,6 +7,7 @@ import {
 import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
 import { encrypt, decrypt } from '@/lib/whatsapp/encryption'
 import { validateAiCredentials } from '@/lib/ai/validate'
+import { apiKeyFingerprint } from '@/lib/ai/key-fingerprint'
 import { embedTexts } from '@/lib/ai/embeddings'
 import { AiError, type AiProvider } from '@/lib/ai/types'
 
@@ -24,6 +25,10 @@ function bad(message: string) {
 export async function GET() {
   try {
     const { supabase, accountId } = await getCurrentAccount()
+
+    // Mirrored to the UI as a warning banner: without this env var every
+    // decrypt() on this server throws, so the bot can never read its key.
+    const encryptionKeySet = Boolean(process.env.ENCRYPTION_KEY)
 
     const { data, error } = await supabase
       .from('ai_configs')
@@ -43,7 +48,9 @@ export async function GET() {
       )
     }
 
-    if (!data) return NextResponse.json({ configured: false })
+    if (!data) {
+      return NextResponse.json({ configured: false, encryption_key_set: encryptionKeySet })
+    }
     // The keys are selected only to derive the has_* flags; neither is
     // returned to the client.
     const { api_key, embeddings_api_key, ...safe } = data
@@ -51,6 +58,7 @@ export async function GET() {
       configured: true,
       has_key: !!api_key,
       has_embeddings_key: !!embeddings_api_key,
+      encryption_key_set: encryptionKeySet,
       ...safe,
     })
   } catch (err) {
@@ -197,7 +205,20 @@ export async function POST(request: Request) {
       }
     }
 
-    const encryptedKey = rawKey ? encrypt(rawKey) : null
+    // ALWAYS re-encrypt from the plaintext we just validated, using the
+    // env var active on this server right now. A save therefore doubles
+    // as a clean re-key: previously an untouched key kept its old
+    // ciphertext, so a rotated ENCRYPTION_KEY survived a "successful"
+    // save and the worker still failed to decrypt it.
+    let encryptedKey: string
+    try {
+      encryptedKey = encrypt(apiKeyPlain)
+    } catch (err) {
+      console.error('[ai/config POST] encrypt failed:', err)
+      return bad(
+        'ENCRYPTION_KEY is missing or invalid on this server — set it in the environment before saving the API key.',
+      )
+    }
     const shared: Record<string, unknown> = {
       provider,
       model,
@@ -210,7 +231,13 @@ export async function POST(request: Request) {
     // so a partial save (e.g. flipping a toggle) doesn't wipe it.
     if (handoffProvided) shared.handoff_agent_id = handoffAgentId
     if (rawEmbeddingsKey) {
-      shared.embeddings_api_key = encrypt(rawEmbeddingsKey)
+      try {
+        shared.embeddings_api_key = encrypt(rawEmbeddingsKey)
+      } catch {
+        return bad(
+          'ENCRYPTION_KEY is missing or invalid on this server — set it in the environment before saving the embeddings key.',
+        )
+      }
     } else if (clearEmbeddingsKey) {
       shared.embeddings_api_key = null
     }
@@ -218,7 +245,7 @@ export async function POST(request: Request) {
     if (existing) {
       const { error: upErr } = await supabase
         .from('ai_configs')
-        .update(encryptedKey ? { ...shared, api_key: encryptedKey } : shared)
+        .update({ ...shared, api_key: encryptedKey })
         .eq('account_id', accountId)
       if (upErr) {
         console.error('[ai/config POST] update error:', upErr)
@@ -242,6 +269,18 @@ export async function POST(request: Request) {
         )
       }
     }
+
+    // Diagnostic breadcrumb: the webhook worker logs the same fingerprint
+    // when it reads the config for an inbound, so a "I updated the key but
+    // the bot still fails" report is resolved by comparing the two lines.
+    console.log('[ai/config] saved', {
+      accountId,
+      provider,
+      model,
+      is_active: isActive,
+      auto_reply_enabled: autoReplyEnabled,
+      key_fingerprint: apiKeyFingerprint(apiKeyPlain),
+    })
 
     return NextResponse.json({ success: true })
   } catch (err) {

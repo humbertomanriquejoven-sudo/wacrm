@@ -61,6 +61,9 @@ export function AiConfig() {
   const [removing, setRemoving] = useState(false);
 
   const [configured, setConfigured] = useState(false);
+  // ENCRYPTION_KEY presence on the SERVER (GET reports it). Older
+  // deployments omit the flag — default true so no spurious banner.
+  const [encryptionKeySet, setEncryptionKeySet] = useState(true);
   const [provider, setProvider] = useState<AiProvider>('openai');
   const [model, setModel] = useState(AI_PROVIDER_DEFAULT_MODEL.openai);
   const [apiKey, setApiKey] = useState('');
@@ -95,6 +98,7 @@ export function AiConfig() {
         toast.error(data.error ?? t('loadFailed'));
         return;
       }
+      setEncryptionKeySet(data.encryption_key_set !== false);
       if (data.configured) {
         setConfigured(true);
         setProvider(data.provider);
@@ -266,6 +270,12 @@ export function AiConfig() {
       )}
 
       <div className="space-y-6">
+        {!encryptionKeySet && (
+          <p className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {t('encryptionKeyMissing')}
+          </p>
+        )}
+
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">

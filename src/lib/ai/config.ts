@@ -1,6 +1,10 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { decrypt } from '@/lib/whatsapp/encryption'
-import type { AiConfig } from './types'
+import { AiKeyDecryptError, type AiConfig } from './types'
+
+/** Exact line greppable in EasyPanel/server logs on ANY decrypt failure. */
+const CRITICAL_KEY_LOG =
+  '[CRITICAL_AI_KEY_ERROR]: No se pudo desencriptar la API Key. Verifica ENCRYPTION_KEY en las variables de entorno'
 
 interface AiConfigRow {
   provider: 'openai' | 'anthropic'
@@ -52,6 +56,38 @@ export async function loadAiConfig(
   // rather than letting decrypt() throw on null.
   if (!row.api_key) return null
 
+  // The chat key is the one failure that must NOT be swallowed: a
+  // rotated/mismatched ENCRYPTION_KEY (or ciphertext encrypted in a
+  // different environment) means every inbound would fail, so log the
+  // greppable CRITICAL line and throw a typed error that dispatch turns
+  // into the neutral acknowledgement.
+  let apiKey: string
+  try {
+    apiKey = decrypt(row.api_key)
+  } catch (err) {
+    console.error(CRITICAL_KEY_LOG, {
+      accountId,
+      reason: err instanceof Error ? err.message : String(err),
+    })
+    throw new AiKeyDecryptError(
+      `Stored AI API key could not be decrypted (ENCRYPTION_KEY missing or mismatched): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+      { cause: err },
+    )
+  }
+  // Valid ciphertext of an empty string (or a partial write) — same class
+  // of failure: there is no key to call the provider with.
+  if (!apiKey) {
+    console.error(CRITICAL_KEY_LOG, {
+      accountId,
+      reason: 'decrypted to empty string',
+    })
+    throw new AiKeyDecryptError(
+      'Decrypted AI API key is empty — re-enter the key in Settings → AI Assistant.',
+    )
+  }
+
   // The embeddings key is optional and independent of the chat key —
   // a corrupt/undecryptable one should downgrade to lexical KB, not
   // take down draft/auto-reply, so decrypt failures are swallowed here.
@@ -72,7 +108,7 @@ export async function loadAiConfig(
   return {
     provider: row.provider,
     model: row.model,
-    apiKey: decrypt(row.api_key),
+    apiKey,
     systemPrompt: row.system_prompt,
     isActive: row.is_active,
     autoReplyEnabled: row.auto_reply_enabled,

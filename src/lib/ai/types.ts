@@ -90,10 +90,38 @@ export interface ToolDefinition {
 export class AiError extends Error {
   readonly code: string
   readonly status: number
-  constructor(message: string, opts: { code?: string; status?: number } = {}) {
+  /**
+   * The HTTP status the upstream provider actually returned, when this
+   * error came from a non-2xx response. Kept separate from `status`,
+   * which maps to OUR HTTP response (401 for a rejected key so the
+   * settings "Test key" button can show it, 502 for everything else) —
+   * logs need the real 402/404/500 to diagnose the provider side.
+   */
+  readonly upstreamStatus?: number
+  constructor(
+    message: string,
+    opts: { code?: string; status?: number; upstreamStatus?: number } = {},
+  ) {
     super(message)
     this.name = 'AiError'
     this.code = opts.code ?? 'ai_error'
     this.status = opts.status ?? 502
+    this.upstreamStatus = opts.upstreamStatus
+  }
+}
+
+/**
+ * Thrown when the stored `ai_configs.api_key` cannot be decrypted or comes
+ * back empty — i.e. `ENCRYPTION_KEY` is missing from THIS environment or
+ * differs from the key that encrypted the ciphertext (local vs Hostinger
+ * vs EasyPanel drift). Dispatch catches it, logs the
+ * `[CRITICAL_AI_KEY_ERROR]` line and sends the neutral acknowledgement, so
+ * a key/environment mismatch can never mean silent silence.
+ */
+export class AiKeyDecryptError extends Error {
+  readonly code = 'ai_key_decrypt_failed'
+  constructor(message: string, opts: { cause?: unknown } = {}) {
+    super(message, opts)
+    this.name = 'AiKeyDecryptError'
   }
 }
