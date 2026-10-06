@@ -43,37 +43,31 @@ vi.mock('./generate', async () => {
     stripInternalReasoning: actual.stripInternalReasoning,
   };
 });
-vi.mock('./tools', () => ({
-  AI_TOOLS: [
-    {
-      name: 'agendar_cita',
-      description: '',
-      parameters: { type: 'object', properties: {} },
-    },
-  ],
-  executeToolCall: h.executeToolCall,
-  loadContactContext: h.loadContactContext,
-  extractBookingResult: (output: string) => {
-    const marker = output.lastIndexOf('JSON_RESULT');
-    if (marker === -1) return null;
-    const start = output.indexOf('{', marker);
-    if (start === -1) return null;
-    try {
-      const parsed = JSON.parse(output.slice(start)) as Record<string, unknown>;
-      return {
-        confirmado: parsed.confirmado === true,
-        link: typeof parsed.link === 'string' ? parsed.link : null,
-        inicio: typeof parsed.inicio === 'string' ? parsed.inicio : null,
-        idCita: typeof parsed.idCita === 'string' ? parsed.idCita : null,
-        fecha: typeof parsed.fecha === 'string' ? parsed.fecha : null,
-        hora: typeof parsed.hora === 'string' ? parsed.hora : null,
-        calendarSynced: parsed.calendarSynced !== false,
-      };
-    } catch {
-      return null;
-    }
-  },
-}));
+vi.mock('./tools', async () => {
+  // The real trailer parser and tool classifier are used on purpose: the
+  // grounding behaviour under test (which tools count as a cita mutation, and
+  // how a JSON_RESULT is read) lives in them, and a hand-copied stub here is
+  // what silently drifts out of sync with the implementation.
+  const actual = await vi.importActual<typeof import('./tools')>('./tools');
+  return {
+    AI_TOOLS: [
+      {
+        name: 'agendar_cita',
+        description: '',
+        parameters: { type: 'object', properties: {} },
+      },
+      {
+        name: 'reagendar_cita',
+        description: '',
+        parameters: { type: 'object', properties: {} },
+      },
+    ],
+    executeToolCall: h.executeToolCall,
+    loadContactContext: h.loadContactContext,
+    extractBookingResult: actual.extractBookingResult,
+    isCitaMutatingTool: actual.isCitaMutatingTool,
+  };
+});
 vi.mock('@/lib/flows/meta-send', () => ({
   engineSendText: h.engineSendText,
   engineSendAiReply: h.engineSendAiReply,
@@ -152,8 +146,11 @@ vi.mock('./admin-client', () => ({
 import {
   dispatchInboundToAiReply,
   AGENDAR_FALLBACK_MESSAGE,
+  REAGENDAR_FALLBACK_MESSAGE,
   guardBookingReply,
   buildBookingConfirmationMessage,
+  buildRescheduleConfirmationMessage,
+  buildRescheduleFailureMessage,
 } from './auto-reply';
 
 const ARGS = {
@@ -1320,5 +1317,189 @@ describe('buildBookingConfirmationMessage — pure function', () => {
     );
     expect(out).toContain('para el 2026-09-18 a las 14:00');
     expect(out).toContain('¡Listo, Humberto!');
+  });
+});
+
+// ============================================================================
+// Rescheduling regressions.
+//
+// The dangerous failure here is a confirmation that does not match reality:
+// either a move that silently became a NEW booking, or a "listo, la movimos"
+// for a patch that never happened. These tests pin the reply to the tool's
+// structured result instead of the model's prose.
+// ============================================================================
+describe('dispatchInboundToAiReply — reschedule grounding', () => {
+  const rescheduleCall = {
+    id: 'call-1',
+    name: 'reagendar_cita',
+    arguments: { nuevoInicio: '2026-09-22T09:00:00-05:00' },
+  };
+
+  const okTrailer =
+    'Cita reagendada al 2026-09-22T09:00:00-05:00.\n\n' +
+    'JSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ' +
+    '{"accion":"reagendar","confirmado":true,"exito":true,"calendarSynced":true,' +
+    '"inicio":"2026-09-22T09:00:00-05:00","idCita":"cita-1",' +
+    '"link":"https://meet.google.com/new-room","fecha":"2026-09-22","hora":"09:00"}';
+
+  it('confirms the move with the NEW link and discards the model prose', async () => {
+    h.generateReply
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [rescheduleCall] })
+      // The model volunteers the stale link of the slot the customer left.
+      .mockResolvedValueOnce({
+        text: '¡Listo! La movimos al martes 22 a las 9:00 AM. Meet: https://meet.google.com/old-room',
+        handoff: false,
+      });
+    h.executeToolCall.mockResolvedValue(okTrailer);
+
+    await dispatchInboundToAiReply(ARGS);
+
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string;
+    expect(sent).toContain('https://meet.google.com/new-room');
+    expect(sent).not.toContain('old-room');
+    expect(sent).toContain('reagendada');
+  });
+
+  it('never claims success when the move failed — keeps the original slot', async () => {
+    h.generateReply
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [rescheduleCall] })
+      .mockResolvedValueOnce({
+        text: '¡Listo! Ya la movimos al martes 22 a las 9:00 AM.',
+        handoff: false,
+      });
+    h.executeToolCall.mockResolvedValue(
+      'No se pudo reagendar.\n\n' +
+        'JSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ' +
+        '{"accion":"reagendar","confirmado":false,"exito":false,"motivo":"horario_ocupado","calendarSynced":false}'
+    );
+
+    await dispatchInboundToAiReply(ARGS);
+
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string;
+    expect(sent).toContain('ya está ocupado');
+    expect(sent).toContain('horario original');
+    expect(sent).not.toMatch(/¡Listo!|quedó|movimos|listo/i);
+  });
+
+  it('offers a new booking when there is nothing to reschedule (no compensating create)', async () => {
+    h.generateReply
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [rescheduleCall] })
+      .mockResolvedValueOnce({ text: 'Entendido.', handoff: false });
+    h.executeToolCall.mockResolvedValue(
+      'No encontré ninguna cita previa activa.\n\n' +
+        'JSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ' +
+        '{"accion":"reagendar","confirmado":false,"exito":false,"motivo":"sin_cita_previa"}'
+    );
+
+    await dispatchInboundToAiReply(ARGS);
+
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string;
+    expect(sent).toContain('encontré ninguna cita previa');
+    expect(sent).toContain('agendo una nueva');
+    // Exactly one tool round: the model must not "fix" this with agendar_cita.
+    expect(h.executeToolCall).toHaveBeenCalledTimes(1);
+    expect(h.executeToolCall.mock.calls[0][3].name).toBe('reagendar_cita');
+  });
+
+  it('never goes silent when the reschedule tool throws', async () => {
+    h.generateReply.mockResolvedValue({
+      text: '',
+      handoff: false,
+      toolCalls: [rescheduleCall],
+    });
+    h.executeToolCall.mockRejectedValue(new Error('network timeout'));
+
+    await dispatchInboundToAiReply(ARGS);
+
+    expect(h.engineSendAiReply).toHaveBeenCalledWith(
+      expect.objectContaining({ text: REAGENDAR_FALLBACK_MESSAGE })
+    );
+  });
+
+  it('does not touch the provider when the CRM row has no remote event', async () => {
+    h.generateReply
+      .mockResolvedValueOnce({ text: '', handoff: false, toolCalls: [rescheduleCall] })
+      .mockResolvedValueOnce({ text: 'Entendido.', handoff: false });
+    h.executeToolCall.mockResolvedValue(
+      'Cita movida solo en el CRM.\n\n' +
+        'JSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ' +
+        '{"accion":"reagendar","confirmado":true,"exito":true,"calendarSynced":false,' +
+        '"inicio":"2026-09-22T09:00:00-05:00","idCita":"cita-1","link":"https://meet.google.com/old-room"}'
+    );
+
+    await dispatchInboundToAiReply(ARGS);
+
+    const sent = h.engineSendAiReply.mock.calls[0][0].text as string;
+    // calendarSynced:false must never reach the customer as a confirmation.
+    expect(sent).not.toMatch(/¡Listo!|reagendada con éxito/i);
+    expect(h.engineSendAiReply).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('reschedule message builders', () => {
+  const base = {
+    inicio: '2026-09-22T09:00:00-05:00',
+    fecha: '2026-09-22',
+    hora: '09:00',
+    idCita: 'cita-1',
+  };
+
+  it('buildRescheduleConfirmationMessage returns null unless confirmed', () => {
+    expect(
+      buildRescheduleConfirmationMessage(
+        { ...base, confirmado: false, exito: false, link: 'https://meet.google.com/x' },
+        'Ana'
+      )
+    ).toBeNull();
+  });
+
+  it('buildRescheduleConfirmationMessage carries the returned link', () => {
+    const out = buildRescheduleConfirmationMessage(
+      { ...base, confirmado: true, exito: true, link: 'https://meet.google.com/new-room' },
+      'Ana'
+    );
+    expect(out).toContain('Ana');
+    expect(out).toContain('2026-09-22');
+    expect(out).toContain('09:00');
+    expect(out).toContain('https://meet.google.com/new-room');
+  });
+
+  it('buildRescheduleFailureMessage returns null on success', () => {
+    expect(
+      buildRescheduleFailureMessage(
+        { ...base, confirmado: true, exito: true, link: '' },
+        'Ana'
+      )
+    ).toBeNull();
+  });
+
+  it('buildRescheduleFailureMessage distinguishes busy from provider error', () => {
+    expect(
+      buildRescheduleFailureMessage(
+        { ...base, confirmado: false, exito: false, motivo: 'horario_ocupado', link: '' },
+        'Ana'
+      )
+    ).toContain('ese horario ya está ocupado');
+    expect(
+      buildRescheduleFailureMessage(
+        { ...base, confirmado: false, exito: false, motivo: 'error_proveedor', link: '' },
+        'Ana'
+      )
+    ).toContain('sin cambios');
+  });
+
+  it('guardBookingReply lets the authoritative reschedule text through', () => {
+    // The deterministic confirmation contains no link of its own beyond the
+    // one the provider returned, so the guard must not strip it as a "fake"
+    // booking claim.
+    const booking = {
+      ...base,
+      accion: 'reagendar' as const,
+      confirmado: true,
+      exito: true,
+      link: 'https://meet.google.com/new-room',
+    };
+    const msg = buildRescheduleConfirmationMessage(booking, 'Ana') as string;
+    expect(guardBookingReply(msg, booking)).toBe(msg);
   });
 });

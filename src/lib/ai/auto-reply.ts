@@ -1,5 +1,6 @@
 import { supabaseAdmin } from './admin-client';
 import { loadAiConfig } from './config';
+import { apiKeyFingerprint } from './key-fingerprint';
 import { buildConversationContext } from './context';
 import { retrieveKnowledge } from './knowledge';
 import { generateReply, stripInternalReasoning } from './generate';
@@ -10,6 +11,7 @@ import {
   AI_TOOLS,
   executeToolCall,
   extractBookingResult,
+  isCitaMutatingTool,
   loadContactContext,
   type BookingToolResult,
 } from './tools';
@@ -28,7 +30,7 @@ import {
 } from './unblock';
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { ChatMessage } from './types';
+import { AiError, AiKeyDecryptError, type ChatMessage } from './types';
 
 /** Maximum tool-call rounds per inbound to avoid infinite loops. */
 const MAX_TOOL_ROUNDS = 3;
@@ -227,6 +229,53 @@ async function sendOutboundProbe(
 }
 
 /**
+ * REGLA DE ORO — emergency acknowledgement.
+ *
+ * Puts SOMETHING on WhatsApp when a turn dies before/while the LLM was
+ * being called: an undecryptable stored key, a context load failure, a
+ * provider rejection. The outbound path does NOT depend on the AI key, so
+ * this works precisely when the AI key is the thing that is broken.
+ *
+ * The text is `buildUngroundedAckMessage` — it asserts nothing that could
+ * be false (no cita, no fecha, no enlace). It NEVER fires when the caller
+ * already decided to stay silent: `suppressReply` (Flow answered / reaction)
+ * turns it into a log line only. Returns true when it reached WhatsApp.
+ */
+async function sendTurnFallback(
+  args: DispatchArgs,
+  reason: string
+): Promise<boolean> {
+  if (args.suppressReply) {
+    console.warn(
+      `[ai auto-reply] fallback_skipped conversation=${args.conversationId} reason=${reason} (suppressReply=true — something else already owns this message)`
+    );
+    return false;
+  }
+  try {
+    await engineSendAiReply({
+      accountId: args.accountId,
+      userId: args.configOwnerUserId,
+      conversationId: args.conversationId,
+      contactId: args.contactId,
+      text: buildUngroundedAckMessage(),
+      aiGenerated: true,
+      composeMessageId: args.composeMessageId,
+      single: true,
+    });
+    console.warn(
+      `[ai auto-reply] fallback_sent conversation=${args.conversationId} reason=${reason}`
+    );
+    return true;
+  } catch (err) {
+    console.error(
+      `[ai auto-reply] fallback_failed conversation=${args.conversationId} reason=${reason}`,
+      err instanceof Error ? { message: err.message, stack: err.stack } : err
+    );
+    return false;
+  }
+}
+
+/**
  * Tope de auto-respuestas a partir del cual NO hay tope: cualquier valor
  * configurado mayor o igual a este se envía al RPC como este mismo número
  * (un límite alto pero real), de modo que el bot conteste siempre a cada
@@ -300,12 +349,81 @@ async function resetAutoReplyCounter(
 }
 
 /**
+ * Deterministic, customer-facing reschedule confirmation built from the REAL
+ * reagendar_cita result.
+ *
+ * Reached only when the tool reported `confirmado:true`, which happens only
+ * AFTER the provider accepted the `events.patch` and the CRM row was updated —
+ * so this bubble cannot claim a move that did not happen. It quotes the link
+ * the provider returned for the NEW slot, which is the whole point of
+ * re-reading it after a patch: the customer must not be handed the URL of the
+ * appointment they just moved away from.
+ *
+ * Returns null when nothing was actually moved.
+ */
+export function buildRescheduleConfirmationMessage(
+  booking: BookingToolResult,
+  contactName?: string | null
+): string | null {
+  if (booking.confirmado !== true) return null;
+  const nombre = contactName?.trim() || 'Humberto';
+  const fecha = booking.fecha ?? booking.inicio?.slice(0, 10) ?? '';
+  const hora = booking.hora ?? booking.inicio?.slice(11, 16) ?? '';
+  const link = booking.link || MEET_FALLBACK_LINK;
+  return `¡Listo, ${nombre}! Tu cita fue reagendada con éxito para el ${fecha} a las ${hora}.\n\nEste es el enlace actualizado de tu videollamada de Google Meet:\n${link}`;
+}
+
+/**
+ * Deterministic reply for a reschedule that did NOT happen.
+ *
+ * The point of this function is that a failed or impossible move must never
+ * reach the customer as a confirmation. Two outcomes are kept apart because
+ * they need opposite replies:
+ *
+ *  - `sin_cita_previa`: there was nothing to move. That is a normal turn — say
+ *    so kindly and offer to book a new one.
+ *  - anything else (slot taken, provider error, unreadable date): the move was
+ *    refused. Apologise, state the move did not happen, and never quote a date
+ *    or a link, because the appointment is still at its original time.
+ *
+ * Returns null when there is no failure to report.
+ */
+export function buildRescheduleFailureMessage(
+  booking: BookingToolResult,
+  contactName?: string | null
+): string | null {
+  if (booking.exito !== false) return null;
+  const nombre = contactName?.trim();
+
+  if (booking.motivo === 'sin_cita_previa') {
+    return nombre
+      ? `${nombre.trim()}, no encontré ninguna cita previa tuya activa, así que no hay nada que reagendar por ahora. Con gusto te agendo una nueva: dime qué fecha y hora prefieres.`
+      : 'No encontré ninguna cita previa tuya activa, así que no hay nada que reagendar por ahora. Con gusto te agendo una nueva: dime qué fecha y hora prefieres.';
+  }
+
+  const slotBusy = booking.motivo === 'horario_ocupado';
+  return (
+    (nombre ? `Perdón, ${nombre.trim()}: ` : 'Perdón: ') +
+    (slotBusy
+      ? 'ese horario ya está ocupado, así que no pude mover tu cita a esa hora. Tu cita sigue en su horario original. ¿Te ofrezco otros horarios libres?'
+      : 'no pude reagendar tu cita en este momento. Tu cita sigue como estaba, sin cambios. ¿Intentamos con otra fecha y hora?')
+  );
+}
+
+/**
  * Customer-facing fallback when a scheduling tool ran but we could not
  * produce a confirmation with a Meet link (tool threw, or the model ran
  * out of rounds). Sent instead of leaving the customer in silence.
  */
 export const AGENDAR_FALLBACK_MESSAGE =
   'Tu cita ha sido procesada, pero tuvimos un inconveniente generando el enlace de Google Meet. Un asesor te contactará en breve.';
+
+/**
+ * Fallback for a reschedule whose outcome is unknown because the tool itself
+ * blew up. It must NOT claim the move happened.
+ */
+export const REAGENDAR_FALLBACK_MESSAGE =
+  'No pude confirmar el cambio de horario de tu cita. Tu cita sigue en su horario original; por favor confirma la fecha y hora con un asesor.';
 
 /**
  * Neutral acknowledgement for the turns where the grounding guard
@@ -506,7 +624,7 @@ function looksLikeBookingConfirmation(text: string): boolean {
  *  - raw wall-clock/timestamp reads ("17:32:11 -05:00", ISO datetimes) are
  *    stripped first so the bubble only ever carries the final text the AI
  *    redacted for the customer,
- *  - real agendar_cita success + link  → replace every Meet/calendar URL
+ *  - real scheduling success + link → replace every Meet/calendar URL
  *    with that link (append it if the model omitted it),
  *  - real success but no link         → use MEET_FALLBACK_LINK, keeping a
  *    Google Meet URL in any confirmation,
@@ -515,11 +633,18 @@ function looksLikeBookingConfirmation(text: string): boolean {
  *    intermediate "un momento…" wait message (always, booking or not)
  *    return null so the caller skips the turn without muting; anything
  *    else keeps its fake URLs stripped.
+ *
+ * `authoritative` marks text the BACKEND composed from a verified tool result
+ * (a reschedule confirmation, or the truthful account of a refused one). That
+ * text is not a model claim, so the suppression branches are skipped for it —
+ * otherwise the accurate "no encontré ninguna cita previa… te agendo una nueva"
+ * would be mistaken for a fabricated booking and dropped, and the customer
+ * would get a redundant acknowledgement instead of the real answer.
  */
 export function guardBookingReply(
   raw: string,
   booking: BookingToolResult | null,
-  opts: { bookingContext?: boolean } = {}
+  opts: { bookingContext?: boolean; authoritative?: boolean } = {}
 ): string | null {
   if (!raw) return raw;
 
@@ -540,6 +665,8 @@ export function guardBookingReply(
       ? replaced
       : `${replaced}\nAquí tienes el enlace de tu reunión: ${resolvedLink}`;
   }
+
+  if (opts.authoritative) return text.replace(FAKE_LINK_RE, '');
 
   // NUNCA enviar un texto que prometa un enlace de Meet/meeting sin que la
   // tool lo haya devuelto: "Este es el enlace de Google Meet para que te
@@ -692,18 +819,19 @@ export async function dispatchInboundToAiReply(
     );
   }
 
-  // Tracks whether this turn already put a message on the wire, and whether
-  // it was entitled to. `entitled` only becomes true once every INTENTIONAL
-  // gate (config, automation override, human assignment, context, rate
-  // limit) has been passed, so the catch block's fallback send can never
-  // override a decision to deliberately stay silent.
+  // Tracks whether this turn already put a message on the wire. Every gate
+  // that deliberately stays silent RETURNS instead of throwing, so anything
+  // that reaches the catch block is an UNINTENDED failure — and an
+  // unintended failure always earns the neutral acknowledgement (the
+  // helper itself honours `suppressReply`, so a Flow-consumed message or a
+  // reaction can never be answered by accident).
   let replyDispatched = false;
-  let entitledToReply = false;
 
   // A suppressed dispatch still walks every gate above (config, assignment,
-  // rate limit) purely to keep the logs honest, but never reaches the wire.
-  // `entitledToReply` stays false so the catch block's fallback send cannot
-  // override the decision.
+  // rate limit) purely to keep the logs honest, but never reaches the wire:
+  // `sendTurnFallback` refuses to send under `suppressReply`, so neither a
+  // turn failure nor a config failure can answer a message a Flow or a
+  // reaction already owns.
   if (args.suppressReply) {
     console.log(
       `[ai auto-reply] dispatch requested for conversation ${conversationId} with suppressReply=true — ` +
@@ -714,14 +842,50 @@ export async function dispatchInboundToAiReply(
   try {
     const db = supabaseAdmin();
 
-    let config = await loadAiConfig(db, accountId);
+    let config: AiConfigLike | null;
+    try {
+      config = await loadAiConfig(db, accountId);
+    } catch (err) {
+      // A stored key that cannot be decrypted (rotated ENCRYPTION_KEY,
+      // corrupt ciphertext, partial write) is a KEY failure — the operator
+      // never chose silence. REGLA DE ORO: name the real cause and put the
+      // neutral acknowledgement on WhatsApp; the send path does not need
+      // the AI key, so it works even when the AI key is unusable.
+      if (err instanceof AiKeyDecryptError) {
+        console.error(
+          '[CRITICAL_AI_KEY_ERROR]: No se pudo desencriptar la API Key. Verifica ENCRYPTION_KEY en las variables de entorno'
+        );
+      }
+      console.error('[ai auto-reply] config_load_failed', {
+        accountId,
+        conversationId,
+        contactId,
+        message: err instanceof Error ? err.message : String(err),
+      });
+      await sendTurnFallback(args, 'ai config could not be loaded/decrypted');
+      return;
+    }
     if (!config || !config.autoReplyEnabled) {
-      // loadAiConfig returns null for a missing row, is_active=false, an
+      // loadAiConfig returns null for a missing row, is_active=false, or an
       // empty api_key — three very different operator mistakes that all
-      // used to collapse into one invisible no-op.
+      // used to collapse into one invisible no-op. Re-read the raw row so
+      // the log says WHICH one it is: "I updated the key and the bot went
+      // quiet" is answerable from this line alone.
+      const { data: rawRow } = await db
+        .from('ai_configs')
+        .select('is_active, auto_reply_enabled, api_key')
+        .eq('account_id', accountId)
+        .maybeSingle();
+      const row = (rawRow ?? null) as {
+        is_active?: boolean;
+        auto_reply_enabled?: boolean;
+        api_key?: string | null;
+      } | null;
+      const gap = row
+        ? `row exists, is_active=${row.is_active}, auto_reply_enabled=${row.auto_reply_enabled}, key_present=${Boolean(row.api_key)}`
+        : 'no ai_configs row';
       console.warn(
-        `[ai auto-reply] not enabled for account ${accountId} — skipping. ` +
-          `Check ai_configs: row exists?, is_active=true?, auto_reply_enabled=true?, and a non-empty API key.`
+        `[ai auto-reply] not enabled for account ${accountId} — skipping. ${gap}.`
       );
       if (bypass) {
         config = emergencyConfig(config);
@@ -736,12 +900,20 @@ export async function dispatchInboundToAiReply(
           return;
         }
       } else {
+        // Toggles off (or no row at all) is a deliberate operator choice —
+        // stay silent as logged. But a row whose switches are ON and whose
+        // key has vanished is not: honour the REGLA DE ORO and answer.
+        if (row && row.is_active && row.auto_reply_enabled && !row.api_key) {
+          await sendTurnFallback(args, 'ai_configs row has no API key');
+        }
         return;
       }
     }
 
     console.log(
-      `[ai auto-reply] config OK — provider=${config.provider} model=${config.model}`
+      `[ai auto-reply] config OK — provider=${config.provider} model=${config.model} ` +
+        `key_fingerprint=${apiKeyFingerprint(config.apiKey)} ` +
+        `is_active=${config.isActive} auto_reply_enabled=${config.autoReplyEnabled}`
     );
 
     const { data: autoResponders, error: autoResponderErr } = await db
@@ -820,7 +992,22 @@ export async function dispatchInboundToAiReply(
     // agente tenga que hacer un "Take over" manual.
     await resetAutoReplyCounter(db, conversationId);
 
-    const messages = await buildConversationContext(db, conversationId);
+    let messages: ChatMessage[];
+    try {
+      messages = await buildConversationContext(db, conversationId);
+    } catch (err) {
+      // A DB failure building the transcript is not a gate decision — the
+      // customer's message already arrived and nobody chose to ignore it.
+      // REGLA DE ORO: log it and answer with the neutral acknowledgement.
+      console.error('[ai auto-reply] context_load_failed', {
+        accountId,
+        conversationId,
+        contactId,
+        message: err instanceof Error ? err.message : String(err),
+      });
+      await sendTurnFallback(args, 'conversation context could not be loaded');
+      return;
+    }
     if (messages.length === 0) {
       console.error(
         `[ai auto-reply] conversation context for ${conversationId} came back empty — nothing to answer.`
@@ -848,9 +1035,9 @@ export async function dispatchInboundToAiReply(
       }
     }
 
-    // Every gate that deliberately stays silent has now passed. From here
-    // on, ANY failure must still reach the customer.
-    entitledToReply = true;
+    // Every gate that deliberately stays silent has now passed (each one
+    // RETURNs; none throws), so from here on any failure must reach the
+    // customer — which the catch block's fallback guarantees.
 
     // ...unless this particular inbound was context-only. Placed after the
     // gates so the logs still show how the account was configured, and before
@@ -903,9 +1090,15 @@ export async function dispatchInboundToAiReply(
     // una intención real de agendamiento NUNCA termine sin mensaje aunque el
     // modelo devuelva texto vacío (bot "congelado").
     let bookingAttempted = false;
-    // Latest REAL successful booking from agendar_cita's JSON_RESULT.
+    // Latest REAL successful booking from a scheduling tool's JSON_RESULT.
     // Everything else that looks like a confirmation is hallucination.
     let realBooking: BookingToolResult | null = null;
+    // Latest REAL failure from a scheduling tool. Kept so a refused move is
+    // reported truthfully instead of leaving the customer on silence (or, far
+    // worse, letting the model's prose confirm a move that never happened).
+    let bookingFailure: BookingToolResult | null = null;
+    /** True once `finalText` came from the backend, not from the model. */
+    let finalTextIsDeterministic = false;
     const conversationMessages: ChatMessage[] = [...messages];
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
@@ -921,16 +1114,25 @@ export async function dispatchInboundToAiReply(
         messages: conversationMessages,
         tools: AI_TOOLS,
       }).catch((err: unknown) => {
-        // Never let a provider failure abort the turn quietly. Log the
-        // full error (AiError carries provider + code + status, which is
-        // what distinguishes 401 bad key / 429 rate limit / 404 wrong
-        // model / timeout), then rethrow so the outer catch records it.
-        console.error(
-          `[ai auto-reply] provider call FAILED (${config.provider}/${config.model}, round ${round + 1}) for conversation ${conversationId}:`,
-          err instanceof Error
-            ? { message: err.message, stack: err.stack, ...(err as object) }
-            : err
-        );
+        // Structured provider-failure line — the ONE line to read when
+        // "the bot stopped answering". Carries: which provider/model was
+        // called, our mapped status, the UPSTREAM HTTP status OpenRouter
+        // actually returned (401 bad key / 402 no credit / 404 unknown
+        // model / 429 / 500), AiError's code (invalid_key, rate_limited,
+        // timeout, empty_response, provider_error) and the provider's own
+        // error message verbatim. Then rethrow: the outer catch owns the
+        // customer-facing fallback.
+        console.error('[ai auto-reply] provider_failure', {
+          provider: config.provider,
+          model: config.model,
+          round: round + 1,
+          conversationId,
+          accountId,
+          code: err instanceof AiError ? err.code : 'unknown',
+          status: err instanceof AiError ? err.status : undefined,
+          upstream_status: err instanceof AiError ? err.upstreamStatus : undefined,
+          message: err instanceof Error ? err.message : String(err),
+        });
         throw err;
       });
 
@@ -955,19 +1157,26 @@ export async function dispatchInboundToAiReply(
             console.error(`[ai auto-reply] tool "${tc.name}" threw:`, err);
             if (tc.name === 'agendar_cita') {
               toolFallback = AGENDAR_FALLBACK_MESSAGE;
+            } else if (tc.name === 'reagendar_cita') {
+              // Never say "moví tu cita" when we do not know what happened.
+              toolFallback = REAGENDAR_FALLBACK_MESSAGE;
             }
-            output =
-              tc.name === 'agendar_cita'
-                ? AGENDAR_FALLBACK_MESSAGE
-                : `Error: la herramienta ${tc.name} no pudo completarse.`;
+            output = isCitaMutatingTool(tc.name)
+              ? (toolFallback ?? 'Error: la herramienta no pudo completarse.')
+              : `Error: la herramienta ${tc.name} no pudo completarse.`;
           }
           // Grounding: remember the LAST confirmed booking's real link so
           // the outgoing message can never carry a link the tool didn't
           // return. Ignore tool results that announced an error.
-          if (tc.name === 'agendar_cita') {
+          if (isCitaMutatingTool(tc.name)) {
             bookingAttempted = true;
             const parsed = extractBookingResult(output);
-            if (parsed?.confirmado) realBooking = parsed;
+            if (parsed?.confirmado) {
+              realBooking = parsed;
+              bookingFailure = null;
+            } else if (parsed && parsed.exito === false) {
+              bookingFailure = parsed;
+            }
           }
           toolResults.push({
             role: 'tool',
@@ -1004,19 +1213,38 @@ export async function dispatchInboundToAiReply(
         contactCtx?.name
       );
       toolFallback = null;
+      finalTextIsDeterministic = true;
     } else if (realBooking?.confirmado) {
-      // The instant agendar_cita REALLY succeeded, the backend composes and
-      // dispatches the confirmation itself — it must never depend on the
-      // model's final echo (which can be empty or a handoff, leaving a
-      // booked cita with NO WhatsApp message). Covers the case where Google
+      // The instant a scheduling tool REALLY succeeded, the backend composes
+      // and dispatches the confirmation itself — it must never depend on the
+      // model's final echo (which can be empty or a handoff, leaving a booked
+      // or moved cita with NO WhatsApp message). Covers the case where Google
       // generated the Meet link or the fallback link.
-      const deterministic = buildBookingConfirmationMessage(
-        realBooking,
-        contactCtx?.name
-      );
+      // A move is worded as a move: reusing the booking wording here would
+      // tell the customer a cita was "agendada" when it was in fact shifted.
+      const deterministic =
+        realBooking.accion === 'reagendar'
+          ? buildRescheduleConfirmationMessage(
+              realBooking,
+              contactCtx?.name
+            )
+          : buildBookingConfirmationMessage(realBooking, contactCtx?.name);
       if (deterministic) {
         finalText = deterministic;
         toolFallback = null;
+        finalTextIsDeterministic = true;
+      }
+    } else if (bookingFailure) {
+      // The tool refused. Replace whatever the model wrote — including a
+      // confident "¡listo, te la movimos!" — with the truthful outcome.
+      const truthful = buildRescheduleFailureMessage(
+        bookingFailure,
+        contactCtx?.name
+      );
+      if (truthful) {
+        finalText = truthful;
+        toolFallback = null;
+        finalTextIsDeterministic = true;
       }
     }
 
@@ -1095,6 +1323,9 @@ export async function dispatchInboundToAiReply(
         calendarFailed ? null : realBooking,
         {
           bookingContext: hasBookingIntent(messages),
+          // Backend-composed text is already grounded; suppressing it would
+          // swallow the accurate answer to a refused move.
+          authoritative: finalTextIsDeterministic,
         }
       );
       const isWaitOnly =
@@ -1198,8 +1429,10 @@ export async function dispatchInboundToAiReply(
       // La confirmación de una cita REAL va en UNA sola burbuja: se salta
       // el split por párrafos para que el cliente reciba la fecha, la hora
       // y el enlace de Meet juntos, sin cortes que puedan dejar el enlace
-      // fuera o dividido en varios mensajes.
-      single: realBooking?.confirmado === true,
+      // fuera o dividido en varios mensajes. Lo mismo para el aviso
+      // determinístico de un reagendamiento rechazado: es una sola
+      // explicación, no una conversación.
+      single: realBooking?.confirmado === true || finalTextIsDeterministic,
     }).catch(async (err: unknown) => {
       // The model already produced an answer, so a send failure is the
       // one error the operator most needs verbatim: "contact phone
@@ -1232,7 +1465,7 @@ export async function dispatchInboundToAiReply(
             userId: configOwnerUserId,
             text: stripInternalReasoning(finalText),
             composeMessageId: args.composeMessageId,
-            single: realBooking?.confirmado === true,
+            single: realBooking?.confirmado === true || finalTextIsDeterministic,
             previousError: err,
           });
           if (requeued) {
@@ -1288,32 +1521,15 @@ export async function dispatchInboundToAiReply(
     // the last resort is not another log line: send the neutral
     // acknowledgement. It asserts nothing that could be false (no cita, no
     // date, no link, no promise of a human), and it keeps the thread alive.
-    if (entitledToReply && !replyDispatched) {
-      try {
-        await engineSendAiReply({
-          accountId,
-          userId: configOwnerUserId,
-          conversationId,
-          contactId,
-          text: buildUngroundedAckMessage(),
-          aiGenerated: true,
-          composeMessageId: args.composeMessageId,
-          single: true,
-        });
-        replyDispatched = true;
-        console.warn(
-          `[ai auto-reply] conversation ${conversationId}: the turn failed but a fallback acknowledgement WAS delivered so the customer is not left without an answer.`
-        );
-      } catch (fallbackErr) {
-        // WhatsApp itself is unreachable — there is no third option left to
-        // try, so record the original failure together with this one.
-        console.error(
-          `[ai auto-reply] conversation ${conversationId}: FAILED to send even the fallback acknowledgement:`,
-          fallbackErr instanceof Error
-            ? { message: fallbackErr.message, stack: fallbackErr.stack }
-            : fallbackErr
-        );
-      }
+    // REGLA DE ORO: a throw reached here, so this was NOT a deliberate
+    // stay-silent decision (those all return above). Put the neutral
+    // acknowledgement on WhatsApp unless something already went out.
+    if (!replyDispatched) {
+      const sent = await sendTurnFallback(
+        args,
+        'dispatch threw after the original error was logged'
+      );
+      if (sent) replyDispatched = true;
     }
   }
 }
