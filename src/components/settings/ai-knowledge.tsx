@@ -34,6 +34,12 @@ interface DocSummary {
   filename?: string | null;
   /** Parser that produced the text ('xlsx', 'pdf', 'png', …). */
   source_type?: string | null;
+  /** Lifecycle: uploading → processing → ready / error (migration 061). */
+  status?: string | null;
+  /** Original file size in bytes (migration 061). */
+  file_size?: number | null;
+  /** Why the document is in 'error' (migration 061). */
+  error_message?: string | null;
 }
 
 /** Badge tone per file family, so a price sheet reads differently to a photo. */
@@ -67,6 +73,45 @@ function documentExtension(doc: DocSummary): string | null {
   const fromName = doc.filename?.match(/\.([A-Za-z0-9]+)$/)?.[1];
   const ext = (fromName ?? doc.source_type ?? '').toLowerCase();
   return ext || null;
+}
+
+/**
+ * Status chips (migration 061). A row without `status` is a pre-061
+ * document — there is no chip, which keeps the list exactly as it was
+ * before the migration rather than inventing a state the server never
+ * reported.
+ */
+const STATUS_LABEL_KEY: Record<string, string> = {
+  uploading: 'statusUploading',
+  processing: 'statusProcessing',
+  ready: 'statusReady',
+  error: 'statusError',
+};
+
+const STATUS_CHIP_CLASS: Record<string, string> = {
+  uploading: 'bg-sky-500/15 text-sky-700 dark:text-sky-300',
+  processing: 'bg-amber-500/15 text-amber-700 dark:text-amber-300',
+  ready: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300',
+  error: 'bg-rose-500/15 text-rose-700 dark:text-rose-300',
+};
+
+/**
+ * Human-readable original size — the second half of "this file really
+ * exists in storage": the row shows the name AND how big the stored
+ * original is. Falls back to nothing for hand-typed documents (no
+ * original file) or a malformed value.
+ */
+function formatFileSize(bytes: number | null | undefined): string | null {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return null;
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unitIndex]}`;
 }
 
 /** Editor target: 'new' when creating, a doc id when editing, null when closed. */
@@ -135,6 +180,12 @@ export function AiKnowledgeCard({
   const [content, setContent] = useState('');
   const [saving, setSaving] = useState(false);
   const [reindexing, setReindexing] = useState(false);
+  // Row awaiting delete confirmation — a delete here removes the stored
+  // original AND the index, so it asks first instead of firing on the
+  // first click (the old behaviour).
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(
+    null
+  );
   // True when the list could not be loaded (as opposed to being empty).
   const [loadError, setLoadError] = useState(false);
   const loadedAccountIdRef = useRef<string | null>(null);
@@ -280,6 +331,7 @@ export function AiKnowledgeCard({
   };
 
   const remove = async (id: string) => {
+    setConfirmingDeleteId(null);
     // Optimistic removal: the row disappears the instant the click lands, and
     // is restored if the server refuses. Deleting is reversible here (the
     // document and its vectors are still on the server until the call
@@ -391,6 +443,7 @@ export function AiKnowledgeCard({
               <ul className="divide-border border-border divide-y rounded-md border">
                 {docs.map((doc) => {
                   const ext = documentExtension(doc);
+                  const fileSize = formatFileSize(doc.file_size);
                   return (
                   <li
                     key={doc.id}
@@ -415,39 +468,84 @@ export function AiKnowledgeCard({
                             {doc.title}
                           </span>
                         )}
-                        {/* Proof of persistence: the date comes back from
-                            Postgres, so a row that survived a tab switch or
-                            a reload is visibly a stored row. Formatted with
-                            the browser locale — no translation key needed. */}
-                        {doc.created_at && (
-                          <span className="text-muted-foreground block truncate text-xs">
-                            {new Date(doc.created_at).toLocaleDateString()}
-                          </span>
-                        )}
+                        <span className="flex flex-wrap items-center gap-x-2">
+                          {/* Proof of persistence: the date comes back from
+                              Postgres, so a row that survived a tab switch or
+                              a reload is visibly a stored row. Formatted with
+                              the browser locale — no translation key needed. */}
+                          {doc.created_at && (
+                            <span className="text-muted-foreground text-xs">
+                              {new Date(doc.created_at).toLocaleDateString()}
+                            </span>
+                          )}
+                          {/* The stored original's size — the second proof
+                              that a real file exists in the bucket, not just
+                              extracted text. */}
+                          {fileSize && (
+                            <span className="text-muted-foreground text-xs">
+                              {fileSize}
+                            </span>
+                          )}
+                          {doc.status && STATUS_LABEL_KEY[doc.status] && (
+                            <span
+                              className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${STATUS_CHIP_CLASS[doc.status] ?? STATUS_CHIP_CLASS.ready}`}
+                              /* On failure the reason travels with the chip —
+                                 the server stored it in error_message. */
+                              title={
+                                doc.status === 'error'
+                                  ? (doc.error_message ?? undefined)
+                                  : undefined
+                              }
+                            >
+                              {t(STATUS_LABEL_KEY[doc.status])}
+                            </span>
+                          )}
+                        </span>
                       </span>
                     </span>
-                    {canEdit && (
-                      <span className="flex shrink-0 gap-1">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-8 w-8 p-0"
-                          onClick={() => void openEdit(doc.id)}
-                          title="Edit"
-                        >
-                          <Pencil className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="text-destructive hover:text-destructive h-8 w-8 p-0"
-                          onClick={() => void remove(doc.id)}
-                          title="Delete"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </span>
-                    )}
+                    {canEdit &&
+                      (confirmingDeleteId === doc.id ? (
+                        <span className="flex shrink-0 items-center gap-1">
+                          <span className="text-muted-foreground text-xs">
+                            {t('deleteConfirm')}
+                          </span>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setConfirmingDeleteId(null)}
+                          >
+                            {t('cancel')}
+                          </Button>
+                          <Button
+                            variant="destructive"
+                            size="sm"
+                            onClick={() => void remove(doc.id)}
+                          >
+                            {t('deleteYes')}
+                          </Button>
+                        </span>
+                      ) : (
+                        <span className="flex shrink-0 gap-1">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 w-8 p-0"
+                            onClick={() => void openEdit(doc.id)}
+                            title="Edit"
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="text-destructive hover:text-destructive h-8 w-8 p-0"
+                            onClick={() => setConfirmingDeleteId(doc.id)}
+                            title="Delete"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </span>
+                      ))}
                   </li>
                   );
                 })}

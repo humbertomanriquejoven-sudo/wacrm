@@ -1784,6 +1784,7 @@
       "loadFailed": "Failed to load AI configuration",
       "providerAndKey": "Provider & key",
       "encryptionNotice": "Your key is encrypted at rest (AES-256-GCM) and never shown again after saving.",
+      "encryptionKeyMissing": "ENCRYPTION_KEY is not set on this server — stored API keys cannot be decrypted, so the bot will not answer. Add ENCRYPTION_KEY to the environment (EasyPanel → Variables) and reload.",
       "provider": "Provider",
       "model": "Model",
       "apiKey": "API key",
@@ -1853,7 +1854,13 @@
       "uploadFailed": "Upload failed.",
       "uploadTooLarge": "File must be 16 MB or smaller.",
       "uploadUnsupported": "Unsupported file type.",
-      "uploadEmpty": "The file is empty."
+      "uploadEmpty": "The file is empty.",
+      "statusUploading": "Uploading…",
+      "statusProcessing": "Indexing…",
+      "statusReady": "Available to the agent",
+      "statusError": "Error",
+      "deleteConfirm": "Delete this document? The stored original and its index are removed too.",
+      "deleteYes": "Delete"
     }
   }
 }

@@ -7,10 +7,16 @@ import {
 import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
 import { loadEmbeddingsKey } from '@/lib/ai/config'
 import { ingestDocument, ingestWarning } from '@/lib/ai/knowledge'
+import { isMissingColumnError } from '@/lib/ai/knowledge-schema'
 import {
   httpStatusForDbError,
   reportKnowledgeDbError,
 } from '@/lib/ai/knowledge-errors'
+import {
+  deleteKnowledgeDocument,
+  knowledgeDeleteFailureResponse,
+  markKnowledgeDocumentStatus,
+} from '@/lib/ai/knowledge-documents'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -47,6 +53,13 @@ export async function GET(_request: Request, { params }: Params) {
 /**
  * PATCH /api/ai/knowledge/[id]  (admin+) — update title/content and
  * re-index when the content changed.
+ *
+ * When the content changes the row also walks the lifecycle: it is
+ * marked 'processing' while the new text is being chunked, then 'ready'
+ * or 'error' with the reason. A database without migration 061 has no
+ * status columns — the first update is retried without them (missing
+ * column is a schema gap, not a failure), and every later status write
+ * degrades silently through `markKnowledgeDocumentStatus`.
  */
 export async function PATCH(request: Request, { params }: Params) {
   try {
@@ -70,15 +83,35 @@ export async function PATCH(request: Request, { params }: Params) {
 
     const update: Record<string, string> = {}
     if (title !== undefined) update.title = title
-    if (content !== undefined) update.content = content
+    if (content !== undefined) {
+      update.content = content
+      // 061 lifecycle: re-indexing is under way from this moment.
+      update.status = 'processing'
+      update.error_message = ''
+    }
 
-    const { data: updated, error } = await supabase
+    let { data: updated, error } = await supabase
       .from('ai_knowledge_documents')
       .update(update)
       .eq('account_id', accountId)
       .eq('id', id)
       .select('id')
       .maybeSingle()
+    if (error && isMissingColumnError(error) && 'status' in update) {
+      // Migration 061 not applied yet: drop the lifecycle columns and
+      // retry the substantive part of the update — an edit must not
+      // fail because an optional column is absent.
+      const rest = { ...update };
+      delete rest.status;
+      delete rest.error_message;
+      ;({ data: updated, error } = await supabase
+        .from('ai_knowledge_documents')
+        .update(rest)
+        .eq('account_id', accountId)
+        .eq('id', id)
+        .select('id')
+        .maybeSingle())
+    }
     if (error) {
       console.error('[ai/knowledge/[id] PATCH] error:', error)
       return NextResponse.json(
@@ -102,14 +135,17 @@ export async function PATCH(request: Request, { params }: Params) {
         await ingestDocument(supabase, accountId, { embeddingsApiKey }, id, content)
       } catch (err) {
         console.error('[ai/knowledge/[id] PATCH] ingest error:', err)
+        const warning = ingestWarning('Updated', err)
+        await markKnowledgeDocumentStatus(supabase, accountId, id, 'error', warning)
         return NextResponse.json(
           {
             success: true,
-            warning: ingestWarning('Updated', err),
+            warning,
           },
           { status: 200 },
         )
       }
+      await markKnowledgeDocumentStatus(supabase, accountId, id, 'ready', null)
       if (corrupt) {
         return NextResponse.json({
           success: true,
@@ -126,26 +162,21 @@ export async function PATCH(request: Request, { params }: Params) {
 }
 
 /**
- * DELETE /api/ai/knowledge/[id]  (admin+) — chunks cascade.
+ * DELETE /api/ai/knowledge/[id]  (admin+) — stored original first,
+ * then the row; chunks cascade. Shares `deleteKnowledgeDocument` with
+ * DELETE /api/ai/knowledge?id= so cleanup cannot drift between them.
  */
 export async function DELETE(_request: Request, { params }: Params) {
   try {
     const { supabase, accountId } = await requireRole('admin')
     const { id } = await params
-    const { error } = await supabase
-      .from('ai_knowledge_documents')
-      .delete()
-      .eq('account_id', accountId)
-      .eq('id', id)
-    if (error) {
-      console.error('[ai/knowledge/[id] DELETE] error:', error)
-      return NextResponse.json(
-        reportKnowledgeDbError(error, 'delete knowledge document', {
-          accountId,
-          documentId: id,
-        }),
-        { status: httpStatusForDbError(error) },
-      )
+    const result = await deleteKnowledgeDocument(supabase, accountId, id)
+    if (!result.ok) {
+      const { body, status } = knowledgeDeleteFailureResponse(result, {
+        accountId,
+        documentId: id,
+      })
+      return NextResponse.json(body, { status })
     }
     return NextResponse.json({ success: true })
   } catch (err) {

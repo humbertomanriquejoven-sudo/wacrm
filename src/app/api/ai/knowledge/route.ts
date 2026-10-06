@@ -7,67 +7,43 @@ import {
 import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
 import { loadEmbeddingsKey } from '@/lib/ai/config'
 import { ingestDocument, ingestWarning } from '@/lib/ai/knowledge'
-import { isMissingColumnError } from '@/lib/ai/knowledge-schema'
 import {
   httpStatusForDbError,
   reportKnowledgeDbError,
 } from '@/lib/ai/knowledge-errors'
+import {
+  deleteKnowledgeDocument,
+  knowledgeDeleteFailureResponse,
+  markKnowledgeDocumentStatus,
+  selectKnowledgeDocumentSummaries,
+} from '@/lib/ai/knowledge-documents'
 
 /**
  * GET /api/ai/knowledge
  *
  * List the account's knowledge-base documents (any member).
+ *
+ * The projection degrades through the tiers in
+ * `DOCUMENT_SUMMARY_PROJECTIONS` (061 → 055 → 030): PostgREST rejects
+ * the whole projection when one column is unknown, which would leave
+ * the panel showing "No documents yet." on a database that has plenty
+ * of documents. `created_at` (migration 030, always present) drives the
+ * ordering — this panel is an upload log ("what did I add, most recent
+ * first"), so a document edited months later must not jump to the top
+ * as if it had just been added.
  */
 export async function GET() {
   try {
     const { supabase, accountId } = await getCurrentAccount()
-
-    // Ask for the 055 columns first, but never let their absence break the
-    // list: PostgREST rejects the whole projection when one column is unknown,
-    // which would leave the panel showing "No documents yet." on a database
-    // that has plenty of documents.
-    //
-    // `created_at` comes from migration 030 (the table's own definition), so
-    // unlike filename/source_type it is always present and is safe to depend
-    // on. The UI uses it to show when a document was added.
-    // Ordered by created_at DESC, not updated_at: this panel is an upload
-    // log ("what did I add, most recent first"), so a document edited months
-    // later should not jump to the top as if it had just been added.
-    const rich = await supabase
-      .from('ai_knowledge_documents')
-      .select('id, title, filename, source_type, created_at, updated_at')
-      .eq('account_id', accountId)
-      .order('created_at', { ascending: false })
-
-    if (!rich.error) {
-      return NextResponse.json({ documents: rich.data ?? [] })
-    }
-
-    if (!isMissingColumnError(rich.error)) {
-      console.error('[ai/knowledge GET] error:', rich.error)
-      return NextResponse.json(
-        reportKnowledgeDbError(rich.error, 'list knowledge documents', {
-          accountId,
-          projection: 'rich',
-        }),
-        { status: httpStatusForDbError(rich.error) },
-      )
-    }
-
-    console.warn(
-      '[ai/knowledge GET] 055 not applied; listing documents without filename/source_type.',
+    const { data, error } = await selectKnowledgeDocumentSummaries(
+      supabase,
+      accountId,
     )
-    const { data, error } = await supabase
-      .from('ai_knowledge_documents')
-      .select('id, title, created_at, updated_at')
-      .eq('account_id', accountId)
-      .order('created_at', { ascending: false })
     if (error) {
       console.error('[ai/knowledge GET] error:', error)
       return NextResponse.json(
-        reportKnowledgeDbError(error, 'list knowledge documents (legacy shape)', {
+        reportKnowledgeDbError(error, 'list knowledge documents', {
           accountId,
-          projection: 'legacy',
         }),
         { status: httpStatusForDbError(error) },
       )
@@ -82,7 +58,10 @@ export async function GET() {
  * POST /api/ai/knowledge  (admin+)
  *
  * Create a document, then chunk + (optionally) embed it. If indexing
- * fails the document is still saved so the admin can retry via reindex.
+ * fails the document is still saved so the admin can retry via reindex —
+ * and (migration 061) the failure is recorded on the row as
+ * status='error' with the reason, so the list shows it instead of
+ * pretending everything is fine.
  */
 export async function POST(request: Request) {
   try {
@@ -132,15 +111,20 @@ export async function POST(request: Request) {
       )
     } catch (err) {
       console.error('[ai/knowledge POST] ingest error:', err)
+      // Record the failure on the row (best-effort — 061 may be absent),
+      // then tell the caller. The document is saved either way.
+      const warning = ingestWarning('Saved', err)
+      await markKnowledgeDocumentStatus(supabase, accountId, doc.id, 'error', warning)
       return NextResponse.json(
         {
           success: true,
           id: doc.id,
-          warning: ingestWarning('Saved', err),
+          warning,
         },
         { status: 200 },
       )
     }
+    await markKnowledgeDocumentStatus(supabase, accountId, doc.id, 'ready', null)
 
     if (corrupt) {
       return NextResponse.json({
@@ -160,13 +144,14 @@ export async function POST(request: Request) {
  * DELETE /api/ai/knowledge?id={id}  (admin+)
  *
  * Query-param alias of DELETE /api/ai/knowledge/[id]. Both forms are
- * supported because the id has to travel somewhere: the collection route is
- * the natural target for `?id=`, the dynamic segment for REST purity. They
- * share one implementation so the account scoping and the chunk cascade
- * cannot drift between them.
+ * supported because the id has to travel somewhere: the collection route
+ * is the natural target for `?id=`, the dynamic segment for REST purity.
+ * They share `deleteKnowledgeDocument` so the account scoping, the
+ * stored-file removal and the chunk cascade cannot drift between them.
  *
- * Chunks and their embeddings go with the document: the `document_id`
- * foreign key is ON DELETE CASCADE (migration 030), so the vectors are
+ * Cleanup order (see the function for the full note): stored original
+ * first, then the row — the `document_id` foreign key is ON DELETE
+ * CASCADE (migration 030), so the chunks and their embeddings are
  * physically removed and cannot still be retrieved.
  */
 export async function DELETE(request: Request) {
@@ -180,20 +165,13 @@ export async function DELETE(request: Request) {
       return NextResponse.json({ error: 'id is required' }, { status: 400 })
     }
 
-    const { error } = await supabase
-      .from('ai_knowledge_documents')
-      .delete()
-      .eq('account_id', accountId)
-      .eq('id', id)
-    if (error) {
-      console.error('[ai/knowledge DELETE] error:', error)
-      return NextResponse.json(
-        reportKnowledgeDbError(error, 'delete knowledge document', {
-          accountId,
-          documentId: id,
-        }),
-        { status: httpStatusForDbError(error) },
-      )
+    const result = await deleteKnowledgeDocument(supabase, accountId, id)
+    if (!result.ok) {
+      const { body, status } = knowledgeDeleteFailureResponse(result, {
+        accountId,
+        documentId: id,
+      })
+      return NextResponse.json(body, { status })
     }
     return NextResponse.json({ success: true, id })
   } catch (err) {

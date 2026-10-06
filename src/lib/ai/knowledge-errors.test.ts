@@ -122,6 +122,42 @@ describe('reportKnowledgeDbError', () => {
     expect(body.advice).toContain('055_knowledge_document_filename.sql');
   });
 
+  it('points at migration 061 when the missing column belongs to it', () => {
+    // 42703 is ambiguous: BOTH 055 (filename/source_type) and 061
+    // (storage_path/status/file_size/…) report it. The column name in the
+    // message is the only signal — pointing an operator at 055 when 061 is
+    // the gap sends them to re-apply a migration that is already there.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    for (const column of [
+      'storage_path',
+      'file_size',
+      'mime_type',
+      'status',
+      'error_message',
+    ]) {
+      const body = reportKnowledgeDbError(
+        pgError('42703', `column ai_knowledge_documents.${column} does not exist`),
+        'insert knowledge document'
+      );
+      expect(body.advice).toContain('061_knowledge_document_storage.sql');
+      expect(body.advice).not.toContain('055_knowledge_document_filename.sql');
+    }
+  });
+
+  it('recognises the PostgREST wording of a missing column too', () => {
+    // PostgREST answers a projection with PGRST204 and its own phrasing —
+    // no "column … does not exist" to match, and no SQLSTATE 42703.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const body = reportKnowledgeDbError(
+      pgError(
+        'PGRST204',
+        "Could not find the 'status' column of 'ai_knowledge_documents' in the schema cache"
+      ),
+      'list knowledge documents'
+    );
+    expect(body.advice).toContain('061_knowledge_document_storage.sql');
+  });
+
   it('still produces a usable message when the driver gives no code', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const body = reportKnowledgeDbError(

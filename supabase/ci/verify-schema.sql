@@ -83,6 +83,34 @@ BEGIN
       'ai_knowledge_documents.source_type is missing — migration 055 did not apply';
   END IF;
 
+  -- The knowledge base's original-file storage + lifecycle status (061).
+  -- Same reasoning as the 055 assertions: the app probes for these and
+  -- degrades around them, so an unapplied 061 would be invisible in the
+  -- UI — uploads keep working but silently lose the original file and
+  -- every status chip.
+  IF NOT EXISTS (SELECT 1 FROM storage.buckets WHERE id = 'knowledge-base') THEN
+    RAISE EXCEPTION
+      'the knowledge-base bucket row was not created (migration 061)';
+  END IF;
+  IF NOT EXISTS (
+       SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'ai_knowledge_documents'
+          AND column_name = 'status'
+     ) THEN
+    RAISE EXCEPTION
+      'ai_knowledge_documents.status is missing — migration 061 did not apply; documents cannot record their processing state';
+  END IF;
+  IF NOT EXISTS (
+       SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'ai_knowledge_documents'
+          AND column_name = 'storage_path'
+     ) THEN
+    RAISE EXCEPTION
+      'ai_knowledge_documents.storage_path is missing — migration 061 did not apply; stored originals could never be deleted';
+  END IF;
+
   RAISE NOTICE 'schema verification passed';
 END
 $$;

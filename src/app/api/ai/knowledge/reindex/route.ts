@@ -3,6 +3,7 @@ import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
 import { loadEmbeddingsKey } from '@/lib/ai/config'
 import { ingestDocument } from '@/lib/ai/knowledge'
+import { markKnowledgeDocumentStatus } from '@/lib/ai/knowledge-documents'
 import { AiError } from '@/lib/ai/types'
 
 /**
@@ -55,11 +56,24 @@ export async function POST() {
       try {
         await ingestDocument(supabase, accountId, { embeddingsApiKey }, doc.id, doc.content)
         reindexed += 1
+        // Reindexing succeeded: clear any earlier failure recorded on the
+        // row (best-effort — without migration 061 there is no status
+        // column and this write degrades silently).
+        await markKnowledgeDocumentStatus(supabase, accountId, doc.id, 'ready', null)
       } catch (err) {
         // One bad document (e.g. a mid-run embeddings rate-limit) should
         // not abort the whole batch.
         const message = err instanceof AiError ? err.message : String(err)
         console.error(`[ai/knowledge/reindex] doc ${doc.id} failed:`, message)
+        // Record the failure ON the document (status='error') so the list
+        // shows which one is broken, not just that something was.
+        await markKnowledgeDocumentStatus(
+          supabase,
+          accountId,
+          doc.id,
+          'error',
+          `Reindex failed: ${message}`,
+        )
         return NextResponse.json(
           {
             success: false,

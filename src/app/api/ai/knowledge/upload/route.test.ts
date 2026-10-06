@@ -7,6 +7,8 @@ const mocks = vi.hoisted(() => ({
   loadEmbeddingsKey: vi.fn(),
   ingestDocument: vi.fn(),
   parseKnowledgeFile: vi.fn(),
+  uploadKnowledgeFile: vi.fn(),
+  removeKnowledgeFile: vi.fn(),
 }));
 
 const SUPPORTED_EXTENSIONS = [
@@ -61,6 +63,15 @@ vi.mock('@/lib/ai/knowledge-parser', () => ({
   },
 }));
 
+// Storage calls are stubbed (so no real Storage is touched), but
+// knowledgeObjectPath and sanitizeFilename stay REAL: the cleanup path
+// builds its path with them, and that path must round-trip.
+vi.mock('@/lib/ai/knowledge-storage', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/ai/knowledge-storage')>()),
+  uploadKnowledgeFile: mocks.uploadKnowledgeFile,
+  removeKnowledgeFile: mocks.removeKnowledgeFile,
+}));
+
 import { POST } from './route';
 import { AiError } from '@/lib/ai/types';
 
@@ -75,12 +86,82 @@ const context = {
 const FILE_BYTES = 16 * 1024 * 1024;
 
 const inserted: Array<{ table: string; row: Record<string, unknown> }> = [];
+const updates: Array<{
+  table: string;
+  values: Record<string, unknown>;
+  filters: Record<string, unknown>;
+}> = [];
+const deletions: Array<{ table: string; filters: Record<string, unknown> }> = [];
 
-function makeDb() {
+interface DbOptions {
+  /**
+   * Columns the "database" does not have — every insert/update payload
+   * carrying one fails exactly like Postgres would (42703 + the column
+   * name), which is what drives the 061 → 055 → 030 degradation tiers.
+   */
+  failColumns?: string[];
+  /** Documents the list reload returns. */
+  documents?: Record<string, unknown>[];
+}
+
+function missingColumnError(column: string) {
+  return {
+    code: '42703',
+    message: `column ai_knowledge_documents.${column} does not exist`,
+    details: '',
+    hint: '',
+  };
+}
+
+/**
+ * Chain stub with the shape the route actually uses:
+ * `.update(v).eq().eq()` / `.delete().eq().eq()` — awaitable once the
+ * eq filters are applied.
+ */
+function eqChainTo(
+  entry: { filters: Record<string, unknown> },
+  result: { data?: unknown; error: unknown }
+) {
+  const chain: Record<string, unknown> = {
+    eq: (col: string, val: unknown) => {
+      entry.filters[col] = val;
+      return chain;
+    },
+  };
+  return Object.assign(Promise.resolve(result), chain);
+}
+
+function makeDb(opts: DbOptions = {}) {
   inserted.length = 0;
+  updates.length = 0;
+  deletions.length = 0;
+  const failColumns = opts.failColumns ?? [];
+  const documents =
+    opts.documents ??
+    ([
+      {
+        id: 'doc-1',
+        title: 'lista-precios',
+        filename: 'lista-precios.xlsx',
+        source_type: 'xlsx',
+        status: 'ready',
+        file_size: 32,
+        created_at: '2026-10-01T00:00:00Z',
+        updated_at: '2026-10-01T00:00:00Z',
+      },
+    ] as Record<string, unknown>[]);
   return {
     from: (table: string) => ({
       insert: (row: Record<string, unknown>) => {
+        const missing = failColumns.find((column) => column in row);
+        if (missing) {
+          return {
+            select: () => ({
+              single: () =>
+                Promise.resolve({ data: null, error: missingColumnError(missing) }),
+            }),
+          };
+        }
         inserted.push({ table, row });
         return {
           select: () => ({
@@ -88,6 +169,28 @@ function makeDb() {
               Promise.resolve({ data: { id: 'doc-1' }, error: null }),
           }),
         };
+      },
+      update: (values: Record<string, unknown>) => {
+        const entry = { table, values, filters: {} as Record<string, unknown> };
+        const missing = failColumns.find((column) => column in values);
+        if (missing) {
+          return eqChainTo(entry, { data: null, error: missingColumnError(missing) });
+        }
+        updates.push(entry);
+        return eqChainTo(entry, { data: null, error: null });
+      },
+      delete: () => {
+        const entry = { table, filters: {} as Record<string, unknown> };
+        deletions.push(entry);
+        return eqChainTo(entry, { error: null });
+      },
+      // The list reload: .select().eq().order().
+      select: () => {
+        const chain: Record<string, unknown> = {
+          eq: () => chain,
+          order: () => Promise.resolve({ data: documents, error: null }),
+        };
+        return chain;
       },
     }),
   };
@@ -124,6 +227,14 @@ beforeEach(() => {
     text: 'Producto, Precio\nMolino, 300',
     extension: 'xlsx',
   });
+  mocks.uploadKnowledgeFile.mockReset();
+  mocks.uploadKnowledgeFile.mockResolvedValue(
+    'account-1/doc-1/lista-precios.xlsx'
+  );
+  mocks.removeKnowledgeFile.mockReset();
+  mocks.removeKnowledgeFile.mockResolvedValue(undefined);
+  updates.length = 0;
+  deletions.length = 0;
   mocks.checkRateLimit.mockReset();
   mocks.checkRateLimit.mockReturnValue({ success: true });
   mocks.rateLimitResponse.mockReset();
@@ -161,6 +272,11 @@ describe('/api/ai/knowledge/upload', () => {
         // (e.g. an unreadable image) can be identified and re-uploaded.
         filename: 'lista-precios.xlsx',
         source_type: 'xlsx',
+        // 061 lifecycle: the row enters the world as 'uploading'.
+        file_size: 32,
+        mime_type:
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        status: 'uploading',
       },
     });
     expect(mocks.ingestDocument).toHaveBeenCalledWith(
@@ -170,6 +286,14 @@ describe('/api/ai/knowledge/upload', () => {
       'doc-1',
       'Producto, Precio\nMolino, 300'
     );
+    // …and the list in the response is the SAME shape GET returns, so the
+    // client can reconcile from this response alone.
+    expect(body.documents).toHaveLength(1);
+    expect(body.documents[0]).toMatchObject({
+      id: 'doc-1',
+      status: 'ready',
+      file_size: 32,
+    });
   });
 
   it('honors an explicit title from the form', async () => {
@@ -387,6 +511,130 @@ describe('/api/ai/knowledge/upload', () => {
         code: '42501',
       });
       spy.mockRestore();
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // Stored originals + the status lifecycle (migration 061).
+  // ---------------------------------------------------------------------
+  describe('stores the original file and tracks document status', () => {
+    it('uploads the original to storage and records the path before indexing', async () => {
+      const response = await POST(multipart(xlsxFile()));
+      expect(response.status).toBe(200);
+
+      expect(mocks.uploadKnowledgeFile).toHaveBeenCalledTimes(1);
+      const [client, params] = mocks.uploadKnowledgeFile.mock.calls[0];
+      // The caller's RLS client, so the 061 storage policies decide.
+      expect(client).toBeInstanceOf(Object);
+      expect(params).toMatchObject({
+        accountId: 'account-1',
+        documentId: 'doc-1',
+      });
+      expect(params.file).toBeInstanceOf(File);
+
+      // The row points at the object AND moves to 'processing' — the
+      // moment the original is durable and indexing is under way.
+      expect(updates[0]).toMatchObject({
+        table: 'ai_knowledge_documents',
+        values: {
+          storage_path: 'account-1/doc-1/lista-precios.xlsx',
+          status: 'processing',
+        },
+        filters: { account_id: 'account-1', id: 'doc-1' },
+      });
+      // After a clean index run the document lands on 'ready'.
+      expect(updates[updates.length - 1].values).toMatchObject({
+        status: 'ready',
+        error_message: null,
+      });
+      expect(mocks.removeKnowledgeFile).not.toHaveBeenCalled();
+    });
+
+    it('undoes the row and reports 500 when the original cannot be stored', async () => {
+      mocks.uploadKnowledgeFile.mockRejectedValueOnce(
+        new Error('Bucket write denied')
+      );
+      const response = await POST(multipart(xlsxFile()));
+
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body.error).toContain('Bucket write denied');
+      // The cleanup tries to drop whatever partial object exists…
+      expect(mocks.removeKnowledgeFile).toHaveBeenCalledWith(
+        expect.anything(),
+        'account-1/doc-1/lista-precios.xlsx'
+      );
+      // …and the row itself: nothing may reference a file that was never
+      // stored, and no half-saved document may linger in the list.
+      expect(deletions).toHaveLength(1);
+      expect(deletions[0]).toMatchObject({
+        table: 'ai_knowledge_documents',
+        filters: { account_id: 'account-1', id: 'doc-1' },
+      });
+      // The storage_path update never ran, and nothing was indexed.
+      expect(updates).toHaveLength(0);
+      expect(mocks.ingestDocument).not.toHaveBeenCalled();
+    });
+
+    it('marks the document failed with the reason when indexing fails', async () => {
+      mocks.ingestDocument.mockRejectedValue(
+        new Error('embedding quota exceeded')
+      );
+      const response = await POST(multipart(xlsxFile()));
+
+      // Still a 200: the document (original file included) is saved.
+      expect(response.status).toBe(200);
+      const statusWrites = updates.filter((u) => 'status' in u.values);
+      expect(statusWrites[statusWrites.length - 1].values).toMatchObject({
+        status: 'error',
+        error_message: expect.stringContaining('embedding quota exceeded'),
+      });
+    });
+  });
+
+  describe('degrades gracefully when migration 061 / 055 is not applied', () => {
+    it('061 missing: skips storage and status, warns which migration to apply', async () => {
+      mocks.requireRole.mockResolvedValue({
+        ...context,
+        supabase: makeDb({ failColumns: ['status'] }),
+      });
+      const response = await POST(multipart(xlsxFile()));
+
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.warning).toContain('061_knowledge_document_storage.sql');
+      // 055 columns still exist, so this is NOT the filename-degraded shape.
+      expect(body.degradedSchema).toBe(false);
+      expect(inserted[0].row).toMatchObject({
+        filename: 'lista-precios.xlsx',
+      });
+      expect(inserted[0].row).not.toHaveProperty('status');
+      // An object with nowhere to record its path would be an orphan.
+      expect(mocks.uploadKnowledgeFile).not.toHaveBeenCalled();
+      expect(mocks.removeKnowledgeFile).not.toHaveBeenCalled();
+      // The status writes (processing/ready) all fail with 42703 and
+      // degrade silently — no row was ever touched after the insert.
+      expect(updates).toHaveLength(0);
+    });
+
+    it('055 missing: stores no filename/type and degradedSchema says so', async () => {
+      mocks.requireRole.mockResolvedValue({
+        ...context,
+        supabase: makeDb({ failColumns: ['filename', 'status'] }),
+      });
+      const response = await POST(multipart(xlsxFile()));
+
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.warning).toContain('055_knowledge_document_filename.sql');
+      expect(body.degradedSchema).toBe(true);
+      expect(inserted[0].row).toEqual({
+        account_id: 'account-1',
+        created_by: 'user-1',
+        title: 'lista-precios',
+        content: 'Producto, Precio\nMolino, 300',
+      });
+      expect(mocks.uploadKnowledgeFile).not.toHaveBeenCalled();
     });
   });
 });

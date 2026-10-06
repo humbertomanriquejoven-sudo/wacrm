@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   checkRateLimit: vi.fn(),
   rateLimitResponse: vi.fn(),
   isMissingColumnError: vi.fn(),
+  removeKnowledgeFile: vi.fn(),
   deletions: [] as { table: string; filters: Record<string, unknown> }[],
 }));
 
@@ -37,6 +38,13 @@ vi.mock('@/lib/ai/knowledge-schema', () => ({
   isMissingColumnError: mocks.isMissingColumnError,
 }));
 
+// The delete flow removes the stored original BEFORE the row — this mock
+// lets a test fail that removal and assert the row survives.
+vi.mock('@/lib/ai/knowledge-storage', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/ai/knowledge-storage')>()),
+  removeKnowledgeFile: mocks.removeKnowledgeFile,
+}));
+
 vi.mock('@/lib/ai/types', () => ({ AiError: class extends Error {} }));
 
 import { DELETE, GET } from './route';
@@ -52,7 +60,16 @@ const selects: string[] = [];
 /** Captures each `.order(column, opts)` call, per call. */
 const orders: { column: string; ascending: boolean | undefined }[] = [];
 
-function makeListDb(opts: { richFails?: boolean } = {}) {
+function makeListDb(
+  opts: {
+    /** Projections mentioning `filename` fail (055/061 not applied). */
+    richFails?: boolean;
+    /** `storage_path` the document's load step returns (061). */
+    storagePath?: string | null;
+    /** Fail the load step as a missing-column error (no 061 column). */
+    loadFails?: boolean;
+  } = {}
+) {
   selects.length = 0;
   orders.length = 0;
   mocks.deletions.length = 0;
@@ -98,6 +115,22 @@ function makeListDb(opts: { richFails?: boolean } = {}) {
                 error: shouldFail ? { message: 'column does not exist' } : null,
               });
             },
+            // The delete flow's load step: .select('storage_path').eq().eq().maybeSingle().
+            maybeSingle: () =>
+              Promise.resolve(
+                opts.loadFails
+                  ? {
+                      data: null,
+                      error: {
+                        code: '42703',
+                        message:
+                          'column ai_knowledge_documents.storage_path does not exist',
+                        details: '',
+                        hint: '',
+                      },
+                    }
+                  : { data: { storage_path: opts.storagePath ?? null }, error: null }
+              ),
           };
           return chain;
         },
@@ -116,6 +149,8 @@ beforeEach(() => {
   mocks.requireRole.mockResolvedValue(ACCOUNT);
   mocks.checkRateLimit.mockReturnValue({ success: true });
   mocks.isMissingColumnError.mockReturnValue(false);
+  mocks.removeKnowledgeFile.mockReset();
+  mocks.removeKnowledgeFile.mockResolvedValue(undefined);
 });
 
 describe('GET /api/ai/knowledge', () => {
@@ -130,16 +165,17 @@ describe('GET /api/ai/knowledge', () => {
     expect(orders).toEqual([{ column: 'created_at', ascending: false }]);
   });
 
-  it('keeps the same ordering on the 055-degraded path', async () => {
+  it('keeps the same ordering on every degraded projection', async () => {
     mocks.isMissingColumnError.mockReturnValue(true);
     mocks.getCurrentAccount.mockResolvedValue({
       ...ACCOUNT,
       supabase: makeListDb({ richFails: true }),
     });
     await GET();
-    // Both reads must sort identically, or the list reshuffles itself
-    // depending on whether the migration happens to be applied.
+    // All three rungs (061 → 055 → 030) must sort identically, or the
+    // list reshuffles itself depending on which migration is applied.
     expect(orders).toEqual([
+      { column: 'created_at', ascending: false },
       { column: 'created_at', ascending: false },
       { column: 'created_at', ascending: false },
     ]);
@@ -163,9 +199,10 @@ describe('GET /api/ai/knowledge', () => {
     expect(selects[0]).toContain('created_at');
   });
 
-  it('still lists documents when migration 055 columns are missing', async () => {
-    // PostgREST rejects the WHOLE projection on one unknown column, so the
-    // rich read failing must degrade instead of reporting an empty base.
+  it('still lists documents when the richer projections are rejected', async () => {
+    // PostgREST rejects the WHOLE projection on one unknown column, so
+    // the 061 and 055 rungs failing must degrade to the 030 columns
+    // instead of reporting an empty base.
     mocks.isMissingColumnError.mockReturnValue(true);
     mocks.getCurrentAccount.mockResolvedValue({
       ...ACCOUNT,
@@ -175,10 +212,14 @@ describe('GET /api/ai/knowledge', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.documents).toHaveLength(1);
-    // The reduced projection keeps created_at (migration 030) but drops the
-    // 055-only columns.
-    expect(selects[1]).not.toContain('filename');
-    expect(selects[1]).toContain('created_at');
+    // The 061 and 055 rungs were rejected…
+    expect(selects[0]).toContain('status');
+    expect(selects[1]).toContain('filename');
+    // …and the final rung keeps created_at (migration 030) but drops
+    // everything the missing migrations own.
+    expect(selects[2]).not.toContain('filename');
+    expect(selects[2]).not.toContain('status');
+    expect(selects[2]).toContain('created_at');
   });
 
   it('reports a genuine failure as a 500, not as an empty base', async () => {
@@ -246,5 +287,62 @@ describe('DELETE /api/ai/knowledge?id=', () => {
     );
     expect(res.status).toBe(429);
     expect(mocks.deletions).toHaveLength(0);
+  });
+
+  it('removes the stored original before the row', async () => {
+    mocks.requireRole.mockResolvedValue({
+      ...ACCOUNT,
+      supabase: makeListDb({ storagePath: 'account-1/doc-1/precios.xlsx' }),
+    });
+    const res = await DELETE(
+      new Request('http://localhost/api/ai/knowledge?id=doc-1')
+    );
+    expect(res.status).toBe(200);
+    // The original file (migration 061) goes first — removing the row
+    // first would leave an unreachable object nobody can reference.
+    expect(mocks.removeKnowledgeFile).toHaveBeenCalledTimes(1);
+    expect(mocks.removeKnowledgeFile).toHaveBeenCalledWith(
+      expect.anything(),
+      'account-1/doc-1/precios.xlsx'
+    );
+    expect(mocks.deletions[0]).toMatchObject({
+      table: 'ai_knowledge_documents',
+      filters: { account_id: 'account-1', id: 'doc-1' },
+    });
+  });
+
+  it('keeps the row when the stored original cannot be removed', async () => {
+    mocks.removeKnowledgeFile.mockRejectedValueOnce(
+      new Error('permission denied for bucket')
+    );
+    mocks.requireRole.mockResolvedValue({
+      ...ACCOUNT,
+      supabase: makeListDb({ storagePath: 'account-1/doc-1/precios.xlsx' }),
+    });
+    const res = await DELETE(
+      new Request('http://localhost/api/ai/knowledge?id=doc-1')
+    );
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.error).toContain('permission denied for bucket');
+    // The row is the retry handle for the file — deleting it here would
+    // strand an object with nothing left pointing at it.
+    expect(mocks.deletions).toHaveLength(0);
+  });
+
+  it('degrades to a row-only delete when storage_path column is absent', async () => {
+    // Migration 061 not applied: the load step fails with 42703, which
+    // means "there is no stored original", not "the document is broken".
+    mocks.isMissingColumnError.mockReturnValue(true);
+    mocks.requireRole.mockResolvedValue({
+      ...ACCOUNT,
+      supabase: makeListDb({ loadFails: true }),
+    });
+    const res = await DELETE(
+      new Request('http://localhost/api/ai/knowledge?id=doc-1')
+    );
+    expect(res.status).toBe(200);
+    expect(mocks.removeKnowledgeFile).not.toHaveBeenCalled();
+    expect(mocks.deletions).toHaveLength(1);
   });
 });

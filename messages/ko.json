@@ -1784,6 +1784,7 @@
       "loadFailed": "AI 설정을 불러오지 못했습니다",
       "providerAndKey": "공급자 & 키",
       "encryptionNotice": "키는 저장 시 암호화되며(AES-256-GCM), 저장 후에는 다시 표시되지 않습니다.",
+      "encryptionKeyMissing": "이 서버에 ENCRYPTION_KEY가 설정되지 않아 저장된 API 키를 복호화할 수 없고 봇이 응답하지 않습니다. 환경 변수(EasyPanel → Variables)에 ENCRYPTION_KEY를 추가한 후 다시 로드하세요.",
       "provider": "공급자",
       "model": "모델",
       "apiKey": "API 키",
@@ -1853,7 +1854,13 @@
       "uploadFailed": "업로드하지 못했습니다.",
       "uploadTooLarge": "파일은 16 MB 이하여야 합니다.",
       "uploadUnsupported": "지원하지 않는 파일 형식입니다.",
-      "uploadEmpty": "파일이 비어 있습니다."
+      "uploadEmpty": "파일이 비어 있습니다.",
+      "statusUploading": "업로드 중…",
+      "statusProcessing": "색인 중…",
+      "statusReady": "어시스턴트 사용 가능",
+      "statusError": "오류",
+      "deleteConfirm": "이 문서를 삭제할까요? 저장된 원본과 색인도 함께 제거됩니다.",
+      "deleteYes": "삭제"
     }
   }
 }

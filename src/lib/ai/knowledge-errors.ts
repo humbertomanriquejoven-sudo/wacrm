@@ -136,6 +136,23 @@ function adviceFor(parts: KnowledgeDbErrorParts): string | undefined {
     (parts.message.toLowerCase().includes('does not exist') &&
       parts.message.toLowerCase().includes('column'))
   ) {
+    // Which column is missing decides WHICH migration to point at:
+    //   * filename/source_type → 055
+    //   * storage_path/file_size/mime_type/status/error_message → 061
+    // Both arrive as 42703/PGRST204, so the column name in the driver's
+    // message is the only signal. Two message shapes are read — the
+    // Postgres `column x.y does not exist` and PostgREST's
+    // `Could not find the 'x' column of 'y' in the schema cache`.
+    const missingColumn =
+      parts.message.match(/column\s+"?([\w.]+)"?\s+does not exist/i)?.[1] ??
+      parts.message.match(/Could not find the '(\w+)' column/i)?.[1] ??
+      '';
+    const columnName = missingColumn.split('.').pop() ?? '';
+    if (
+      /^(storage_path|file_size|mime_type|status|error_message)$/i.test(columnName)
+    ) {
+      return 'The database schema is missing a column this app expects. Apply supabase/migrations/061_knowledge_document_storage.sql (storage_path, file_size, mime_type, status, error_message).';
+    }
     return 'The database schema is missing a column this app expects. Apply supabase/migrations/055_knowledge_document_filename.sql (filename, source_type).';
   }
   if (parts.code === '22001') {
