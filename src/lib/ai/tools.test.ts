@@ -3,6 +3,7 @@ import { describe, it, expect, vi } from 'vitest'
 vi.mock('@/lib/calendar', () => ({
   calendarConfigured: vi.fn(() => true),
   ver_disponibilidad: vi.fn(async () => 'horarios libres: L 09:00'),
+  consultar_citas: vi.fn(async () => '1) idCita="cita-1" | 2026-09-20 09:00-09:45'),
   agendar_cita: vi.fn(async () => 'Cita agendada'),
   reagendar_cita: vi.fn(async () => 'Cita reagendada'),
   cancelar_cita: vi.fn(async () => 'Cita cancelada'),
@@ -15,18 +16,19 @@ vi.mock('@/lib/gmail', () => ({
   leer_correos: vi.fn(async () => '- De: ana@x.com\n  Asunto: Hola'),
 }))
 
-import { executeToolCall, AI_TOOLS, VER_DISPONIBILIDAD_TOOL, AGENDAR_CITA_TOOL, REAGENDAR_CITA_TOOL, CANCELAR_CITA_TOOL, LISTAR_EVENTOS_TOOL, ENVIAR_CORREO_TOOL, LEER_CORREOS_TOOL } from './tools'
+import { executeToolCall, AI_TOOLS, VER_DISPONIBILIDAD_TOOL, AGENDAR_CITA_TOOL, REAGENDAR_CITA_TOOL, CANCELAR_CITA_TOOL, CONSULTAR_CITAS_TOOL, LISTAR_EVENTOS_TOOL, ENVIAR_CORREO_TOOL, LEER_CORREOS_TOOL } from './tools'
 import * as cal from '@/lib/calendar'
 import * as gmailModule from '@/lib/gmail'
 
 const mockDb = {} as never
 
 describe('AI_TOOLS array', () => {
-  it('contains the 8 expected tools', () => {
+  it('contains the 9 expected tools', () => {
     expect(AI_TOOLS.map((t) => t.name)).toEqual(
       expect.arrayContaining([
         'update_client_profile',
         'ver_disponibilidad',
+        'consultar_citas',
         'agendar_cita',
         'reagendar_cita',
         'cancelar_cita',
@@ -35,7 +37,7 @@ describe('AI_TOOLS array', () => {
         'leer_correos',
       ]),
     )
-    expect(AI_TOOLS).toHaveLength(8)
+    expect(AI_TOOLS).toHaveLength(9)
   })
 
   it('all have name, description and required parameters', () => {
@@ -54,11 +56,29 @@ describe('calendar tool definitions', () => {
   it('agendar_cita requires inicio and nombre', () => {
     expect(AGENDAR_CITA_TOOL.parameters.required).toEqual(['inicio', 'nombre'])
   })
-  it('reagendar_cita requires idCita and nuevoInicio', () => {
-    expect(REAGENDAR_CITA_TOOL.parameters.required).toEqual(['idCita', 'nuevoInicio'])
+  it('consultar_citas takes no arguments — it always reads the current contact', () => {
+    expect(CONSULTAR_CITAS_TOOL.parameters.required).toBeUndefined()
+    expect(Object.keys(CONSULTAR_CITAS_TOOL.parameters.properties ?? {})).toEqual([])
   })
-  it('cancelar_cita requires idCita', () => {
-    expect(CANCELAR_CITA_TOOL.parameters.required).toEqual(['idCita'])
+  it('reagendar_cita requires only nuevoInicio; the cita is resolved for it', () => {
+    // idCita used to be required, which meant a model that could not recall
+    // the UUID had to fall back to agendar_cita — the duplicate-event bug.
+    expect(REAGENDAR_CITA_TOOL.parameters.required).toEqual(['nuevoInicio'])
+    expect(REAGENDAR_CITA_TOOL.parameters.properties).toHaveProperty('idCita')
+  })
+  it('cancelar_cita has no required arguments', () => {
+    expect(CANCELAR_CITA_TOOL.parameters.required).toBeUndefined()
+  })
+  it('tells the three lifecycle tools apart and forbids the duplicate path', () => {
+    // The naming alone (`agendar_cita` vs `reagendar_cita`) is one character;
+    // the descriptions carry the disambiguation the model actually reads.
+    expect(AGENDAR_CITA_TOOL.description).toMatch(/reagendar_cita/)
+    expect(AGENDAR_CITA_TOOL.description).toMatch(/duplicad/i)
+    expect(REAGENDAR_CITA_TOOL.description).toMatch(/NUNCA crea un evento nuevo/i)
+    expect(REAGENDAR_CITA_TOOL.description).toMatch(/NO llames agendar_cita/i)
+    expect(REAGENDAR_CITA_TOOL.description).toMatch(/confirmado:true/)
+    expect(CANCELAR_CITA_TOOL.description).toMatch(/reagendar_cita/)
+    expect(CONSULTAR_CITAS_TOOL.description).toMatch(/reagendar_cita/)
   })
   it('enviar_correo requires to, subject and body', () => {
     expect(ENVIAR_CORREO_TOOL.parameters.required).toEqual(['to', 'subject', 'body'])
@@ -105,20 +125,55 @@ describe('executeToolCall — calendar dispatch', () => {
     expect(out).toContain('Error')
   })
 
-  it('calls reagendar_cita', async () => {
-    const out = await executeToolCall(mockDb, 'a', 'c', {
+  it('forwards the contact id to reagendar_cita so it can resolve the cita itself', async () => {
+    const out = await executeToolCall(mockDb, 'a', 'contact-9', {
       id: '5', name: 'reagendar_cita', arguments: { idCita: 'c-1', nuevoInicio: '2026-09-15T11:00:00-05:00' },
     })
     expect(out).toContain('Cita reagendada')
-    expect(cal.reagendar_cita).toHaveBeenCalledWith({ db: mockDb, accountId: 'a', idCita: 'c-1', nuevoInicio: '2026-09-15T11:00:00-05:00' })
+    expect(cal.reagendar_cita).toHaveBeenCalledWith({
+      db: mockDb, accountId: 'a', contactId: 'contact-9',
+      idCita: 'c-1', nuevoInicio: '2026-09-15T11:00:00-05:00',
+    })
   })
 
-  it('calls cancelar_cita', async () => {
+  it('resolves the active cita when the model omits idCita', async () => {
+    // The duplicate-event bug: without this, a model that could not recall
+    // the UUID had no move path left and reached for agendar_cita instead.
+    const out = await executeToolCall(mockDb, 'a', 'contact-9', {
+      id: '5b', name: 'reagendar_cita', arguments: { nuevoInicio: '2026-09-15T11:00:00-05:00' },
+    })
+    expect(out).toContain('Cita reagendada')
+    expect(cal.reagendar_cita).toHaveBeenCalledWith(
+      expect.objectContaining({ contactId: 'contact-9', idCita: undefined })
+    )
+  })
+
+  it('returns error for reagendar_cita when nuevoInicio is missing', async () => {
     const out = await executeToolCall(mockDb, 'a', 'c', {
+      id: '5c', name: 'reagendar_cita', arguments: { idCita: 'c-1' },
+    })
+    expect(out).toContain('Error')
+    expect(cal.reagendar_cita).not.toHaveBeenCalled()
+  })
+
+  it('dispatches consultar_citas against the current contact', async () => {
+    const out = await executeToolCall(mockDb, 'a', 'contact-9', {
+      id: '5d', name: 'consultar_citas', arguments: {},
+    })
+    expect(out).toContain('idCita')
+    expect(cal.consultar_citas).toHaveBeenCalledWith({
+      db: mockDb, accountId: 'a', contactId: 'contact-9',
+    })
+  })
+
+  it('calls cancelar_cita with the contact so it can resolve the cita itself', async () => {
+    const out = await executeToolCall(mockDb, 'a', 'contact-9', {
       id: '6', name: 'cancelar_cita', arguments: { idCita: 'c-1' },
     })
     expect(out).toContain('Cita cancelada')
-    expect(cal.cancelar_cita).toHaveBeenCalledWith({ db: mockDb, accountId: 'a', idCita: 'c-1' })
+    expect(cal.cancelar_cita).toHaveBeenCalledWith({
+      db: mockDb, accountId: 'a', contactId: 'contact-9', idCita: 'c-1',
+    })
   })
 
   it('calls listar_eventos with default maxResults', async () => {

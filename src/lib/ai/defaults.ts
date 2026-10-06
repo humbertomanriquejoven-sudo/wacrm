@@ -225,8 +225,28 @@ export function buildSystemPrompt(args: {
         '5) NUNCA simules, pretendas ni confirmes una cita sin invocar agendar_cita y esperar su resultado real. ' +
         '6) agendar_cita devuelve una marca de éxito (confirmado: true) más el enlace exacto (hangoutLink o htmlLink) en JSON_RESULT. ' +
         'En cuanto lo veas, responde al cliente en ESE MISMO mensaje, en español y en UNA sola burbuja: confirma la fecha y la hora agendadas E incluye el enlace devuelto tal cual para que se conecte. ' +
-        'Nunca inventes un enlace: cita solo el que la herramienta devolvió realmente; un correo faltante nunca debe bloquear la cita — agenda igual y comparte el enlace. ' +
-        'Para cambios, llama reagendar_cita(idCita, nuevoInicio); para cancelar, llama cancelar_cita(idCita) — verifica la disponibilidad primero (ver_disponibilidad). ' +
+        'Nunca inventes un enlace: cita solo el que la herramienta devolvió realmente; un correo faltante nunca debe bloquear la cita — agenda igual y comparte el enlace.'
+    );
+    // Decision table for the three lifecycle tools. `agendar_cita` and
+    // `reagendar_cita` differ by one character and share the same shape of
+    // arguments, so the model used to pick "create" for a customer who only
+    // wanted to move an existing appointment — the source of the duplicated
+    // agenda entries. Stating the mapping explicitly, and naming the ONE tool
+    // that reads the real rows, is what keeps the paths apart.
+    parts.push(
+      'CERRAR / MOVER / CANCELAR UNA CITA — ELIGE LA HERRAMIENTA CORRECTA (decisión estricta): ' +
+        '· El cliente NO tiene ninguna cita y quiere una nueva → agendar_cita. ' +
+        '· El cliente YA tiene una cita confirmada y pide cambiarla de fecha u hora ("cambiarla", "moverla", "aplazarla", "adelantarla", "otra hora", "otro día") → reagendar_cita. ' +
+        'PROHIBIDO usar agendar_cita en ese caso: crearía un SEGUNDO evento y el cliente tendría dos citas. ' +
+        '· El cliente ya tiene cita y quiere que no haya ninguna → cancelar_cita. ' +
+        '· Dudas de si ya tiene cita → consultar_citas primero (solo lectura, no crea ni cambia nada). ' +
+        'REAGENDAR_CITA: no necesitas inventar ni recordar un idCita; si lo omites, la herramienta localiza la cita activa del cliente. ' +
+        'Pásalo solo si tiene varias citas y ya te refieres a una en concreto (consultar_citas te da los ids). ' +
+        'La herramienta mueve el evento existente y verifica el resultado antes de responder: ' +
+        '· si devuelve confirmado:true, el movimiento ocurrió de verdad y trae el enlace VIGENTE de la reunión → confírmalo al cliente con ESE enlace nuevo, nunca con el anterior; ' +
+        '· si devuelve un error, NO le confirmes nada: dile con franqueza que no fue posible moverla a esa hora y que su cita sigue en el horario original, y ofrécele otras opciones. ' +
+        '· si dice que no hay cita previa, no es un error: comméntaselo amablemente y ofrécele agendar una nueva. ' +
+        'CITA SIN CITA PREVIA: nunca "compenses" un reagendamiento fallido llamando a agendar_cita; eso duplica la cita. ' +
         'Para revisar la agenda completa (p. ej. "¿qué tengo esta semana?"), llama listar_eventos con maxResults=100 (o superior) para que el límite interno de 5 resultados no oculte eventos. ' +
         'Nunca inventes disponibilidad, horas, listas de horarios ni eventos: ofrece solo las horas/eventos que las herramientas devolvieron realmente, y nunca prometas una hora sin llamarla. ' +
         'REENVÍO DEL ENLACE: cuando el cliente pida su enlace ("mándame el link", "envíame el enlace de la reunión"), NO escribas ni inventes ninguna URL: ' +
@@ -314,11 +334,18 @@ export function buildSystemPrompt(args: {
   // reschedule/cancel requests with the actual `idCita` values.
   const activeCitas = citas && citas.length > 0 ? citas : [];
   if (activeCitas.length > 0) {
+    // Rendered in Bogotá wall time: the raw `fecha_inicio` is a UTC instant,
+    // and "a las 2026-09-18T21:00:00.000Z" is not a time the model can reason
+    // about when deciding whether a requested slot overlaps this one.
     parts.push(
-      'Este cliente tiene actualmente estas citas confirmadas (usa el valor de idCita, NO la fecha, ' +
-        'al llamar reagendar_cita o cancelar_cita): ' +
+      'Este cliente tiene citas registradas en el sistema (para reagendar o cancelar). ' +
+        'El idCita es OPCIONAL: reagendar_cita y cancelar_cita localizan solas la cita activa de este cliente si lo omites; ' +
+        'pásalo solo cuando tenga varias y te refieras a una en concreto. ' +
+        'Si necesitas el detalle completo (estado, hora exacta, enlace), llama consultar_citas. ' +
+        'NO crees una cita nueva para "arreglar" un cambio de horario: eso le dejaría dos citas. ' +
+        'Citas encontradas: ' +
         activeCitas
-          .map((c, i) => `${i + 1}) idCita="${c.id}" a las ${c.fecha_inicio}`)
+          .map((c, i) => `${i + 1}) idCita="${c.id}" — ${c.fecha_inicio}`)
           .join('; ')
     );
   }

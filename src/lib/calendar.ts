@@ -698,9 +698,111 @@ function withTimeout<T>(
   });
 }
 
+/**
+ * Minimal shape of a Google event needed to resolve its meeting link. Declared
+ * structurally (not as `Schema$Event`) so tests and other providers can pass a
+ * plain object without importing the googleapis types.
+ */
+export interface CalendarEventLike {
+  hangoutLink?: string | null;
+  htmlLink?: string | null;
+  conferenceData?: {
+    entryPoints?: Array<{
+      entryPointType?: string | null;
+      uri?: string | null;
+    } | null> | null;
+  } | null;
+}
+
+/**
+ * Resolve the customer-facing meeting link of an event, applying the MANDATORY
+ * hierarchy: hangoutLink > conferenceData.entryPoints[video] > htmlLink >
+ * MEET_FALLBACK_LINK.
+ *
+ * Shared by every lifecycle operation because a MOVED event can come back with
+ * a freshly generated Meet link: re-reading it here is what stops the CRM (and
+ * therefore the customer) from being pointed at the link of the previous slot.
+ * A confirmed appointment never leaves without a URL.
+ */
+export function resolveMeetLink(data: CalendarEventLike | null | undefined): {
+  link: string;
+  esMeet: boolean;
+} {
+  const hangout = data?.hangoutLink ?? null;
+  const videoUri =
+    data?.conferenceData?.entryPoints?.find(
+      (entry) => entry?.entryPointType === 'video'
+    )?.uri ?? null;
+  const link = hangout ?? videoUri ?? data?.htmlLink ?? MEET_FALLBACK_LINK;
+  return {
+    link,
+    esMeet: hangout !== null || videoUri !== null || link === MEET_FALLBACK_LINK,
+  };
+}
+
+/**
+ * Fecha (YYYY-MM-DD) y hora (HH:MM) de un instante en hora de Bogotá.
+ *
+ * Tolerates an unparseable instant (a malformed DB value) by returning empty
+ * strings instead of throwing: this formats DB-sourced timestamps for the
+ * agent's benefit, and must never be the thing that fails a booking.
+ */
+function fechaHoraLocal(start: Date): { fecha: string; hora: string } {
+  if (Number.isNaN(start.getTime())) return { fecha: '', hora: '' };
+  const fecha = new Intl.DateTimeFormat('en-CA', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    timeZone: CAL_TIMEZONE,
+  }).format(start);
+  const hora = new Intl.DateTimeFormat('es-CO', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+    timeZone: CAL_TIMEZONE,
+  })
+    .format(start)
+    .replace(/[^\d:]/g, '');
+  return { fecha, hora };
+}
+
+/**
+ * Trailer that carries the machine-readable outcome of a scheduling tool.
+ *
+ * This is the ONLY channel the auto-reply engine trusts to build a
+ * customer-facing confirmation, so a tool that reports success here is
+ * reporting a verified provider result, never an intention. `exito:false`
+ * entries let the engine say something truthful instead of inventing one.
+ */
+function toolResultJson(structured: Record<string, unknown>): string {
+  return `JSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ${JSON.stringify(structured)}`;
+}
+
+/**
+ * A scheduling tool outcome that did NOT succeed.
+ *
+ * Carries a `motivo` code so the engine can tell "this contact has no
+ * appointment to move" (a normal conversational turn — offer to book a new
+ * one) apart from "the provider rejected the move" (an apology, no
+ * confirmation). Both must never be rendered as a confirmation.
+ */
+function toolFailure(
+  mensaje: string,
+  extra: { motivo: string; accion?: CitaAccion } = { motivo: 'desconocido' }
+): string {
+  return `${mensaje}\n\n${toolResultJson({
+    exito: false,
+    confirmado: false,
+    motivo: extra.motivo,
+    ...(extra.accion ? { accion: extra.accion } : {}),
+  })}`;
+}
+
+/** Lifecycle operation a scheduling tool performed. */
+export type CitaAccion = 'crear' | 'reagendar' | 'cancelar';
+
 /** agendar_cita — create a 45-minute event and persist the CRM row. */
-export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
-  const { db, accountId, contactoId, inicio, nombre, motivo, correoCliente } =
+export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {  const { db, accountId, contactoId, inicio, nombre, motivo, correoCliente } =
     args;
   const parsedStart = parseAppointmentStartDetailed(inicio);
   if (parsedStart.kind !== 'ok') {
@@ -841,16 +943,9 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
     // Jerarquía OBLIGATORIA del enlace: hangoutLink > conferenceData
     // (entryPoint video) > htmlLink > 'https://meet.google.com/new'. Una
     // cita confirmada NUNCA queda sin enlace real de Google Meet.
-    const hangout = created.data.hangoutLink ?? null;
-    const videoUri =
-      created.data.conferenceData?.entryPoints?.find(
-        (entry) => entry.entryPointType === 'video'
-      )?.uri ?? null;
-    const meetLink =
-      hangout ?? videoUri ?? created.data.htmlLink ?? MEET_FALLBACK_LINK;
-    meetUrl = meetLink;
-    linkEsMeet =
-      hangout !== null || videoUri !== null || meetUrl === MEET_FALLBACK_LINK;
+    const resolved = resolveMeetLink(created.data);
+    meetUrl = resolved.link;
+    linkEsMeet = resolved.esMeet;
     event = { id: created.data.id };
     eventAttendees =
       created.data.attendees?.map((a) => ({
@@ -929,20 +1024,7 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
 
   // Fecha (YYYY-MM-DD) y hora (HH:MM) en hora local de Bogotá — el
   // mensaje de éxito de la tool debe citarlas tal cual al cliente.
-  const fecha = new Intl.DateTimeFormat('en-CA', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    timeZone: CAL_TIMEZONE,
-  }).format(start);
-  const hora = new Intl.DateTimeFormat('es-CO', {
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-    timeZone: CAL_TIMEZONE,
-  })
-    .format(start)
-    .replace(/[^\d:]/g, '');
+  const { fecha, hora } = fechaHoraLocal(start);
 
   const enlaceMsg = meetUrl
     ? linkEsMeet
@@ -964,6 +1046,7 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
   // Es un ámbito de la tool, no del mensaje al cliente.
   const structured: Record<string, unknown> = {
     exito: true,
+    accion: 'crear',
     mensaje: 'Cita agendada correctamente',
     fecha,
     hora,
@@ -988,33 +1071,162 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {
   // reenvío de link por BD), después de esa línea de éxito.
   const resumenExito = `ÉXITO: Cita creada para ${name} el ${fecha} a las ${hora}. Enlace de Google Meet OBLIGATORIO: ${meetUrl}`;
 
-  return `${resumenExito}\n\n${human}\n\nJSON_RESULT (no lo repitas en el mensaje al cliente, usa su contenido): ${JSON.stringify(structured)}`;
+  return `${resumenExito}\n\n${human}\n\n${toolResultJson(structured)}`;
 }
 
 export interface ReagendarCitaArgs {
   db: SupabaseClient;
   accountId: string;
-  idCita: string;
+  /**
+   * Contact whose active appointment to move is resolved automatically when
+   * `idCita` is absent. This is what makes the tool self-sufficient: the model
+   * no longer has to recall a UUID from the prompt, so it cannot fall back to
+   * `agendar_cita` (and duplicate the event) just because it forgot the id.
+   */
+  contactId?: string;
+  /** Explicit appointment to move. Takes precedence over `contactId`. */
+  idCita?: string;
   nuevoInicio: string;
 }
 
-/** reagendar_cita — move an existing appointment to a new start time. */
-export async function reagendar_cita(args: ReagendarCitaArgs): Promise<string> {
-  const { db, accountId, idCita, nuevoInicio } = args;
-  const start = parseAppointmentStart(nuevoInicio);
-  if (start === null) {
-    return 'Error: "nuevoInicio" no es una fecha válida o cae fuera del horario de atención.';
+/** A `citas` row as needed to move it. */
+interface CitaResoluble {
+  id: string;
+  google_event_id: string;
+  account_id: string;
+  fecha_inicio: string;
+  estado: string;
+  meet_link: string | null;
+  summary: string | null;
+  description: string | null;
+  attendees: unknown;
+  motivo: string | null;
+}
+
+const CITA_MOVIBLE =
+  'id, google_event_id, account_id, fecha_inicio, estado, meet_link, summary, description, attendees, motivo';
+
+/**
+ * The contact's appointment to move, most relevant first.
+ *
+ * This is the ATOMIC lookup the reschedule flow needs: it scopes to the
+ * account AND the contact, keeps only `confirmada` rows, and prefers the
+ * soonest one still ahead of us. Asking for a concrete `idCita` is never
+ * required — and never authoritative over the account/contact scope.
+ */
+async function buscarCitaActiva(
+  db: SupabaseClient,
+  accountId: string,
+  contactId: string
+): Promise<CitaResoluble | null> {
+  const { data, error } = await db
+    .from('citas')
+    .select(CITA_MOVIBLE)
+    .eq('account_id', accountId)
+    .eq('contact_id', contactId)
+    .eq('estado', 'confirmada')
+    .order('fecha_inicio', { ascending: true })
+    .limit(25);
+
+  if (error || !Array.isArray(data) || data.length === 0) {
+    if (error) console.error('[calendar] active cita lookup failed:', error);
+    return null;
   }
 
-  const { data: cita, error: findErr } = await db
-    .from('citas')
-    .select('id, google_event_id, account_id, fecha_inicio')
-    .eq('id', idCita)
-    .eq('account_id', accountId)
-    .maybeSingle();
-  if (findErr || !cita) {
-    return 'Error: no se encontró la cita indicada.';
+  const ahora = Date.now();
+  // Soonest upcoming first; a past booking is only used when nothing is ahead
+  // (the customer may still be asking about the one they just had).
+  const futuras = data.filter(
+    (c) => new Date(c.fecha_inicio as string).getTime() >= ahora
+  );
+  const elegible = futuras.length > 0 ? futuras : data;
+  return elegible[0] as CitaResoluble;
+}
+
+/**
+ * Resolve the appointment a reschedule/cancel refers to, from an explicit id
+ * or from the contact's active one. Returns `undefined` on a lookup error and
+ * `null` when there is genuinely nothing to act on, so the caller can tell
+ * "no appointment exists" (conversational) from "the DB is down" (retryable).
+ */
+async function resolverCitaObjetivo(
+  db: SupabaseClient,
+  accountId: string,
+  args: { idCita?: string; contactId?: string }
+): Promise<CitaResoluble | null | undefined> {
+  if (args.idCita) {
+    const { data, error } = await db
+      .from('citas')
+      .select(CITA_MOVIBLE)
+      .eq('id', args.idCita)
+      .eq('account_id', accountId)
+      .maybeSingle();
+    if (error) {
+      console.error('[calendar] cita lookup failed:', error);
+      return undefined;
+    }
+    if (!data) return null;
+    return data as CitaResoluble;
   }
+  if (args.contactId) {
+    return buscarCitaActiva(db, accountId, args.contactId);
+  }
+  return null;
+}
+
+/**
+ * Customer-facing text for a contact with no appointment on file. Shared by
+ * every lookup-driven path so the agent always invites a fresh booking instead
+ * of dead-ending the conversation.
+ */
+function sinCitaPreviaMessage(nombre?: string | null): string {
+  const saludo = nombre?.trim() ? `, ${nombre.trim()}` : '';
+  return (
+    `No encontré ninguna cita previa activa${saludo}, así que no hay nada que reagendar por ahora. ` +
+    'Con gusto te agendo una nueva: dime la fecha y la hora que prefieras.'
+  );
+}
+
+/**
+ * reagendar_cita — MOVE an existing appointment to a new start time.
+ *
+ * Hard invariants (see the rescheduling regression suite):
+ *  1. It NEVER creates an event. The move is an `events.patch` on the stored
+ *     `google_event_id`; a duplicate agenda entry is impossible by
+ *     construction, not by convention.
+ *  2. The customer's data (summary, description, attendees, motivo) is carried
+ *     through, so a move cannot silently drop the client record.
+ *  3. The confirmation is emitted only AFTER the provider answered OK and the
+ *     CRM row was updated, and it carries the link returned for the NEW slot —
+ *     never the previous one.
+ */
+export async function reagendar_cita(args: ReagendarCitaArgs): Promise<string> {
+  const { db, accountId, idCita, contactId, nuevoInicio } = args;
+  const start = parseAppointmentStart(nuevoInicio);
+  if (start === null) {
+    return toolFailure(
+      'Error: "nuevoInicio" no es una fecha válida o cae fuera del horario de atención.',
+      { motivo: 'fecha_invalida', accion: 'reagendar' }
+    );
+  }
+
+  const cita = await resolverCitaObjetivo(db, accountId, { idCita, contactId });
+  if (cita === undefined) {
+    return toolFailure(
+      'Error: no se pudo consultar la cita del cliente en el sistema.',
+      { motivo: 'consulta_fallida', accion: 'reagendar' }
+    );
+  }
+  if (cita === null) {
+    // Requirement: say so kindly and offer a new booking — never attempt a
+    // compensating `agendar_cita`, which is what duplicated the agenda.
+    return toolFailure(sinCitaPreviaMessage(), {
+      motivo: 'sin_cita_previa',
+      accion: 'reagendar',
+    });
+  }
+
+  const end = new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000);
 
   // The event being moved still occupies its current slot in the
   // calendar until we PATCH it, so its own window must not count as
@@ -1028,110 +1240,338 @@ export async function reagendar_cita(args: ReagendarCitaArgs): Promise<string> {
       };
 
   try {
-    const busy = await fetchBusy(
-      start,
-      new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000),
-      oldInterval
-    );
+    const busy = await fetchBusy(start, end, oldInterval);
     if (busy.length > 0) {
-      return 'Error: ese horario ya está ocupado. Consulta ver_disponibilidad antes de reagendar.';
+      return toolFailure(
+        'Error: ese horario ya está ocupado. Consulta ver_disponibilidad antes de reagendar.',
+        { motivo: 'horario_ocupado', accion: 'reagendar' }
+      );
     }
   } catch (err) {
     console.error('[calendar] reagendar freebusy failed:', err);
-    return 'Error: no se pudo confirmar el horario en el calendario.';
+    return toolFailure(
+      'Error: no se pudo confirmar el horario en el calendario.',
+      { motivo: 'disponibilidad_no_verificable', accion: 'reagendar' }
+    );
   }
 
-  const cal = calendarClient();
-  try {
-    await cal.events.patch(
-      {
-        calendarId: CAL_ID,
-        eventId: cita.google_event_id,
-        sendUpdates: 'all',
-        requestBody: {
-          start: { dateTime: bogotaIso(start), timeZone: CAL_TIMEZONE },
-          end: {
-            dateTime: bogotaIso(
-              new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000)
-            ),
-            timeZone: CAL_TIMEZONE,
+  /**
+   * A row whose `google_event_id` is the local-only placeholder written when
+   * `events.insert` failed means there is no remote event to move. Patching a
+   * synthetic id would 404/410 and, worse, invite a compensating insert that
+   * duplicates the agenda once the calendar recovers. Move the CRM row and
+   * report `calendarSynced: false` so the customer is told the truth.
+   */
+  const esEventoRemoto =
+    typeof cita.google_event_id === 'string' &&
+    cita.google_event_id.length > 0 &&
+    !cita.google_event_id.startsWith('local-');
+
+  let calendarSynced = true;
+  /** Link for the NEW slot, re-read from the provider's patch response. */
+  let nuevoLink = cita.meet_link ?? null;
+  let linkEsMeet = nuevoLink !== null;
+
+  if (esEventoRemoto) {
+    try {
+      const cal = calendarClient();
+      const respuesta = await cal.events.patch(
+        {
+          calendarId: CAL_ID,
+          eventId: cita.google_event_id,
+          // Google notifies the attendees itself; we also send our own
+          // confirmation below so WhatsApp and email never disagree.
+          sendUpdates: 'all',
+          requestBody: {
+            // Move only. summary/description/attendees are re-sent so the
+            // client record survives even if the provider treats this as a
+            // replace rather than a merge.
+            ...(cita.summary ? { summary: cita.summary } : {}),
+            ...(cita.description ? { description: cita.description } : {}),
+            ...(Array.isArray(cita.attendees) && cita.attendees.length > 0
+              ? { attendees: cita.attendees }
+              : {}),
+            start: { dateTime: bogotaIso(start), timeZone: CAL_TIMEZONE },
+            end: { dateTime: bogotaIso(end), timeZone: CAL_TIMEZONE },
           },
         },
-      },
-      { timeout: CALENDAR_TIMEOUT_MS }
-    );
-  } catch (err) {
-    console.error('[calendar] events.patch failed:', err);
-    return 'Error: Google Calendar no pudo reagendar la cita.';
+        { timeout: CALENDAR_TIMEOUT_MS }
+      );
+
+      // Re-resolve the link from the PATCHED event: moving an event can make
+      // Google issue a different Meet URL, and resending the previous one would
+      // point the customer at a stale room.
+      const resolved = resolveMeetLink(respuesta?.data);
+      if (resolved.link !== MEET_FALLBACK_LINK) {
+        nuevoLink = resolved.link;
+        linkEsMeet = resolved.esMeet;
+      }
+    } catch (err) {
+      console.error('[calendar] events.patch failed:', err);
+      return toolFailure(
+        'Error: Google Calendar no pudo reagendar la cita.',
+        { motivo: 'proveedor_error', accion: 'reagendar' }
+      );
+    }
+  } else {
+    calendarSynced = false;
   }
 
+  if (!nuevoLink) nuevoLink = MEET_FALLBACK_LINK;
+
+  // Persist the move. `meet_link` is updated too, otherwise the CRM keeps
+  // advertising the link of the slot the customer just left.
   const { error } = await db
     .from('citas')
     .update({
       fecha_inicio: start.toISOString(),
-      fecha_fin: new Date(
-        start.getTime() + APPOINTMENT_DURATION_MIN * 60_000
-      ).toISOString(),
+      fecha_fin: end.toISOString(),
+      meet_link: nuevoLink,
     })
-    .eq('id', idCita)
+    .eq('id', cita.id)
     .eq('account_id', accountId);
   if (error) {
     console.error('[calendar] citas update failed:', error);
-    return `Error: el evento se movió en Google Calendar pero no se pudo actualizar el CRM (${error.message}).`;
+    return toolFailure(
+      `Error: el evento se movió en Google Calendar pero no se pudo actualizar el CRM (${error.message}).`,
+      { motivo: 'crm_update_fallido', accion: 'reagendar' }
+    );
   }
 
-  return `Cita reagendada para: ${bogotaIso(start)} (45 minutos).`;
+  // Confirmation email, mirroring agendar_cita: best-effort, and a mail failure
+  // never invalidates a move that already succeeded in the provider.
+  let emailSent = false;
+  const destinatario =
+    Array.isArray(cita.attendees)
+      ? (cita.attendees as Array<{ email?: string | null }>).find(
+          (a) => typeof a?.email === 'string' && a.email.trim()
+        )?.email
+      : undefined;
+  if (destinatario) {
+    const mail = await enviarConfirmacionCita({
+      to: destinatario,
+      nombre: destinatario,
+      motivo: cita.motivo ?? 'Consulta / Valoración',
+      inicioIso: start.toISOString(),
+      duracionMin: APPOINTMENT_DURATION_MIN,
+      meetUrl: nuevoLink,
+      esMeet: linkEsMeet,
+    });
+    emailSent = mail.startsWith('Correo enviado');
+    if (!emailSent && mail) {
+      console.warn('[calendar] reschedule confirmation email failed:', mail);
+    }
+  }
+
+  const { fecha, hora } = fechaHoraLocal(start);
+  const human =
+    `Cita reagendada para: ${bogotaIso(start)} (${APPOINTMENT_DURATION_MIN} minutos).` +
+    (calendarSynced
+      ? ''
+      : ' (El evento no existe en Google Calendar, solo se actualizó la cita del CRM.)') +
+    (emailSent ? ' Correo de confirmación enviado.' : '');
+
+  const structured: Record<string, unknown> = {
+    exito: true,
+    accion: 'reagendar',
+    mensaje: 'Cita reagendada correctamente',
+    confirmado: true,
+    calendarSynced,
+    fecha,
+    hora,
+    link: nuevoLink,
+    inicio: bogotaIso(start),
+    duracionMin: APPOINTMENT_DURATION_MIN,
+    idCita: cita.id,
+    estado: 'confirmada',
+  };
+
+  const resumenExito = `ÉXITO: cita existente MOVIDA (no se creó una nueva) para el ${fecha} a las ${hora}. Enlace de la reunión: ${nuevoLink}`;
+  return `${resumenExito}\n\n${human}\n\n${toolResultJson(structured)}`;
+}
+
+export interface ConsultarCitasArgs {
+  db: SupabaseClient;
+  accountId: string;
+  contactId: string;
+}
+
+/**
+ * consultar_citas — the contact's own appointments, newest-relevant first.
+ *
+ * This exists so the agent can ground "can I move it?" on REAL rows before
+ * choosing between creating, moving and cancelling. Without it the model had to
+ * recall a UUID from the system prompt, and when it could not it reached for
+ * `agendar_cita` — producing a second event for a customer who only wanted to
+ * move the first one.
+ *
+ * Read-only: it never touches the calendar provider.
+ */
+export async function consultar_citas(args: ConsultarCitasArgs): Promise<string> {
+  const { db, accountId, contactId } = args;
+
+  const { data, error } = await db
+    .from('citas')
+    .select('id, fecha_inicio, fecha_fin, estado, motivo, meet_link, google_event_id')
+    .eq('account_id', accountId)
+    .eq('contact_id', contactId)
+    .order('fecha_inicio', { ascending: true });
+
+  if (error) {
+    console.error('[calendar] consultar_citas failed:', error);
+    return `Error: no se pudieron consultar las citas del cliente (${error.message}).`;
+  }
+
+  const citas = (Array.isArray(data) ? data : []) as Array<{
+    id: string;
+    fecha_inicio: string;
+    fecha_fin: string;
+    estado: string;
+    motivo: string | null;
+    meet_link: string | null;
+    google_event_id: string;
+  }>;
+
+  if (citas.length === 0) {
+    return (
+      'Este cliente no tiene ninguna cita registrada.\n\n' +
+      toolResultJson({ exito: true, accion: 'consultar', citas: [], total: 0 })
+    );
+  }
+
+  const ahora = Date.now();
+  const lineas = citas.map((c, i) => {
+    const { fecha, hora } = fechaHoraLocal(new Date(c.fecha_inicio));
+    const { hora: horaFin } = fechaHoraLocal(new Date(c.fecha_fin));
+    const estado = c.estado === 'cancelada' ? 'cancelada' : 'confirmada';
+    const pasada = new Date(c.fecha_inicio).getTime() < ahora;
+    const enlace = c.meet_link ? ` | enlace: ${c.meet_link}` : '';
+    return (
+      `${i + 1}) idCita="${c.id}" | ${fecha} ${hora}-${horaFin} (America/Bogota) | ` +
+      `estado: ${estado}${pasada ? ', ya pasó' : ''}` +
+      `${c.motivo ? ` | motivo: ${c.motivo}` : ''}${enlace}`
+    );
+  });
+
+  const activas = citas.filter((c) => c.estado === 'confirmada').length;
+
+  return (
+    `Citas de este cliente (${citas.length} en total, ${activas} confirmada(s)):\n` +
+    `${lineas.join('\n')}\n\n` +
+    'Usa el idCita exacto en reagendar_cita o cancelar_cita. ' +
+    'Para MOVER una de estas citas llama reagendar_cita: NUNCA agendar_cita, ' +
+    'que crearía un evento duplicado.\n\n' +
+    toolResultJson({
+      exito: true,
+      accion: 'consultar',
+      total: citas.length,
+      citas: citas.map((c) => {
+        const { fecha, hora } = fechaHoraLocal(new Date(c.fecha_inicio));
+        return {
+          idCita: c.id,
+          fecha,
+          hora,
+          estado: c.estado,
+          link: c.meet_link ?? null,
+        };
+      }),
+    })
+  );
 }
 
 export interface CancelarCitaArgs {
   db: SupabaseClient;
   accountId: string;
-  idCita: string;
+  /** Contact whose active cita to cancel when `idCita` is omitted. */
+  contactId?: string;
+  idCita?: string;
 }
 
-/** cancelar_cita — delete the remote event and mark the row 'cancelada'. */
+/**
+ * cancelar_cita — delete the remote event and mark the row 'cancelada'.
+ *
+ * Shares {@link resolverCitaObjetivo} with reagendar_cita so both lifecycle
+ * tools resolve "which appointment" the same way (explicit id, else the
+ * contact's active one) and can never act on a row from another account.
+ */
 export async function cancelar_cita(args: CancelarCitaArgs): Promise<string> {
-  const { db, accountId, idCita } = args;
+  const { db, accountId, idCita, contactId } = args;
 
-  const { data: cita, error: findErr } = await db
-    .from('citas')
-    .select('id, google_event_id, account_id, estado')
-    .eq('id', idCita)
-    .eq('account_id', accountId)
-    .maybeSingle();
-  if (findErr || !cita) {
-    return 'Error: no se encontró la cita indicada.';
-  }
-  if (cita.estado === 'cancelada') {
-    return 'La cita ya estaba cancelada.';
-  }
-
-  const cal = calendarClient();
-  try {
-    await cal.events.delete(
-      {
-        calendarId: CAL_ID,
-        eventId: cita.google_event_id,
-        sendUpdates: 'all',
-      },
-      { timeout: CALENDAR_TIMEOUT_MS }
+  const cita = await resolverCitaObjetivo(db, accountId, { idCita, contactId });
+  if (cita === undefined) {
+    return toolFailure(
+      'Error: no se pudo consultar la cita del cliente en el sistema.',
+      { motivo: 'consulta_fallida', accion: 'cancelar' }
     );
-  } catch (err) {
-    console.error('[calendar] events.delete failed:', err);
-    return 'Error: Google Calendar no pudo eliminar la cita.';
+  }
+  if (cita === null) {
+    return toolFailure(sinCitaPreviaMessage(), {
+      motivo: 'sin_cita_previa',
+      accion: 'cancelar',
+    });
+  }
+
+  if (cita.estado === 'cancelada') {
+    // Idempotent: a replayed cancel must not tell the customer it happened twice.
+    return `La cita ya estaba cancelada.\n\n${toolResultJson({
+      exito: true,
+      accion: 'cancelar',
+      mensaje: 'La cita ya estaba cancelada',
+      confirmado: true,
+      idCita: cita.id,
+    })}`;
+  }
+
+  const esEventoRemoto =
+    typeof cita.google_event_id === 'string' &&
+    cita.google_event_id.length > 0 &&
+    !cita.google_event_id.startsWith('local-');
+
+  if (esEventoRemoto) {
+    try {
+      const cal = calendarClient();
+      await cal.events.delete(
+        {
+          calendarId: CAL_ID,
+          eventId: cita.google_event_id,
+          sendUpdates: 'all',
+        },
+        { timeout: CALENDAR_TIMEOUT_MS }
+      );
+    } catch (err) {
+      console.error('[calendar] events.delete failed:', err);
+      return toolFailure(
+        'Error: Google Calendar no pudo eliminar la cita.',
+        { motivo: 'proveedor_error', accion: 'cancelar' }
+      );
+    }
   }
 
   const { error } = await db
     .from('citas')
     .update({ estado: 'cancelada' })
-    .eq('id', idCita)
+    .eq('id', cita.id)
     .eq('account_id', accountId);
   if (error) {
     console.error('[calendar] citas update estado failed:', error);
-    return `Error: el evento se eliminó de Google Calendar pero no se pudo actualizar el CRM (${error.message}).`;
+    return toolFailure(
+      `Error: el evento se eliminó de Google Calendar pero no se pudo actualizar el CRM (${error.message}).`,
+      { motivo: 'crm_update_fallido', accion: 'cancelar' }
+    );
   }
 
-  return 'Cita cancelada correctamente.';
+  const { fecha, hora } = fechaHoraLocal(new Date(cita.fecha_inicio));
+  return (
+    `Cita cancelada correctamente.\n\n${toolResultJson({
+      exito: true,
+      accion: 'cancelar',
+      mensaje: 'Cita cancelada correctamente',
+      confirmado: true,
+      idCita: cita.id,
+      fecha: fecha || null,
+      hora: hora || null,
+    })}`
+  );
 }
 
 // ------------------------------------------------------------

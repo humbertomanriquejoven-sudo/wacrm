@@ -3,10 +3,12 @@ import type { ToolDefinition, ToolCall } from './types'
 import {
   agendar_cita,
   cancelar_cita,
+  consultar_citas,
   listar_eventos,
   reagendar_cita,
   ver_disponibilidad,
 } from '@/lib/calendar'
+import type { CitaAccion } from '@/lib/calendar'
 import { enviar_correo, leer_correos, gmailConfigured } from '@/lib/gmail'
 
 // ============================================================
@@ -86,8 +88,11 @@ export const VER_DISPONIBILIDAD_TOOL: ToolDefinition = {
 export const AGENDAR_CITA_TOOL: ToolDefinition = {
   name: 'agendar_cita',
   description:
-    'Agenda una reunión de 45 minutos para el cliente en el calendario del negocio. ' +
-    'LLÁMALA DE INMEDIATO en cuanto el cliente indique una fecha y hora concretas (p. ej. "mañana a las 6 pm"): ' +
+    'AGENDA UNA CITA NUEVA, solo cuando el cliente NO tiene ninguna cita previa que mover. ' +
+    '⚠️ Si el cliente ya tiene una cita confirmada y pide cambiarla de fecha u hora, ' +
+    'NO llames esta herramienta: eso crearía un SEGUNDO evento duplicado en la agenda. Usa reagendar_cita. ' +
+    'Si no estás seguro de si ya tiene cita, llama antes consultar_citas (solo lectura). ' +
+    'Llámala de inmediato en cuanto el cliente indique una fecha y hora concretas para una cita nueva (p. ej. "mañana a las 6 pm"): ' +
     'no vuelvas a preguntar la fecha, no preguntes "cuál horario prefiere", no pidas un rango de hora de inicio/fin ni pidas confirmar la hora elegida. ' +
     'Convierte la hora del cliente al ISO de Bogotá en el mismo turno (p. ej. "mañana a las 6 pm" → 2026-09-18T18:00:00-05:00). ' +
     'motivo es opcional y por defecto es "Consulta / Valoración" cuando se omite. ' +
@@ -122,28 +127,58 @@ export const AGENDAR_CITA_TOOL: ToolDefinition = {
   },
 }
 
-/** Google Calendar — move an existing appointment to another slot. */
+/**
+ * Google Calendar — read-only lookup of this contact's own appointments.
+ *
+ * Its reason to exist is tool SELECTION: the model previously had to recall a
+ * UUID from the system prompt to move or cancel a cita, and when it could not
+ * it called `agendar_cita` instead, duplicating the event. Reading the real
+ * rows first removes the guesswork.
+ */
+export const CONSULTAR_CITAS_TOOL: ToolDefinition = {
+  name: 'consultar_citas',
+  description:
+    'Consulta las citas YA REGISTRADAS de este cliente en el CRM. Solo lectura: no crea, no mueve y no cancela nada. ' +
+    'Devuelve cada cita con su idCita, fecha y hora en hora de Bogotá, estado y enlace. ' +
+    'Úsala antes de reagendar o cancelar para conocer el idCita exacto, y siempre que dudes de si el cliente ya tiene una cita: ' +
+    'si ya tiene una y quiere otro horario, el movimiento se hace con reagendar_cita, nunca con agendar_cita.',
+  parameters: {
+    type: 'object',
+    properties: {},
+  },
+}
+
+/** Google Calendar — move an EXISTING appointment to another slot. */
 export const REAGENDAR_CITA_TOOL: ToolDefinition = {
   name: 'reagendar_cita',
   description:
-    'Mueve una cita existente a una nueva hora de inicio. ' +
-    'Llama ver_disponibilidad primero para encontrar un horario libre; el horario actual de la cita se excluye de las verificaciones de disponibilidad, ' +
-    'así que es válido moverla de vuelta a su hora actual. ' +
-    'Usa el valor idCita de la cita confirmada de este cliente (listado en tus instrucciones), no una fecha.',
+    'MUEVE (reagenda) una cita YA EXISTENTE a una nueva fecha/hora. Actualiza el evento original del calendario; ' +
+    'NUNCA crea un evento nuevo, así que no produce citas duplicadas. Úsala en cuanto el cliente con cita confirmada pida ' +
+    'cambiarla, moverla, aplazarla, adelantar o cambiar la hora. ' +
+    'NO llames agendar_cita para esto: crearías un segundo evento. ' +
+    'No necesitas|idCita: si lo omites, la herramienta busca la cita activa del cliente automáticamente; ' +
+    'pásalo solo si el cliente tiene varias citas y ya te\refieres a una en concreto (consultar_citas te da los ids). ' +
+    'Llama ver_disponibilidad primero para encontrar un horario libre (el horario actual de la cita se excluye de esa ' +
+    'verificación, así que es válido moverla de vuelta a su hora actual). ' +
+    'La herramienta CONFIRMA el movimiento con el proveedor antes de responder: si devuelve confirmado:true, el evento ' +
+    'quedó movido de verdad y trae el enlace vigente de la reunión (usa ese enlace, nunca el anterior); si devuelve un ' +
+    'error, NO le confirmes nada al cliente: dile que no fue posible moverla a esa hora. ' +
+    'Si el cliente no tiene ninguna cita previa, la herramienta lo dice: entonces sí ofrécele agendar una cita nueva.',
   parameters: {
     type: 'object',
     properties: {
       idCita: {
         type: 'string',
-        description: 'El id de una de las citas confirmadas de este cliente',
+        description:
+          'Opcional. id de una cita confirmada de este cliente. Si lo omites, se usa su cita activa más próxima.',
       },
       nuevoInicio: {
         type: 'string',
         description:
-          'Nueva fecha-hora de inicio de la cita en formato ISO, p. ej. "2026-05-05T15:00:00-05:00"',
+          'Nueva fecha-hora de inicio de la cita en formato ISO con offset de Bogotá, p. ej. "2026-05-05T15:00:00-05:00"',
       },
     },
-    required: ['idCita', 'nuevoInicio'],
+    required: ['nuevoInicio'],
   },
 }
 
@@ -151,7 +186,9 @@ export const REAGENDAR_CITA_TOOL: ToolDefinition = {
 export const CANCELAR_CITA_TOOL: ToolDefinition = {
   name: 'cancelar_cita',
   description:
-    'Cancela una cita existente y la marca como cancelada en el CRM.',
+    'Cancela una cita existente: elimina su evento del calendario y la marca como cancelada en el CRM. ' +
+    'Úsala solo cuando el cliente pida cancelar o aplazarDEFINITIVAMENTE (si va a reagendar, usa reagendar_cita; ' +
+    'si quiere una cita nueva, usa agendar_cita). Como reagendar_cita, no necesitas|idCita si el cliente tiene una sola cita activa.',
   parameters: {
     type: 'object',
     properties: {
@@ -160,7 +197,6 @@ export const CANCELAR_CITA_TOOL: ToolDefinition = {
         description: 'El id de una de las citas confirmadas de este cliente',
       },
     },
-    required: ['idCita'],
   },
 }
 
@@ -243,28 +279,39 @@ export const LEER_CORREOS_TOOL: ToolDefinition = {
 }
 
 /**
- * Structured result parsed out of agendar_cita's `JSON_RESULT` trailer.
- * Auto-reply uses this to ground the confirmation in the REAL event:
- * even if the model hallucinates a link, we can strip/inject the true one.
+ * Structured result parsed out of a scheduling tool's `JSON_RESULT` trailer.
+ * Auto-reply uses this to ground the confirmation in the REAL event: even if
+ * the model hallucinates a link or claims a move that failed, we can
+ * strip/inject the true value or withhold the confirmation entirely.
  */
 export interface BookingToolResult {
+  /** Lifecycle operation the tool reported. */
+  accion?: CitaAccion | 'consultar' | null;
+  /**
+   * false when the tool did NOT succeed. The trailer is emitted on failures
+   * too, so the engine can explain the problem instead of staying silent or
+   * inventing a confirmation.
+   */
+  exito?: boolean;
+  /** Machine-readable failure reason (e.g. 'sin_cita_previa'). */
+  motivo?: string | null;
   confirmado: boolean
   link: string | null
   inicio: string | null
   idCita: string | null
-  /** Fecha (YYYY-MM-DD) y hora (HH:MM) locales devueltas por agendar_cita. */
+  /** Fecha (YYYY-MM-DD) y hora (HH:MM) locales devueltas por la herramienta. */
   fecha: string | null
   hora: string | null
   /**
-   * false cuando Google Calendar no pudo crear el evento (timeout o error
-   * de API) y la cita solo quedó persistida en el CRM. Ausente o true
-   * significa que el evento quedó sincronizado.
+   * false when Google Calendar could not create/move the event (timeout or
+   * error de API) and the cita only persisted in the CRM. Absent or true
+   * means the event stayed synchronized.
    */
   calendarSynced?: boolean
 }
 
 /**
- * Parse the `JSON_RESULT` block that agendar_cita appends to its
+ * Parse the `JSON_RESULT` block that a scheduling tool appends to its
  * human-readable result. Returns null when there is no trailer (e.g. the
  * tool errored, threw, or was an availability check), so the caller never
  * mistakes a simulated success for a real one.
@@ -276,7 +323,19 @@ export function extractBookingResult(output: string): BookingToolResult | null {
   if (start === -1) return null
   try {
     const parsed = JSON.parse(output.slice(start)) as Record<string, unknown>
+    const accion = parsed.accion
     return {
+      accion:
+        accion === 'crear' ||
+        accion === 'reagendar' ||
+        accion === 'cancelar' ||
+        accion === 'consultar'
+          ? accion
+          : null,
+      // Ausente => se asume éxito (los trailers previos sólo describían
+      // confirmaciones).
+      exito: parsed.exito !== false,
+      motivo: typeof parsed.motivo === 'string' ? parsed.motivo : null,
       confirmado: parsed.confirmado === true,
       link:
         typeof parsed.link === 'string' && parsed.link.trim()
@@ -295,10 +354,22 @@ export function extractBookingResult(output: string): BookingToolResult | null {
   }
 }
 
+/**
+ * Tools that change a cita's state. A confirmation about any of them must be
+ * grounded on the tool's own `JSON_RESULT`, never on the model's prose.
+ */
+export const CITA_MUTATING_TOOLS = ['agendar_cita', 'reagendar_cita'] as const;
+
+/** True for a tool that creates, moves or cancels a cita. */
+export function isCitaMutatingTool(name: string): boolean {
+  return (CITA_MUTATING_TOOLS as readonly string[]).includes(name);
+}
+
 /** All tools available to the AI agent. */
 export const AI_TOOLS: ToolDefinition[] = [
   UPDATE_CLIENT_PROFILE_TOOL,
   VER_DISPONIBILIDAD_TOOL,
+  CONSULTAR_CITAS_TOOL,
   AGENDAR_CITA_TOOL,
   REAGENDAR_CITA_TOOL,
   CANCELAR_CITA_TOOL,
@@ -327,6 +398,9 @@ export async function executeToolCall(
     }
     return ver_disponibilidad(desde, hasta)
   }
+  if (toolCall.name === 'consultar_citas') {
+    return consultar_citas({ db, accountId, contactId })
+  }
   if (toolCall.name === 'agendar_cita') {
     const { inicio, nombre, motivo, email } = toolCall.arguments
     if (typeof inicio !== 'string' || typeof nombre !== 'string') {
@@ -346,17 +420,29 @@ export async function executeToolCall(
   }
   if (toolCall.name === 'reagendar_cita') {
     const { idCita, nuevoInicio } = toolCall.arguments
-    if (typeof idCita !== 'string' || typeof nuevoInicio !== 'string') {
-      return 'Error: reagendar_cita requiere "idCita" y "nuevoInicio".'
+    if (typeof nuevoInicio !== 'string') {
+      return 'Error: reagendar_cita requiere "nuevoInicio".'
     }
-    return reagendar_cita({ db, accountId, idCita, nuevoInicio })
+    // `contactId` is always forwarded: when the model does not know the
+    // idCita (it used to be required), the tool resolves the contact's active
+    // cita itself instead of failing — which is what used to push the model
+    // toward agendar_cita and a duplicated event.
+    return reagendar_cita({
+      db,
+      accountId,
+      contactId,
+      idCita: typeof idCita === 'string' && idCita ? idCita : undefined,
+      nuevoInicio,
+    })
   }
   if (toolCall.name === 'cancelar_cita') {
     const { idCita } = toolCall.arguments
-    if (typeof idCita !== 'string') {
-      return 'Error: cancelar_cita requiere "idCita".'
-    }
-    return cancelar_cita({ db, accountId, idCita })
+    return cancelar_cita({
+      db,
+      accountId,
+      contactId,
+      idCita: typeof idCita === 'string' && idCita ? idCita : undefined,
+    })
   }
   if (toolCall.name === 'listar_eventos') {
     const { desde, hasta, maxResults } = toolCall.arguments

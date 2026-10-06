@@ -222,4 +222,60 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('Pensamiento:');
     expect(prompt).toContain('nota de voz');
   });
+
+  it('separates create, reschedule and cancel in one decision table', () => {
+    const prompt = buildSystemPrompt({
+      userPrompt: null,
+      mode: 'auto_reply',
+      calendarEnabled: true,
+    });
+    expect(prompt).toContain('ELIGE LA HERRAMIENTA CORRECTA');
+    expect(prompt).toContain('NO tiene ninguna cita y quiere una nueva → agendar_cita');
+    expect(prompt).toContain('YA tiene una cita confirmada y pide cambiarla');
+    expect(prompt).toContain('quiere que no haya ninguna → cancelar_cita');
+    // The duplicate-agenda bug: telling the model agendar_cita is forbidden
+    // precisely when a cita already exists.
+    expect(prompt).toContain('PROHIBIDO usar agendar_cita');
+    expect(prompt).toMatch(/nunca "compenses" un reagendamiento fallido.*agendar_cita/s);
+    expect(prompt).toContain('consultar_citas primero');
+  });
+
+  it('makes the reschedule reply conditional on the tool result, never on prose', () => {
+    const prompt = buildSystemPrompt({
+      userPrompt: null,
+      mode: 'auto_reply',
+      calendarEnabled: true,
+    });
+    expect(prompt).toContain('si devuelve confirmado:true');
+    expect(prompt).toContain('nunca con el anterior');
+    expect(prompt).toContain('si devuelve un error, NO le confirmes nada');
+    expect(prompt).toContain('sigue en el horario original');
+    expect(prompt).toContain('no es un error');
+  });
+
+  it('tells the model it need not remember an idCita', () => {
+    const prompt = buildSystemPrompt({
+      userPrompt: null,
+      mode: 'auto_reply',
+      calendarEnabled: true,
+    });
+    expect(prompt).toContain('no necesitas inventar ni recordar un idCita');
+  });
+
+  it('marks the injected idCita as optional and points at consultar_citas', () => {
+    const prompt = buildSystemPrompt({
+      userPrompt: null,
+      mode: 'auto_reply',
+      calendarEnabled: true,
+      contactContext: {
+        name: 'Ana',
+        email: null,
+        location: null,
+        citas: [{ id: 'cita-7', fecha_inicio: '2026-09-22T09:00:00-05:00' }],
+      },
+    });
+    expect(prompt).toContain('idCita="cita-7"');
+    expect(prompt).toContain('El idCita es OPCIONAL');
+    expect(prompt).toContain('NO crees una cita nueva para "arreglar" un cambio de horario');
+  });
 });

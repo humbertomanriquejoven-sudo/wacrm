@@ -48,6 +48,7 @@ import {
   listar_eventos,
   consultarOcupados,
   listar_ocupados_detalle,
+  consultar_citas,
   parseBogotaInstant,
   APPOINTMENT_DURATION_MIN,
 } from '@/lib/calendar';
@@ -699,7 +700,338 @@ describe('reagendar_cita / cancelar_cita', () => {
       idCita: 'missing',
       nuevoInicio: '2026-09-15T11:00:00-05:00',
     });
-    expect(out).toContain('no se encontró la cita');
+    // No appointment to move: say so kindly and offer a fresh booking instead
+    // of erroring out (which used to push the model toward agendar_cita, and
+    // therefore toward a duplicate event).
+    expect(out).toContain('No encontré ninguna cita previa activa');
+    expect(out).toContain('agendo una nueva');
+    // Nothing was created in the calendar.
+    expect(h.insert).not.toHaveBeenCalled();
+    expect(h.patch).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// Rescheduling regressions.
+//
+// A customer asking to move an appointment used to end up with a SECOND event
+// in the agenda and/or a confirmation for a move that never happened. Every
+// test below pins one of the guarantees that fixes it.
+// ============================================================================
+describe('reagendar_cita — rescheduling guarantees', () => {
+  const CITA = {
+    id: 'cita-1',
+    account_id: 'acct-1',
+    google_event_id: 'evt-123',
+    // Deliberately in the past relative to the requested new slot.
+    fecha_inicio: '2026-09-08T10:00:00-05:00',
+    estado: 'confirmada',
+    meet_link: 'https://meet.google.com/old-room',
+    summary: 'Cita con Cliente - Ana',
+    description: 'Reunión agendada automáticamente por el agente IA del CRM.',
+    attendees: [{ email: 'ana@example.com', responseStatus: 'accepted' }],
+    motivo: 'Cotización',
+  };
+
+  beforeEach(() => {
+    h.freebusy.mockReset();
+    h.freebusy.mockResolvedValue(freebusyEmpty());
+    h.patch.mockReset();
+    h.patch.mockResolvedValue({ data: {} });
+    h.insert.mockReset();
+    h.del.mockReset();
+    h.del.mockResolvedValue({ data: '' });
+  });
+
+  /** DB stub: one `citas` row, either resolved by id or by contact. */
+  function citaDb(opts: { byId?: boolean; rows?: unknown[] } = {}) {
+    const log = { updates: [] as Record<string, unknown>[] };
+    const chain: Record<string, unknown> = {
+      eq: () => chain,
+      order: () => chain,
+      limit: () =>
+        Promise.resolve({
+          data: opts.rows ?? [CITA],
+          error: null,
+        }),
+      maybeSingle: () =>
+        Promise.resolve({ data: (opts.rows ?? [CITA])[0] ?? null, error: null }),
+    };
+    return {
+      log,
+      from: (table: string) => {
+        if (table !== 'citas') throw new Error(`unexpected table ${table}`);
+        return {
+          select: () => {
+            // The id-scoped lookup ends in maybeSingle; the contact-scoped
+            // one in order().limit(). Both are served by the same chain.
+            void opts.byId;
+            return chain;
+          },
+          update: (patch: Record<string, unknown>) => {
+            log.updates.push(patch);
+            return { eq: () => ({ eq: () => Promise.resolve({ error: null }) }) };
+          },
+        };
+      },
+    };
+  }
+
+  it('moves the existing event and never creates one', async () => {
+    const d = citaDb();
+
+    const out = await reagendar_cita({
+      db: d as never,
+      accountId: 'acct-1',
+      idCita: 'cita-1',
+      nuevoInicio: '2026-09-15T11:00:00-05:00',
+    });
+
+    // THE invariant: a reschedule is a patch on the stored event id.
+    expect(h.insert).not.toHaveBeenCalled();
+    expect(h.patch).toHaveBeenCalledTimes(1);
+    expect(h.patch.mock.calls[0][0]).toMatchObject({
+      calendarId: process.env.GOOGLE_CALENDAR_ID,
+      eventId: 'evt-123',
+    });
+    expect(d.log.updates).toHaveLength(1);
+    expect(out).toContain('confirmado');
+  });
+
+  it('resolves the active cita from the contact when no idCita is given', async () => {
+    // Without this the model had to recall a UUID from the prompt, and on
+    // failure it reached for agendar_cita → duplicate event.
+    const d = citaDb();
+
+    const out = await reagendar_cita({
+      db: d as never,
+      accountId: 'acct-1',
+      contactId: 'contact-1',
+      nuevoInicio: '2026-09-15T11:00:00-05:00',
+    });
+
+    expect(h.patch).toHaveBeenCalledTimes(1);
+    expect(h.insert).not.toHaveBeenCalled();
+    expect(out).toContain('cita-1');
+  });
+
+  it('preserves the customer data on the moved event', async () => {
+    await reagendar_cita({
+      db: citaDb() as never,
+      accountId: 'acct-1',
+      contactId: 'contact-1',
+      nuevoInicio: '2026-09-15T11:00:00-05:00',
+    });
+
+    const body = h.patch.mock.calls[0][0].requestBody as Record<string, unknown>;
+    expect(body.summary).toBe('Cita con Cliente - Ana');
+    expect(body.description).toContain('agendada automáticamente');
+    expect(body.attendees).toEqual(CITA.attendees);
+  });
+
+  it('persists the new slot and the NEW meeting link', async () => {
+    h.patch.mockResolvedValue({
+      data: { hangoutLink: 'https://meet.google.com/new-room' },
+    });
+    const d = citaDb();
+
+    await reagendar_cita({
+      db: d as never,
+      accountId: 'acct-1',
+      contactId: 'contact-1',
+      nuevoInicio: '2026-09-15T11:00:00-05:00',
+    });
+
+    expect(d.log.updates[0]).toMatchObject({
+      fecha_inicio: new Date('2026-09-15T11:00:00-05:00').toISOString(),
+      // The link of the slot the customer just left must not survive.
+      meet_link: 'https://meet.google.com/new-room',
+    });
+  });
+
+  it('confirms only the link the provider returned, and reports exito', async () => {
+    h.patch.mockResolvedValue({
+      data: { conferenceData: { entryPoints: [{ entryPointType: 'video', uri: 'https://meet.google.com/entrypoint' }] } },
+    });
+
+    const out = await reagendar_cita({
+      db: citaDb() as never,
+      accountId: 'acct-1',
+      contactId: 'contact-1',
+      nuevoInicio: '2026-09-15T11:00:00-05:00',
+    });
+
+    const parsed = JSON.parse(
+      out.slice(out.indexOf('{', out.indexOf('JSON_RESULT')))
+    ) as Record<string, unknown>;
+    expect(parsed.confirmado).toBe(true);
+    expect(parsed.exito).toBe(true);
+    expect(parsed.accion).toBe('reagendar');
+    expect(parsed.link).toBe('https://meet.google.com/entrypoint');
+    expect(out).not.toContain('old-room');
+  });
+
+  it('does NOT confirm when the provider rejects the move', async () => {
+    h.patch.mockRejectedValue(new Error('409 conflict'));
+    const d = citaDb();
+
+    const out = await reagendar_cita({
+      db: d as never,
+      accountId: 'acct-1',
+      contactId: 'contact-1',
+      nuevoInicio: '2026-09-15T11:00:00-05:00',
+    });
+
+    // No false confirmation...
+    expect(out).not.toContain('confirmado":true');
+    expect(out).toContain('no pudo reagendar');
+    // ...and the CRM row is left alone so the cita keeps its real time.
+    expect(d.log.updates).toHaveLength(0);
+    expect(h.insert).not.toHaveBeenCalled();
+  });
+
+  it('does NOT confirm when the requested slot is taken', async () => {
+    h.freebusy.mockResolvedValue({
+      data: {
+        calendars: {
+          [process.env.GOOGLE_CALENDAR_ID!]: {
+            busy: [{ start: '2026-09-15T11:00:00-05:00', end: '2026-09-15T11:45:00-05:00' }],
+          },
+        },
+      },
+    });
+    const d = citaDb();
+
+    const out = await reagendar_cita({
+      db: d as never,
+      accountId: 'acct-1',
+      contactId: 'contact-1',
+      nuevoInicio: '2026-09-15T11:00:00-05:00',
+    });
+
+    expect(out).toContain('ya está ocupado');
+    expect(out).not.toContain('confirmado":true');
+    expect(h.patch).not.toHaveBeenCalled();
+    expect(d.log.updates).toHaveLength(0);
+  });
+
+  it('reports calendarSynced:false when there is no remote event to move', async () => {
+    // `agendar_cita` stores a 'local-…' placeholder when events.insert failed.
+    // Patching a synthetic id would 404 and invite a compensating insert.
+    const d = citaDb({ rows: [{ ...CITA, google_event_id: 'local-abc' }] });
+
+    const out = await reagendar_cita({
+      db: d as never,
+      accountId: 'acct-1',
+      contactId: 'contact-1',
+      nuevoInicio: '2026-09-15T11:00:00-05:00',
+    });
+
+    expect(h.patch).not.toHaveBeenCalled();
+    expect(h.insert).not.toHaveBeenCalled();
+    expect(d.log.updates).toHaveLength(1);
+    expect(out).toContain('"calendarSynced":false');
+  });
+
+  it('keeps the stored link when the provider returns none', async () => {
+    h.patch.mockResolvedValue({ data: {} });
+    const d = citaDb();
+
+    await reagendar_cita({
+      db: d as never,
+      accountId: 'acct-1',
+      contactId: 'contact-1',
+      nuevoInicio: '2026-09-15T11:00:00-05:00',
+    });
+
+    expect(d.log.updates[0]).toMatchObject({
+      meet_link: 'https://meet.google.com/old-room',
+    });
+  });
+
+  it('refuses a fecha outside business hours before touching anything', async () => {
+    const d = citaDb();
+
+    const out = await reagendar_cita({
+      db: d as never,
+      accountId: 'acct-1',
+      contactId: 'contact-1',
+      nuevoInicio: 'no es una fecha',
+    });
+
+    expect(out).toContain('no es una fecha válida');
+    expect(h.patch).not.toHaveBeenCalled();
+    expect(h.insert).not.toHaveBeenCalled();
+  });
+});
+
+describe('consultar_citas', () => {
+  beforeEach(() => {
+    h.insert.mockReset();
+    h.patch.mockReset();
+  });
+
+  it('lists the contact rows read-only and points at the right tool', async () => {
+    const supabase = {
+      from: () => ({
+        select: () => ({
+          eq: () => ({
+            eq: () => ({
+              order: () =>
+                Promise.resolve({
+                  data: [
+                    {
+                      id: 'cita-1',
+                      fecha_inicio: '2026-09-15T11:00:00-05:00',
+                      fecha_fin: '2026-09-15T11:45:00-05:00',
+                      estado: 'confirmada',
+                      motivo: 'Cotización',
+                      meet_link: 'https://meet.google.com/room',
+                      google_event_id: 'evt-1',
+                    },
+                  ],
+                  error: null,
+                }),
+            }),
+          }),
+        }),
+      }),
+    } as never;
+
+    const out = await consultar_citas({
+      db: supabase,
+      accountId: 'acct-1',
+      contactId: 'contact-1',
+    });
+
+    expect(out).toContain('idCita="cita-1"');
+    expect(out).toContain('2026-09-15');
+    expect(out).toContain('reagendar_cita');
+    // Read-only: it must never write or touch the provider.
+    expect(h.insert).not.toHaveBeenCalled();
+    expect(h.patch).not.toHaveBeenCalled();
+  });
+
+  it('says so plainly when the contact has no citas', async () => {
+    const supabase = {
+      from: () => ({
+        select: () => ({
+          eq: () => ({
+            eq: () => ({
+              order: () => Promise.resolve({ data: [], error: null }),
+            }),
+          }),
+        }),
+      }),
+    } as never;
+
+    const out = await consultar_citas({
+      db: supabase,
+      accountId: 'acct-1',
+      contactId: 'contact-1',
+    });
+
+    expect(out).toContain('no tiene ninguna cita');
   });
 });
 
