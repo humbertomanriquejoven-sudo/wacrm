@@ -42,7 +42,6 @@ function SignupPageInner() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
-  const supabase = createClient();
 
   const handleSignup = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -60,6 +59,11 @@ function SignupPageInner() {
 
     setLoading(true);
 
+    // Created on submit, never on render: a missing/misconfigured
+    // Supabase env must render the form (not 500 the page), and
+    // surface the failure here as a usable form error instead.
+    const supabase = createClient();
+
     // If we have an invite token, point Supabase's verification
     // email back at the join page so the user can accept after
     // verifying. Without a token, Supabase uses its default
@@ -68,16 +72,22 @@ function SignupPageInner() {
       ? `${window.location.origin}/join/${encodeURIComponent(inviteToken)}`
       : undefined;
 
-    const { error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        data: {
-          full_name: fullName,
+    let error: { message: string } | null = null;
+    try {
+      const result = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            full_name: fullName,
+          },
+          ...(emailRedirectTo ? { emailRedirectTo } : {}),
         },
-        ...(emailRedirectTo ? { emailRedirectTo } : {}),
-      },
-    });
+      });
+      error = result.error;
+    } catch {
+      error = { message: "Unexpected error creating the account" };
+    }
 
     if (error) {
       setError(error.message);

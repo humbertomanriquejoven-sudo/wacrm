@@ -77,13 +77,38 @@ const THEME_BOOT_SCRIPT = `
 })();
 `;
 
+/**
+ * Resolve the locale + messages for this request, failing safe to
+ * English when the i18n stack cannot answer. `getLocale()` /
+ * `getMessages()` read the per-request config (NEXT_PUBLIC_APP_LOCALE
+ * + the messages JSON); if either throws, the server render dies with
+ * a generic 500 for EVERY page. The layout must never take the shell
+ * down — fall back to the shipped English dictionary, which the
+ * browser will happily re-render once messages load.
+ */
+async function resolveLocale() {
+  try {
+    const locale = await getLocale();
+    const messages = await getMessages();
+    return { locale, messages };
+  } catch (err) {
+    console.error(
+      "[layout] i18n init failed — falling back to 'en':",
+      err instanceof Error ? err.message : err,
+    );
+    // Static import keeps the fallback bundler-safe even if the
+    // dynamic i18n pipeline is what broke.
+    const { default: enMessages } = await import("../../messages/en.json");
+    return { locale: "en", messages: enMessages };
+  }
+}
+
 export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
-  const locale = await getLocale();
-  const messages = await getMessages();
+  const { locale, messages } = await resolveLocale();
 
   return (
     <html

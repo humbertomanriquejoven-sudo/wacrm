@@ -20,16 +20,26 @@ export default function ForgotPasswordPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
-  const supabase = createClient();
 
   const handleReset = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     setLoading(true);
 
-    const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${window.location.origin}/auth/callback?next=/reset-password`,
-    });
+    // Created on submit, never on render: a missing/misconfigured
+    // Supabase env must render the form (not 500 the page), and
+    // surface the failure here as a usable form error instead.
+    const supabase = createClient();
+
+    let error: { message: string } | null = null;
+    try {
+      const result = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/auth/callback?next=/reset-password`,
+      });
+      error = result.error;
+    } catch {
+      error = { message: "Unexpected error sending the reset link" };
+    }
 
     if (error) {
       setError(error.message);

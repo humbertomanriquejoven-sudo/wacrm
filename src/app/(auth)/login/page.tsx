@@ -42,17 +42,29 @@ function LoginPageInner() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const supabase = createClient();
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     setLoading(true);
 
-    const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
+    // Created on submit, never on render: a missing/misconfigured
+    // Supabase env must render the login screen (not 500 the page),
+    // and surface the failure here as a usable form error instead.
+    const supabase = createClient();
+
+    let error: { message: string } | null = null;
+    try {
+      const result = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+      error = result.error;
+    } catch {
+      // e.g. a network hiccup or an environment with no Supabase URL —
+      // surface it in the form instead of leaving the button spinning.
+      error = { message: "Unexpected error signing in" };
+    }
 
     if (error) {
       setError(error.message);

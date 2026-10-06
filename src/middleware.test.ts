@@ -111,3 +111,30 @@ describe("middleware — refreshed auth cookies survive redirects", () => {
     expect(res.cookies.get(ROTATED.name)?.value).toBe(ROTATED.value);
   });
 });
+
+describe("middleware — fail-safe when Supabase env is missing (never a 500)", () => {
+  it("treats a protected page as unauthenticated (redirects to /login) instead of throwing", async () => {
+    delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+    delete process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+    const res = await middleware(
+      new NextRequest("https://app.test/dashboard"),
+    );
+
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toContain("/login");
+  });
+
+  it("still serves the login page itself (no redirect loop, no throw)", async () => {
+    delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+    delete process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+    const res = await middleware(
+      new NextRequest("https://app.test/login"),
+    );
+
+    // Not a redirect to itself — the raw pass-through response.
+    expect(res.headers.get("location")).toBeNull();
+    expect(res.status).toBe(200);
+  });
+});
