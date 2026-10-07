@@ -430,6 +430,7 @@
       "scheduleSuccess": "Seguimiento programado.",
       "scheduleFailed": "No se pudo programar un seguimiento para este contacto.",
       "scheduleDisabled": "Los seguimientos están desactivados para este chat. Activa el interruptor primero.",
+      "noHandle": "Este contacto no tiene un @handle público. Los seguimientos automáticos solo funcionan con contactos @user (por ejemplo: @usuario).",
       "invalidMinutes": "Introduce un número entero de minutos entre 1 y 10080.",
       "followRowLabel": "Seguimiento automático",
       "waitRowLabel": "Esperar respuesta",

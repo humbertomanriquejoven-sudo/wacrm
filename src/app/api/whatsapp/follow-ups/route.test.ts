@@ -55,6 +55,15 @@ const state = {
     follow_up_enabled: null,
     response_wait_enabled: true,
   } as Record<string, unknown> | null,
+  // Contact identity read by the `schedule` handle gate (public @handle).
+  contact: {
+    id: 'contact-1',
+    username: '@contact',
+    phone: null,
+    wa_id: null,
+    wa_user_id: null,
+    recipient_id: null,
+  } as Record<string, unknown> | null,
   // Timer 2 rows served by the mocked `response_wait_timers` reads.
   responseWait: null as Record<string, unknown> | null,
   waitLast: null as Record<string, unknown> | null,
@@ -76,11 +85,18 @@ function chainFor(table: string, op: string, payload?: unknown) {
       entry.filters[`neq:${col}`] = val;
       return chain;
     },
+    in: (col: string, val: unknown) => {
+      entry.filters[`in:${col}`] = val;
+      return chain;
+    },
     order: () => chain,
     limit: () => chain,
     maybeSingle: () => {
       if (table === 'conversations' && op === 'select') {
         return Promise.resolve({ data: state.conversation, error: null });
+      }
+      if (table === 'contacts' && op === 'select') {
+        return Promise.resolve({ data: state.contact, error: null });
       }
       if (table === 'response_wait_timers' && op === 'select') {
         // `.neq('status', 'active')` marks the one-shot OUTCOME read.
@@ -129,6 +145,14 @@ beforeEach(() => {
     contact_id: 'contact-1',
     follow_up_enabled: null,
     response_wait_enabled: true,
+  };
+  state.contact = {
+    id: 'contact-1',
+    username: '@contact',
+    phone: null,
+    wa_id: null,
+    wa_user_id: null,
+    recipient_id: null,
   };
   state.ops.length = 0;
   mocks.requireRole.mockResolvedValue({
@@ -238,6 +262,27 @@ describe('POST /api/whatsapp/follow-ups — custom minutes', () => {
     expect(body.reason).toBe('disabled');
     expect(mocks.scheduleManualFollowUp).not.toHaveBeenCalled();
   });
+
+  it('refuses to schedule for a contact with no public @handle (reason: not_handle)', async () => {
+    state.contact = {
+      id: 'contact-1',
+      username: null,
+      phone: '573001234567',
+      wa_id: null,
+      wa_user_id: null,
+      recipient_id: null,
+    };
+    const res = await post({
+      conversation_id: 'conv-1',
+      action: 'schedule',
+      delay_minutes: 5,
+    });
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.scheduled).toBe(false);
+    expect(body.reason).toBe('not_handle');
+    expect(mocks.scheduleManualFollowUp).not.toHaveBeenCalled();
+  });
 });
 
 describe('POST /api/whatsapp/follow-ups — inline toggle', () => {
@@ -261,9 +306,11 @@ describe('POST /api/whatsapp/follow-ups — inline toggle', () => {
         (o.payload as { status?: string })?.status === 'cancelled',
     );
     expect(cancel).toBeDefined();
+    // Both `pending` (queued, not yet claimed) and `processing` (mid-dispatch)
+    // rows are cancelled — a switch OFF must win over an in-flight send.
     expect(cancel?.filters).toMatchObject({
       conversation_id: 'conv-1',
-      status: 'pending',
+      'in:status': ['pending', 'processing'],
     });
   });
 
@@ -293,6 +340,9 @@ describe('POST /api/whatsapp/follow-ups — Timer 2 (wait reply)', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.scheduled).toBe(true);
+    // The banner reads `delay_minutes` back so ↻ Reiniciar can re-arm from
+    // the same value and show the full countdown client-side immediately.
+    expect(body.delay_minutes).toBe(5);
     expect(mocks.scheduleResponseWaitTimer).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({

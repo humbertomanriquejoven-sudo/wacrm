@@ -259,6 +259,7 @@ export type FollowUpStage = '10m' | '24h'
 
 export type FollowUpStatus =
   | 'pending'
+  | 'processing'
   | 'completed'
   | 'cancelled'
   | 'no_response'
@@ -281,6 +282,7 @@ export interface FollowUp {
 
 export type ResponseWaitStatus =
   | 'active'
+  | 'processing'
   | 'completed'
   | 'cancelled'
   | 'no_response'

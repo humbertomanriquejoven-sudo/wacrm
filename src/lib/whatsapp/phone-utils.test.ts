@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  hasPublicUserHandle,
   isRecipientNotAllowedError,
   isValidE164,
   normalizePhone,
@@ -205,11 +206,64 @@ describe("recipientAddressVariants", () => {
     expect(variants.length).toBeGreaterThan(1);
   });
 
-  it("returns nothing to send for an empty address", () => {
+it("returns nothing to send for an empty address", () => {
     // The only condition under which a recipient is undeliverable.
     expect(recipientAddressVariants("")).toEqual([]);
     expect(recipientAddressVariants("   ")).toEqual([]);
     expect(recipientAddressVariants(null)).toEqual([]);
     expect(recipientAddressVariants(undefined)).toEqual([]);
+  });
+});
+
+describe("hasPublicUserHandle", () => {
+  const base = {
+    username: null,
+    phone: null,
+    wa_id: null,
+    wa_user_id: null,
+    recipient_id: null,
+  } as const;
+
+  it("accepts a canonical username (leading @)", () => {
+    expect(hasPublicUserHandle({ ...base, username: "@anaruiz" })).toBe(true);
+  });
+
+  it("accepts a username without the @ prefix", () => {
+    expect(hasPublicUserHandle({ ...base, username: "anaruiz" })).toBe(true);
+  });
+
+  it("accepts a legacy bare @handle stored in phone", () => {
+    expect(hasPublicUserHandle({ ...base, phone: "@tienda" })).toBe(true);
+  });
+
+  it("accepts a Meta display id carrying the @user routing suffix", () => {
+    expect(
+      hasPublicUserHandle({ ...base, wa_id: "1486998326437295@user" }),
+    ).toBe(true);
+    expect(
+      hasPublicUserHandle({ ...base, recipient_id: "1486998326437295@user" }),
+    ).toBe(true);
+  });
+
+  it("accepts an @lid display id", () => {
+    expect(
+      hasPublicUserHandle({ ...base, wa_user_id: "123456@lid" }),
+    ).toBe(true);
+  });
+
+  it("rejects a phone-only contact with no handle anywhere", () => {
+    expect(hasPublicUserHandle({ ...base, phone: "573001234567" })).toBe(false);
+    expect(hasPublicUserHandle({ ...base, phone: "573001234567", username: "unknown" })).toBe(false);
+  });
+
+  it("rejects a bare BSUID / numeric id", () => {
+    expect(hasPublicUserHandle({ ...base, wa_user_id: "1486998326437295" })).toBe(false);
+    expect(hasPublicUserHandle({ ...base, phone: "CO.1008477715690681" })).toBe(false);
+  });
+
+  it("rejects an empty / placeholder contact", () => {
+    expect(hasPublicUserHandle(base)).toBe(false);
+    expect(hasPublicUserHandle({ ...base, phone: "unknown" })).toBe(false);
+    expect(hasPublicUserHandle({})).toBe(false);
   });
 });

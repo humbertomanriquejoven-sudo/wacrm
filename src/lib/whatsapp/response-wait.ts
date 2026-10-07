@@ -48,9 +48,60 @@
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { hasPublicUserHandle } from '@/lib/whatsapp/phone-utils'
 
 /** Terminal states that close an ACTIVE wait timer. */
-export type ResponseWaitStatus = 'active' | 'completed' | 'cancelled' | 'no_response'
+export type ResponseWaitStatus =
+  | 'active'
+  | 'processing'
+  | 'completed'
+  | 'cancelled'
+  | 'no_response'
+
+/**
+ * Read a contact's identity fields and decide whether it has a PUBLIC user
+ * handle (`@user` / `@username` / `@lid`) — the only contacts automation is
+ * allowed to message.
+ *
+ * FAIL-CLOSED on purpose: a missing row or a read error returns `false`,
+ * because the only consequence is "skip this automated send". That is the
+ * safe direction when the rule is that no automated message may target a
+ * non-@user contact — unlike the switch checks elsewhere in this codebase,
+ * which fail OPEN because their `false` would silently disable a feature.
+ * This lives HERE (not in the runner) so both the worker's schedulers and
+ * the auto-arm (which the send core imports independently) can share it
+ * without a circular import. Never throws.
+ */
+export async function contactHasPublicHandle(
+  db: SupabaseClient,
+  contactId: string,
+): Promise<boolean> {
+  try {
+    const { data, error } = await db
+      .from('contacts')
+      .select('username, phone, wa_id, wa_user_id, recipient_id')
+      .eq('id', contactId)
+      .maybeSingle()
+    if (error || !data) {
+      console.warn(
+        `[response-wait] could not read contact ${contactId} identity (${error?.message ?? 'no row'}); treating as no public handle.`,
+      )
+      return false
+    }
+    return hasPublicUserHandle(data as {
+      username?: string | null
+      phone?: string | null
+      wa_id?: string | null
+      wa_user_id?: string | null
+      recipient_id?: string | null
+    })
+  } catch (err) {
+    console.warn(
+      `[response-wait] contact ${contactId} identity read threw (${err instanceof Error ? err.message : err}); treating as no public handle.`,
+    )
+    return false
+  }
+}
 
 export interface ResponseWaitScheduleResult {
   scheduled: boolean
@@ -67,7 +118,7 @@ export const ARM_DEFAULT_MINUTES = 10
 
 export interface ArmResponseWaitResult {
   scheduled: boolean
-  reason: 'already_active' | 'armed' | 'disabled' | 'error'
+  reason: 'already_active' | 'armed' | 'disabled' | 'not_handle' | 'error'
   id: string | null
   expires_at: string | null
 }
@@ -183,7 +234,7 @@ export async function cancelResponseWaitTimers(
       .from('response_wait_timers')
       .update({ status: 'cancelled', cancelled_reason: reason })
       .eq('conversation_id', conversationId)
-      .eq('status', 'active')
+      .in('status', ['active', 'processing'])
     if (error) {
       // Migration 065 pending (column missing): fall back to the legacy
       // two-field update so cancels still work on an un-migrated DB.
@@ -192,7 +243,7 @@ export async function cancelResponseWaitTimers(
           .from('response_wait_timers')
           .update({ status: 'cancelled' })
           .eq('conversation_id', conversationId)
-          .eq('status', 'active')
+          .in('status', ['active', 'processing'])
         if (legacyErr) {
           console.error(
             `[response-wait] could not cancel active timers for conversation ${conversationId}:`,
@@ -267,6 +318,16 @@ export async function armResponseWaitIfIdle(
         `[response-wait] auto-arm skipped for conversation ${conversationId} — "Esperar respuesta" switch is OFF.`,
       )
       return { scheduled: false, reason: 'disabled', id: null, expires_at: null }
+    }
+
+    // ONLY contacts with a public @user / @lid handle may be auto-armed:
+    // the automated nudge must never target a phone-only / bare-BSUID
+    // contact. FAIL-CLOSED (contactHasPublicHandle).
+    if (!(await contactHasPublicHandle(db, contactId))) {
+      console.log(
+        `[response-wait] auto-arm skipped for conversation ${conversationId} — contact ${contactId} has no public @handle.`,
+      )
+      return { scheduled: false, reason: 'not_handle', id: null, expires_at: null }
     }
 
     const { data: active } = await db

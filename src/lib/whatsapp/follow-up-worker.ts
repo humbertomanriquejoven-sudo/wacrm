@@ -4,6 +4,7 @@ import { sendMessageToConversation } from '@/lib/whatsapp/send-message'
 import { loadAiConfig } from '@/lib/ai/config'
 import { generateReply, stripInternalReasoning } from '@/lib/ai/generate'
 import { buildConversationContext } from '@/lib/ai/context'
+import { contactHasPublicHandle } from './response-wait'
 
 /**
  * Timer 2 (`response_wait_timers`) logic — arming, re-arming, auto-arm on
@@ -99,6 +100,7 @@ export interface ScheduleFollowUpResult {
     | 'already_followed_up'
     | 'duplicate_pending'
     | 'disabled'
+    | 'not_handle'
     | 'error'
   id: string | null
 }
@@ -207,6 +209,18 @@ export async function scheduleFollowUp(
       return { scheduled: false, reason: 'disabled', id: null }
     }
 
+    // ONLY contacts with a public @user / @lid handle may receive automated
+    // follow-ups: a phone-only (or bare-BSUID) contact must never get a bot
+    // nudge. FAIL-CLOSED (contactHasPublicHandle) — a read error means "do
+    // not schedule", never "message this stranger". Enforced again at
+    // dispatch time by the runner, covering legacy rows.
+    if (!(await contactHasPublicHandle(db, contactId))) {
+      console.log(
+        `[follow-up] contact ${contactId} has no public @handle — not scheduling the ${type} stage for conversation ${conversationId}.`,
+      )
+      return { scheduled: false, reason: 'not_handle', id: null }
+    }
+
     // LA REGLA: a contact who already got a follow-up OF THIS TYPE is
     // never chased again for that type — regardless of which conversation
     // it happened in. The other stage is unaffected.
@@ -234,12 +248,14 @@ export async function scheduleFollowUp(
 
     // Don't stack: one PENDING per conversation. If the customer is being
     // chased and types again meanwhile, the old pending is cancelled by
-    // the webhook and this fresh message schedules the next one.
+    // the webhook and this fresh message schedules the next one. A row
+    // being claimed by the runner (`processing`) counts as busy too, so a
+    // sweep in flight never lines up a second sender.
     const { data: pending, error: pendingErr } = await db
       .from('follow_ups')
       .select('id')
       .eq('conversation_id', conversationId)
-      .eq('status', 'pending')
+      .in('status', ['pending', 'processing'])
       .limit(1)
       .maybeSingle()
     if (pendingErr) {
@@ -447,7 +463,7 @@ export async function cancelPendingFollowUps(
       .from('follow_ups')
       .update({ status: 'cancelled' })
       .eq('conversation_id', conversationId)
-      .eq('status', 'pending')
+      .in('status', ['pending', 'processing'])
     if (error) {
       console.error(
         `[follow-up] could not cancel pending follow-ups for conversation ${conversationId}:`,
@@ -476,6 +492,23 @@ export async function cancelPendingFollowUps(
  */
 const GENERIC_REMINDER =
   '¡Hola! Quería confirmar si quedó pendiente algo por tu parte. Quedo atento para ayudarte.'
+
+/**
+ * Hard cap for the AI-generated reminder text. The model is told to stay
+ * under ~30 words, but a wayward provider can still answer with a wall of
+ * text — and this is an automated nudge, not a newsletter. Cuts at the
+ * nearest word boundary at or below `limit` words and keeps a single short
+ * paragraph (no line breaks).
+ */
+export function truncateToLimit(text: string, limit = 30): string {
+  const normalized = text.replace(/\s+/g, ' ').trim()
+  if (!normalized) return ''
+  const words = normalized.split(' ')
+  if (words.length <= limit) return normalized
+  const cut = words.slice(0, limit).join(' ')
+  const clean = cut.replace(/[.,;:!?]+$/, '')
+  return clean.endsWith('.') ? clean : `${clean}.`
+}
 
 /**
  * Natural reminder for a conversation that went quiet. Built by the
@@ -510,11 +543,13 @@ async function buildFollowUpMessage(
     'recent transcript and follow up on the PENDING topic: if the last ' +
     'assistant message was a proposal, a quote or a question, briefly check ' +
     'whether it was clear and whether they want to move forward; otherwise ' +
-    'ask about the open point. Rules: do not repeat the exact words of the ' +
-    'previous assistant message and never sound like a rigid bot; never ' +
-    'invent facts, dates, prices, links or appointments; no greetings ' +
-    'beyond one word; write in the language the customer used; end with a ' +
-    'single open question; keep it under ~30 words.'
+    'ask about the open point. Rules: a SINGLE message no longer than 30 ' +
+    'words, formatted as ONE short paragraph with no blank lines, bullet ' +
+    'points or emojis; do not repeat the exact words of the previous ' +
+    'assistant message and never sound like a rigid bot; never invent ' +
+    'facts, dates, prices, links or appointments; no greeting beyond the ' +
+    'first word; write in the language the customer used; end with a ' +
+    'single open question.'
 
   try {
     const result = await generateReply({
@@ -522,7 +557,7 @@ async function buildFollowUpMessage(
       systemPrompt,
       messages: transcript,
     })
-    const text = stripInternalReasoning(result.text ?? '').trim()
+    const text = truncateToLimit(stripInternalReasoning(result.text ?? ''))
     return text || GENERIC_REMINDER
   } catch (err) {
     console.error(
@@ -583,9 +618,11 @@ export interface RunFollowUpsResult {
  *      consumed, so the system never retries forever and never chases
  *      twice).
  *
- * Best-effort, never throws to the caller. Idempotent by design: the
- * state transitions below are all guarded on `status='pending'`, so an
- * overlapping invocation cannot double-process a row it already moved.
+ * Best-effort, never throws to the caller. Idempotent by ATOMIC CLAIM:
+ * each due row is moved `pending → processing` before any work, and every
+ * later state transition is guarded on `status='processing'`, so an
+ * overlapping invocation (cron + in-process interval) cannot double-process
+ * a row it already claimed.
  */
 export async function runDueFollowUps(
   db: SupabaseClient | null = null,
@@ -627,6 +664,51 @@ export async function runDueFollowUps(
       const type: FollowUpType = row.type === '24h' ? '24h' : '10m'
       result.scanned++
 
+      // ATOMIC CLAIM: move the due row to `processing` BEFORE doing any
+      // work, and only continue when THIS update was the one that won.
+      // Both sweeps (external cron + in-process interval) enter with the
+      // same `pending` set; `.eq('status','pending')` means the second
+      // sweep matches zero rows and skips, so a row can never be sent by
+      // two overlapping invocations. Every later transition is guarded on
+      // `status='processing'`.
+      const { data: claimed, error: claimErr } = await client
+        .from('follow_ups')
+        .update({ status: 'processing' })
+        .eq('id', id)
+        .eq('status', 'pending')
+        .select('id')
+        .maybeSingle()
+      if (claimErr) {
+        console.error(`[follow-up] could not claim ${id}:`, claimErr.message)
+        continue
+      }
+      if (!claimed) {
+        // Lost the race — another sweep owns this row. Never send twice.
+        continue
+      }
+
+      // PUBLIC-HANDLE GATE: only @user / @lid contacts may receive the
+      // automated nudge. FAIL-CLOSED (contactHasPublicHandle): if the row
+      // cannot be proven handle-backed it is dropped, so a phone-only or
+      // bare-BSUID contact is never sent to. Covers legacy pending rows
+      // created before the gate was introduced.
+      if (!(await contactHasPublicHandle(client, contactId))) {
+        const { error: cancelErr } = await client
+          .from('follow_ups')
+          .update({ status: 'cancelled' })
+          .eq('id', id)
+          .eq('status', 'processing')
+        if (cancelErr) {
+          console.error(`[follow-up] could not cancel ${id} (no public @handle):`, cancelErr.message)
+        } else {
+          result.cancelled++
+          console.log(
+            `[follow-up] follow-up ${id} cancelled — contact ${contactId} has no public @handle.`,
+          )
+        }
+        continue
+      }
+
       // PER-CHAT SWITCH: a chat in OFF must never dispatch. The inbox route
       // also cancels pending rows the moment the switch flips off, but this
       // is the authoritative check at SEND time — it covers the ON→OFF race
@@ -636,7 +718,7 @@ export async function runDueFollowUps(
           .from('follow_ups')
           .update({ status: 'cancelled' })
           .eq('id', id)
-          .eq('status', 'pending')
+          .eq('status', 'processing')
         if (cancelErr) {
           console.error(`[follow-up] could not cancel ${id} (chat OFF):`, cancelErr.message)
         } else {
@@ -668,7 +750,7 @@ export async function runDueFollowUps(
           .from('follow_ups')
           .update({ status: 'cancelled' })
           .eq('id', id)
-          .eq('status', 'pending')
+          .eq('status', 'processing')
         if (cancelErr) {
           console.error(`[follow-up] could not cancel ${id} (anti-race):`, cancelErr.message)
         } else {
@@ -707,7 +789,7 @@ export async function runDueFollowUps(
           .from('follow_ups')
           .update({ status: 'no_response' })
           .eq('id', id)
-          .eq('status', 'pending')
+          .eq('status', 'processing')
         if (noRespErr) {
           console.error(`[follow-up] could not mark ${id} as no_response:`, noRespErr.message)
         } else {
@@ -720,7 +802,7 @@ export async function runDueFollowUps(
         .from('follow_ups')
         .update({ status: 'completed' })
         .eq('id', id)
-        .eq('status', 'pending')
+        .eq('status', 'processing')
       if (doneErr) {
         console.error(`[follow-up] could not mark ${id} as completed:`, doneErr.message)
         continue
@@ -774,26 +856,30 @@ export interface RunResponseWaitResult {
  * resolve it.
  *
  * For each due row:
- *   1. AUTO-CANCEL SAFETY NET — if the customer replied AFTER the timer
+ *   1. ATOMIC CLAIM (`active` → `processing`) so an overlapping sweep can
+ *      never dispatch the same timer twice.
+ *   2. @HANDLE GATE — only contacts with a public @user / @lid handle may
+ *      be nudged; anything else is cancelled (reason `not_handle`).
+ *   3. AUTO-CANCEL SAFETY NET — if the customer replied AFTER the timer
  *      started (`started_at`), the row is cancelled and nothing is sent.
  *      (The inbound webhook already cancelled it, so this covers the
  *      race where the reply landed just before/after the sweep's scan.)
- *   2. Otherwise generate a contextual AI follow-up and send it through
+ *   4. Otherwise generate a contextual AI follow-up and send it through
  *      `sendMessageToConversation` (with `autoArm: false`).
- *   3. ONE-SHOT EXECUTION — the moment the single nudge is dispatched the
+ *   5. ONE-SHOT EXECUTION — the moment the single nudge is dispatched the
  *      row closes as `completed` AND the conversation's "Esperar
  *      respuesta" switch (`response_wait_enabled`) flips OFF, so the
  *      cycle strictly never re-enters a loop. The agent must press ↻
  *      Reiniciar (or re-enable the switch) to watch again. The update is
- *      guarded on `status='active'`: if the client replied at the exact
- *      moment of expiry, the webhook already cancelled the row and this
+ *      guarded on `status='processing'`: if the client replied at the exact
+ *      moment of dispatch, the webhook already cancelled the row and this
  *      sweep does not resurrect it. `no_response` still closes a row whose
  *      nudge never went out (a provider/send failure is terminal — the
  *      system never retries forever).
  *
  * Scoped strictly to `conversation_id`; a missing table or schema glitch
  * degrades to a logged no-op. Never throws. Idempotent: every state
- * transition is guarded on `status='active'`.
+ * transition is guarded on `status='processing'` (the claimed state).
  */
 export async function runDueResponseWaitTimers(
   db: SupabaseClient | null = null,
@@ -827,8 +913,66 @@ export async function runDueResponseWaitTimers(
     for (const row of due) {
       const id = row.id as string
       const conversationId = row.conversation_id as string
+      const contactId = row.contact_id as string
       const accountId = row.account_id as string
       result.scanned++
+
+      // ATOMIC CLAIM: move the due row to `processing` BEFORE doing any
+      // work, and only continue when THIS update was the one that won.
+      // Both sweeps (external cron + in-process interval) enter with the
+      // same `active` set; `.eq('status','active')` means the second sweep
+      // matches zero rows and skips — a timer can never fire twice. Every
+      // later transition is guarded on `status='processing'`.
+      const { data: claimed, error: claimErr } = await client
+        .from('response_wait_timers')
+        .update({ status: 'processing' })
+        .eq('id', id)
+        .eq('status', 'active')
+        .select('id')
+        .maybeSingle()
+      if (claimErr) {
+        console.error(`[response-wait] could not claim ${id}:`, claimErr.message)
+        continue
+      }
+      if (!claimed) {
+        // Lost the race — another sweep owns this row. Never send twice.
+        continue
+      }
+
+      // PUBLIC-HANDLE GATE: only @user / @lid contacts may receive the
+      // automated nudge. FAIL-CLOSED (contactHasPublicHandle): a timer that
+      // cannot be proven handle-backed is dropped, so a phone-only or
+      // bare-BSUID contact is never nudged. Covers legacy active rows armed
+      // before the gate was introduced.
+      if (!(await contactHasPublicHandle(client, contactId))) {
+        const { error: cancelErr } = await client
+          .from('response_wait_timers')
+          .update({ status: 'cancelled', cancelled_reason: 'not_handle' })
+          .eq('id', id)
+          .eq('status', 'processing')
+        if (cancelErr) {
+          if (/column .* does not exist|42703|PGRST204|schema cache/i.test(cancelErr.message)) {
+            const { error: legacyErr } = await client
+              .from('response_wait_timers')
+              .update({ status: 'cancelled' })
+              .eq('id', id)
+              .eq('status', 'processing')
+            if (legacyErr) {
+              console.error(`[response-wait] could not cancel ${id} (no @handle):`, legacyErr.message)
+            } else {
+              result.cancelled++
+            }
+          } else {
+            console.error(`[response-wait] could not cancel ${id} (no @handle):`, cancelErr.message)
+          }
+        } else {
+          result.cancelled++
+          console.log(
+            `[response-wait] timer ${id} cancelled — contact ${contactId} has no public @handle.`,
+          )
+        }
+        continue
+      }
 
       const last = await lastMessage(client, conversationId)
 
@@ -848,7 +992,7 @@ export async function runDueResponseWaitTimers(
           .from('response_wait_timers')
           .update({ status: 'cancelled', cancelled_reason: 'anti_race' })
           .eq('id', id)
-          .eq('status', 'active')
+          .eq('status', 'processing')
         if (cancelErr) {
           // Migration 065 pending (column missing): retry the legacy update
           // so the one-shot cancel still lands on an un-migrated DB.
@@ -857,7 +1001,7 @@ export async function runDueResponseWaitTimers(
               .from('response_wait_timers')
               .update({ status: 'cancelled' })
               .eq('id', id)
-              .eq('status', 'active')
+              .eq('status', 'processing')
             if (legacyErr) {
               console.error(`[response-wait] could not cancel ${id} (reply race):`, legacyErr.message)
             } else {
@@ -900,7 +1044,7 @@ export async function runDueResponseWaitTimers(
           .from('response_wait_timers')
           .update({ status: 'no_response' })
           .eq('id', id)
-          .eq('status', 'active')
+          .eq('status', 'processing')
         if (noRespErr) {
           console.error(`[response-wait] could not mark ${id} as no_response:`, noRespErr.message)
         } else {
@@ -913,14 +1057,14 @@ export async function runDueResponseWaitTimers(
       // `completed` AND the conversation's "Esperar respuesta" switch flips
       // to OFF — a finished cycle strictly never re-enters a loop. The
       // agent must press ↻ Reiniciar (or re-enable the switch) to watch
-      // again. Guarded on `status='active'`: if the inbound webhook
-      // cancelled this row at the exact moment of expiry (the client DID
+      // again. Guarded on `status='processing'`: if the inbound webhook
+      // cancelled this row at the exact moment of dispatch (the client DID
       // reply), zero rows match and nothing is resurrected.
       const { error: doneErr } = await client
         .from('response_wait_timers')
         .update({ status: 'completed' })
         .eq('id', id)
-        .eq('status', 'active')
+        .eq('status', 'processing')
       if (doneErr) {
         console.error(`[response-wait] could not mark ${id} as completed:`, doneErr.message)
         continue

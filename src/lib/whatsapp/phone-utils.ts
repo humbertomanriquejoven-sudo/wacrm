@@ -286,6 +286,38 @@ export function normalizeUsername(value: string | null | undefined): string | nu
 }
 
 /**
+ * True when a contact carries a PUBLIC user handle — the only kind of
+ * contact the automatic follow-up system is allowed to message.
+ *
+ * The operator signals "handle contact" in three ways:
+ *   1. `username` holds the canonical handle (`'@anaruiz'`), which the
+ *      inbound webhook writes from Meta's `profile.username`;
+ *   2. `phone` (legacy) still holds a bare handle (`'@tienda'`) — migration
+ *      051 moves those into `username`, but an un-migrated row may carry
+ *      one;
+ *   3. `wa_id` / `wa_user_id` / `recipient_id` is a Meta display id tagged
+ *      with its routing suffix (`'1486998326437295@user'`, `'…@lid'`),
+ *      which is the delivery form of a user-scoped contact.
+ *
+ * Anything else — a dialable number, a bare BSUID, a placeholder like
+ * `'unknown'` — has NO public handle, so automation must not target it.
+ * Deliberately conservative: the caller treats a `false` as "do not send".
+ */
+export function hasPublicUserHandle(contact: {
+  username?: string | null
+  phone?: string | null
+  wa_id?: string | null
+  wa_user_id?: string | null
+  recipient_id?: string | null
+}): boolean {
+  if (normalizeUsername(contact.username)) return true
+  if (normalizeUsername(contact.phone)) return true
+  return [contact.wa_id, contact.wa_user_id, contact.recipient_id].some(
+    (value) => typeof value === 'string' && /@(user|lid)\b/i.test(value),
+  )
+}
+
+/**
  * The value to hand Meta for a NON-PHONE identifier, or null when unusable.
  *
  * Deliberately a PASS-THROUGH, unlike `normalizeMetaIdentifier`. That

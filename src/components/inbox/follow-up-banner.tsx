@@ -20,8 +20,8 @@ import type { FollowUp, ResponseWaitTimer } from "@/types";
 //   BLOCK 2 — "Esperar respuesta" (Timer 2, response-wait, ONE-SHOT).
 //     [ N ] min  [↻ Reiniciar]  [ ON/OFF switch ]   MM:SS
 //     `response_wait_timers.active` (started_at + expires_at) → inline
-//     live countdown, shown WHILE the switch is ON and a timer is active;
-//     it ticks every second and never hides.
+//     live countdown, ALWAYS visible in its slot (dims when idle); it ticks
+//     every second and never hides.
 //
 //     AUTO (never needs a button):
 //       · ONLY while Switch 2 is ON: any outbound (agent or bot) with the
@@ -256,7 +256,11 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       if (json) {
         if (json.scheduled === false) {
           toast.error(
-            json.reason === "disabled" ? t("scheduleDisabled") : t("scheduleFailed"),
+            json.reason === "disabled"
+              ? t("scheduleDisabled")
+              : json.reason === "not_handle"
+                ? t("noHandle")
+                : t("scheduleFailed"),
           );
         } else {
           toast.success(t("scheduleSuccess"));
@@ -272,7 +276,13 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     async (checked: boolean) => {
       setBusyFollow("toggle");
       try {
-        if (await post("set_enabled", { enabled: checked })) toast.success(t("toggleSuccess"));
+        // OPTIMISTIC: flip the switch and the ACTIVO/INACTIVO label
+        // immediately, so a click never leaves the banner looking "stuck"
+        // on the old state while the POST round-trips (or waits out a
+        // refresh). `refresh()` below reconciles with the server truth.
+        setStatus((s) => (s ? { ...s, conversation_enabled: checked } : s));
+        if (await post("set_enabled", { enabled: checked }))
+          toast.success(t("toggleSuccess"));
         await refresh();
       } finally {
         setBusyFollow(null);
@@ -290,6 +300,17 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     async (checked: boolean) => {
       setBusyWait("wait_toggle");
       try {
+        // OPTIMISTIC, mirroring the server's side effects: OFF also cancels
+        // the running countdown (the route cancels ACTIVE timers).
+        setStatus((s) =>
+          s
+            ? {
+                ...s,
+                response_wait_enabled: checked,
+                response_wait: checked ? s.response_wait : null,
+              }
+            : s,
+        );
         if (await post("wait_enabled", { enabled: checked })) {
           if (checked) toast.success(t("waitEnabledSuccess"));
           else toast.success(t("waitDisabledSuccess"));
@@ -316,8 +337,34 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       // generar duplicados ni ejecuciones dobles.
       const json = await post("wait_reset", { delay_minutes: value });
       if (json) {
-        if (json.scheduled === false) toast.error(t("waitFailed"));
-        else toast.success(t("waitResetSuccess"));
+        if (json.scheduled === false) {
+          toast.error(t("waitFailed"));
+        } else {
+          toast.success(t("waitResetSuccess"));
+          // OPTIMISTIC: show the fresh full-minutes countdown NOW (from the
+          // server's own `expires_at` + `delay_minutes`) and flip Switch 2
+          // to ACTIVO immediately, so the reset is visible on the very
+          // click instead of after a round-trip. `refresh()` reconciles.
+          const expiresAt =
+            typeof json.expires_at === "string"
+              ? json.expires_at
+              : new Date(Date.now() + value * 60_000).toISOString();
+          setStatus((s) =>
+            s
+              ? {
+                  ...s,
+                  response_wait_enabled: true,
+                  response_wait: {
+                    id: typeof json.id === "string" ? json.id : "wait-pending",
+                    status: "active",
+                    delay_minutes: value,
+                    started_at: new Date().toISOString(),
+                    expires_at: expiresAt,
+                  },
+                }
+              : s,
+          );
+        }
       }
       await refresh();
     } finally {
@@ -378,7 +425,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
           <span
             className={cn(
               "min-w-[3.5rem] font-mono text-sm tabular-nums",
-              pending ? "text-foreground" : "text-transparent",
+              pending ? "text-foreground" : "text-muted-foreground",
             )}
             aria-live="off"
           >
@@ -436,14 +483,15 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
             {t("waitReset")}
           </BannerButton>
 
-          {waitEnabled && wait && (
-            <span
-              className="min-w-[3.5rem] font-mono text-sm tabular-nums text-foreground"
-              aria-live="off"
-            >
-              {waitEta ?? "00:00"}
-            </span>
-          )}
+          <span
+            className={cn(
+              "min-w-[3.5rem] font-mono text-sm tabular-nums",
+              wait && waitEnabled ? "text-foreground" : "text-muted-foreground",
+            )}
+            aria-live="off"
+          >
+            {waitEta ?? "00:00"}
+          </span>
 
           <span className="ml-auto flex items-center gap-1.5">
             <span

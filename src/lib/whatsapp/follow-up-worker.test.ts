@@ -13,6 +13,19 @@ const h = vi.hoisted(() => {
       follow_up_enabled: null,
       response_wait_enabled: true,
     } as { follow_up_enabled: boolean | null; response_wait_enabled: boolean } | null,
+    // contacts — identity fields used by the public-@handle gate. Keyed by
+    // contact id. `contact-1` defaults to a handle contact so every legacy
+    // test still passes the gate; gate tests swap/remove the entry.
+    contacts: {} as Record<
+      string,
+      {
+        username?: string | null
+        phone?: string | null
+        wa_id?: string | null
+        wa_user_id?: string | null
+        recipient_id?: string | null
+      }
+    >,
     sendMessageToConversation: vi.fn(),
     loadAiConfig: vi.fn(),
     generateReply: vi.fn(),
@@ -95,24 +108,55 @@ vi.mock('@/lib/ai/admin-client', () => ({
             if (status === 'no_response') h.state.noResponse.push(status)
             // Real client: `.update().eq().eq()` mutates the matching rows.
             // The runner relies on this to see `completed` before scheduling
-            // the next stage, so the mock must apply the payload.
-            const upFilters: Array<{ key: string; value: unknown }> = []
+            // the next stage, so the mock must apply the payload. The atomic
+            // CLAIM step finishes with `.select('id').maybeSingle()`: the
+            // claimed row must be computed BEFORE applying the payload (the
+            // update flips `status` away from the guard's `pending`), and it
+            // must be null when a second sweep lost the race — so the runner
+            // skips the row instead of double-sending.
+            const upFilters: Array<{
+              key: string
+              value: unknown
+              isIn?: boolean
+            }> = []
+            const matchRow = (row: Record<string, unknown>) =>
+              upFilters.every((f) =>
+                f.isIn
+                  ? Array.isArray(f.value) &&
+                    (f.value as unknown[]).includes(row[f.key])
+                  : row[f.key] === f.value,
+              )
             const apply = () => {
               for (const row of h.state.followUps) {
-                if (upFilters.every((f) => row[f.key] === f.value)) {
-                  Object.assign(row, payload)
-                }
+                if (matchRow(row)) Object.assign(row, payload)
               }
             }
-            return {
-              eq: (key: string, value: unknown) => ({
-                eq: (key2: string, value2: unknown) => {
-                  upFilters.push({ key, value }, { key: key2, value: value2 })
-                  apply()
-                  return Promise.resolve({ data: null, error: null })
-                },
-              }),
-            }
+            const makeChain = (): Record<string, unknown> => ({
+              eq: (key: string, value: unknown) => {
+                upFilters.push({ key, value })
+                return makeChain()
+              },
+              in: (key: string, value: unknown) => {
+                upFilters.push({ key, value, isIn: true })
+                return makeChain()
+              },
+              then: (resolve: (v: unknown) => unknown) => {
+                apply()
+                return Promise.resolve({ data: null, error: null }).then(
+                  resolve as never,
+                )
+              },
+              select: () => {
+                const claimed =
+                  h.state.followUps.find(matchRow) ?? null
+                apply()
+                return {
+                  maybeSingle: () =>
+                    Promise.resolve({ data: claimed, error: null }),
+                }
+              },
+            })
+            return makeChain()
           },
           then: (
             onFulfilled?: (value: { data: Record<string, unknown>[]; error: null } | null) => void,
@@ -125,10 +169,15 @@ vi.mock('@/lib/ai/admin-client', () => ({
         if (h.state.waitTimersBroken) {
           throw new Error('relation "public.response_wait_timers" does not exist')
         }
-        const filters: Array<{ op: 'eq' | 'lte'; key: string; value: unknown }> = []
+        const filters: Array<{ op: 'eq' | 'in' | 'lte'; key: string; value: unknown }> = []
         const matches = (row: Record<string, unknown>) =>
           filters.every((f) => {
             if (f.op === 'eq') return row[f.key] === f.value
+            if (f.op === 'in')
+              return (
+                Array.isArray(f.value) &&
+                (f.value as unknown[]).includes(row[f.key])
+              )
             if (f.op === 'lte')
               return (row[f.key] as number) <= (f.value as number)
             return true
@@ -144,7 +193,7 @@ vi.mock('@/lib/ai/admin-client', () => ({
             return chain
           },
           in: (key: string, value: unknown) => {
-            filters.push({ op: 'eq', key, value })
+            filters.push({ op: 'in', key, value })
             return chain
           },
           lte: (key: string, value: unknown) => {
@@ -174,23 +223,48 @@ vi.mock('@/lib/ai/admin-client', () => ({
             if (status === 'cancelled') h.state.waitCancelled.push(status)
             if (status === 'completed') h.state.waitCompleted.push(status)
             if (status === 'no_response') h.state.waitNoResponse.push(status)
-            const upFilters: Array<{ key: string; value: unknown }> = []
+            const upFilters: Array<{
+              key: string
+              value: unknown
+              isIn?: boolean
+            }> = []
+            const matchRow = (row: Record<string, unknown>) =>
+              upFilters.every((f) =>
+                f.isIn
+                  ? Array.isArray(f.value) &&
+                    (f.value as unknown[]).includes(row[f.key])
+                  : row[f.key] === f.value,
+              )
             const apply = () => {
               for (const row of h.state.waitTimers) {
-                if (upFilters.every((f) => row[f.key] === f.value)) {
-                  Object.assign(row, payload)
-                }
+                if (matchRow(row)) Object.assign(row, payload)
               }
             }
-            return {
-              eq: (key: string, value: unknown) => ({
-                eq: (key2: string, value2: unknown) => {
-                  upFilters.push({ key, value }, { key: key2, value: value2 })
-                  apply()
-                  return Promise.resolve({ data: null, error: null })
-                },
-              }),
-            }
+            const makeChain = (): Record<string, unknown> => ({
+              eq: (key: string, value: unknown) => {
+                upFilters.push({ key, value })
+                return makeChain()
+              },
+              in: (key: string, value: unknown) => {
+                upFilters.push({ key, value, isIn: true })
+                return makeChain()
+              },
+              then: (resolve: (v: unknown) => unknown) => {
+                apply()
+                return Promise.resolve({ data: null, error: null }).then(
+                  resolve as never,
+                )
+              },
+              select: () => {
+                const claimed = h.state.waitTimers.find(matchRow) ?? null
+                apply()
+                return {
+                  maybeSingle: () =>
+                    Promise.resolve({ data: claimed, error: null }),
+                }
+              },
+            })
+            return makeChain()
           },
           then: (
             onFulfilled?: (value: { data: Record<string, unknown>[]; error: null } | null) => void,
@@ -258,6 +332,19 @@ vi.mock('@/lib/ai/admin-client', () => ({
           },
         }
       }
+      if (table === 'contacts') {
+        return {
+          select: () => ({
+            eq: (key: string, value: unknown) => ({
+              maybeSingle: () =>
+                Promise.resolve({
+                  data: h.state.contacts[String(value)] ?? null,
+                  error: null,
+                }),
+            }),
+          }),
+        }
+      }
       throw new Error(`unexpected table ${table}`)
     },
   }),
@@ -290,6 +377,7 @@ import {
   runDueFollowUps,
   runDueResponseWaitTimers,
   runScheduledFollowUps,
+  truncateToLimit,
   FOLLOW_UP_DELAY_MS,
 } from './follow-up-worker'
 
@@ -299,6 +387,15 @@ function resetState() {
   h.state.messages = []
   h.state.aiConfig = { created_by: 'user-owner' }
   h.state.conversation = { follow_up_enabled: null, response_wait_enabled: true }
+  h.state.contacts = {
+    'contact-1': {
+      username: '@han411',
+      phone: null,
+      wa_id: null,
+      wa_user_id: null,
+      recipient_id: null,
+    },
+  }
   h.state.cancelled = []
   h.state.completed = []
   h.state.noResponse = []
@@ -1264,5 +1361,199 @@ describe('runScheduledFollowUps — both timers run independently', () => {
       started_at: '2026-10-06T12:00:00.000Z',
       expires_at: '2026-10-06T12:05:00.000Z',
     })
+  })
+})
+
+describe('public-@handle gate', () => {
+  it('scheduleFollowUp refuses a contact with no public handle (reason: not_handle)', async () => {
+    resetState()
+    h.state.contacts['contact-1'] = {
+      username: null,
+      phone: '573001234567',
+      wa_id: null,
+      wa_user_id: null,
+      recipient_id: null,
+    }
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await scheduleFollowUp(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+    })
+
+    expect(res).toMatchObject({
+      scheduled: false,
+      reason: 'not_handle',
+      id: null,
+    })
+    expect(h.state.followUps).toHaveLength(0)
+  })
+
+  it('armResponseWaitIfIdle refuses a contact with no public handle', async () => {
+    resetState()
+    h.state.contacts['contact-1'] = {
+      username: null,
+      phone: '573001234567',
+      wa_id: null,
+      wa_user_id: null,
+      recipient_id: null,
+    }
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await armResponseWaitIfIdle(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+      now: new Date('2026-10-06T12:00:00.000Z'),
+    })
+
+    expect(res).toMatchObject({ scheduled: false, reason: 'not_handle' })
+    expect(h.state.waitTimers).toHaveLength(0)
+  })
+
+  it('runDueFollowUps cancels (never sends) a due reminder for a handle-less contact', async () => {
+    resetState()
+    h.state.contacts['contact-1'] = {
+      username: null,
+      phone: '573001234567',
+      wa_id: null,
+      wa_user_id: null,
+      recipient_id: null,
+    }
+    h.state.followUps = [
+      {
+        id: 'fu-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        type: '10m',
+        status: 'pending',
+        execute_at: '2026-10-06T12:09:00.000Z',
+      },
+    ]
+    h.state.messages = [{ sender_type: 'bot', content_text: 'hi' }]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
+
+    expect(res).toMatchObject({ scanned: 1, sent: 0, cancelled: 1 })
+    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
+    expect(h.state.followUps[0]).toMatchObject({ status: 'cancelled' })
+  })
+
+  it('runDueResponseWaitTimers cancels (never sends) a due timer for a handle-less contact', async () => {
+    resetState()
+    h.state.contacts['contact-1'] = {
+      username: null,
+      phone: '573001234567',
+      wa_id: null,
+      wa_user_id: null,
+      recipient_id: null,
+    }
+    h.state.waitTimers = [
+      {
+        id: 'wait-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        status: 'active',
+        delay_minutes: 5,
+        started_at: '2026-10-06T12:00:00.000Z',
+        expires_at: '2026-10-06T12:05:00.000Z',
+      },
+    ]
+    h.state.messages = [{ sender_type: 'bot', content_text: 'hi' }]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueResponseWaitTimers(db, new Date('2026-10-06T12:05:01.000Z'))
+
+    expect(res).toMatchObject({ scanned: 1, sent: 0, cancelled: 1 })
+    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
+    expect(h.state.waitTimers[0]).toMatchObject({
+      status: 'cancelled',
+      cancelled_reason: 'not_handle',
+    })
+  })
+
+  it('accepts a contact whose phone still carries a legacy @handle', async () => {
+    resetState()
+    h.state.contacts['contact-1'] = {
+      username: null,
+      phone: '@tienda',
+      wa_id: null,
+      wa_user_id: null,
+      recipient_id: null,
+    }
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await scheduleFollowUp(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+    })
+
+    expect(res.scheduled).toBe(true)
+  })
+
+  it('accepts a contact identified by an @user / @lid display id', async () => {
+    resetState()
+    h.state.contacts['contact-1'] = {
+      username: null,
+      phone: null,
+      wa_id: '1486998326437295@user',
+      wa_user_id: null,
+      recipient_id: null,
+    }
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await scheduleFollowUp(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+    })
+
+    expect(res.scheduled).toBe(true)
+  })
+})
+
+describe('atomic claim (processing)', () => {
+  it('never rescans or sends a row another sweep already claimed', async () => {
+    resetState()
+    h.state.followUps = [
+      {
+        id: 'fu-claim',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        type: '10m',
+        status: 'processing',
+        execute_at: '2026-10-06T12:09:00.000Z',
+      },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
+
+    expect(res).toMatchObject({ scanned: 0, sent: 0 })
+    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
+  })
+})
+
+describe('truncateToLimit', () => {
+  it('caps the message at 30 words, one paragraph, trailing period', () => {
+    const text =
+      'Hola, este es un mensaje de seguimiento muy largo que el modelo generó ' +
+      'sin respetar el límite de palabras y por eso vamos a cortarlo al límite ' +
+      'exacto de treinta palabras manteniendo una sola frase.' +
+      '\n\nSegundo párrafo que debe desaparecer por completo.'
+    const cut = truncateToLimit(text, 30)
+    expect(cut.split(' ').length).toBeLessThanOrEqual(30)
+    expect(cut).not.toContain('\n')
+    expect(cut).toMatch(/\.$/)
+  })
+
+  it('leaves a short message untouched', () => {
+    expect(truncateToLimit('Hola, ¿quedó claro?')).toBe('Hola, ¿quedó claro?')
   })
 })
