@@ -1,16 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  BellOff,
-  Check,
-  Clock,
-  Loader2,
-  Plus,
-  RotateCcw,
-  Timer as TimerIcon,
-  X,
-} from "lucide-react";
+import { BellOff, Clock, Loader2, Plus, RotateCcw, Timer as TimerIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { useTranslations } from "next-intl";
@@ -18,39 +9,55 @@ import { Switch } from "@/components/ui/switch";
 import type { FollowUp, ResponseWaitTimer } from "@/types";
 
 // ------------------------------------------------------------------
-// Per-conversation timer banner — TWO fully independent, persistent
-// timers per chat:
+// Per-conversation timer banner — TWO fully independent, persistent,
+// one-shot timers per chat:
 //
-//   ROW 1 — Follow-up (Timer 1, the classic programmed reminder).
-//     [ N ] min  [Schedule]  [ ON/OFF switch ]
-//     `follow_ups.pending` (execute_at) drives the live countdown.
+//   BLOCK 1 — "Seguimiento automático" (Timer 1, the programmed reminder).
+//     [ N ] min  [Programar]  [ ON/OFF switch ]
+//     `follow_ups.pending` (execute_at) → ⏱️ Próximo seguimiento en: MM:SS.
 //     OFF cancels the queued row and the worker refuses to dispatch.
 //
-//   ROW 2 — Wait Reply (Timer 2, response-wait, auto-cancelable).
-//     [ N ] min  [Start]  [Reset]  [Cancel]
-//     `response_wait_timers.active` (started_at + expires_at) drives the
-//     live countdown. The FIRST inbound message from the customer
-//     cancels it server-side (webhook), so no follow-up is ever sent to
-//     someone who answered. On expiry the worker sends a contextual AI
-//     nudge. Reset cancels the current countdown and re-arms it from the
-//     exact minutes currently typed.
+//   BLOCK 2 — "Esperar respuesta" (Timer 2, response-wait, ONE-SHOT).
+//     [ N ] min  [▶ Iniciar]  [↻ Reiniciar]
+//     `response_wait_timers.active` (started_at + expires_at) → live
+//     countdown "⏱️ Tiempo restante: MM:SS".
+//
+//     ONE-SHOT (strictly non-recurrent):
+//       · Escenario A — el cliente responde antes de 00:00 → la webhook
+//         cancela el timer (cancelled_reason='inbound'/'anti_race');
+//         la UI muestra "💬 Cliente respondió (Temporizador cancelado)" y
+//         NO se envía nada.
+//       · Escenario B — llega a 00:00 sin respuesta → el worker envía el
+//         seguimiento UNA sola vez y el timer pasa a `completed`
+//         (desactivado). La UI muestra "✅ Tiempo de espera finalizado
+//         (Acción ejecutada)". NUNCA se reinicia solo: el agente debe
+//         pulsar ▶ Iniciar / ↻ Reiniciar para volver a usarlo.
+//     ↻ Reiniciar = cancelar la cuenta regresiva actual (misma fila) y
+//     rearmarla desde los minutos EXACTOS del campo, sin duplicados.
 //
 // ISOLATION / CORRECTNESS GUARANTEES:
 //   * NO shared/global React timer state. Every value is loaded from the
-//     server for THIS `conversation_id` and re-read on every refresh.
-//     The parent keys the banner by conversation (`key={conversation.id}`)
-//     so switching chats unmounts/remounts it — local inputs can never
-//     leak from Chat A into Chat B.
-//   * Dynamic remainder: the UI ALWAYS computes `expires_at − NOW()` from
-//     a 1-second clock. Switch away for 2 minutes and come back: a 5-minute
-//     timer honestly shows 3:00, never resets, never borrows Chat B's values.
-//   * The send itself is triggered by the backend (cron or the in-process
-//     worker in `src/instrumentation.ts`), never by this component — the
-//     countdown is display-only, so closing the tab never loses a timer.
+//     server for THIS `conversation_id`; the parent keys the banner by
+//     conversation (`key={conversation.id}`) so switching chats cannot
+//     leak inputs or counters between conversations.
+//   * Dynamic remainder: the UI ALWAYS computes `expires_at − NOW()` on a
+//     1-second clock. Switch away for 2 minutes and come back: a 5-minute
+//     timer honestly shows 3:00, never resets, never borrows another
+//     chat's values, and survives an F5 (the row lives in the DB).
+//   * The send is triggered by the backend (cron / in-process worker),
+//     never by this component — the countdown is display-only.
 // ------------------------------------------------------------------
 
-type Busy = "cancel" | "schedule" | "toggle" | null;
-type WaitBusy = "wait_set" | "wait_reset" | "wait_cancel" | null;
+type Busy = "schedule" | "toggle" | null;
+type WaitBusy = "wait_set" | "wait_reset" | null;
+
+interface WaitLast {
+  id?: string;
+  conversation_id?: string;
+  status?: string;
+  cancelled_reason?: string | null;
+  updated_at?: string;
+}
 
 interface FollowUpStatus {
   pending: (Pick<FollowUp, "id" | "type" | "execute_at"> & { status: string })[];
@@ -58,6 +65,7 @@ interface FollowUpStatus {
     ResponseWaitTimer,
     "id" | "status" | "delay_minutes" | "started_at" | "expires_at"
   > | null;
+  response_wait_last: WaitLast | null;
   global_enabled: boolean;
   conversation_enabled: boolean | null;
 }
@@ -68,7 +76,7 @@ const MAX_MINUTES = 10080;
 /**
  * Parse the EXACT integer the agent typed. Returns null for an empty or
  * out-of-range box so the caller can refuse rather than silently
- * substituting a default — see the spec: no cached/fallback values.
+ * substituting a default.
  */
 function parseMinutes(raw: string): number | null {
   const trimmed = raw.trim();
@@ -79,9 +87,9 @@ function parseMinutes(raw: string): number | null {
 }
 
 /**
- * Live remainder: `expires_at − now`. Seconds-granular (`3:00` style);
+ * Live remainder: `expires_at − now`. Seconds-granular (`09:42` style);
  * hours spill over to `1h 20m 05s`. `00:00` means the moment arrived (the
- * backend worker delivers and a refresh then clears the row).
+ * backend delivers/executes and a refresh then clears the active row).
  */
 function formatRemaining(expiresAt: string, nowTs: number): string {
   const diff = new Date(expiresAt).getTime() - nowTs;
@@ -91,11 +99,14 @@ function formatRemaining(expiresAt: string, nowTs: number): string {
   const m = Math.floor((totalSec % 3600) / 60);
   const s = totalSec % 60;
   if (h > 0) return `${h}h ${m}m ${s.toString().padStart(2, "0")}s`;
-  return `${m}:${s.toString().padStart(2, "0")}`;
+  return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
 }
 
 const INPUT_CLASS =
   "h-6 w-14 rounded-md border border-border bg-card px-1.5 text-center text-xs text-foreground outline-none focus-visible:ring-1 focus-visible:ring-primary disabled:opacity-60";
+
+const LABEL_CLASS =
+  "inline-flex items-center gap-1.5 font-medium text-foreground";
 
 export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   const t = useTranslations("Inbox.followUp");
@@ -136,8 +147,9 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     void refresh();
     // 1s tick keeps BOTH countdowns honest (`expires_at − now`).
     const clock = setInterval(() => setNowTs(Date.now()), 1000);
-    // Re-read the queue so a delivered timer (flipped to completed/
-    // cancelled by the worker or the inbound webhook) disappears locally.
+    // Re-read the queue so a delivered/executed/cancelled timer
+    // (flipped to `completed`/`cancelled` by the worker or the inbound
+    // webhook) updates the UI on its own.
     const serverRefresh = setInterval(() => void refresh(), 30_000);
     return () => {
       clearInterval(clock);
@@ -171,7 +183,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     [conversationId, t],
   );
 
-  // ---- Timer 1 (follow-up) handlers ---------------------------------
+  // ---- Timer 1 (seguimiento automático) -----------------------------
   const scheduleFollowUp = useCallback(async () => {
     const value = parseMinutes(followUpMinutes);
     if (value === null) {
@@ -183,7 +195,6 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       const json = await post("schedule", { delay_minutes: value });
       if (json) {
         if (json.scheduled === false) {
-          // Backend refused (chat switched OFF mid-flight, or a DB error).
           toast.error(
             json.reason === "disabled" ? t("scheduleDisabled") : t("scheduleFailed"),
           );
@@ -196,16 +207,6 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       setBusyFollow(null);
     }
   }, [followUpMinutes, post, refresh, t]);
-
-  const cancelFollowUp = useCallback(async () => {
-    setBusyFollow("cancel");
-    try {
-      if (await post("cancel", {})) toast.success(t("cancelSuccess"));
-      await refresh();
-    } finally {
-      setBusyFollow(null);
-    }
-  }, [post, refresh, t]);
 
   const toggleEnabled = useCallback(
     async (checked: boolean) => {
@@ -220,7 +221,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     [post, refresh, t],
   );
 
-  // ---- Timer 2 (wait reply) handlers --------------------------------
+  // ---- Timer 2 (esperar respuesta, ONE-SHOT) ------------------------
   const startWait = useCallback(async () => {
     const value = parseMinutes(waitMinutes);
     if (value === null) {
@@ -248,8 +249,10 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     }
     setBusyWait("wait_reset");
     try {
-      // Reset = cancel the current countdown, then re-arm from the box's
-      // exact value. One UPSERT on the server — no duplicates.
+      // Reiniciar = cancelar cualquier cuenta regresiva en curso y rearmar
+      // desde los minutos EXACTOS del campo. El servidor hace un único
+      // UPSERT (una sola fila ACTIVE por conversación), así que no puede
+      // generar duplicados ni ejecuciones dobles.
       const json = await post("wait_reset", { delay_minutes: value });
       if (json) {
         if (json.scheduled === false) toast.error(t("waitFailed"));
@@ -261,174 +264,174 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     }
   }, [waitMinutes, post, refresh, t]);
 
-  const cancelWait = useCallback(async () => {
-    setBusyWait("wait_cancel");
-    try {
-      if (await post("wait_cancel", {})) toast.success(t("waitCancelledSuccess"));
-      await refresh();
-    } finally {
-      setBusyWait(null);
-    }
-  }, [post, refresh, t]);
-
   if (!status) return null;
 
   const pending = status.pending[0] ?? null;
   const enabled = status.conversation_enabled !== false;
   const wait = status.response_wait ?? null;
+  const waitLast = status.response_wait_last ?? null;
 
   const followEta = pending ? formatRemaining(pending.execute_at, nowTs) : null;
   const waitEta = wait ? formatRemaining(wait.expires_at, nowTs) : null;
 
+  // One-shot outcome for the wait timer (Escenario A / Escenario B).
+  const waitOutcome: "active" | "executed" | "replied" | null = wait
+    ? "active"
+    : waitLast?.status === "completed"
+      ? "executed"
+      : waitLast?.status === "cancelled" && waitLast?.cancelled_reason !== "manual"
+        ? "replied"
+        : null;
+
   return (
     <div
       className={cn(
-        "border-b px-3 py-2 text-xs sm:px-4",
+        "border-b text-xs",
         pending || wait
           ? "border-primary/20 bg-primary/5"
           : "border-border bg-muted/40",
       )}
     >
-      {/* Row 1 — Follow-up (Timer 1) */}
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-        <span className="flex min-w-0 items-center gap-1.5 font-medium">
-          {enabled ? (
-            <Clock
-              className={cn(
-                "h-3.5 w-3.5 flex-shrink-0",
-                pending ? "text-primary" : "text-muted-foreground",
+      <div className="space-y-2 px-3 py-2 sm:px-4">
+        {/* ─── Bloque 1: Seguimiento automático ───────────────────── */}
+        <div className="space-y-1">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <span className={LABEL_CLASS}>
+              {enabled ? (
+                <Clock
+                  className={cn(
+                    "h-3.5 w-3.5 flex-shrink-0",
+                    pending ? "text-primary" : "text-muted-foreground",
+                  )}
+                />
+              ) : (
+                <BellOff className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
               )}
+              <span>{t("followRowLabel")}</span>
+            </span>
+
+            <input
+              type="number"
+              min={1}
+              max={MAX_MINUTES}
+              inputMode="numeric"
+              value={followUpMinutes}
+              onChange={(e) => setFollowUpMinutes(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void scheduleFollowUp();
+              }}
+              disabled={!enabled || busyFollow === "schedule"}
+              aria-label={t("customMinutes")}
+              className={INPUT_CLASS}
             />
-          ) : (
-            <BellOff className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+            <span className="text-muted-foreground">{t("minutesUnit")}</span>
+            <BannerButton
+              onClick={() => void scheduleFollowUp()}
+              busy={busyFollow === "schedule"}
+              disabled={!enabled}
+              icon={Plus}
+            >
+              {t("scheduleTimer")}
+            </BannerButton>
+
+            <span className="ml-auto flex items-center gap-1.5">
+              <span
+                className={cn(
+                  "font-semibold",
+                  enabled
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : "text-muted-foreground",
+                )}
+              >
+                {enabled ? t("active") : t("inactive")}
+              </span>
+              <Switch
+                checked={enabled}
+                onCheckedChange={(checked: boolean) => void toggleEnabled(checked)}
+                disabled={busyFollow === "toggle"}
+              />
+            </span>
+          </div>
+
+          {pending && (
+            <p className="text-muted-foreground">
+              {t("followNext", { time: followEta ?? "00:00" })}
+            </p>
           )}
-          <span>{t("followRowLabel")}</span>
-        </span>
+        </div>
 
-        <input
-          type="number"
-          min={1}
-          max={MAX_MINUTES}
-          inputMode="numeric"
-          value={followUpMinutes}
-          onChange={(e) => setFollowUpMinutes(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void scheduleFollowUp();
-          }}
-          disabled={!enabled || busyFollow === "schedule"}
-          aria-label={t("customMinutes")}
-          className={INPUT_CLASS}
+        {/* ─── Separador ──────────────────────────────────────────── */}
+        <div
+          className={cn(
+            "border-t border-dashed",
+            pending || wait ? "border-primary/20" : "border-border",
+          )}
         />
-        <span className="text-muted-foreground">{t("minutesUnit")}</span>
-        <BannerButton
-          onClick={() => void scheduleFollowUp()}
-          busy={busyFollow === "schedule"}
-          disabled={!enabled}
-          icon={pending ? Check : Plus}
-        >
-          {t("scheduleTimer")}
-        </BannerButton>
-        {pending && (
-          <BannerButton
-            onClick={() => void cancelFollowUp()}
-            busy={busyFollow === "cancel"}
-            icon={X}
-          >
-            {t("cancel")}
-          </BannerButton>
-        )}
 
-        <span className="ml-auto flex items-center gap-1.5">
-          <span
+        {/* ─── Bloque 2: Esperar respuesta (ONE-SHOT) ─────────────── */}
+        <div className="space-y-1">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <span className={LABEL_CLASS}>
+              <TimerIcon
+                className={cn(
+                  "h-3.5 w-3.5 flex-shrink-0",
+                  wait ? "text-primary" : "text-muted-foreground",
+                )}
+              />
+              <span>{t("waitRowLabel")}</span>
+            </span>
+
+            <input
+              type="number"
+              min={1}
+              max={MAX_MINUTES}
+              inputMode="numeric"
+              value={waitMinutes}
+              onChange={(e) => setWaitMinutes(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void startWait();
+              }}
+              disabled={busyWait !== null}
+              aria-label={t("customMinutes")}
+              className={INPUT_CLASS}
+            />
+            <span className="text-muted-foreground">{t("minutesUnit")}</span>
+            <BannerButton
+              onClick={() => void startWait()}
+              busy={busyWait === "wait_set"}
+              icon={Plus}
+            >
+              {t("waitStart")}
+            </BannerButton>
+            <BannerButton
+              onClick={() => void resetWait()}
+              busy={busyWait === "wait_reset"}
+              icon={RotateCcw}
+            >
+              {t("waitReset")}
+            </BannerButton>
+          </div>
+
+          <p
             className={cn(
-              "font-semibold",
-              enabled ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground",
+              "text-muted-foreground",
+              waitOutcome === "active" && "text-foreground",
             )}
           >
-            {enabled ? t("active") : t("paused")}
-          </span>
-          <Switch
-            checked={enabled}
-            onCheckedChange={(checked: boolean) => void toggleEnabled(checked)}
-            disabled={busyFollow === "toggle"}
-          />
-        </span>
-
-        <span className="truncate text-muted-foreground">
-          {!enabled ? (
-            t("off")
-          ) : pending ? (
-            <>
-              {pending.type === "24h" ? t("pending24hTitle") : t("pending10mTitle")}
-              <span className="ml-1.5 font-mono tabular-nums">· {followEta}</span>
-            </>
-          ) : (
-            t("none")
-          )}
-        </span>
-      </div>
-
-      {/* Row 2 — Wait Reply (Timer 2) */}
-      <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5">
-        <span className="flex min-w-0 items-center gap-1.5 font-medium">
-          <TimerIcon
-            className={cn(
-              "h-3.5 w-3.5 flex-shrink-0",
-              wait ? "text-primary" : "text-muted-foreground",
+            {waitOutcome === "active" && (
+              <>
+                <span className="font-medium text-foreground">
+                  {t("waitActiveStatus")}
+                </span>
+                <span className="ml-2 font-mono tabular-nums">
+                  {t("waitRemaining", { time: waitEta ?? "00:00" })}
+                </span>
+              </>
             )}
-          />
-          <span>{t("waitRowLabel")}</span>
-        </span>
-
-        <input
-          type="number"
-          min={1}
-          max={MAX_MINUTES}
-          inputMode="numeric"
-          value={waitMinutes}
-          onChange={(e) => setWaitMinutes(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void startWait();
-          }}
-          disabled={busyWait !== null}
-          aria-label={t("customMinutes")}
-          className={INPUT_CLASS}
-        />
-        <span className="text-muted-foreground">{t("minutesUnit")}</span>
-        <BannerButton
-          onClick={() => void startWait()}
-          busy={busyWait === "wait_set"}
-          icon={Plus}
-        >
-          {t("waitStart")}
-        </BannerButton>
-        <BannerButton
-          onClick={() => void resetWait()}
-          busy={busyWait === "wait_reset"}
-          icon={RotateCcw}
-        >
-          {t("waitReset")}
-        </BannerButton>
-        {wait && (
-          <BannerButton
-            onClick={() => void cancelWait()}
-            busy={busyWait === "wait_cancel"}
-            icon={X}
-          >
-            {t("waitCancel")}
-          </BannerButton>
-        )}
-
-        <span className="truncate text-muted-foreground">
-          {wait ? (
-            <>
-              {t("waitScheduled")}
-              <span className="ml-1.5 font-mono tabular-nums">· {waitEta}</span>
-            </>
-          ) : (
-            t("waitNone")
-          )}
-        </span>
+            {waitOutcome === "executed" && <>{t("waitExecuted")}</>}
+            {waitOutcome === "replied" && <>{t("waitCancelledByReply")}</>}
+          </p>
+        </div>
       </div>
     </div>
   );

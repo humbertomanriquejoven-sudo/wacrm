@@ -197,24 +197,47 @@ export async function scheduleResponseWaitTimer(
   }
 }
 
+/** Why a wait timer was cancelled (migration 065). */
+export type ResponseWaitCancelReason = 'inbound' | 'anti_race' | 'manual'
+
 /**
- * Cancel every ACTIVE response-wait timer for a conversation.
+ * Cancel every ACTIVE response-wait timer for a conversation and record
+ * WHY (one-shot bookkeeping): `inbound` (the critical rule — the customer
+ * replied), `anti_race` (runner safety net), `manual` (agent action).
  *
  * Invoked by the inbound webhook the moment a REAL customer message
  * lands (the customer answered — the wait is over), and by the
- * `wait_cancel` route action. Never throws.
+ * `wait_cancel` route action. Tolerates migration 065 not yet applied by
+ * retrying the legacy update without `cancelled_reason`. Never throws.
  */
 export async function cancelResponseWaitTimers(
   db: SupabaseClient,
   conversationId: string,
+  reason: ResponseWaitCancelReason = 'inbound',
 ): Promise<void> {
   try {
     const { error } = await db
       .from('response_wait_timers')
-      .update({ status: 'cancelled' })
+      .update({ status: 'cancelled', cancelled_reason: reason })
       .eq('conversation_id', conversationId)
       .eq('status', 'active')
     if (error) {
+      // Migration 065 pending (column missing): fall back to the legacy
+      // two-field update so cancels still work on an un-migrated DB.
+      if (/column .* does not exist|42703|PGRST204|schema cache/i.test(error.message)) {
+        const { error: legacyErr } = await db
+          .from('response_wait_timers')
+          .update({ status: 'cancelled' })
+          .eq('conversation_id', conversationId)
+          .eq('status', 'active')
+        if (legacyErr) {
+          console.error(
+            `[response-wait] could not cancel active timers for conversation ${conversationId}:`,
+            legacyErr.message,
+          )
+        }
+        return
+      }
       console.error(
         `[response-wait] could not cancel active timers for conversation ${conversationId}:`,
         error.message,
@@ -222,7 +245,7 @@ export async function cancelResponseWaitTimers(
       return
     }
     console.log(
-      `[response-wait] cancelled active timers for conversation ${conversationId} (customer replied).`,
+      `[response-wait] cancelled active timers for conversation ${conversationId} (reason: ${reason}).`,
     )
   } catch (err) {
     console.error(
@@ -987,11 +1010,26 @@ export async function runDueResponseWaitTimers(
       if (repliedAfterStart) {
         const { error: cancelErr } = await client
           .from('response_wait_timers')
-          .update({ status: 'cancelled' })
+          .update({ status: 'cancelled', cancelled_reason: 'anti_race' })
           .eq('id', id)
           .eq('status', 'active')
         if (cancelErr) {
-          console.error(`[response-wait] could not cancel ${id} (reply race):`, cancelErr.message)
+          // Migration 065 pending (column missing): retry the legacy update
+          // so the one-shot cancel still lands on an un-migrated DB.
+          if (/column .* does not exist|42703|PGRST204|schema cache/i.test(cancelErr.message)) {
+            const { error: legacyErr } = await client
+              .from('response_wait_timers')
+              .update({ status: 'cancelled' })
+              .eq('id', id)
+              .eq('status', 'active')
+            if (legacyErr) {
+              console.error(`[response-wait] could not cancel ${id} (reply race):`, legacyErr.message)
+            } else {
+              result.cancelled++
+            }
+          } else {
+            console.error(`[response-wait] could not cancel ${id} (reply race):`, cancelErr.message)
+          }
         } else {
           result.cancelled++
           console.log(

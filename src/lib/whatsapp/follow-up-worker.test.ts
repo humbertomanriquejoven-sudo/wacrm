@@ -640,6 +640,44 @@ describe('cancelResponseWaitTimers', () => {
     expect(h.state.waitTimers[0]).toMatchObject({ status: 'cancelled' })
     expect(h.state.waitTimers[1]).toMatchObject({ status: 'active' })
   })
+
+  it('records WHY it was cancelled (default: inbound — the customer replied)', async () => {
+    resetState()
+    h.state.waitTimers = [
+      {
+        id: 'wait-1',
+        conversation_id: 'conv-1',
+        status: 'active',
+      },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    await cancelResponseWaitTimers(db, 'conv-1')
+
+    expect(h.state.waitTimers[0]).toMatchObject({
+      status: 'cancelled',
+      cancelled_reason: 'inbound',
+    })
+  })
+
+  it('embeds the given reason (manual → agent cancellation)', async () => {
+    resetState()
+    h.state.waitTimers = [
+      {
+        id: 'wait-1',
+        conversation_id: 'conv-1',
+        status: 'active',
+      },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    await cancelResponseWaitTimers(db, 'conv-1', 'manual')
+
+    expect(h.state.waitTimers[0]).toMatchObject({
+      status: 'cancelled',
+      cancelled_reason: 'manual',
+    })
+  })
 })
 
 describe('cancelPendingFollowUps', () => {
@@ -994,6 +1032,11 @@ describe('runDueResponseWaitTimers', () => {
     expect(res).toMatchObject({ scanned: 1, sent: 0, cancelled: 1 })
     expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
     expect(h.state.waitCancelled).toEqual(['cancelled'])
+    // Race safety-net cancel is labelled `anti_race` (one-shot bookkeeping).
+    expect(h.state.waitTimers[0]).toMatchObject({
+      status: 'cancelled',
+      cancelled_reason: 'anti_race',
+    })
   })
 
   it('does nothing before expiry', async () => {

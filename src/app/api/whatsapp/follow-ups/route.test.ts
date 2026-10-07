@@ -38,7 +38,7 @@ vi.mock('@/lib/ai/admin-client', () => ({
   supabaseAdmin: mocks.supabaseAdmin,
 }));
 
-import { POST } from './route';
+import { GET, POST } from './route';
 
 interface Op {
   table: string;
@@ -54,6 +54,12 @@ const state = {
     contact_id: 'contact-1',
     follow_up_enabled: null,
   } as Record<string, unknown> | null,
+  // Timer 2 rows served by the mocked `response_wait_timers` reads.
+  responseWait: null as Record<string, unknown> | null,
+  waitLast: null as Record<string, unknown> | null,
+  // When set, the FIRST wait-last read fails with a migration-065 style
+  // "column does not exist" so we can assert the legacy retry.
+  waitLastError: null as string | null,
   ops: [] as Op[],
 };
 
@@ -65,12 +71,30 @@ function chainFor(table: string, op: string, payload?: unknown) {
       entry.filters[col] = val;
       return chain;
     },
-    maybeSingle: () =>
-      Promise.resolve(
-        table === 'conversations' && op === 'select'
-          ? { data: state.conversation, error: null }
-          : { data: null, error: null },
-      ),
+    neq: (col: string, val: unknown) => {
+      entry.filters[`neq:${col}`] = val;
+      return chain;
+    },
+    order: () => chain,
+    limit: () => chain,
+    maybeSingle: () => {
+      if (table === 'conversations' && op === 'select') {
+        return Promise.resolve({ data: state.conversation, error: null });
+      }
+      if (table === 'response_wait_timers' && op === 'select') {
+        // `.neq('status', 'active')` marks the one-shot OUTCOME read.
+        if (entry.filters['neq:status'] === 'active') {
+          if (state.waitLastError) {
+            const message = state.waitLastError;
+            state.waitLastError = null; // consumed → legacy retry succeeds
+            return Promise.resolve({ data: null, error: { message } });
+          }
+          return Promise.resolve({ data: state.waitLast, error: null });
+        }
+        return Promise.resolve({ data: state.responseWait, error: null });
+      }
+      return Promise.resolve({ data: null, error: null });
+    },
     // Allows `await update(...).eq(...).eq(...)` without maybeSingle.
     then: (resolve: (value: unknown) => unknown) =>
       resolve({ data: null, error: null }),
@@ -110,7 +134,15 @@ beforeEach(() => {
     accountId: 'acc-1',
     userId: 'user-1',
   });
+  mocks.getCurrentAccount.mockResolvedValue({
+    supabase: db,
+    accountId: 'acc-1',
+    userId: 'user-1',
+  });
   mocks.supabaseAdmin.mockReturnValue(db);
+  state.responseWait = null;
+  state.waitLast = null;
+  state.waitLastError = null;
   mocks.scheduleManualFollowUp.mockResolvedValue({
     scheduled: true,
     reason: 'scheduled',
@@ -304,7 +336,7 @@ describe('POST /api/whatsapp/follow-ups — Timer 2 (wait reply)', () => {
     expect(mocks.scheduleResponseWaitTimer).not.toHaveBeenCalled();
   });
 
-  it('wait_cancel cancels the active timer for the thread', async () => {
+  it('wait_cancel cancels the active timer for the thread (reason: manual)', async () => {
     const res = await post({
       conversation_id: 'conv-1',
       action: 'wait_cancel',
@@ -313,6 +345,80 @@ describe('POST /api/whatsapp/follow-ups — Timer 2 (wait reply)', () => {
     expect(mocks.cancelResponseWaitTimers).toHaveBeenCalledWith(
       expect.anything(),
       'conv-1',
+      'manual',
     );
+  });
+});
+
+function getConversationStatus() {
+  return GET(
+    new Request('http://test/api/whatsapp/follow-ups?conversation_id=conv-1'),
+  );
+}
+
+describe('GET /api/whatsapp/follow-ups — one-shot outcome state', () => {
+  it('returns the last terminal wait row (completed → "Acción ejecutada")', async () => {
+    state.waitLast = {
+      id: 'wait-9',
+      conversation_id: 'conv-1',
+      status: 'completed',
+      cancelled_reason: null,
+      updated_at: '2026-10-06T12:05:00.000Z',
+    };
+    const res = await getConversationStatus();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.response_wait).toBeNull();
+    expect(body.response_wait_last).toMatchObject({
+      id: 'wait-9',
+      status: 'completed',
+      cancelled_reason: null,
+    });
+  });
+
+  it('flags a reply-cancelled wait ("Cliente respondió") via cancelled_reason', async () => {
+    state.waitLast = {
+      id: 'wait-7',
+      conversation_id: 'conv-1',
+      status: 'cancelled',
+      cancelled_reason: 'inbound',
+      updated_at: '2026-10-06T11:40:00.000Z',
+    };
+    const res = await getConversationStatus();
+    const body = await res.json();
+    expect(body.response_wait_last).toMatchObject({
+      status: 'cancelled',
+      cancelled_reason: 'inbound',
+    });
+  });
+
+  it('degrades to a legacy outcome read when migration 065 is not applied', async () => {
+    state.waitLast = {
+      id: 'wait-5',
+      conversation_id: 'conv-1',
+      status: 'cancelled',
+      updated_at: '2026-10-06T10:00:00.000Z',
+    };
+    state.waitLastError = 'column response_wait_timers.cancelled_reason does not exist';
+    const res = await getConversationStatus();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.response_wait_last).toMatchObject({ id: 'wait-5', status: 'cancelled' });
+    expect(body.response_wait_last?.cancelled_reason).toBeUndefined();
+  });
+
+  it('keeps the active timer visible and the outcome empty while waiting', async () => {
+    state.responseWait = {
+      id: 'wait-1',
+      conversation_id: 'conv-1',
+      status: 'active',
+      delay_minutes: 5,
+      started_at: '2026-10-06T12:00:00.000Z',
+      expires_at: '2026-10-06T12:05:00.000Z',
+    };
+    const res = await getConversationStatus();
+    const body = await res.json();
+    expect(body.response_wait).toMatchObject({ id: 'wait-1', status: 'active' });
+    expect(body.response_wait_last).toBeNull();
   });
 });

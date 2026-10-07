@@ -145,6 +145,34 @@ export async function GET(request: Request) {
       .limit(1)
       .maybeSingle()
 
+    // Timer 2 one-shot OUTCOME — the most recent terminal row, so the UI
+    // can keep showing "✅ finalizado (acción ejecutada)" after the timer
+    // fired, or "💬 cliente respondió (temporizador cancelado)" after the
+    // webhook cancelled it — across refreshes and chat switches. Tolerant
+    // of migration 065 pending (cancelled_reason missing).
+    let waitLast: Record<string, unknown> | null = null
+    const lastRes = await supabase
+      .from('response_wait_timers')
+      .select('id, conversation_id, status, cancelled_reason, updated_at')
+      .eq('conversation_id', conversationId)
+      .neq('status', 'active')
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    if (lastRes.error && isMissingColumnError(lastRes.error.message)) {
+      const legacy = await supabase
+        .from('response_wait_timers')
+        .select('id, conversation_id, status, updated_at')
+        .eq('conversation_id', conversationId)
+        .neq('status', 'active')
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      if (!legacy.error && legacy.data) waitLast = legacy.data
+    } else if (!lastRes.error && lastRes.data) {
+      waitLast = lastRes.data
+    }
+
     // Account-wide switch. Missing row / read error ⇒ enabled (the worker
     // shows follow-ups even before the operator visits Settings).
     let globalEnabled = true
@@ -161,6 +189,7 @@ export async function GET(request: Request) {
     return NextResponse.json({
       pending: pending ?? [],
       response_wait: waitTimer ?? null,
+      response_wait_last: waitLast,
       global_enabled: globalEnabled,
       conversation_enabled: owned.conv.follow_up_enabled,
     })
@@ -281,7 +310,7 @@ export async function POST(request: Request) {
     }
 
     if (action === 'wait_cancel') {
-      await cancelResponseWaitTimers(supabaseAdmin(), conversationId)
+      await cancelResponseWaitTimers(supabaseAdmin(), conversationId, 'manual')
       return NextResponse.json({ success: true })
     }
 
