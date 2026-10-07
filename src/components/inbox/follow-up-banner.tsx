@@ -39,20 +39,27 @@ import type { FollowUp, ResponseWaitTimer } from "@/types";
 //     (same row) and rearm it from the EXACT minutes of the field,
 //     without duplicates.
 //
-//     SELF-HEAL / NEVER STUCK AT 00:00 — Switch 2 says ACTIVO but the row
-//     is missing (never armed, just toggled ON, worker closed it, a stale
-//     row whose expiry already passed…), so there is no `expires_at` to
-//     count down from. The banner then:
-//       1. starts a CLIENT-SIDE countdown of `NOW() + N` immediately, so
-//          the slot counts `N:00 → N-1:00 …` instead of sitting on 00:00;
-//       2. asks the server (`wait_autoinit`) to turn it into a REAL row.
-//          The route only writes when firing it would be correct: switch
-//          ON, no cycle in flight, and the thread actually waiting on the
-//          customer. Otherwise (`not_awaiting`, `processing`, `disabled`)
-//          the local countdown keeps ticking display-only — a timer must
-//          never nudge a customer who already replied, and must never
-//          stack behind the worker's one-shot dispatch. One attempt per
-//          countdown cycle (never a tight retry loop), no error toasts.
+//     PERSISTENCE / PER-CHAT ISOLATION — recover, never restart:
+//       · Mount / chat switch / tab return / F5 re-READ this chat's state
+//         from BD (`GET?conversation_id=…`). Nothing is invented locally:
+//         a countdown armed 15 s ago resumes as `N − 15s`, never as a
+//         fresh `N:00`.
+//       · READS NEVER WRITE — no effect here may create or reset a
+//         timestamp in BD. A new `expires_at` only enters BD through an
+//         explicit agent action (↻ Reiniciar, [Programar]) or through the
+//         send-triggered auto-arm.
+//       · No ACTIVE row (the auto-arm never ran for this chat) → the
+//         server derives a READ-ONLY anchor (`response_wait_derived` = the
+//         last OUTBOUND message + the chat's assigned delay — the same
+//         inputs the auto-arm uses), so the slot still shows the TRUE
+//         persisted remainder instead of a client-side cycle that would
+//         restart on every mount. Thread not waiting (customer already
+//         replied / empty chat) or the anchor already elapsed → no anchor
+//         → the slot idles at 00:00; a real countdown starts again only
+//         on the next outbound or an explicit ↻ Reiniciar.
+//       · SERVER CLOCK — remainders are evaluated as
+//         `max(0, expires_at − server_now)` (skew captured from each
+//         poll), so a drifted laptop clock cannot distort or jump them.
 //
 // ISOLATION / CORRECTNESS GUARANTEES:
 //   * NO shared/global React timer state. Every value is loaded from the
@@ -86,11 +93,24 @@ interface FollowUpStatus {
     ResponseWaitTimer,
     "id" | "status" | "delay_minutes" | "started_at" | "expires_at"
   > | null;
+  /**
+   * READ-ONLY recovery anchor from the server: the remainder this chat
+   * WOULD be showing had the auto-arm run (last OUTBOUND message + the
+   * chat's assigned delay), but only while it is still in the future and
+   * no ACTIVE row exists. Persisted inputs (a message row + the assigned
+   * duration) — mounting this component cannot create or move it.
+   */
+  response_wait_derived: {
+    expires_at: string;
+    delay_minutes: number;
+  } | null;
   response_wait_last: WaitLast | null;
   global_enabled: boolean;
   conversation_enabled: boolean | null;
   /** Timer 2 ON/OFF switch (Switch 2). Worker flips OFF after a 1-shot run. */
   response_wait_enabled: boolean;
+  /** Server wall clock of this read — the reference for every remainder. */
+  server_now?: string;
 }
 
 /** Minutes cap: 7 days, matching the API's own clamp. */
@@ -102,15 +122,6 @@ const MAX_MINUTES = 10080;
  * uses server-side (`ARM_DEFAULT_MINUTES`).
  */
 const DEFAULT_WAIT_MINUTES = 10;
-
-/**
- * Grace period before an ACTIVE row whose `expires_at` already passed is
- * considered STALE for display. The worker closes a due row within seconds
- * (claim → dispatch → close), so a row lingering past this window means the
- * cycle is mid-flight or the sweep is down — either way it must stop
- * pinning the countdown at 00:00 while Switch 2 says ACTIVO.
- */
-const STALE_MS = 10_000;
 
 /**
  * Parse the EXACT integer the agent typed. Returns null for an empty or
@@ -141,24 +152,6 @@ function formatRemaining(expiresAt: string, nowTs: number): string {
   return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
 }
 
-/**
- * Expiry of a BD countdown that is still worth rendering, or `NaN`.
- *
- * A row is live while `expires_at` is in the future; one that just expired
- * stays live for `STALE_MS` (the worker is claiming/closing it — showing
- * `00:00` for those seconds is honest), and beyond that it is STALE: the
- * caller must stop rendering it so a dead row cannot pin the slot at 00:00
- * while the switch says ACTIVO. A missing/invalid timestamp is never live.
- */
-function liveWaitExpiry(
-  wait: { expires_at?: string | null } | null | undefined,
-  nowTs: number,
-): number {
-  const expiry = wait?.expires_at ? Date.parse(wait.expires_at) : NaN;
-  if (!Number.isFinite(expiry)) return NaN;
-  return expiry > nowTs - STALE_MS ? expiry : NaN;
-}
-
 const INPUT_CLASS =
   "h-6 w-14 rounded-md border border-border bg-card px-1.5 text-center text-xs text-foreground outline-none focus-visible:ring-1 focus-visible:ring-primary disabled:opacity-60";
 
@@ -182,19 +175,11 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   // Once the agent types in the box, the server's assigned value stops
   // overriding it (the box is the single source of what they type).
   const waitTouched = useRef(false);
-  // CLIENT-SIDE fallback countdown for Timer 2 (the self-heal above): what
-  // the slot shows while Switch 2 is ACTIVO but there is no usable ACTIVE
-  // row in BD. Created/renewed by the keeper effect below, never rendered
-  // while a real row is live (BD wins), and dropped when the switch goes
-  // OFF. It is display-only state: the real timer is the server row.
-  const [localWait, setLocalWait] = useState<{
-    expires_at: string;
-    delay_minutes: number;
-  } | null>(null);
-  // `expires_at` of the countdown cycle we already asked the server to
-  // persist — one `wait_autoinit` per cycle, so a refusal (or a network
-  // error) degrades to "keep counting locally" instead of hammering the API.
-  const autoInitFor = useRef<string | null>(null);
+  // Server − client clock offset, captured from each poll's `server_now`.
+  // Every remainder below is evaluated against the SERVER's wall clock
+  // (`expires_at − (Date.now() + skew)`), so a drifted laptop clock can
+  // never distort — or visibly jump — a countdown recovered from BD.
+  const [serverSkew, setServerSkew] = useState(0);
 
   useEffect(() => {
     mounted.current = true;
@@ -211,7 +196,13 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       );
       if (!res.ok) return null;
       const j = (await res.json()) as FollowUpStatus;
-      if (mounted.current) setStatus(j);
+      if (mounted.current) {
+        // Re-anchor the countdowns to the SERVER clock (see `server_now`).
+        const serverTs =
+          typeof j.server_now === "string" ? Date.parse(j.server_now) : NaN;
+        if (Number.isFinite(serverTs)) setServerSkew(serverTs - Date.now());
+        setStatus(j);
+      }
       return j;
     } catch {
       return null;
@@ -275,19 +266,12 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     const assigned =
       status.response_wait?.delay_minutes ??
       status.response_wait_last?.delay_minutes ??
-      10;
+      DEFAULT_WAIT_MINUTES;
     setWaitMinutes(String(assigned));
   }, [status]);
 
   const post = useCallback(
-    async (
-      action: string,
-      extra: Record<string, unknown>,
-      // Background calls (the auto-init self-heal) stay silent: a refused
-      // arm is an expected outcome there — the local countdown keeps
-      // ticking — and must not pop an error toast at the agent.
-      opts?: { silent?: boolean },
-    ) => {
+    async (action: string, extra: Record<string, unknown>) => {
       try {
         const res = await fetch("/api/whatsapp/follow-ups", {
           method: "POST",
@@ -300,14 +284,12 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
         });
         const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
         if (!res.ok) {
-          if (!opts?.silent) {
-            toast.error((json?.error as string) ?? t("updateError"));
-          }
+          toast.error((json?.error as string) ?? t("updateError"));
           return null;
         }
         return json;
       } catch {
-        if (!opts?.silent) toast.error(t("networkError"));
+        toast.error(t("networkError"));
         return null;
       }
     },
@@ -435,10 +417,6 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
                 }
               : s,
           );
-          // The real row owns the countdown again — drop the local
-          // fallback so the keeper below re-evaluates from BD truth.
-          setLocalWait(null);
-          autoInitFor.current = null;
         }
       }
       await refresh();
@@ -447,73 +425,6 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     }
   }, [waitMinutes, post, refresh, t]);
 
-  // ── Timer 2 keeper: ACTIVO must never sit on 00:00 ──────────────
-  // Runs on the 1-second clock (`waitNowTs`) so a countdown that runs out
-  // restarts (or gets replaced by a real BD row) without any user action.
-  useEffect(() => {
-    if (!status) return;
-
-    // Switch 2 OFF → no countdown at all (and no stale local leftover).
-    if (status.response_wait_enabled === false) {
-      setLocalWait(null);
-      autoInitFor.current = null;
-      return;
-    }
-
-    // A real, unexpired BD row owns the slot: it is the one that fires.
-    if (Number.isFinite(liveWaitExpiry(status.response_wait, waitNowTs))) {
-      return;
-    }
-
-    // Minutes for this cycle: EXACTLY what the box shows — the agent's
-    // typed value once they touched it, otherwise the chat's assigned
-    // duration (the value the box is prefilled with), else the default.
-    const assigned =
-      status.response_wait?.delay_minutes ??
-      status.response_wait_last?.delay_minutes ??
-      DEFAULT_WAIT_MINUTES;
-    const minutes = waitTouched.current
-      ? (parseMinutes(waitMinutes) ?? assigned)
-      : assigned;
-
-    let cycle: string;
-    if (localWait && Date.parse(localWait.expires_at) > waitNowTs) {
-      // Still counting — never restart a running countdown on a refresh.
-      cycle = localWait.expires_at;
-    } else {
-      // (Re)start from NOW + N; the render turns it into `max(0, expires −
-      // now)` → MM:SS, ticked every second by clock 2.
-      cycle = new Date(waitNowTs + minutes * 60_000).toISOString();
-      setLocalWait({ expires_at: cycle, delay_minutes: minutes });
-    }
-
-    // Turn it into a REAL timer — one attempt per countdown cycle, and
-    // never while an explicit ↻ Reiniciar / toggle round-trip is in
-    // flight (those paths arm the row themselves; the refresh() below
-    // reconciles). A refused arm (`not_awaiting` / `processing` /
-    // `disabled`) simply stays display-only until the next cycle.
-    //
-    // A nudge that already FAILED to dispatch is terminal for the worker
-    // (`no_response` — it never retries a failed send): queueing a fresh
-    // row from here would turn that terminal state into an every-cycle
-    // retry loop. ↻ Reiniciar stays the explicit way to try again.
-    const failedSend = status.response_wait_last?.status === "no_response";
-    if (failedSend || busyWait !== null || autoInitFor.current === cycle) return;
-    autoInitFor.current = cycle;
-    void (async () => {
-      await post("wait_autoinit", { delay_minutes: minutes }, { silent: true });
-      await refresh();
-    })();
-  }, [
-    status,
-    localWait,
-    waitNowTs,
-    waitMinutes,
-    busyWait,
-    post,
-    refresh,
-  ]);
-
   if (!status) return null;
 
   const pending = status.pending[0] ?? null;
@@ -521,16 +432,20 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   const waitEnabled = status.response_wait_enabled !== false;
   const wait = status.response_wait ?? null;
 
-  // BD row wins while it is live. A row whose expiry is already STALE (the
-  // worker is mid-dispatch or the sweep is down) or a missing row falls
-  // back to the client-side countdown while the switch is ACTIVO, so the
-  // slot counts down instead of freezing on 00:00. Switch OFF → only a
-  // real BD row renders (dimmed), as before.
-  const waitLive = Number.isFinite(liveWaitExpiry(wait, waitNowTs));
-  const waitTimer = wait && waitLive ? wait : waitEnabled ? localWait : null;
+  // The ACTIVE BD row is always the source of truth (it is the row the
+  // worker fires). Without one, the server-derived anchor keeps the slot
+  // counting the TRUE persisted remainder while Switch 2 is ON — it comes
+  // from data that did NOT change by merely mounting this component, so
+  // leaving the chat and coming back resumes the same value. Switch OFF →
+  // nothing to show. Remainders run on the SERVER clock (`serverSkew`).
+  const waitTimer = wait ?? (waitEnabled ? status.response_wait_derived : null);
 
-  const followEta = pending ? formatRemaining(pending.execute_at, followNowTs) : null;
-  const waitEta = waitTimer ? formatRemaining(waitTimer.expires_at, waitNowTs) : null;
+  const followEta = pending
+    ? formatRemaining(pending.execute_at, followNowTs + serverSkew)
+    : null;
+  const waitEta = waitTimer
+    ? formatRemaining(waitTimer.expires_at, waitNowTs + serverSkew)
+    : null;
 
   return (
     <div

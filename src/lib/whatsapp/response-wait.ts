@@ -138,20 +138,11 @@ export async function scheduleResponseWaitTimer(
     /** Whole minutes, validated by the caller. */
     delayMinutes: number
     now?: Date
-    /**
-     * When the wait STARTED — defaults to `now`. The inbox's auto-init arm
-     * passes the thread's LAST OUTBOUND message timestamp instead, because
-     * `started_at` is the runner's anti-race anchor: a timer created a
-     * moment AFTER the customer already replied would otherwise look
-     * "unanswered" (`replied_at < started_at`) and fire a nudge at 00:00.
-     * Anchoring it to our own outbound makes any later reply cancel it.
-     */
-    startedAt?: string
   },
 ): Promise<ResponseWaitScheduleResult> {
   const { conversationId, contactId, accountId, delayMinutes } = params
   const now = params.now ?? new Date()
-  const startedAt = params.startedAt ?? now.toISOString()
+  const startedAt = now.toISOString()
   const expiresAt = new Date(now.getTime() + delayMinutes * 60_000).toISOString()
 
   try {

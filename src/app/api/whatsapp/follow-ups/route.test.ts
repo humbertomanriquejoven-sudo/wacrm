@@ -67,9 +67,7 @@ const state = {
   // Timer 2 rows served by the mocked `response_wait_timers` reads.
   responseWait: null as Record<string, unknown> | null,
   waitLast: null as Record<string, unknown> | null,
-  // A row the one-shot worker is currently dispatching (`status=processing`).
-  waitProcessing: null as Record<string, unknown> | null,
-  // Thread's newest message, read by the `wait_autoinit` safety gate.
+  // Thread's newest message, read by the GET's read-only derived anchor.
   lastMessage: null as Record<string, unknown> | null,
   // When set, the FIRST wait-last read fails with a migration-065 style
   // "column does not exist" so we can assert the legacy retry.
@@ -111,11 +109,6 @@ function chainFor(table: string, op: string, payload?: unknown) {
             return Promise.resolve({ data: null, error: { message } });
           }
           return Promise.resolve({ data: state.waitLast, error: null });
-        }
-        // `.eq('status', 'processing')` is the auto-init's "the worker is
-        // dispatching this cycle right now" check.
-        if (entry.filters['status'] === 'processing') {
-          return Promise.resolve({ data: state.waitProcessing, error: null });
         }
         return Promise.resolve({ data: state.responseWait, error: null });
       }
@@ -181,7 +174,6 @@ beforeEach(() => {
   state.responseWait = null;
   state.waitLast = null;
   state.waitLastError = null;
-  state.waitProcessing = null;
   state.lastMessage = null;
   mocks.scheduleManualFollowUp.mockResolvedValue({
     scheduled: true,
@@ -477,128 +469,6 @@ describe('POST /api/whatsapp/follow-ups — Timer 2 (wait reply)', () => {
   });
 });
 
-describe('POST /api/whatsapp/follow-ups — wait_autoinit (banner self-heal)', () => {
-  // Regression: the banner showed "Esperar respuesta ACTIVO" frozen at
-  // 00:00 whenever Switch 2 was ON but no ACTIVE row existed. The banner
-  // now calls `wait_autoinit`, which must turn that state into a REAL
-  // countdown ONLY when firing it at 00:00 would be correct.
-  it('arms a real timer when the thread is waiting on the customer', async () => {
-    state.lastMessage = {
-      sender_type: 'bot',
-      created_at: '2026-10-06T11:00:00.000Z',
-    };
-    const res = await post({
-      conversation_id: 'conv-1',
-      action: 'wait_autoinit',
-      delay_minutes: 10,
-    });
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.scheduled).toBe(true);
-    expect(body.expires_at).toBe('2026-10-06T12:05:00.000Z');
-    // `started_at` anchors to OUR last outbound, not to "now": a reply
-    // landing while this row is being written must still cancel it at
-    // dispatch time (replied_at >= started_at → anti-race drop).
-    expect(mocks.scheduleResponseWaitTimer).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        conversationId: 'conv-1',
-        contactId: 'contact-1',
-        accountId: 'acc-1',
-        delayMinutes: 10,
-        startedAt: '2026-10-06T11:00:00.000Z',
-      }),
-    );
-    // It is a BACKGROUND heal: it must never flip the one-shot switch or
-    // cancel anything — only create/refresh the single ACTIVE row.
-    const convUpdate = state.ops.find(
-      (o) => o.table === 'conversations' && o.op === 'update',
-    );
-    expect(convUpdate).toBeUndefined();
-    expect(mocks.cancelResponseWaitTimers).not.toHaveBeenCalled();
-  });
-
-  it('refuses when the customer already replied (last message is theirs)', async () => {
-    state.lastMessage = {
-      sender_type: 'customer',
-      created_at: '2026-10-06T11:30:00.000Z',
-    };
-    const res = await post({
-      conversation_id: 'conv-1',
-      action: 'wait_autoinit',
-      delay_minutes: 10,
-    });
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body).toMatchObject({ success: false, scheduled: false, reason: 'not_awaiting' });
-    expect(mocks.scheduleResponseWaitTimer).not.toHaveBeenCalled();
-  });
-
-  it('refuses on a thread with no messages at all', async () => {
-    state.lastMessage = null;
-    const res = await post({
-      conversation_id: 'conv-1',
-      action: 'wait_autoinit',
-      delay_minutes: 10,
-    });
-    const body = await res.json();
-    expect(body.reason).toBe('not_awaiting');
-    expect(mocks.scheduleResponseWaitTimer).not.toHaveBeenCalled();
-  });
-
-  it('refuses while the worker is dispatching this cycle (processing row)', async () => {
-    state.lastMessage = { sender_type: 'agent', created_at: '2026-10-06T11:00:00.000Z' };
-    state.waitProcessing = { id: 'wait-2', status: 'processing' };
-    const res = await post({
-      conversation_id: 'conv-1',
-      action: 'wait_autoinit',
-      delay_minutes: 10,
-    });
-    const body = await res.json();
-    expect(body.reason).toBe('processing');
-    expect(mocks.scheduleResponseWaitTimer).not.toHaveBeenCalled();
-  });
-
-  it('refuses while the "Esperar respuesta" switch is OFF', async () => {
-    state.conversation = {
-      id: 'conv-1',
-      account_id: 'acc-1',
-      contact_id: 'contact-1',
-      follow_up_enabled: null,
-      response_wait_enabled: false,
-    };
-    state.lastMessage = { sender_type: 'agent', created_at: '2026-10-06T11:00:00.000Z' };
-    const res = await post({
-      conversation_id: 'conv-1',
-      action: 'wait_autoinit',
-      delay_minutes: 10,
-    });
-    const body = await res.json();
-    expect(body.reason).toBe('disabled');
-    expect(mocks.scheduleResponseWaitTimer).not.toHaveBeenCalled();
-  });
-
-  it('clamps out-of-range values and rejects a malformed delay_minutes', async () => {
-    state.lastMessage = { sender_type: 'agent', created_at: '2026-10-06T11:00:00.000Z' };
-    const bad = await post({
-      conversation_id: 'conv-1',
-      action: 'wait_autoinit',
-    });
-    expect(bad.status).toBe(400);
-    expect(mocks.scheduleResponseWaitTimer).not.toHaveBeenCalled();
-
-    await post({
-      conversation_id: 'conv-1',
-      action: 'wait_autoinit',
-      delay_minutes: 9999999,
-    });
-    expect(mocks.scheduleResponseWaitTimer).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ delayMinutes: 10080 }),
-    );
-  });
-});
-
 function getConversationStatus() {
   return GET(
     new Request('http://test/api/whatsapp/follow-ups?conversation_id=conv-1'),
@@ -678,5 +548,122 @@ describe('GET /api/whatsapp/follow-ups — one-shot outcome state', () => {
     const body = await res.json();
     expect(body.response_wait).toMatchObject({ id: 'wait-1', status: 'active' });
     expect(body.response_wait_last).toBeNull();
+  });
+});
+
+describe('GET /api/whatsapp/follow-ups — per-chat persistence (read-only recovery)', () => {
+  // Recovering a chat's timer must NEVER create or reset a timestamp:
+  // switching chats, returning to the tab, or pressing F5 re-reads the
+  // same persisted values. A new `expires_at` may only enter BD through
+  // an explicit agent action (↻ Reiniciar / Programar) or the
+  // send-triggered auto-arm — never through a GET.
+  it('derives the true remainder from the last OUTBOUND message when no active row exists', async () => {
+    const sentAt = Date.now() - 2 * 60_000; // outbound 2 min ago
+    state.lastMessage = {
+      sender_type: 'agent',
+      created_at: new Date(sentAt).toISOString(),
+    };
+    state.waitLast = {
+      id: 'wait-4',
+      conversation_id: 'conv-1',
+      status: 'cancelled',
+      delay_minutes: 7,
+      cancelled_reason: null,
+      updated_at: new Date(sentAt).toISOString(),
+    };
+
+    const res = await getConversationStatus();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.response_wait).toBeNull();
+    // `expires_at = last outbound + the chat's assigned delay` — the very
+    // timestamp the auto-arm would have written, recomputed identically on
+    // every mount so navigation can only RESUME it, never restart it.
+    expect(body.response_wait_derived).toEqual({
+      expires_at: new Date(sentAt + 7 * 60_000).toISOString(),
+      delay_minutes: 7,
+    });
+    // STRICTLY READ-ONLY: no writes, no arming, no cancelling.
+    expect(state.ops.filter((o) => o.op !== 'select')).toEqual([]);
+    expect(mocks.scheduleResponseWaitTimer).not.toHaveBeenCalled();
+    expect(mocks.cancelResponseWaitTimers).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the default delay when the chat never ran Timer 2', async () => {
+    const sentAt = Date.now() - 60_000;
+    state.lastMessage = {
+      sender_type: 'bot',
+      created_at: new Date(sentAt).toISOString(),
+    };
+    state.waitLast = null;
+    const body = await (await getConversationStatus()).json();
+    expect(body.response_wait_derived).toEqual({
+      expires_at: new Date(sentAt + 10 * 60_000).toISOString(),
+      delay_minutes: 10,
+    });
+  });
+
+  it('derives nothing while the customer is the last writer (they already replied)', async () => {
+    state.lastMessage = {
+      sender_type: 'customer',
+      created_at: new Date(Date.now() - 60_000).toISOString(),
+    };
+    const body = await (await getConversationStatus()).json();
+    expect(body.response_wait_derived).toBeNull();
+  });
+
+  it('derives nothing when the anchor already elapsed (nothing left to count)', async () => {
+    state.lastMessage = {
+      sender_type: 'agent',
+      // 1 h ago with the 10-minute default → the wait ended long ago.
+      created_at: new Date(Date.now() - 60 * 60_000).toISOString(),
+    };
+    const body = await (await getConversationStatus()).json();
+    expect(body.response_wait_derived).toBeNull();
+  });
+
+  it('derives nothing while the "Esperar respuesta" switch is OFF', async () => {
+    state.conversation = {
+      id: 'conv-1',
+      account_id: 'acc-1',
+      contact_id: 'contact-1',
+      follow_up_enabled: null,
+      response_wait_enabled: false,
+    };
+    state.lastMessage = {
+      sender_type: 'agent',
+      created_at: new Date(Date.now() - 60_000).toISOString(),
+    };
+    const body = await (await getConversationStatus()).json();
+    expect(body.response_wait_derived).toBeNull();
+  });
+
+  it('lets an ACTIVE row win over the derived anchor (single source of truth)', async () => {
+    const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+    state.responseWait = {
+      id: 'wait-1',
+      conversation_id: 'conv-1',
+      status: 'active',
+      delay_minutes: 5,
+      started_at: new Date(Date.now() - 60_000).toISOString(),
+      expires_at: expiresAt,
+    };
+    state.lastMessage = {
+      sender_type: 'agent',
+      created_at: new Date(Date.now() - 60_000).toISOString(),
+    };
+    const body = await (await getConversationStatus()).json();
+    expect(body.response_wait).toMatchObject({ id: 'wait-1', expires_at: expiresAt });
+    expect(body.response_wait_derived).toBeNull();
+  });
+
+  it('reports the server wall clock so remainders run on SERVER time', async () => {
+    const before = Date.now();
+    const body = await (await getConversationStatus()).json();
+    const after = Date.now();
+    const serverTs = Date.parse(body.server_now as string);
+    expect(Number.isFinite(serverTs)).toBe(true);
+    expect(serverTs).toBeGreaterThanOrEqual(before - 5_000);
+    expect(serverTs).toBeLessThanOrEqual(after + 5_000);
   });
 });
