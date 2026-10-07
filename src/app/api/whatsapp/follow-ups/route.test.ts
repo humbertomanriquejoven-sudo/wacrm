@@ -53,6 +53,7 @@ const state = {
     account_id: 'acc-1',
     contact_id: 'contact-1',
     follow_up_enabled: null,
+    response_wait_enabled: true,
   } as Record<string, unknown> | null,
   // Timer 2 rows served by the mocked `response_wait_timers` reads.
   responseWait: null as Record<string, unknown> | null,
@@ -127,6 +128,7 @@ beforeEach(() => {
     account_id: 'acc-1',
     contact_id: 'contact-1',
     follow_up_enabled: null,
+    response_wait_enabled: true,
   };
   state.ops.length = 0;
   mocks.requireRole.mockResolvedValue({
@@ -300,6 +302,14 @@ describe('POST /api/whatsapp/follow-ups — Timer 2 (wait reply)', () => {
         delayMinutes: 5,
       }),
     );
+    // An explicit schedule is a manual action: it re-enables Switch 2.
+    const convUpdate = state.ops.find(
+      (o) =>
+        o.table === 'conversations' &&
+        o.op === 'update' &&
+        (o.payload as { response_wait_enabled?: boolean })?.response_wait_enabled === true,
+    );
+    expect(convUpdate).toBeDefined();
   });
 
   it('wait_reset cancels the old countdown and re-arms from the box value', async () => {
@@ -312,6 +322,59 @@ describe('POST /api/whatsapp/follow-ups — Timer 2 (wait reply)', () => {
       expect.anything(),
       expect.objectContaining({ delayMinutes: 3 }),
     );
+    // ↻ Reiniciar re-enables Switch 2 (the worker had flipped it OFF).
+    const convUpdate = state.ops.find(
+      (o) =>
+        o.table === 'conversations' &&
+        o.op === 'update' &&
+        (o.payload as { response_wait_enabled?: boolean })?.response_wait_enabled === true,
+    );
+    expect(convUpdate).toBeDefined();
+  });
+
+  it('wait_enabled OFF cancels the active timer and persists the switch', async () => {
+    const res = await post({
+      conversation_id: 'conv-1',
+      action: 'wait_enabled',
+      enabled: false,
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.response_wait_enabled).toBe(false);
+    const convUpdate = state.ops.find(
+      (o) => o.table === 'conversations' && o.op === 'update',
+    );
+    expect(convUpdate?.payload).toEqual({ response_wait_enabled: false });
+    expect(mocks.cancelResponseWaitTimers).toHaveBeenCalledWith(
+      expect.anything(),
+      'conv-1',
+      'manual',
+    );
+  });
+
+  it('wait_enabled ON persists the switch WITHOUT arming a timer', async () => {
+    const res = await post({
+      conversation_id: 'conv-1',
+      action: 'wait_enabled',
+      enabled: true,
+    });
+    expect(res.status).toBe(200);
+    const convUpdate = state.ops.find(
+      (o) => o.table === 'conversations' && o.op === 'update',
+    );
+    expect(convUpdate?.payload).toEqual({ response_wait_enabled: true });
+    // Turning the switch ON never arms by itself — the countdown starts on
+    // the next outbound message (or via ↻ Reiniciar / wait_schedule).
+    expect(mocks.scheduleResponseWaitTimer).not.toHaveBeenCalled();
+    expect(mocks.cancelResponseWaitTimers).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed wait_enabled body', async () => {
+    const res = await post({
+      conversation_id: 'conv-1',
+      action: 'wait_enabled',
+    });
+    expect(res.status).toBe(400);
   });
 
   it('clamps out-of-range values to the max', async () => {
@@ -370,6 +433,7 @@ describe('GET /api/whatsapp/follow-ups — one-shot outcome state', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.response_wait).toBeNull();
+    expect(body.response_wait_enabled).toBe(true);
     expect(body.response_wait_last).toMatchObject({
       id: 'wait-9',
       status: 'completed',

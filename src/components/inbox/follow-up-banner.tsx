@@ -10,32 +10,34 @@ import type { FollowUp, ResponseWaitTimer } from "@/types";
 
 // ------------------------------------------------------------------
 // Per-conversation timer banner — TWO fully independent, persistent
-// timers per chat:
+// timers per chat, each with its OWN ON/OFF switch:
 //
 //   BLOCK 1 — "Seguimiento automático" (Timer 1, the programmed reminder).
-//     [ N ] min  [Programar]  [ ON/OFF switch ]
-//     `follow_ups.pending` (execute_at) → ⏱️ Próximo seguimiento en: MM:SS.
-//     OFF cancels the queued row and the worker refuses to dispatch.
+//     [ N ] min  [Programar]  [ ON/OFF switch ]   MM:SS
+//     `follow_ups.pending` (execute_at) → inline live countdown.
+//     Switch OFF cancels the queued row and the worker refuses to dispatch.
 //
 //   BLOCK 2 — "Esperar respuesta" (Timer 2, response-wait, ONE-SHOT).
-//     [ N ] min  [↻ Reiniciar]
-//     `response_wait_timers.active` (started_at + expires_at) → live
-//     countdown "MM:SS" rendered INLINE on the same row, right after the
-//     controls — it always ticks every second and never hides.
+//     [ N ] min  [↻ Reiniciar]  [ ON/OFF switch ]   MM:SS
+//     `response_wait_timers.active` (started_at + expires_at) → inline
+//     live countdown, shown WHILE the switch is ON and a timer is active;
+//     it ticks every second and never hides.
 //
 //     AUTO (never needs a button):
-//       · ANY outbound (agent or bot) with the client silent → auto-arm:
-//         `expires_at = NOW() + N` (N = the chat's configured minutes,
-//         default 10). An active countdown simply continues.
+//       · ONLY while Switch 2 is ON: any outbound (agent or bot) with the
+//         client silent → auto-arm: `expires_at = NOW() + N` (N = the
+//         chat's configured minutes, default 10). An active countdown
+//         simply continues. Turning the switch OFF cancels the countdown
+//         and blocks future auto-arms.
 //       · Client replies → webhook cancels (cancelled_reason='inbound');
-//         the row closes as `cancelled` and nothing is sent.
-//       · Zero with no reply → the worker sends ONE contextual AI nudge
-//         and closes the row as `completed` (single execution). It never
-//         re-arms by itself.
-//       · After a reply, the next outbound (bot or agent) hands the timer
-//         a fresh start automatically.
-//     ↻ Reiniciar = cancel the current countdown (same row) and rearm it
-//     from the EXACT minutes of the field, without duplicates.
+//         the row closes as `cancelled` and nothing is sent. The switch
+//         STAYS ON so the next outbound auto-arms a fresh countdown.
+//       · Zero with no reply → the worker sends ONE contextual AI nudge,
+//         closes the row as `completed` AND flips the switch OFF (single
+//         execution — it strictly never re-enters a loop).
+//     ↻ Reiniciar = re-enable the switch, cancel any current countdown
+//     (same row) and rearm it from the EXACT minutes of the field,
+//     without duplicates.
 //
 // ISOLATION / CORRECTNESS GUARANTEES:
 //   * NO shared/global React timer state. Every value is loaded from the
@@ -51,7 +53,7 @@ import type { FollowUp, ResponseWaitTimer } from "@/types";
 // ------------------------------------------------------------------
 
 type Busy = "schedule" | "toggle" | null;
-type WaitBusy = "wait_reset" | null;
+type WaitBusy = "wait_toggle" | "wait_reset" | null;
 
 interface WaitLast {
   id?: string;
@@ -72,6 +74,8 @@ interface FollowUpStatus {
   response_wait_last: WaitLast | null;
   global_enabled: boolean;
   conversation_enabled: boolean | null;
+  /** Timer 2 ON/OFF switch (Switch 2). Worker flips OFF after a 1-shot run. */
+  response_wait_enabled: boolean;
 }
 
 /** Minutes cap: 7 days, matching the API's own clamp. */
@@ -162,6 +166,22 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   useEffect(() => {
     const clock = setInterval(() => setWaitNowTs(Date.now()), 1000);
     return () => clearInterval(clock);
+  }, []);
+
+  // Re-sync BOTH clocks the moment the tab regains focus / user comes back,
+  // so a throttled background interval never leaves the countdown looking
+  // stale — it recomputes `expires_at − now` from the real wall clock.
+  useEffect(() => {
+    const resync = () => {
+      setFollowNowTs(Date.now());
+      setWaitNowTs(Date.now());
+    };
+    document.addEventListener("visibilitychange", resync);
+    window.addEventListener("focus", resync);
+    return () => {
+      document.removeEventListener("visibilitychange", resync);
+      window.removeEventListener("focus", resync);
+    };
   }, []);
 
   // Re-read the queue so a delivered/executed/cancelled timer (flipped to
@@ -263,8 +283,25 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
 
   // ---- Timer 2 (esperar respuesta, ONE-SHOT) ------------------------
   // There is NO "▶ Iniciar" button — the timer starts automatically the
-  // moment the agent (or bot) sends an outbound message. ↻ Reiniciar is the
-  // only control here.
+  // moment the agent (or bot) sends an outbound message WHILE Switch 2 is
+  // ON. Switch 2 is the master ON/OFF for this feature; ↻ Reiniciar is the
+  // manual re-arm control (and re-enables the switch).
+  const toggleWaitEnabled = useCallback(
+    async (checked: boolean) => {
+      setBusyWait("wait_toggle");
+      try {
+        if (await post("wait_enabled", { enabled: checked })) {
+          if (checked) toast.success(t("waitEnabledSuccess"));
+          else toast.success(t("waitDisabledSuccess"));
+        }
+        await refresh();
+      } finally {
+        setBusyWait(null);
+      }
+    },
+    [post, refresh, t],
+  );
+
   const resetWait = useCallback(async () => {
     const value = parseMinutes(waitMinutes);
     if (value === null) {
@@ -292,20 +329,11 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
 
   const pending = status.pending[0] ?? null;
   const enabled = status.conversation_enabled !== false;
+  const waitEnabled = status.response_wait_enabled !== false;
   const wait = status.response_wait ?? null;
-  const waitLast = status.response_wait_last ?? null;
 
   const followEta = pending ? formatRemaining(pending.execute_at, followNowTs) : null;
   const waitEta = wait ? formatRemaining(wait.expires_at, waitNowTs) : null;
-
-  // One-shot outcome for the wait timer (Escenario A / Escenario B).
-  const waitOutcome: "active" | "executed" | "replied" | null = wait
-    ? "active"
-    : waitLast?.status === "completed"
-      ? "executed"
-      : waitLast?.status === "cancelled" && waitLast?.cancelled_reason !== "manual"
-        ? "replied"
-        : null;
 
   return (
     <div
@@ -408,7 +436,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
             {t("waitReset")}
           </BannerButton>
 
-          {waitOutcome === "active" && (
+          {waitEnabled && wait && (
             <span
               className="min-w-[3.5rem] font-mono text-sm tabular-nums text-foreground"
               aria-live="off"
@@ -416,12 +444,24 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
               {waitEta ?? "00:00"}
             </span>
           )}
-          {waitOutcome === "executed" && (
-            <span className="text-muted-foreground">{t("waitExecuted")}</span>
-          )}
-          {waitOutcome === "replied" && (
-            <span className="text-muted-foreground">{t("waitCancelledByReply")}</span>
-          )}
+
+          <span className="ml-auto flex items-center gap-1.5">
+            <span
+              className={cn(
+                "font-semibold",
+                waitEnabled
+                  ? "text-emerald-600 dark:text-emerald-400"
+                  : "text-muted-foreground",
+              )}
+            >
+              {waitEnabled ? t("active") : t("inactive")}
+            </span>
+            <Switch
+              checked={waitEnabled}
+              onCheckedChange={(checked: boolean) => void toggleWaitEnabled(checked)}
+              disabled={busyWait === "wait_toggle"}
+            />
+          </span>
         </div>
       </div>
     </div>

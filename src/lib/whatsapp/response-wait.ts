@@ -26,23 +26,25 @@
 //     `cancelResponseWaitTimers`. Independently, at dispatch time the
 //     runner re-checks the thread's last message and drops the reminder
 //     if the customer replied AFTER `started_at` — the race safety net.
-//   * AUTO-ARM ON SEND: `armResponseWaitIfIdle` is called right after ANY
-//     outbound (agent or bot/AI) message is persisted. It starts the
-//     countdown immediately ("en cuanto enviamos un mensaje"), continues an
-//     active countdown without restarting it, and arms with the chat's
-//     last-used duration after the customer replied (or 10 min by default).
+//   * AUTO-ARM ON SEND — SWITCH-GATED: `armResponseWaitIfIdle` is called
+//     right after ANY outbound (agent or bot/AI) message is persisted. It
+//     NO-OPS while `conversations.response_wait_enabled` is OFF (the Timer
+//     2 switch), so "Esperar respuesta" only auto-starts when the agent
+//     left the feature ON for this chat. When ON it starts the countdown
+//     immediately ("en cuanto enviamos un mensaje"), continues an active
+//     countdown without restarting it, and arms with the chat's last-used
+//     duration after the customer replied (or 10 min by default).
 //   * ON EXPIRY — SINGLE EXECUTION (one-shot): while the customer stays
 //     silent the runner sends ONE contextual follow-up and then closes the
-//     row as `completed`. It never re-arms by itself — the agent's
-//     ↻ Reiniciar button (or the next outbound auto-arm) is what starts a
-//     fresh cycle. The only ways OUT of `active` are a customer reply
-//     (webhook cancel → `cancelled`) or a nudge that failed to dispatch
-//     (`no_response`).
+//     row as `completed` AND flips the Timer 2 switch OFF — a finished
+//     cycle strictly never re-enters a loop. The agent's ↻ Reiniciar (or
+//     re-enabling the switch) is what starts a fresh cycle. The only ways
+//     OUT of `active` are a customer reply (webhook cancel → `cancelled`)
+//     or a nudge that failed to dispatch (`no_response`).
 //   * Timer 2 is NOT gated by `conversations.follow_up_enabled`: that
-//     switch belongs to Timer 1 (automation). The wait timer is an
-//     explicit agent action and must fire even when the automation
-//     switch is off. The process kill switch (`FOLLOW_UP_ENABLED=false`)
-//     still wins.
+//     switch belongs to Timer 1 (automation). The wait timer has its OWN
+//     independent switch and must fire even when the automation switch is
+//     off. The process kill switch (`FOLLOW_UP_ENABLED=false`) still wins.
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js'
@@ -65,7 +67,7 @@ export const ARM_DEFAULT_MINUTES = 10
 
 export interface ArmResponseWaitResult {
   scheduled: boolean
-  reason: 'already_active' | 'armed' | 'error'
+  reason: 'already_active' | 'armed' | 'disabled' | 'error'
   id: string | null
   expires_at: string | null
 }
@@ -219,19 +221,27 @@ export async function cancelResponseWaitTimers(
 /**
  * AUTO-ARM ON SEND — start Timer 2 the moment an OUTBOUND message is
  * persisted ("en cuanto enviamos un mensaje, agente o bot"), without
- * waiting for the agent to press ▶ Iniciar.
+ * waiting for the agent to press any button. GATED by the conversation's
+ * Timer 2 ON/OFF switch (`conversations.response_wait_enabled`): while it
+ * is OFF the auto-arm is a strict no-op (`reason: 'disabled'`) — the
+ * countdown only starts when the agent turns the "Esperar respuesta"
+ * switch ON.
  *
  * Semantics ("comienza/continúa", strictly per conversation, no stacking):
- *   1. If an ACTIVE countdown already exists → DO NOTHING (continue). A
+ *   1. If the Timer 2 switch is OFF for this chat → DO NOTHING (disabled).
+ *      A missing column (migration 066 pending) is treated as ON so an
+ *      un-migrated database keeps its current behaviour.
+ *   2. If an ACTIVE countdown already exists → DO NOTHING (continue). A
  *      second message mid-wait keeps the same countdown; it never
  *      restarts, never stacks a parallel timer.
- *   2. Otherwise arm from the chat's LAST-USED `delay_minutes` (the value
+ *   3. Otherwise arm from the chat's LAST-USED `delay_minutes` (the value
  *      the agent assigned to THIS conversation — survives reloads and chat
  *      switches) or `ARM_DEFAULT_MINUTES` if the chat never used Timer 2.
  *
  * The inbound webhook (`cancelResponseWaitTimers`) stops the countdown the
- * instant the customer replies; the next agent send re-arms it. Never
- * throws — a failure must never fail the message send itself.
+ * instant the customer replies; the switch stays ON and the next outbound
+ * auto-arms it again. Never throws — a failure must never fail the
+ * message send itself.
  */
 export async function armResponseWaitIfIdle(
   db: SupabaseClient,
@@ -245,6 +255,20 @@ export async function armResponseWaitIfIdle(
   const { conversationId, contactId, accountId } = params
   const now = params.now ?? new Date()
   try {
+    // Timer 2 ON/OFF switch gate. Missing column (066 pending) → enabled.
+    const { data: convRow } = await db
+      .from('conversations')
+      .select('response_wait_enabled')
+      .eq('id', conversationId)
+      .maybeSingle()
+    const switchOn = convRow?.response_wait_enabled !== false
+    if (!switchOn) {
+      console.log(
+        `[response-wait] auto-arm skipped for conversation ${conversationId} — "Esperar respuesta" switch is OFF.`,
+      )
+      return { scheduled: false, reason: 'disabled', id: null, expires_at: null }
+    }
+
     const { data: active } = await db
       .from('response_wait_timers')
       .select('id, expires_at')

@@ -8,7 +8,11 @@ const h = vi.hoisted(() => {
     messages: [] as Record<string, unknown>[],
     aiConfig: { created_by: 'user-owner' } as Record<string, unknown> | null,
     // conversations.follow_up_enabled — null = inherit the account switch.
-    conversation: { follow_up_enabled: null } as { follow_up_enabled: boolean | null } | null,
+    // conversations.response_wait_enabled — the Timer 2 ON/OFF switch.
+    conversation: {
+      follow_up_enabled: null,
+      response_wait_enabled: true,
+    } as { follow_up_enabled: boolean | null; response_wait_enabled: boolean } | null,
     sendMessageToConversation: vi.fn(),
     loadAiConfig: vi.fn(),
     generateReply: vi.fn(),
@@ -230,6 +234,28 @@ vi.mock('@/lib/ai/admin-client', () => ({
                 Promise.resolve({ data: h.state.conversation, error: null }),
             }),
           }),
+          // The runner flips conversations.response_wait_enabled OFF after
+          // a one-shot completion — record the write and apply it.
+          update: (payload: Record<string, unknown>) => {
+            h.state.calls.push('conversations.update')
+            const apply = () => {
+              if (
+                payload.response_wait_enabled !== undefined &&
+                h.state.conversation
+              ) {
+                h.state.conversation = {
+                  ...h.state.conversation,
+                  response_wait_enabled: payload.response_wait_enabled as boolean,
+                }
+              }
+            }
+            return {
+              eq: () => {
+                apply()
+                return Promise.resolve({ data: null, error: null })
+              },
+            }
+          },
         }
       }
       throw new Error(`unexpected table ${table}`)
@@ -272,7 +298,7 @@ function resetState() {
   h.state.waitTimers = []
   h.state.messages = []
   h.state.aiConfig = { created_by: 'user-owner' }
-  h.state.conversation = { follow_up_enabled: null }
+  h.state.conversation = { follow_up_enabled: null, response_wait_enabled: true }
   h.state.cancelled = []
   h.state.completed = []
   h.state.noResponse = []
@@ -408,7 +434,7 @@ describe('scheduleFollowUp', () => {
 
   it('refuses to schedule when the chat override is OFF', async () => {
     resetState()
-    h.state.conversation = { follow_up_enabled: false }
+    h.state.conversation = { follow_up_enabled: false, response_wait_enabled: true }
     const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
 
     const res = await scheduleFollowUp(db, {
@@ -768,6 +794,23 @@ describe('armResponseWaitIfIdle — auto-start on send', () => {
       expires_at: '2026-10-06T12:10:00.000Z',
     })
   })
+
+  it('is a strict no-op while the "Esperar respuesta" switch is OFF', async () => {
+    resetState()
+    h.state.conversation = { follow_up_enabled: null, response_wait_enabled: false }
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await armResponseWaitIfIdle(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+      now: new Date('2026-10-06T12:00:00.000Z'),
+    })
+
+    expect(res).toMatchObject({ scheduled: false, reason: 'disabled' })
+    // No timer may ever be armed for a switched-off conversation.
+    expect(h.state.waitTimers).toHaveLength(0)
+  })
 })
 
 describe('cancelPendingFollowUps', () => {
@@ -913,7 +956,7 @@ describe('runDueFollowUps', () => {
 
   it('cancels instead of sending when the per-chat switch is OFF', async () => {
     resetState()
-    h.state.conversation = { follow_up_enabled: false }
+    h.state.conversation = { follow_up_enabled: false, response_wait_enabled: true }
     h.state.followUps = [
       {
         id: 'fu-1',
@@ -1097,8 +1140,9 @@ describe('runDueResponseWaitTimers', () => {
       }),
     )
     // ONE-SHOT: the nudge went out exactly once; the timer closes as
-    // `completed` and NEVER re-arms by itself. The agent must press
-    // ↻ Reiniciar (or the next outbound) to watch again.
+    // `completed`, the conversation's "Esperar respuesta" switch flips OFF
+    // (so the cycle never re-enters a loop), and the timer NEVER re-arms by
+    // itself. The agent must press ↻ Reiniciar (or re-enable) to watch again.
     expect(h.state.waitCompleted).toEqual(['completed'])
     expect(h.state.waitTimers).toHaveLength(1)
     expect(h.state.waitTimers[0]).toMatchObject({
@@ -1108,6 +1152,8 @@ describe('runDueResponseWaitTimers', () => {
       started_at: '2026-10-06T12:00:00.000Z',
       expires_at: '2026-10-06T12:05:00.000Z',
     })
+    expect(h.state.calls).toContain('conversations.update')
+    expect(h.state.conversation).toMatchObject({ response_wait_enabled: false })
   })
 
   it('cancels without sending when the customer replied AT/AFTER started_at', async () => {

@@ -25,6 +25,8 @@ import {
  *         - reschedule   push the due time of the PENDING reminder back
  *         - schedule     queue a reminder now (defaults to the 10m stage)
  *         - set_enabled  per-chat override for {conversation_id, enabled}
+ *         - wait_enabled   per-chat ON/OFF switch for Timer 2 (Esperar
+ *                          respuesta); OFF also cancels the ACTIVE timer
  *         - wait_schedule  arm Timer 2 (response-wait) for N minutes
  *         - wait_reset     cancel the current Timer 2 + re-arm from N
  *         - wait_cancel    cancel the ACTIVE Timer 2 for the thread
@@ -54,38 +56,50 @@ interface ResolvedConversation {
     id: string
     contact_id: string
     follow_up_enabled: boolean | null
+    /** Timer 2 ON/OFF switch. Missing column (066 pending) → ON. */
+    response_wait_enabled: boolean
   }
 }
 type ResolveFailure = { ok: false; status: number; error: string }
 type Resolved = ResolvedConversation | ResolveFailure
 
+/**
+ * Load the conversation through progressively narrower projections, so the
+ * inbox keeps loading on a partially-migrated database: newest columns
+ * first (066 → 063), falling back to the raw legacy projection when
+ * PostgREST rejects a named column (migration pending).
+ */
 async function resolveConversation(
   supabase: Ctx['supabase'],
   conversationId: string,
   accountId: string,
 ): Promise<Resolved> {
-  const full = await supabase
-    .from('conversations')
-    .select('id, account_id, contact_id, follow_up_enabled')
-    .eq('id', conversationId)
-    .maybeSingle()
+  const projections = [
+    'id, account_id, contact_id, follow_up_enabled, response_wait_enabled',
+    'id, account_id, contact_id, follow_up_enabled',
+    'id, account_id, contact_id',
+  ]
 
-  let data = (full.data as Record<string, unknown> | null) ?? null
-  let error = full.error
-  // Migration 063 not applied → retry without the per-chat switch. The
-  // thread still loads (switch treated as "inherit"), instead of the whole
-  // banner 500-ing and the inbox appearing to hang.
-  if (error && isMissingColumnError(error.message)) {
-    console.warn(
-      '[follow-ups] conversations.follow_up_enabled is absent (migration 063 pending) — serving the legacy projection.',
-    )
-    const legacy = await supabase
+  let data: Record<string, unknown> | null = null
+  let error: { message: string } | null = null
+  for (const projection of projections) {
+    const res = await supabase
       .from('conversations')
-      .select('id, account_id, contact_id')
+      .select(projection)
       .eq('id', conversationId)
       .maybeSingle()
-    data = (legacy.data as Record<string, unknown> | null) ?? null
-    error = legacy.error
+    if (!res.error) {
+      data = (res.data as Record<string, unknown> | null) ?? null
+      error = null
+      break
+    }
+    if (!isMissingColumnError(res.error.message)) {
+      error = res.error
+      break
+    }
+    console.warn(
+      `[follow-ups] conversations projection failed (${projection}) — ${res.error.message}; retrying legacy projection.`,
+    )
   }
 
   if (error) return { ok: false, status: 500, error: error.message }
@@ -99,6 +113,7 @@ async function resolveConversation(
       id: data.id as string,
       contact_id: data.contact_id as string,
       follow_up_enabled: (data.follow_up_enabled as boolean | null | undefined) ?? null,
+      response_wait_enabled: (data.response_wait_enabled as boolean | undefined) ?? true,
     },
   }
 }
@@ -192,6 +207,7 @@ export async function GET(request: Request) {
       response_wait_last: waitLast,
       global_enabled: globalEnabled,
       conversation_enabled: owned.conv.follow_up_enabled,
+      response_wait_enabled: owned.conv.response_wait_enabled,
     })
   } catch (err) {
     return toErrorResponse(err)
@@ -221,6 +237,7 @@ export async function POST(request: Request) {
         'reschedule',
         'schedule',
         'set_enabled',
+        'wait_enabled',
         'wait_schedule',
         'wait_reset',
         'wait_cancel',
@@ -276,13 +293,47 @@ export async function POST(request: Request) {
       })
     }
 
+    // Timer 2 ON/OFF switch (Switch 2 in the inbox banner). Independent of
+    // the Timer 1 `set_enabled`: OFF disables "Esperar respuesta" for this
+    // chat only — it cancels any ACTIVE countdown AND blocks future
+    // auto-arms until re-enabled. Turning ON alone does NOT arm a timer;
+    // the countdown starts on the next outbound message (or via ↻
+    // Reiniciar / wait_schedule).
+    if (action === 'wait_enabled') {
+      const value = body.enabled
+      if (typeof value !== 'boolean') {
+        return NextResponse.json(
+          { error: 'enabled must be a boolean' },
+          { status: 400 },
+        )
+      }
+      const { error: upErr } = await supabaseAdmin()
+        .from('conversations')
+        .update({ response_wait_enabled: value })
+        .eq('id', conversationId)
+      if (upErr) return NextResponse.json({ error: upErr.message }, { status: 500 })
+      if (value === false) {
+        await cancelResponseWaitTimers(supabaseAdmin(), conversationId, 'manual')
+      }
+      console.log(
+        `[follow-up] ${userId} set the "Esperar respuesta" switch to ${value} for conversation ${conversationId}.`,
+      )
+      return NextResponse.json({
+        success: true,
+        response_wait_enabled: value,
+      })
+    }
+
     // Timer 2 — response-wait. Whole minutes, 1..10080, taken EXACTLY as
     // typed (no defaults/fallbacks). `wait_schedule` and `wait_reset`
     // both UPSERT the conversation's single ACTIVE row (re-arm instead of
     // reject), so neither can stack or duplicate; `wait_reset` explicitly
     // replaces whatever countdown was running with the box's current value.
-    // Timer 2 is independent of the Timer 1 ON/OFF switch (an explicit
-    // agent action must fire even when automation is off).
+    // Both are explicit agent actions: they re-enable the Timer 2 switch
+    // and arm immediately (even right after a completed cycle, where the
+    // worker had flipped the switch OFF). Timer 2 is independent of the
+    // Timer 1 ON/OFF switch (an explicit agent action must fire even when
+    // automation is off).
     if (action === 'wait_schedule' || action === 'wait_reset') {
       const rawMinutes = Number(body.delay_minutes)
       const delayMinutes =
@@ -293,6 +344,18 @@ export async function POST(request: Request) {
         return NextResponse.json(
           { error: 'delay_minutes must be a whole number between 1 and 10080' },
           { status: 400 },
+        )
+      }
+      // Turn the switch back ON so the armed countdown is reflected by the
+      // banner's Switch 2 (the worker turned it OFF after the last cycle).
+      const { error: switchErr } = await supabaseAdmin()
+        .from('conversations')
+        .update({ response_wait_enabled: true })
+        .eq('id', conversationId)
+      if (switchErr) {
+        console.error(
+          `[follow-up] could not re-enable the "Esperar respuesta" switch for conversation ${conversationId}:`,
+          switchErr.message,
         )
       }
       const res = await scheduleResponseWaitTimer(supabaseAdmin(), {

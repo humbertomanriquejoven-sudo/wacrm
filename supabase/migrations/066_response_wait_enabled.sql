@@ -1,0 +1,31 @@
+-- ============================================================
+-- 066_response_wait_enabled.sql — per-conversation ON/OFF switch
+--                       for "Esperar respuesta" (Timer 2).
+--
+-- The inbox banner shows TWO fully independent toggle switches:
+--
+--   Switch 1 — "Seguimiento automático" → conversations.follow_up_enabled
+--               (migration 063, NULL = inherit the account switch).
+--   Switch 2 — "Esperar respuesta"      → conversations.response_wait_enabled
+--               (THIS migration, NOT NULL DEFAULT true).
+--
+-- Semantics (1-shot / no loop):
+--   * Auto-arm on send ONLY fires while this switch is ON
+--     (`armResponseWaitIfIdle` no-ops when it is OFF).
+--   * Flipping the switch OFF cancels any ACTIVE wait timer for the
+--     conversation and blocks new auto-arms until it is re-enabled.
+--   * When the worker dispatches the single one-shot nudge at 00:00 it
+--     closes the row `completed` AND flips THIS switch back to OFF, so a
+--     finished cycle strictly never re-enters a loop — the agent's
+--     ↻ Reiniciar (or re-enabling) is required to watch again.
+--   * A customer reply cancels only the ACTIVE row; the switch stays ON so
+--     the next outbound auto-arms a fresh countdown.
+--
+-- Defaults to TRUE: existing behaviour (auto-arm on any outbound) is
+-- preserved for every row already in the database.
+--
+-- Idempotent — safe to run multiple times.
+-- ============================================================
+
+ALTER TABLE public.conversations
+  ADD COLUMN IF NOT EXISTS response_wait_enabled boolean NOT NULL DEFAULT true;
