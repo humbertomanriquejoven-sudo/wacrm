@@ -56,6 +56,8 @@ interface WaitLast {
   conversation_id?: string;
   status?: string;
   cancelled_reason?: string | null;
+  /** The chat's last-used duration — the value this conversation is "assigned". */
+  delay_minutes?: number;
   updated_at?: string;
 }
 
@@ -117,9 +119,14 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   // EXACTLY what was typed. Fresh for every chat (the banner remounts).
   const [followUpMinutes, setFollowUpMinutes] = useState("10");
   const [waitMinutes, setWaitMinutes] = useState("10");
-  // 1-second clock → the countdown is always `expires_at − NOW()`.
-  const [nowTs, setNowTs] = useState(() => Date.now());
+  // The two timers are 100% independent: each gets its OWN 1-second clock,
+  // so their ticks, state, and countdown values never share an interval.
+  const [followNowTs, setFollowNowTs] = useState(() => Date.now());
+  const [waitNowTs, setWaitNowTs] = useState(() => Date.now());
   const mounted = useRef(true);
+  // Once the agent types in the box, the server's assigned value stops
+  // overriding it (the box is the single source of what they type).
+  const waitTouched = useRef(false);
 
   useEffect(() => {
     mounted.current = true;
@@ -143,19 +150,50 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     }
   }, [conversationId]);
 
+  // Clock 1 (Timer 1 — Seguimiento automático). Independent interval.
+  useEffect(() => {
+    const clock = setInterval(() => setFollowNowTs(Date.now()), 1000);
+    return () => clearInterval(clock);
+  }, []);
+
+  // Clock 2 (Timer 2 — Esperar respuesta). Independent interval.
+  useEffect(() => {
+    const clock = setInterval(() => setWaitNowTs(Date.now()), 1000);
+    return () => clearInterval(clock);
+  }, []);
+
+  // Re-read the queue so a delivered/executed/cancelled timer (flipped to
+  // `completed`/`cancelled` by the worker or the inbound webhook) updates
+  // the UI on its own. This is the only cross-timer poll — it only REFRESHES
+  // the server state, it never drives a countdown.
   useEffect(() => {
     void refresh();
-    // 1s tick keeps BOTH countdowns honest (`expires_at − now`).
-    const clock = setInterval(() => setNowTs(Date.now()), 1000);
-    // Re-read the queue so a delivered/executed/cancelled timer
-    // (flipped to `completed`/`cancelled` by the worker or the inbound
-    // webhook) updates the UI on its own.
     const serverRefresh = setInterval(() => void refresh(), 30_000);
-    return () => {
-      clearInterval(clock);
-      clearInterval(serverRefresh);
-    };
+    return () => clearInterval(serverRefresh);
   }, [refresh]);
+
+  // Refresh IMMEDIATELY after any send in this thread so an auto-armed
+  // "Esperar respuesta" countdown appears without waiting for the poll.
+  useEffect(() => {
+    const onMessageSent = (e: Event) => {
+      const detail = (e as CustomEvent<{ conversationId?: string }>).detail;
+      if (detail?.conversationId === conversationId) void refresh();
+    };
+    window.addEventListener("inbox:message-sent", onMessageSent);
+    return () => window.removeEventListener("inbox:message-sent", onMessageSent);
+  }, [conversationId, refresh]);
+
+  // Prefill Timer 2's box with the chat's ASSIGNED value (the last-used
+  // `delay_minutes` for this conversation) so auto-armed countdowns and the
+  // box always agree. Stops as soon as the agent types a custom value.
+  useEffect(() => {
+    if (!status || waitTouched.current) return;
+    const assigned =
+      status.response_wait?.delay_minutes ??
+      status.response_wait_last?.delay_minutes ??
+      10;
+    setWaitMinutes(String(assigned));
+  }, [status]);
 
   const post = useCallback(
     async (action: string, extra: Record<string, unknown>) => {
@@ -271,8 +309,8 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   const wait = status.response_wait ?? null;
   const waitLast = status.response_wait_last ?? null;
 
-  const followEta = pending ? formatRemaining(pending.execute_at, nowTs) : null;
-  const waitEta = wait ? formatRemaining(wait.expires_at, nowTs) : null;
+  const followEta = pending ? formatRemaining(pending.execute_at, followNowTs) : null;
+  const waitEta = wait ? formatRemaining(wait.expires_at, waitNowTs) : null;
 
   // One-shot outcome for the wait timer (Escenario A / Escenario B).
   const waitOutcome: "active" | "executed" | "replied" | null = wait
@@ -387,7 +425,10 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
               max={MAX_MINUTES}
               inputMode="numeric"
               value={waitMinutes}
-              onChange={(e) => setWaitMinutes(e.target.value)}
+              onChange={(e) => {
+                waitTouched.current = true;
+                setWaitMinutes(e.target.value);
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") void startWait();
               }}

@@ -420,7 +420,7 @@
       "inactive": "INACTIVO",
       "paused": "OFF",
       "cancel": "Cancel",
-      "followNext": "⏱️ Próximo seguimiento en: {time}",
+      "followNext": "Próximo seguimiento en: {time}",
       "schedule10m": "Schedule 10 min",
       "none": "No follow-up scheduled",
       "off": "Follow-ups paused for this chat",

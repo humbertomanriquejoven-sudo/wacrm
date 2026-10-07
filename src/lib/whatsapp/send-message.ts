@@ -37,6 +37,7 @@ import {
   type InteractiveMessagePayload,
 } from '@/lib/whatsapp/interactive';
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption';
+import { armResponseWaitIfIdle } from '@/lib/whatsapp/response-wait';
 import { supabaseAdmin } from '@/lib/flows/admin-client';
 import {
   sanitizePhoneForMeta,
@@ -610,6 +611,29 @@ export async function sendMessageToConversation(
       updated_at: new Date().toISOString(),
     })
     .eq('id', conversationId);
+
+  // TIMER 2 AUTO-ARM — a HUMAN outbound means "we sent a message and are
+  // now waiting for the client's reply", so start this chat's response-wait
+  // countdown immediately ("en cuanto enviamos un mensaje"). Continues an
+  // already-active countdown; after the client replied (webhook cancelled
+  // it) re-arms with the chat's last-used duration. Best-effort: a failure
+  // here must never fail the send. Only HUMAN sends arm — bot/automation
+  // sends (AI auto-replies, Timer 1/Timer 2 nudges) never re-arm, which is
+  // what stops the countdown from chaining after its own nudge.
+  if ((params.senderType ?? 'agent') === 'agent') {
+    try {
+      await armResponseWaitIfIdle(supabaseAdmin(), {
+        conversationId,
+        contactId: contact.id,
+        accountId,
+      });
+    } catch (err) {
+      console.error(
+        '[send-message] response-wait auto-arm threw:',
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
 
   // Pause any active Flow run for this contact — the agent stepping in
   // is the strongest "yield, human is here" signal. Best-effort.

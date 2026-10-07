@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import {
@@ -168,6 +168,19 @@ const sendTemplateMessage = vi.fn(async () => ({ messageId: 'wamid.1' }));
 // sendTemplateMessage) so a test can swap in a rejecting implementation
 // without the factory reading it during hoisting.
 const sendMediaMessageMock = vi.fn(async () => ({ messageId: 'wamid.media' }));
+const armResponseWaitIfIdle = vi.fn(async () => ({
+  scheduled: true,
+  reason: 'armed',
+  id: 'wait-auto',
+  expires_at: '2026-10-06T12:10:00.000Z',
+}));
+
+// Timer 2 auto-arm is best-effort: mock it so its DB write never runs in
+// these tests, and assert WHEN it is (not) called.
+vi.mock('@/lib/whatsapp/response-wait', () => ({
+  armResponseWaitIfIdle: (...args: unknown[]) =>
+    (armResponseWaitIfIdle as (...a: unknown[]) => unknown)(...args),
+}));
 
 // Stub only the senders — the module also exports INTERACTIVE_LIMITS,
 // which `interactive.ts` needs for the payload validation covered above.
@@ -626,5 +639,57 @@ describe('sendMessageToConversation - Meta failure mapping', () => {
     expect(err.status).toBe(502);
     expect(err.code).toBe('meta_error');
     expect(err.message).toMatch(/Service unavailable/);
+  });
+});
+
+describe('sendMessageToConversation — Timer 2 auto-arm on send', () => {
+  beforeEach(() => {
+    armResponseWaitIfIdle.mockClear();
+  });
+
+  it('starts the response-wait countdown for a HUMAN outbound message', async () => {
+    const captured: CapturedWrites = {};
+    await sendMessageToConversation(sendPathDb([], captured), 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: '¿Estás ahí?',
+    });
+
+    expect(armResponseWaitIfIdle).toHaveBeenCalledTimes(1);
+    expect(armResponseWaitIfIdle).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        conversationId: 'cv-1',
+        contactId: 'ct-1',
+        accountId: 'acct-1',
+      })
+    );
+  });
+
+  it('does NOT re-arm for bot/automation sends (no nudge loops)', async () => {
+    // The scheduled-flow sender (Timer 1 / Timer 2 execution, AI replies)
+    // passes senderType 'bot' — sending is NOT "us waiting for a reply",
+    // so it must never start/restart the countdown.
+    await sendMessageToConversation(sendPathDb([], {}), 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'nudge',
+      senderType: 'bot',
+      aiGenerated: true,
+    });
+
+    expect(armResponseWaitIfIdle).not.toHaveBeenCalled();
+  });
+
+  it("never fails the send when the auto-arm DB write throws", async () => {
+    armResponseWaitIfIdle.mockRejectedValueOnce(new Error('db hiccup'));
+    const captured: CapturedWrites = {};
+    const result = await sendMessageToConversation(sendPathDb([], captured), 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'hola',
+    });
+
+    expect(result.whatsappMessageId).toBe('wamid.text');
   });
 });

@@ -258,6 +258,7 @@ import {
   scheduleFollowUp,
   scheduleManualFollowUp,
   scheduleResponseWaitTimer,
+  armResponseWaitIfIdle,
   cancelResponseWaitTimers,
   cancelPendingFollowUps,
   runDueFollowUps,
@@ -676,6 +677,95 @@ describe('cancelResponseWaitTimers', () => {
     expect(h.state.waitTimers[0]).toMatchObject({
       status: 'cancelled',
       cancelled_reason: 'manual',
+    })
+  })
+})
+
+describe('armResponseWaitIfIdle — auto-start on send', () => {
+  it('continues (never duplicates) when an ACTIVE countdown already exists', async () => {
+    resetState()
+    h.state.waitTimers = [
+      {
+        id: 'wait-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        status: 'active',
+        delay_minutes: 5,
+        started_at: '2026-10-06T12:00:00.000Z',
+        expires_at: '2026-10-06T12:05:00.000Z',
+      },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await armResponseWaitIfIdle(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+      now: new Date('2026-10-06T12:01:00.000Z'),
+    })
+
+    expect(res.reason).toBe('already_active')
+    // One row only — a second send mid-wait must never stack a twin.
+    expect(h.state.waitTimers).toHaveLength(1)
+    expect(h.state.waitTimers[0]).toMatchObject({
+      status: 'active',
+      expires_at: '2026-10-06T12:05:00.000Z',
+    })
+  })
+
+  it("re-arms with the chat's LAST-USED minutes after the reply cancelled it", async () => {
+    resetState()
+    h.state.waitTimers = [
+      {
+        id: 'wait-0',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        status: 'cancelled',
+        cancelled_reason: 'inbound',
+        delay_minutes: 2,
+        started_at: '2026-10-06T11:00:00.000Z',
+        expires_at: '2026-10-06T11:02:00.000Z',
+        updated_at: '2026-10-06T11:02:00.000Z',
+      },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await armResponseWaitIfIdle(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+      now: new Date('2026-10-06T12:00:00.000Z'),
+    })
+
+    expect(res.reason).toBe('armed')
+    expect(h.state.waitTimers).toHaveLength(2)
+    expect(h.state.waitTimers[1]).toMatchObject({
+      conversation_id: 'conv-1',
+      status: 'active',
+      delay_minutes: 2,
+      expires_at: '2026-10-06T12:02:00.000Z',
+    })
+  })
+
+  it('defaults to 10 minutes for a chat that never used Timer 2', async () => {
+    resetState()
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await armResponseWaitIfIdle(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+      now: new Date('2026-10-06T12:00:00.000Z'),
+    })
+
+    expect(res.reason).toBe('armed')
+    expect(h.state.waitTimers).toHaveLength(1)
+    expect(h.state.waitTimers[0]).toMatchObject({
+      status: 'active',
+      delay_minutes: 10,
+      expires_at: '2026-10-06T12:10:00.000Z',
     })
   })
 })

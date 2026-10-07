@@ -153,7 +153,7 @@ export async function GET(request: Request) {
     let waitLast: Record<string, unknown> | null = null
     const lastRes = await supabase
       .from('response_wait_timers')
-      .select('id, conversation_id, status, cancelled_reason, updated_at')
+      .select('id, conversation_id, status, delay_minutes, cancelled_reason, updated_at')
       .eq('conversation_id', conversationId)
       .neq('status', 'active')
       .order('updated_at', { ascending: false })
@@ -162,7 +162,7 @@ export async function GET(request: Request) {
     if (lastRes.error && isMissingColumnError(lastRes.error.message)) {
       const legacy = await supabase
         .from('response_wait_timers')
-        .select('id, conversation_id, status, updated_at')
+        .select('id, conversation_id, status, delay_minutes, updated_at')
         .eq('conversation_id', conversationId)
         .neq('status', 'active')
         .order('updated_at', { ascending: false })

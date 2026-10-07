@@ -362,6 +362,7 @@ describe('GET /api/whatsapp/follow-ups — one-shot outcome state', () => {
       id: 'wait-9',
       conversation_id: 'conv-1',
       status: 'completed',
+      delay_minutes: 2,
       cancelled_reason: null,
       updated_at: '2026-10-06T12:05:00.000Z',
     };
@@ -372,6 +373,7 @@ describe('GET /api/whatsapp/follow-ups — one-shot outcome state', () => {
     expect(body.response_wait_last).toMatchObject({
       id: 'wait-9',
       status: 'completed',
+      delay_minutes: 2,
       cancelled_reason: null,
     });
   });
@@ -381,6 +383,7 @@ describe('GET /api/whatsapp/follow-ups — one-shot outcome state', () => {
       id: 'wait-7',
       conversation_id: 'conv-1',
       status: 'cancelled',
+      delay_minutes: 5,
       cancelled_reason: 'inbound',
       updated_at: '2026-10-06T11:40:00.000Z',
     };
@@ -397,13 +400,18 @@ describe('GET /api/whatsapp/follow-ups — one-shot outcome state', () => {
       id: 'wait-5',
       conversation_id: 'conv-1',
       status: 'cancelled',
+      delay_minutes: 3,
       updated_at: '2026-10-06T10:00:00.000Z',
     };
     state.waitLastError = 'column response_wait_timers.cancelled_reason does not exist';
     const res = await getConversationStatus();
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.response_wait_last).toMatchObject({ id: 'wait-5', status: 'cancelled' });
+    expect(body.response_wait_last).toMatchObject({
+      id: 'wait-5',
+      status: 'cancelled',
+      delay_minutes: 3,
+    });
     expect(body.response_wait_last?.cancelled_reason).toBeUndefined();
   });
 

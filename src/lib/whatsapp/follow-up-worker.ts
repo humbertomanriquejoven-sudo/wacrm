@@ -6,6 +6,23 @@ import { generateReply, stripInternalReasoning } from '@/lib/ai/generate'
 import { buildConversationContext } from '@/lib/ai/context'
 
 /**
+ * Timer 2 (`response_wait_timers`) logic — arming, re-arming, auto-arm on
+ * send, and cancel-by-reply — lives in `./response-wait` so the outbound
+ * send core can auto-arm without importing this worker (no cycle). The
+ * inbox route keeps importing these from here.
+ */
+export {
+  armResponseWaitIfIdle,
+  ARM_DEFAULT_MINUTES,
+  cancelResponseWaitTimers,
+  scheduleResponseWaitTimer,
+  type ArmResponseWaitResult,
+  type ResponseWaitCancelReason,
+  type ResponseWaitScheduleResult,
+  type ResponseWaitStatus,
+} from './response-wait'
+
+/**
  * ============================================================
  * TIMED AUTO FOLLOW-UPS — 10 minutes AND 24 hours, once per stage.
  * ============================================================
@@ -63,196 +80,6 @@ export const FOLLOW_UP_INTERVAL_DEFAULT_MS = 60 * 1000
 /** Delay for a given stage. */
 export function followUpDelayMs(type: FollowUpType): number {
   return type === '24h' ? FOLLOW_UP_24H_DELAY_MS : FOLLOW_UP_DELAY_MS
-}
-
-/**
- * ============================================================
- * TIMER 2 — RESPONSE-WAIT TIMERS (per conversation, auto-cancelable).
- * ============================================================
- * While Timer 1 (`follow_ups`) is the "remind later" queue, Timer 2
- * (`response_wait_timers`) counts how long the agent wants to wait after
- * the last outbound message before the system nudges the customer again.
- *
- * RULES:
- *   * ONE ACTIVE row per conversation — Set/Start and Reset UPSERT it
- *     (move `started_at`/`expires_at`/`delay_minutes` or insert), so a
- *     conversation can never hold two overlapping countdowns and a Reset
- *     can never produce a duplicated send.
- *   * PURELY per-conversation: every row is bound to `conversation_id`
- *     (plus denormalized contact/account), and every door is keyed on the
- *     conversation. `expires_at` is persisted, so the UI renders the
- *     LIVE remainder `expires_at - NOW()` — switching chats or reloading
- *     the page can never reset, resume, or cross-contaminate a countdown.
- *   * AUTO-CANCEL BY REPLY (critical): the moment a REAL customer message
- *     lands for the conversation, the inbound webhook calls
- *     `cancelResponseWaitTimers`. Independently, at dispatch time the
- *     runner re-checks the thread's last message and drops the reminder
- *     if the customer replied AFTER `started_at` — the race safety net.
- *   * ON EXPIRY (`NOW() >= expires_at`, status still `active`,
- *     customer silent): the runner generates a contextual AI follow-up
- *     and sends it through the SAME core the inbox uses
- *     (`sendMessageToConversation`).
- *   * Timer 2 is NOT gated by `conversations.follow_up_enabled`: that
- *     switch belongs to Timer 1 (automation). The wait timer is an
- *     explicit agent action and must fire even when the automation
- *     switch is off. The process kill switch (`FOLLOW_UP_ENABLED=false`)
- *     still wins.
- */
-
-/** Terminal states that close an ACTIVE wait timer. */
-export type ResponseWaitStatus = 'active' | 'completed' | 'cancelled' | 'no_response'
-
-export interface ResponseWaitScheduleResult {
-  scheduled: boolean
-  reason: 'scheduled' | 'error'
-  id: string | null
-  expires_at: string | null
-}
-
-/**
- * Arm (Set/Start) or re-arm (Reset) Timer 2 for a conversation.
- * UPSERTS the single ACTIVE row: an existing one is moved to the new
- * `expires_at` instead of rejected, so re-arming never stacks duplicates.
- * Never throws — the inbox shows a toast on `scheduled: false`.
- */
-export async function scheduleResponseWaitTimer(
-  db: SupabaseClient,
-  params: {
-    conversationId: string
-    contactId: string
-    accountId: string
-    /** Whole minutes, validated by the caller. */
-    delayMinutes: number
-    now?: Date
-  },
-): Promise<ResponseWaitScheduleResult> {
-  const { conversationId, contactId, accountId, delayMinutes } = params
-  const now = params.now ?? new Date()
-  const startedAt = now.toISOString()
-  const expiresAt = new Date(now.getTime() + delayMinutes * 60_000).toISOString()
-
-  try {
-    const { data: active, error: findErr } = await db
-      .from('response_wait_timers')
-      .select('id')
-      .eq('conversation_id', conversationId)
-      .eq('status', 'active')
-      .order('expires_at', { ascending: false })
-      .limit(1)
-      .maybeSingle()
-
-    if (!findErr && active?.id) {
-      const { error: upErr } = await db
-        .from('response_wait_timers')
-        .update({
-          delay_minutes: delayMinutes,
-          started_at: startedAt,
-          expires_at: expiresAt,
-        })
-        .eq('id', active.id as string)
-        .eq('status', 'active')
-      if (upErr) {
-        console.error(
-          `[response-wait] could not re-arm the timer for conversation ${conversationId}:`,
-          upErr.message,
-        )
-        return { scheduled: false, reason: 'error', id: null, expires_at: null }
-      }
-      console.log(
-        `[response-wait] timer ${active.id} re-armed for conversation ${conversationId} → ${expiresAt}.`,
-      )
-      return { scheduled: true, reason: 'scheduled', id: active.id as string, expires_at: expiresAt }
-    }
-
-    const { data, error: insErr } = await db
-      .from('response_wait_timers')
-      .insert({
-        conversation_id: conversationId,
-        contact_id: contactId,
-        account_id: accountId,
-        status: 'active',
-        delay_minutes: delayMinutes,
-        started_at: startedAt,
-        expires_at: expiresAt,
-      })
-      .select('id')
-      .single()
-    if (insErr || !data) {
-      console.error(
-        `[response-wait] could not arm a timer for conversation ${conversationId}:`,
-        insErr?.message ?? 'no row returned',
-      )
-      return { scheduled: false, reason: 'error', id: null, expires_at: null }
-    }
-    console.log(
-      `[response-wait] timer ${data.id} armed for conversation ${conversationId} → ${expiresAt} (${delayMinutes} min).`,
-    )
-    return { scheduled: true, reason: 'scheduled', id: data.id as string, expires_at: expiresAt }
-  } catch (err) {
-    console.error(
-      `[response-wait] scheduleResponseWaitTimer threw for conversation ${conversationId}:`,
-      err instanceof Error ? err.message : err,
-    )
-    return { scheduled: false, reason: 'error', id: null, expires_at: null }
-  }
-}
-
-/** Why a wait timer was cancelled (migration 065). */
-export type ResponseWaitCancelReason = 'inbound' | 'anti_race' | 'manual'
-
-/**
- * Cancel every ACTIVE response-wait timer for a conversation and record
- * WHY (one-shot bookkeeping): `inbound` (the critical rule — the customer
- * replied), `anti_race` (runner safety net), `manual` (agent action).
- *
- * Invoked by the inbound webhook the moment a REAL customer message
- * lands (the customer answered — the wait is over), and by the
- * `wait_cancel` route action. Tolerates migration 065 not yet applied by
- * retrying the legacy update without `cancelled_reason`. Never throws.
- */
-export async function cancelResponseWaitTimers(
-  db: SupabaseClient,
-  conversationId: string,
-  reason: ResponseWaitCancelReason = 'inbound',
-): Promise<void> {
-  try {
-    const { error } = await db
-      .from('response_wait_timers')
-      .update({ status: 'cancelled', cancelled_reason: reason })
-      .eq('conversation_id', conversationId)
-      .eq('status', 'active')
-    if (error) {
-      // Migration 065 pending (column missing): fall back to the legacy
-      // two-field update so cancels still work on an un-migrated DB.
-      if (/column .* does not exist|42703|PGRST204|schema cache/i.test(error.message)) {
-        const { error: legacyErr } = await db
-          .from('response_wait_timers')
-          .update({ status: 'cancelled' })
-          .eq('conversation_id', conversationId)
-          .eq('status', 'active')
-        if (legacyErr) {
-          console.error(
-            `[response-wait] could not cancel active timers for conversation ${conversationId}:`,
-            legacyErr.message,
-          )
-        }
-        return
-      }
-      console.error(
-        `[response-wait] could not cancel active timers for conversation ${conversationId}:`,
-        error.message,
-      )
-      return
-    }
-    console.log(
-      `[response-wait] cancelled active timers for conversation ${conversationId} (reason: ${reason}).`,
-    )
-  } catch (err) {
-    console.error(
-      `[response-wait] cancelResponseWaitTimers threw for conversation ${conversationId}:`,
-      err instanceof Error ? err.message : err,
-    )
-  }
 }
 
 /**

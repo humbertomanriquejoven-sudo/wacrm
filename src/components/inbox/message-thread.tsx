@@ -517,6 +517,13 @@ export function MessageThread({
         // with the real DB row. If realtime hasn't arrived yet, at least
         // flip status to 'sent' so the UI stops showing "sending".
         onUpdateMessage(tempId, { status: "sent" });
+        // Tell the follow-up banner to re-read the server NOW so an
+        // auto-armed "Esperar respuesta" countdown appears immediately.
+        window.dispatchEvent(
+          new CustomEvent("inbox:message-sent", {
+            detail: { conversationId: conversation.id },
+          }),
+        );
       } catch (err) {
         console.error("Failed to send message:", err);
         const reason = err instanceof Error ? err.message : "network error";
@@ -582,6 +589,13 @@ export function MessageThread({
         }
 
         onUpdateMessage(tempId, { status: "sent" });
+        // Tell the follow-up banner to re-read the server NOW so an
+        // auto-armed "Esperar respuesta" countdown appears immediately.
+        window.dispatchEvent(
+          new CustomEvent("inbox:message-sent", {
+            detail: { conversationId: conversation.id },
+          }),
+        );
       } catch (err) {
         console.error("Failed to send media:", err);
         const reason = err instanceof Error ? err.message : "network error";
@@ -636,6 +650,13 @@ export function MessageThread({
         }
 
         onUpdateMessage(tempId, { status: "sent" });
+        // Tell the follow-up banner to re-read the server NOW so an
+        // auto-armed "Esperar respuesta" countdown appears immediately.
+        window.dispatchEvent(
+          new CustomEvent("inbox:message-sent", {
+            detail: { conversationId: conversation.id },
+          }),
+        );
       } catch (err) {
         console.error("Failed to send interactive message:", err);
         const reason = err instanceof Error ? err.message : "network error";
@@ -725,6 +746,13 @@ export function MessageThread({
         }
 
         onUpdateMessage(tempId, { status: "sent" });
+        // Tell the follow-up banner to re-read the server NOW so an
+        // auto-armed "Esperar respuesta" countdown appears immediately.
+        window.dispatchEvent(
+          new CustomEvent("inbox:message-sent", {
+            detail: { conversationId: conversation.id },
+          }),
+        );
       } catch (err) {
         console.error("Failed to send template:", err);
         const reason = err instanceof Error ? err.message : "network error";

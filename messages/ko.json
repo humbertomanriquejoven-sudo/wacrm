@@ -420,7 +420,7 @@
       "inactive": "INACTIVO",
       "paused": "OFF",
       "cancel": "취소",
-      "followNext": "⏱️ Próximo seguimiento en: {time}",
+      "followNext": "Próximo seguimiento en: {time}",
       "schedule10m": "10분 후 예약",
       "none": "예약된 후속 메시지 없음",
       "off": "이 대화의 후속 메시지가 일시 중지됨",
