@@ -31,6 +31,9 @@ import {
  *         - wait_schedule  arm Timer 2 (response-wait) for N minutes
  *         - wait_reset     cancel the current Timer 2 + re-arm from N
  *         - wait_cancel    cancel the ACTIVE Timer 2 for the thread
+ *         - wait_autoinit  banner self-heal: arm Timer 2 ONLY when it is
+ *                          safe to fire (switch ON, no cycle in flight,
+ *                          thread actually waiting on the customer)
  *
  * Reads use the RLS-scoped user client (members may SELECT follow_ups).
  * Writes use the service-role client AFTER explicit ownership checks —
@@ -242,6 +245,7 @@ export async function POST(request: Request) {
         'wait_schedule',
         'wait_reset',
         'wait_cancel',
+        'wait_autoinit',
       ].includes(action)
     ) {
       return NextResponse.json({ error: 'Unknown action' }, { status: 400 })
@@ -377,6 +381,104 @@ export async function POST(request: Request) {
     if (action === 'wait_cancel') {
       await cancelResponseWaitTimers(supabaseAdmin(), conversationId, 'manual')
       return NextResponse.json({ success: true })
+    }
+
+    // AUTO-INIT — the banner's self-heal for "the switch says ACTIVO but
+    // there is no countdown running" (the timer frozen at 00:00). The
+    // inbox calls it when Switch 2 is ON and no USABLE active row exists
+    // (no row at all, a missing/expired `expires_at`, or a row the worker
+    // never got to close). It is deliberately NOT a blind insert: a timer
+    // created here really fires a nudge at 00:00, so it only becomes a
+    // REAL row when firing it would be correct.
+    //
+    //   disabled    → the switch flipped OFF in the meantime; the banner
+    //                 keeps its client-side countdown and shows no timer.
+    //   processing  → the one-shot worker owns this cycle RIGHT NOW
+    //                 (dispatching/completing). Arming here would stack a
+    //                 second nudge behind the in-flight one and survive the
+    //                 worker's switch-OFF, breaking one-shot.
+    //   not_awaiting→ the thread has NO messages, or its last message is
+    //                 the customer's (they already replied and the webhook
+    //                 cancelled the row — the switch stays ON by design).
+    //                 A timer armed here would nudge someone who already
+    //                 answered, so the banner shows its local countdown
+    //                 instead. Fail-closed on a read error, same as the
+    //                 other send gates in this route.
+    // Otherwise: `expires_at = NOW() + N` (N = the box's minutes) with
+    // `started_at` anchored to our last OUTBOUND message, so the runner's
+    // anti-race safety net still cancels it if a reply lands while this
+    // very request is being written.
+    if (action === 'wait_autoinit') {
+      const rawMinutes = Number(body.delay_minutes)
+      const delayMinutes =
+        Number.isFinite(rawMinutes) && rawMinutes > 0
+          ? Math.min(10080, Math.floor(rawMinutes))
+          : null
+      if (delayMinutes === null) {
+        return NextResponse.json(
+          { error: 'delay_minutes must be a whole number between 1 and 10080' },
+          { status: 400 },
+        )
+      }
+      if (conv.response_wait_enabled === false) {
+        return NextResponse.json({
+          success: false,
+          scheduled: false,
+          reason: 'disabled',
+        })
+      }
+      const { data: processingRow } = await supabase
+        .from('response_wait_timers')
+        .select('id')
+        .eq('conversation_id', conversationId)
+        .eq('status', 'processing')
+        .limit(1)
+        .maybeSingle()
+      if (processingRow) {
+        return NextResponse.json({
+          success: false,
+          scheduled: false,
+          reason: 'processing',
+        })
+      }
+      const { data: lastMsg, error: lastErr } = await supabase
+        .from('messages')
+        .select('sender_type, created_at')
+        .eq('conversation_id', conversationId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      const last = lastMsg as {
+        sender_type?: string | null
+        created_at?: string | null
+      } | null
+      if (lastErr || !last || last.sender_type === 'customer') {
+        if (lastErr) {
+          console.warn(
+            `[follow-ups] could not read the last message of conversation ${conversationId} for auto-init: ${lastErr.message}`,
+          )
+        }
+        return NextResponse.json({
+          success: false,
+          scheduled: false,
+          reason: 'not_awaiting',
+        })
+      }
+      const res = await scheduleResponseWaitTimer(supabaseAdmin(), {
+        conversationId,
+        contactId: conv.contact_id,
+        accountId,
+        delayMinutes,
+        startedAt: last.created_at ?? new Date().toISOString(),
+      })
+      return NextResponse.json({
+        success: res.scheduled,
+        scheduled: res.scheduled,
+        id: res.id,
+        expires_at: res.expires_at,
+        delay_minutes: delayMinutes,
+        reason: res.reason,
+      })
     }
 
     // Custom delay in minutes — the inbox lets the agent type ANY value

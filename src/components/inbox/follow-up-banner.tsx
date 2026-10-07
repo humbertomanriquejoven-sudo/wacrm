@@ -39,6 +39,21 @@ import type { FollowUp, ResponseWaitTimer } from "@/types";
 //     (same row) and rearm it from the EXACT minutes of the field,
 //     without duplicates.
 //
+//     SELF-HEAL / NEVER STUCK AT 00:00 — Switch 2 says ACTIVO but the row
+//     is missing (never armed, just toggled ON, worker closed it, a stale
+//     row whose expiry already passed…), so there is no `expires_at` to
+//     count down from. The banner then:
+//       1. starts a CLIENT-SIDE countdown of `NOW() + N` immediately, so
+//          the slot counts `N:00 → N-1:00 …` instead of sitting on 00:00;
+//       2. asks the server (`wait_autoinit`) to turn it into a REAL row.
+//          The route only writes when firing it would be correct: switch
+//          ON, no cycle in flight, and the thread actually waiting on the
+//          customer. Otherwise (`not_awaiting`, `processing`, `disabled`)
+//          the local countdown keeps ticking display-only — a timer must
+//          never nudge a customer who already replied, and must never
+//          stack behind the worker's one-shot dispatch. One attempt per
+//          countdown cycle (never a tight retry loop), no error toasts.
+//
 // ISOLATION / CORRECTNESS GUARANTEES:
 //   * NO shared/global React timer state. Every value is loaded from the
 //     server for THIS `conversation_id`; the parent keys the banner by
@@ -82,6 +97,22 @@ interface FollowUpStatus {
 const MAX_MINUTES = 10080;
 
 /**
+ * Fallback duration for Timer 2 when neither the box nor the chat's
+ * assigned value yields a usable number — the same default the auto-arm
+ * uses server-side (`ARM_DEFAULT_MINUTES`).
+ */
+const DEFAULT_WAIT_MINUTES = 10;
+
+/**
+ * Grace period before an ACTIVE row whose `expires_at` already passed is
+ * considered STALE for display. The worker closes a due row within seconds
+ * (claim → dispatch → close), so a row lingering past this window means the
+ * cycle is mid-flight or the sweep is down — either way it must stop
+ * pinning the countdown at 00:00 while Switch 2 says ACTIVO.
+ */
+const STALE_MS = 10_000;
+
+/**
  * Parse the EXACT integer the agent typed. Returns null for an empty or
  * out-of-range box so the caller can refuse rather than silently
  * substituting a default.
@@ -110,6 +141,24 @@ function formatRemaining(expiresAt: string, nowTs: number): string {
   return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
 }
 
+/**
+ * Expiry of a BD countdown that is still worth rendering, or `NaN`.
+ *
+ * A row is live while `expires_at` is in the future; one that just expired
+ * stays live for `STALE_MS` (the worker is claiming/closing it — showing
+ * `00:00` for those seconds is honest), and beyond that it is STALE: the
+ * caller must stop rendering it so a dead row cannot pin the slot at 00:00
+ * while the switch says ACTIVO. A missing/invalid timestamp is never live.
+ */
+function liveWaitExpiry(
+  wait: { expires_at?: string | null } | null | undefined,
+  nowTs: number,
+): number {
+  const expiry = wait?.expires_at ? Date.parse(wait.expires_at) : NaN;
+  if (!Number.isFinite(expiry)) return NaN;
+  return expiry > nowTs - STALE_MS ? expiry : NaN;
+}
+
 const INPUT_CLASS =
   "h-6 w-14 rounded-md border border-border bg-card px-1.5 text-center text-xs text-foreground outline-none focus-visible:ring-1 focus-visible:ring-primary disabled:opacity-60";
 
@@ -133,6 +182,19 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   // Once the agent types in the box, the server's assigned value stops
   // overriding it (the box is the single source of what they type).
   const waitTouched = useRef(false);
+  // CLIENT-SIDE fallback countdown for Timer 2 (the self-heal above): what
+  // the slot shows while Switch 2 is ACTIVO but there is no usable ACTIVE
+  // row in BD. Created/renewed by the keeper effect below, never rendered
+  // while a real row is live (BD wins), and dropped when the switch goes
+  // OFF. It is display-only state: the real timer is the server row.
+  const [localWait, setLocalWait] = useState<{
+    expires_at: string;
+    delay_minutes: number;
+  } | null>(null);
+  // `expires_at` of the countdown cycle we already asked the server to
+  // persist — one `wait_autoinit` per cycle, so a refusal (or a network
+  // error) degrades to "keep counting locally" instead of hammering the API.
+  const autoInitFor = useRef<string | null>(null);
 
   useEffect(() => {
     mounted.current = true;
@@ -218,7 +280,14 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   }, [status]);
 
   const post = useCallback(
-    async (action: string, extra: Record<string, unknown>) => {
+    async (
+      action: string,
+      extra: Record<string, unknown>,
+      // Background calls (the auto-init self-heal) stay silent: a refused
+      // arm is an expected outcome there — the local countdown keeps
+      // ticking — and must not pop an error toast at the agent.
+      opts?: { silent?: boolean },
+    ) => {
       try {
         const res = await fetch("/api/whatsapp/follow-ups", {
           method: "POST",
@@ -231,12 +300,14 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
         });
         const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
         if (!res.ok) {
-          toast.error((json?.error as string) ?? t("updateError"));
+          if (!opts?.silent) {
+            toast.error((json?.error as string) ?? t("updateError"));
+          }
           return null;
         }
         return json;
       } catch {
-        toast.error(t("networkError"));
+        if (!opts?.silent) toast.error(t("networkError"));
         return null;
       }
     },
@@ -364,6 +435,10 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
                 }
               : s,
           );
+          // The real row owns the countdown again — drop the local
+          // fallback so the keeper below re-evaluates from BD truth.
+          setLocalWait(null);
+          autoInitFor.current = null;
         }
       }
       await refresh();
@@ -372,6 +447,73 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     }
   }, [waitMinutes, post, refresh, t]);
 
+  // ── Timer 2 keeper: ACTIVO must never sit on 00:00 ──────────────
+  // Runs on the 1-second clock (`waitNowTs`) so a countdown that runs out
+  // restarts (or gets replaced by a real BD row) without any user action.
+  useEffect(() => {
+    if (!status) return;
+
+    // Switch 2 OFF → no countdown at all (and no stale local leftover).
+    if (status.response_wait_enabled === false) {
+      setLocalWait(null);
+      autoInitFor.current = null;
+      return;
+    }
+
+    // A real, unexpired BD row owns the slot: it is the one that fires.
+    if (Number.isFinite(liveWaitExpiry(status.response_wait, waitNowTs))) {
+      return;
+    }
+
+    // Minutes for this cycle: EXACTLY what the box shows — the agent's
+    // typed value once they touched it, otherwise the chat's assigned
+    // duration (the value the box is prefilled with), else the default.
+    const assigned =
+      status.response_wait?.delay_minutes ??
+      status.response_wait_last?.delay_minutes ??
+      DEFAULT_WAIT_MINUTES;
+    const minutes = waitTouched.current
+      ? (parseMinutes(waitMinutes) ?? assigned)
+      : assigned;
+
+    let cycle: string;
+    if (localWait && Date.parse(localWait.expires_at) > waitNowTs) {
+      // Still counting — never restart a running countdown on a refresh.
+      cycle = localWait.expires_at;
+    } else {
+      // (Re)start from NOW + N; the render turns it into `max(0, expires −
+      // now)` → MM:SS, ticked every second by clock 2.
+      cycle = new Date(waitNowTs + minutes * 60_000).toISOString();
+      setLocalWait({ expires_at: cycle, delay_minutes: minutes });
+    }
+
+    // Turn it into a REAL timer — one attempt per countdown cycle, and
+    // never while an explicit ↻ Reiniciar / toggle round-trip is in
+    // flight (those paths arm the row themselves; the refresh() below
+    // reconciles). A refused arm (`not_awaiting` / `processing` /
+    // `disabled`) simply stays display-only until the next cycle.
+    //
+    // A nudge that already FAILED to dispatch is terminal for the worker
+    // (`no_response` — it never retries a failed send): queueing a fresh
+    // row from here would turn that terminal state into an every-cycle
+    // retry loop. ↻ Reiniciar stays the explicit way to try again.
+    const failedSend = status.response_wait_last?.status === "no_response";
+    if (failedSend || busyWait !== null || autoInitFor.current === cycle) return;
+    autoInitFor.current = cycle;
+    void (async () => {
+      await post("wait_autoinit", { delay_minutes: minutes }, { silent: true });
+      await refresh();
+    })();
+  }, [
+    status,
+    localWait,
+    waitNowTs,
+    waitMinutes,
+    busyWait,
+    post,
+    refresh,
+  ]);
+
   if (!status) return null;
 
   const pending = status.pending[0] ?? null;
@@ -379,14 +521,22 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   const waitEnabled = status.response_wait_enabled !== false;
   const wait = status.response_wait ?? null;
 
+  // BD row wins while it is live. A row whose expiry is already STALE (the
+  // worker is mid-dispatch or the sweep is down) or a missing row falls
+  // back to the client-side countdown while the switch is ACTIVO, so the
+  // slot counts down instead of freezing on 00:00. Switch OFF → only a
+  // real BD row renders (dimmed), as before.
+  const waitLive = Number.isFinite(liveWaitExpiry(wait, waitNowTs));
+  const waitTimer = wait && waitLive ? wait : waitEnabled ? localWait : null;
+
   const followEta = pending ? formatRemaining(pending.execute_at, followNowTs) : null;
-  const waitEta = wait ? formatRemaining(wait.expires_at, waitNowTs) : null;
+  const waitEta = waitTimer ? formatRemaining(waitTimer.expires_at, waitNowTs) : null;
 
   return (
     <div
       className={cn(
         "border-b text-xs",
-        pending || wait
+        pending || wait || waitTimer
           ? "border-primary/20 bg-primary/5"
           : "border-border bg-muted/40",
       )}
@@ -486,7 +636,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
           <span
             className={cn(
               "min-w-[3.5rem] font-mono text-sm tabular-nums",
-              wait && waitEnabled ? "text-foreground" : "text-muted-foreground",
+              waitTimer && waitEnabled ? "text-foreground" : "text-muted-foreground",
             )}
             aria-live="off"
           >
