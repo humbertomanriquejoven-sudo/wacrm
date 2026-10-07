@@ -1,6 +1,8 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { supabaseAdmin } from '@/lib/ai/admin-client'
 import { sendMessageToConversation } from '@/lib/whatsapp/send-message'
+import { cleanRecipientAddress, getRecipientAddress } from '@/lib/whatsapp/meta-api'
+import { isPlaceholderValue } from '@/lib/whatsapp/phone-utils'
 import { loadAiConfig } from '@/lib/ai/config'
 import { generateReply, stripInternalReasoning } from '@/lib/ai/generate'
 import { buildConversationContext } from '@/lib/ai/context'
@@ -1046,6 +1048,67 @@ export async function runDueFollowUps(
         continue
       }
 
+      // UNIFIED DESTINATION — the same getRecipientAddress a manual inbox
+      // send and the bot auto-reply walk through: a valid `phone` wins (with
+      // non-numeric characters stripped); when `phone` is `'unknown'`/empty
+      // the `wa_id` / `recipient_id` Meta persisted on the contact row kick
+      // in. Resolve FIRST so a failed delivery's log carries the exact
+      // address this send was aimed at, and fail fast when there is
+      // genuinely nothing Meta could route to. A DB hiccup reading the
+      // contact is fail-open: the send core re-resolves at dispatch time
+      // anyway. The username/@handle last-resort stays available to the
+      // core, so we only close the row early when it holds NO phone /
+      // wa_id / recipient_id AND no username either.
+      let destination: string | null = null
+      try {
+        const { data: contact, error: contactErr } = await client
+          .from('contacts')
+          .select('phone, wa_id, recipient_id, username')
+          .eq('id', contactId)
+          .maybeSingle()
+        if (contactErr) {
+          console.error(
+            `[follow-up] could not read the contact for conversation ${conversationId} — the send core will resolve the destination anyway:`,
+            contactErr.message,
+          )
+        } else if (contact) {
+          destination = getRecipientAddress(contact)
+          const usernameBare = cleanRecipientAddress(contact?.username ?? '')
+          if (destination) {
+            console.log(
+              `[follow-up] destination for conversation ${conversationId} resolved via getRecipientAddress: ${destination}.`,
+            )
+          } else if (usernameBare && !isPlaceholderValue(usernameBare)) {
+            console.warn(
+              `[follow-up] conversation ${conversationId} has no phone/wa_id/recipient_id — leaving the username/@handle last resort to the send core.`,
+            )
+          } else {
+            console.warn(
+              `[follow-up] conversation ${conversationId} has NO resolvable destination (no phone, wa_id, recipient_id or username) — closing the timer so it is never retried.`,
+            )
+            const { error: noAddrErr } = await client
+              .from('follow_ups')
+              .update({ status: 'no_response' })
+              .eq('id', id)
+              .eq('status', 'processing')
+            if (noAddrErr) {
+              console.error(
+                `[follow-up] could not mark ${id} as no_response (no address):`,
+                noAddrErr.message,
+              )
+            } else {
+              result.noResponse++
+            }
+            continue
+          }
+        }
+      } catch (err) {
+        console.error(
+          `[follow-up] destination resolution threw for conversation ${conversationId} (fail-open, the send core resolves anyway):`,
+          err instanceof Error ? err.message : err,
+        )
+      }
+
       // Generate the nudge text. A failure here (AI context/DB hiccup) must
       // NEVER strand the row in `processing` — a stuck claimed row can never
       // be delivered by another sweep AND it blocks re-scheduling for the
@@ -1093,7 +1156,7 @@ export async function runDueFollowUps(
         })
       } catch (err) {
         console.error(
-          `[follow-up] could not send the follow-up for conversation ${conversationId}:`,
+          `[follow-up] could not send the follow-up for conversation ${conversationId} (destination resolved via getRecipientAddress: ${destination ?? 'none'}):`,
           err instanceof Error ? err.message : err,
         )
         const { error: noRespErr } = await client
@@ -1222,6 +1285,7 @@ export async function runDueResponseWaitTimers(
     for (const row of due) {
       const id = row.id as string
       const conversationId = row.conversation_id as string
+      const contactId = row.contact_id as string
       const accountId = row.account_id as string
       result.scanned++
 
@@ -1322,6 +1386,67 @@ export async function runDueResponseWaitTimers(
         continue
       }
 
+      // UNIFIED DESTINATION — the same getRecipientAddress used by the manual
+      // inbox send, the bot auto-reply and the follow-up runner: a valid
+      // `phone` wins (non-numeric characters stripped); when `phone` is
+      // `'unknown'`/empty the `wa_id` / `recipient_id` Meta persisted on the
+      // contact row kick in. Resolve FIRST so a failed nudge's log carries
+      // the exact address it was aimed at, and fail fast when there is
+      // genuinely nothing Meta could route to. A DB hiccup reading the
+      // contact is fail-open: the send core re-resolves at dispatch time
+      // anyway, and the username/@handle last-resort stays available to it —
+      // we only close the row early when it holds NO phone / wa_id /
+      // recipient_id AND no username either.
+      let destination: string | null = null
+      try {
+        const { data: contact, error: contactErr } = await client
+          .from('contacts')
+          .select('phone, wa_id, recipient_id, username')
+          .eq('id', contactId)
+          .maybeSingle()
+        if (contactErr) {
+          console.error(
+            `[response-wait] could not read the contact for conversation ${conversationId} — the send core will resolve the destination anyway:`,
+            contactErr.message,
+          )
+        } else if (contact) {
+          destination = getRecipientAddress(contact)
+          const usernameBare = cleanRecipientAddress(contact?.username ?? '')
+          if (destination) {
+            console.log(
+              `[response-wait] destination for conversation ${conversationId} resolved via getRecipientAddress: ${destination}.`,
+            )
+          } else if (usernameBare && !isPlaceholderValue(usernameBare)) {
+            console.warn(
+              `[response-wait] conversation ${conversationId} has no phone/wa_id/recipient_id — leaving the username/@handle last resort to the send core.`,
+            )
+          } else {
+            console.warn(
+              `[response-wait] conversation ${conversationId} has NO resolvable destination (no phone, wa_id, recipient_id or username) — closing the timer so it is never retried.`,
+            )
+            const { error: noAddrErr } = await client
+              .from('response_wait_timers')
+              .update({ status: 'no_response' })
+              .eq('id', id)
+              .eq('status', 'processing')
+            if (noAddrErr) {
+              console.error(
+                `[response-wait] could not mark ${id} as no_response (no address):`,
+                noAddrErr.message,
+              )
+            } else {
+              result.noResponse++
+            }
+            continue
+          }
+        }
+      } catch (err) {
+        console.error(
+          `[response-wait] destination resolution threw for conversation ${conversationId} (fail-open, the send core resolves anyway):`,
+          err instanceof Error ? err.message : err,
+        )
+      }
+
       const text = await buildFollowUpMessage(client, accountId, conversationId)
 
       try {
@@ -1340,7 +1465,7 @@ export async function runDueResponseWaitTimers(
         })
       } catch (err) {
         console.error(
-          `[response-wait] could not send the follow-up for conversation ${conversationId}:`,
+          `[response-wait] could not send the follow-up for conversation ${conversationId} (destination resolved via getRecipientAddress: ${destination ?? 'none'}):`,
           err instanceof Error ? err.message : err,
         )
         const { error: noRespErr } = await client

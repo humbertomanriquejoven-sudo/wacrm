@@ -386,6 +386,54 @@ export function cleanRecipientAddress(address: string): string {
   return bare
 }
 
+/**
+ * The contact columns the unified destination resolver reads + what each
+ * one means. Only the three routable identifiers; the worker timers re-read
+ * this shape so Seguimiento Automático / Esperar respuesta resolve to the
+ * SAME address as a manual inbox send or the bot auto-reply.
+ */
+export interface RecipientAddressContact {
+  /** NOT NULL in the DB; the webhook writes the literal `'unknown'` when the sender disclosed no number. */
+  phone?: string | null
+  /** Meta's `wa_id` for the sender, when disclosed. */
+  wa_id?: string | null
+  /** Meta's `recipient_id` for the sender, when disclosed. */
+  recipient_id?: string | null
+}
+
+/**
+ * THE unified destination rule every WhatsApp sender resolves a contact
+ * through — the manual inbox send, the bot auto-reply and the worker timers
+ * (`runDueFollowUps` / `runDueResponseWaitTimers`).
+ *
+ * Priority:
+ *   1. A real `phone`: present, not the `'unknown'` placeholder and with at
+ *      least one digit → returned with every non-numeric character stripped
+ *      (E.164-ready). A legacy `@handle` stored in phone yields no digits,
+ *      so it is treated as absent instead of fabricating a number.
+ *   2. The `wa_id` Meta persisted on the contact row.
+ *   3. The `recipient_id` Meta persisted on the contact row.
+ *
+ * Returns `null` when none of the three holds a usable value. That is the
+ * signal for the caller to fail fast (typed `InvalidRecipientError` /
+ * `no_response`) instead of sending Meta a request that reads like a
+ * malformed API call — or worse, a 200 that Meta silently drops. It never
+ * invents anything: the value returned is exactly what the row says, and the
+ * send path (`canonicalToField`) normalizes it for the wire.
+ */
+export function getRecipientAddress(contact: RecipientAddressContact): string | null {
+  const phone = cleanRecipientAddress(contact?.phone ?? '')
+  if (phone && !isPlaceholderValue(phone)) {
+    const digits = phone.replace(/\D/g, '')
+    if (digits) return digits
+  }
+  const waId = cleanRecipientAddress(contact?.wa_id ?? '')
+  if (waId && !isPlaceholderValue(waId)) return waId
+  const recipientId = cleanRecipientAddress(contact?.recipient_id ?? '')
+  if (recipientId && !isPlaceholderValue(recipientId)) return recipientId
+  return null
+}
+
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
   let message = fallback
   let code: number | null = null
