@@ -24,7 +24,7 @@ import {
   clearStaleFlowRuns,
 } from '@/lib/ai/unblock'
 import { transcribeAudio } from '@/lib/ai/transcribe'
-import { cancelPendingFollowUps } from '@/lib/whatsapp/follow-up-worker'
+import { cancelPendingFollowUps, cancelResponseWaitTimers } from '@/lib/whatsapp/follow-up-worker'
 import {
   describeInboundContent,
   normalizeContentType,
@@ -1229,7 +1229,15 @@ async function processMessage(
   // replay idempotente) — cualquier recordatorio PENDING para este hilo
   // queda cancelado. El cliente respondió y el siguiente reply del bot
   // programará uno nuevo. Best-effort: no puede bloquear el inbound.
+
+  // Timer 1 — cancel any PENDING follow-up for the thread.
   await cancelPendingFollowUps(supabaseAdmin(), conversation.id)
+
+  // Timer 2 — REGLA CRÍTICA: el cliente respondió, así que la espera de
+  // respuesta termina AHORA: cancela el response-wait timer ACTIVO de
+  // esta conversación para que el worker nunca envíe un seguimiento a
+  // alguien que ya contestó.
+  await cancelResponseWaitTimers(supabaseAdmin(), conversation.id)
 
   // Update conversation. The unread bump is done DB-side (migration 037's
   // bump_conversation_on_inbound) rather than as a read-modify-write of the

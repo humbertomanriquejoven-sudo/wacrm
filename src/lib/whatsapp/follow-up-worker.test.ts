@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 const h = vi.hoisted(() => {
   const state = {
     followUps: [] as Record<string, unknown>[],
+    waitTimers: [] as Record<string, unknown>[],
     messages: [] as Record<string, unknown>[],
     aiConfig: { created_by: 'user-owner' } as Record<string, unknown> | null,
     // conversations.follow_up_enabled — null = inherit the account switch.
@@ -15,8 +16,12 @@ const h = vi.hoisted(() => {
     cancelled: [] as string[],
     completed: [] as string[],
     noResponse: [] as string[],
+    waitCancelled: [] as string[],
+    waitCompleted: [] as string[],
+    waitNoResponse: [] as string[],
     calls: [] as string[],
     followUpsBroken: false,
+    waitTimersBroken: false,
   }
   return { state }
 })
@@ -112,6 +117,84 @@ vi.mock('@/lib/ai/admin-client', () => ({
         }
         return chain
       }
+      if (table === 'response_wait_timers') {
+        if (h.state.waitTimersBroken) {
+          throw new Error('relation "public.response_wait_timers" does not exist')
+        }
+        const filters: Array<{ op: 'eq' | 'lte'; key: string; value: unknown }> = []
+        const matches = (row: Record<string, unknown>) =>
+          filters.every((f) => {
+            if (f.op === 'eq') return row[f.key] === f.value
+            if (f.op === 'lte')
+              return (row[f.key] as number) <= (f.value as number)
+            return true
+          })
+        const resolve = () => ({
+          data: h.state.waitTimers.filter(matches),
+          error: null,
+        })
+        const chain = {
+          select: () => chain,
+          eq: (key: string, value: unknown) => {
+            filters.push({ op: 'eq', key, value })
+            return chain
+          },
+          in: (key: string, value: unknown) => {
+            filters.push({ op: 'eq', key, value })
+            return chain
+          },
+          lte: (key: string, value: unknown) => {
+            filters.push({ op: 'lte', key, value })
+            return chain
+          },
+          order: () => chain,
+          limit: () => chain,
+          maybeSingle: () =>
+            Promise.resolve({
+              data: h.state.waitTimers.find(matches) ?? null,
+              error: null,
+            }),
+          insert: (payload: Record<string, unknown>) => {
+            const id = `wait-${h.state.waitTimers.length + 1}`
+            h.state.waitTimers.push({ id, ...payload })
+            h.state.calls.push('response_wait_timers.insert')
+            return {
+              select: () => ({
+                single: () =>
+                  Promise.resolve({ data: { id, ...payload }, error: null }),
+              }),
+            }
+          },
+          update: (payload: Record<string, unknown>) => {
+            const status = payload.status
+            if (status === 'cancelled') h.state.waitCancelled.push(status)
+            if (status === 'completed') h.state.waitCompleted.push(status)
+            if (status === 'no_response') h.state.waitNoResponse.push(status)
+            const upFilters: Array<{ key: string; value: unknown }> = []
+            const apply = () => {
+              for (const row of h.state.waitTimers) {
+                if (upFilters.every((f) => row[f.key] === f.value)) {
+                  Object.assign(row, payload)
+                }
+              }
+            }
+            return {
+              eq: (key: string, value: unknown) => ({
+                eq: (key2: string, value2: unknown) => {
+                  upFilters.push({ key, value }, { key: key2, value: value2 })
+                  apply()
+                  return Promise.resolve({ data: null, error: null })
+                },
+              }),
+            }
+          },
+          then: (
+            onFulfilled?: (value: { data: Record<string, unknown>[]; error: null } | null) => void,
+            onRejected?: (reason: unknown) => void,
+          ) => Promise.resolve(resolve()).then(onFulfilled as never, onRejected as never),
+        }
+        return chain
+      }
       if (table === 'messages') {
         return {
           select: () => ({
@@ -174,21 +257,30 @@ vi.mock('@/lib/ai/context', () => ({
 import {
   scheduleFollowUp,
   scheduleManualFollowUp,
+  scheduleResponseWaitTimer,
+  cancelResponseWaitTimers,
   cancelPendingFollowUps,
   runDueFollowUps,
+  runDueResponseWaitTimers,
+  runScheduledFollowUps,
   FOLLOW_UP_DELAY_MS,
 } from './follow-up-worker'
 
 function resetState() {
   h.state.followUps = []
+  h.state.waitTimers = []
   h.state.messages = []
   h.state.aiConfig = { created_by: 'user-owner' }
   h.state.conversation = { follow_up_enabled: null }
   h.state.cancelled = []
   h.state.completed = []
   h.state.noResponse = []
+  h.state.waitCancelled = []
+  h.state.waitCompleted = []
+  h.state.waitNoResponse = []
   h.state.calls = []
   h.state.followUpsBroken = false
+  h.state.waitTimersBroken = false
   h.state.sendMessageToConversation.mockReset().mockResolvedValue({
     messageId: 'msg-fu',
     whatsappMessageId: 'wamid-fu',
@@ -428,6 +520,125 @@ describe('scheduleManualFollowUp', () => {
       execute_at: '2026-10-06T12:01:00.000Z',
       status: 'pending',
     })
+  })
+})
+
+describe('scheduleResponseWaitTimer', () => {
+  it('arms the wait timer for EXACTLY now + N minutes', async () => {
+    resetState()
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await scheduleResponseWaitTimer(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+      delayMinutes: 5,
+      now: new Date('2026-10-06T12:00:00.000Z'),
+    })
+
+    expect(res).toMatchObject({ scheduled: true, reason: 'scheduled' })
+    expect(res.expires_at).toBe('2026-10-06T12:05:00.000Z')
+    expect(h.state.waitTimers).toHaveLength(1)
+    expect(h.state.waitTimers[0]).toMatchObject({
+      conversation_id: 'conv-1',
+      contact_id: 'contact-1',
+      account_id: 'account-1',
+      status: 'active',
+      delay_minutes: 5,
+      started_at: '2026-10-06T12:00:00.000Z',
+      expires_at: '2026-10-06T12:05:00.000Z',
+    })
+  })
+
+  it('re-arms the SAME active row (no stacking, no duplicates)', async () => {
+    resetState()
+    h.state.waitTimers = [
+      {
+        id: 'wait-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        status: 'active',
+        delay_minutes: 10,
+        started_at: '2026-10-06T12:00:00.000Z',
+        expires_at: '2026-10-06T12:10:00.000Z',
+      },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await scheduleResponseWaitTimer(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+      delayMinutes: 3,
+      now: new Date('2026-10-06T12:02:00.000Z'),
+    })
+
+    expect(res).toMatchObject({ scheduled: true })
+    expect(h.state.waitTimers).toHaveLength(1)
+    expect(h.state.waitTimers[0]).toMatchObject({
+      delay_minutes: 3,
+      started_at: '2026-10-06T12:02:00.000Z',
+      expires_at: '2026-10-06T12:05:00.000Z',
+    })
+  })
+
+  it('is strictly per-conversation: arming Chat A never touches Chat B', async () => {
+    resetState()
+    h.state.waitTimers = [
+      {
+        id: 'wait-b',
+        conversation_id: 'conv-b',
+        status: 'active',
+        delay_minutes: 10,
+        started_at: '2026-10-06T12:00:00.000Z',
+        expires_at: '2026-10-06T12:10:00.000Z',
+      },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await scheduleResponseWaitTimer(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+      delayMinutes: 1,
+      now: new Date('2026-10-06T12:00:00.000Z'),
+    })
+
+    expect(res.scheduled).toBe(true)
+    expect(h.state.waitTimers).toHaveLength(2)
+    // Chat B's row is byte-for-byte untouched.
+    expect(h.state.waitTimers[0]).toMatchObject({
+      id: 'wait-b',
+      conversation_id: 'conv-b',
+      expires_at: '2026-10-06T12:10:00.000Z',
+    })
+    expect(h.state.waitTimers[1]).toMatchObject({ conversation_id: 'conv-1' })
+  })
+})
+
+describe('cancelResponseWaitTimers', () => {
+  it('cancels every ACTIVE wait timer of the conversation', async () => {
+    resetState()
+    h.state.waitTimers = [
+      {
+        id: 'wait-1',
+        conversation_id: 'conv-1',
+        status: 'active',
+      },
+      {
+        id: 'wait-2',
+        conversation_id: 'conv-2',
+        status: 'active',
+      },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    await cancelResponseWaitTimers(db, 'conv-1')
+
+    expect(h.state.waitCancelled).toEqual(['cancelled'])
+    // Only conv-1's row moved; conv-2 is untouched.
+    expect(h.state.waitTimers[0]).toMatchObject({ status: 'cancelled' })
+    expect(h.state.waitTimers[1]).toMatchObject({ status: 'active' })
   })
 })
 
@@ -719,5 +930,140 @@ describe('runDueFollowUps', () => {
     expect(res).toMatchObject({ scanned: 1, sent: 1, scheduled: 0 })
     expect(h.state.followUps).toHaveLength(1)
     expect(h.state.followUps[0]).toMatchObject({ status: 'completed', type: '24h' })
+  })
+})
+
+describe('runDueResponseWaitTimers', () => {
+  it('sends a generated nudge at expiry when the customer stayed silent', async () => {
+    resetState()
+    h.state.waitTimers = [
+      {
+        id: 'wait-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        status: 'active',
+        delay_minutes: 5,
+        started_at: '2026-10-06T12:00:00.000Z',
+        expires_at: '2026-10-06T12:05:00.000Z',
+      },
+    ]
+    // The agent's message is the last one; the customer never replied.
+    h.state.messages = [{ sender_type: 'bot', content_text: '¡Hola! ¿En qué te ayudo?' }]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueResponseWaitTimers(db, new Date('2026-10-06T12:05:01.000Z'))
+
+    expect(res).toMatchObject({ scanned: 1, sent: 1 })
+    expect(h.state.sendMessageToConversation).toHaveBeenCalledTimes(1)
+    expect(h.state.sendMessageToConversation).toHaveBeenCalledWith(
+      expect.anything(),
+      'account-1',
+      expect.objectContaining({
+        conversationId: 'conv-1',
+        messageType: 'text',
+        senderType: 'bot',
+        aiGenerated: true,
+        contentText: '¿Quedó todo claro? Avísame si necesitas algo más.',
+      }),
+    )
+    expect(h.state.waitCompleted).toEqual(['completed'])
+  })
+
+  it('cancels without sending when the customer replied AT/AFTER started_at', async () => {
+    resetState()
+    h.state.waitTimers = [
+      {
+        id: 'wait-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        status: 'active',
+        delay_minutes: 5,
+        started_at: '2026-10-06T12:00:00.000Z',
+        expires_at: '2026-10-06T12:05:00.000Z',
+      },
+    ]
+    h.state.messages = [
+      { sender_type: 'customer', content_text: 'gracias', created_at: '2026-10-06T12:02:00.000Z' },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueResponseWaitTimers(db, new Date('2026-10-06T12:05:01.000Z'))
+
+    expect(res).toMatchObject({ scanned: 1, sent: 0, cancelled: 1 })
+    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
+    expect(h.state.waitCancelled).toEqual(['cancelled'])
+  })
+
+  it('does nothing before expiry', async () => {
+    resetState()
+    h.state.waitTimers = [
+      {
+        id: 'wait-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        status: 'active',
+        delay_minutes: 5,
+        started_at: '2026-10-06T12:00:00.000Z',
+        expires_at: '2026-10-06T12:05:00.000Z',
+      },
+    ]
+    h.state.messages = [{ sender_type: 'bot', content_text: 'hi' }]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueResponseWaitTimers(db, new Date('2026-10-06T12:04:00.000Z'))
+
+    expect(res).toMatchObject({ scanned: 0, sent: 0 })
+  })
+
+  it('never throws when the response_wait_timers table is missing', async () => {
+    resetState()
+    h.state.waitTimersBroken = true
+
+    const res = await runDueResponseWaitTimers(null, new Date())
+
+    expect(res).toMatchObject({ scanned: 0, sent: 0, cancelled: 0, noResponse: 0 })
+    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
+  })
+})
+
+describe('runScheduledFollowUps — both timers run independently', () => {
+  it('fires Timer 1 and Timer 2 for the SAME conversation without interference', async () => {
+    resetState()
+    h.state.followUps = [
+      {
+        id: 'fu-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        type: '10m',
+        status: 'pending',
+        execute_at: '2026-10-06T12:09:00.000Z',
+      },
+    ]
+    h.state.waitTimers = [
+      {
+        id: 'wait-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        status: 'active',
+        delay_minutes: 5,
+        started_at: '2026-10-06T12:00:00.000Z',
+        expires_at: '2026-10-06T12:05:00.000Z',
+      },
+    ]
+    h.state.messages = [{ sender_type: 'bot', content_text: 'hi' }]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runScheduledFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
+
+    expect(res.followUps).toMatchObject({ scanned: 1, sent: 1 })
+    expect(res.responseWait).toMatchObject({ scanned: 1, sent: 1 })
+    expect(h.state.sendMessageToConversation).toHaveBeenCalledTimes(2)
+    expect(h.state.completed).toEqual(['completed'])
+    expect(h.state.waitCompleted).toEqual(['completed'])
   })
 })

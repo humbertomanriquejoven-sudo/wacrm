@@ -1,10 +1,12 @@
 import { NextResponse } from 'next/server'
 import { authorizeCronRequest } from '@/lib/whatsapp/cron-auth'
-import { runDueFollowUps } from '@/lib/whatsapp/follow-up-worker'
+import { runScheduledFollowUps } from '@/lib/whatsapp/follow-up-worker'
 
 /**
- * Drain due follow-up rows (the 10-minute reminders AND their 24-hour
- * second stage).
+ * Drain BOTH per-conversation timers: the classic follow-up queue
+ * (10-minute reminders + the 24-hour second stage) AND the response-wait
+ * timers (Timer 2, "wait for the client's reply" — auto-cancelled the
+ * moment the customer answers).
  *
  * Meant to be hit on a schedule — Vercel Cron / GitHub Actions / an
  * external pinger — exactly like `/api/automations/cron` and
@@ -36,7 +38,7 @@ export async function GET(request: Request) {
   if (!auth.authorized) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
-  return NextResponse.json(await runDueFollowUps())
+  return NextResponse.json(await runScheduledFollowUps())
 }
 
 export async function POST(request: Request) {
@@ -50,5 +52,5 @@ export async function POST(request: Request) {
   if (!auth.authorized) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
-  return NextResponse.json(await runDueFollowUps())
+  return NextResponse.json(await runScheduledFollowUps())
 }

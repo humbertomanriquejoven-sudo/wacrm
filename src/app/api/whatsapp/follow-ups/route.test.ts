@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
   getCurrentAccount: vi.fn(),
   requireRole: vi.fn(),
   scheduleManualFollowUp: vi.fn(),
+  scheduleResponseWaitTimer: vi.fn(),
+  cancelResponseWaitTimers: vi.fn(),
   supabaseAdmin: vi.fn(),
 }));
 
@@ -28,6 +30,8 @@ vi.mock('@/lib/auth/account', () => ({
 
 vi.mock('@/lib/whatsapp/follow-up-worker', () => ({
   scheduleManualFollowUp: mocks.scheduleManualFollowUp,
+  scheduleResponseWaitTimer: mocks.scheduleResponseWaitTimer,
+  cancelResponseWaitTimers: mocks.cancelResponseWaitTimers,
 }));
 
 vi.mock('@/lib/ai/admin-client', () => ({
@@ -112,6 +116,13 @@ beforeEach(() => {
     reason: 'scheduled',
     id: 'fu-1',
   });
+  mocks.scheduleResponseWaitTimer.mockResolvedValue({
+    scheduled: true,
+    reason: 'scheduled',
+    id: 'wait-1',
+    expires_at: '2026-10-06T12:05:00.000Z',
+  });
+  mocks.cancelResponseWaitTimers.mockResolvedValue(undefined);
 });
 
 describe('POST /api/whatsapp/follow-ups — custom minutes', () => {
@@ -235,5 +246,73 @@ describe('POST /api/whatsapp/follow-ups — inline toggle', () => {
         (o.payload as { status?: string })?.status === 'cancelled',
     );
     expect(cancel).toBeUndefined();
+  });
+});
+
+describe('POST /api/whatsapp/follow-ups — Timer 2 (wait reply)', () => {
+  it('wait_schedule arms the timer for EXACTLY the typed minutes', async () => {
+    const res = await post({
+      conversation_id: 'conv-1',
+      action: 'wait_schedule',
+      delay_minutes: 5,
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.scheduled).toBe(true);
+    expect(mocks.scheduleResponseWaitTimer).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        conversationId: 'conv-1',
+        contactId: 'contact-1',
+        accountId: 'acc-1',
+        delayMinutes: 5,
+      }),
+    );
+  });
+
+  it('wait_reset cancels the old countdown and re-arms from the box value', async () => {
+    await post({
+      conversation_id: 'conv-1',
+      action: 'wait_reset',
+      delay_minutes: 3,
+    });
+    expect(mocks.scheduleResponseWaitTimer).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ delayMinutes: 3 }),
+    );
+  });
+
+  it('clamps out-of-range values to the max', async () => {
+    const res = await post({
+      conversation_id: 'conv-1',
+      action: 'wait_schedule',
+      delay_minutes: 9999999,
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.scheduleResponseWaitTimer).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ delayMinutes: 10080 }),
+    );
+  });
+
+  it('rejects a missing or malformed delay_minutes', async () => {
+    const res = await post({
+      conversation_id: 'conv-1',
+      action: 'wait_schedule',
+    });
+    expect(res.status).toBe(400);
+    expect(mocks.scheduleResponseWaitTimer).not.toHaveBeenCalled();
+  });
+
+  it('wait_cancel cancels the active timer for the thread', async () => {
+    const res = await post({
+      conversation_id: 'conv-1',
+      action: 'wait_cancel',
+    });
+    expect(res.status).toBe(200);
+    expect(mocks.cancelResponseWaitTimers).toHaveBeenCalledWith(
+      expect.anything(),
+      'conv-1',
+    );
   });
 });

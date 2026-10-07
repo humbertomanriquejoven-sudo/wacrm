@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server'
 import { authorizeCronRequest } from '@/lib/whatsapp/cron-auth'
-import { runDueFollowUps } from '@/lib/whatsapp/follow-up-worker'
+import { runScheduledFollowUps } from '@/lib/whatsapp/follow-up-worker'
 
 /**
- * Drain due follow-up rows (the 10-minute reminders + their 24-hour
- * second stage).
+ * Drain BOTH per-conversation timers (follow-up queue + response-wait
+ * timers). Same behavior as `/api/cron/follow-ups`.
  *
  * Legacy alias — the canonical path is `/api/cron/follow-ups` (this
  * route is kept so existing deployed schedules keep working). Requires
@@ -24,7 +24,7 @@ export async function GET(request: Request) {
   if (!auth.authorized) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
-  return NextResponse.json(await runDueFollowUps())
+  return NextResponse.json(await runScheduledFollowUps())
 }
 
 export async function POST(request: Request) {
@@ -35,5 +35,5 @@ export async function POST(request: Request) {
   if (!auth.authorized) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
-  return NextResponse.json(await runDueFollowUps())
+  return NextResponse.json(await runScheduledFollowUps())
 }

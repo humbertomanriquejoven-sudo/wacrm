@@ -276,6 +276,29 @@ export interface FollowUp {
 }
 
 // ============================================================
+// Response-wait timers (Timer 2, migration 064)
+// ============================================================
+
+export type ResponseWaitStatus =
+  | 'active'
+  | 'completed'
+  | 'cancelled'
+  | 'no_response'
+
+export interface ResponseWaitTimer {
+  id: string;
+  conversation_id: string;
+  contact_id: string;
+  account_id: string;
+  status: ResponseWaitStatus;
+  delay_minutes: number;
+  started_at: string;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// ============================================================
 // Notifications (migration 027)
 // ============================================================
 

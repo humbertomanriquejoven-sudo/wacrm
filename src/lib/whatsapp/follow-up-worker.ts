@@ -66,6 +66,173 @@ export function followUpDelayMs(type: FollowUpType): number {
 }
 
 /**
+ * ============================================================
+ * TIMER 2 — RESPONSE-WAIT TIMERS (per conversation, auto-cancelable).
+ * ============================================================
+ * While Timer 1 (`follow_ups`) is the "remind later" queue, Timer 2
+ * (`response_wait_timers`) counts how long the agent wants to wait after
+ * the last outbound message before the system nudges the customer again.
+ *
+ * RULES:
+ *   * ONE ACTIVE row per conversation — Set/Start and Reset UPSERT it
+ *     (move `started_at`/`expires_at`/`delay_minutes` or insert), so a
+ *     conversation can never hold two overlapping countdowns and a Reset
+ *     can never produce a duplicated send.
+ *   * PURELY per-conversation: every row is bound to `conversation_id`
+ *     (plus denormalized contact/account), and every door is keyed on the
+ *     conversation. `expires_at` is persisted, so the UI renders the
+ *     LIVE remainder `expires_at - NOW()` — switching chats or reloading
+ *     the page can never reset, resume, or cross-contaminate a countdown.
+ *   * AUTO-CANCEL BY REPLY (critical): the moment a REAL customer message
+ *     lands for the conversation, the inbound webhook calls
+ *     `cancelResponseWaitTimers`. Independently, at dispatch time the
+ *     runner re-checks the thread's last message and drops the reminder
+ *     if the customer replied AFTER `started_at` — the race safety net.
+ *   * ON EXPIRY (`NOW() >= expires_at`, status still `active`,
+ *     customer silent): the runner generates a contextual AI follow-up
+ *     and sends it through the SAME core the inbox uses
+ *     (`sendMessageToConversation`).
+ *   * Timer 2 is NOT gated by `conversations.follow_up_enabled`: that
+ *     switch belongs to Timer 1 (automation). The wait timer is an
+ *     explicit agent action and must fire even when the automation
+ *     switch is off. The process kill switch (`FOLLOW_UP_ENABLED=false`)
+ *     still wins.
+ */
+
+/** Terminal states that close an ACTIVE wait timer. */
+export type ResponseWaitStatus = 'active' | 'completed' | 'cancelled' | 'no_response'
+
+export interface ResponseWaitScheduleResult {
+  scheduled: boolean
+  reason: 'scheduled' | 'error'
+  id: string | null
+  expires_at: string | null
+}
+
+/**
+ * Arm (Set/Start) or re-arm (Reset) Timer 2 for a conversation.
+ * UPSERTS the single ACTIVE row: an existing one is moved to the new
+ * `expires_at` instead of rejected, so re-arming never stacks duplicates.
+ * Never throws — the inbox shows a toast on `scheduled: false`.
+ */
+export async function scheduleResponseWaitTimer(
+  db: SupabaseClient,
+  params: {
+    conversationId: string
+    contactId: string
+    accountId: string
+    /** Whole minutes, validated by the caller. */
+    delayMinutes: number
+    now?: Date
+  },
+): Promise<ResponseWaitScheduleResult> {
+  const { conversationId, contactId, accountId, delayMinutes } = params
+  const now = params.now ?? new Date()
+  const startedAt = now.toISOString()
+  const expiresAt = new Date(now.getTime() + delayMinutes * 60_000).toISOString()
+
+  try {
+    const { data: active, error: findErr } = await db
+      .from('response_wait_timers')
+      .select('id')
+      .eq('conversation_id', conversationId)
+      .eq('status', 'active')
+      .order('expires_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+
+    if (!findErr && active?.id) {
+      const { error: upErr } = await db
+        .from('response_wait_timers')
+        .update({
+          delay_minutes: delayMinutes,
+          started_at: startedAt,
+          expires_at: expiresAt,
+        })
+        .eq('id', active.id as string)
+        .eq('status', 'active')
+      if (upErr) {
+        console.error(
+          `[response-wait] could not re-arm the timer for conversation ${conversationId}:`,
+          upErr.message,
+        )
+        return { scheduled: false, reason: 'error', id: null, expires_at: null }
+      }
+      console.log(
+        `[response-wait] timer ${active.id} re-armed for conversation ${conversationId} → ${expiresAt}.`,
+      )
+      return { scheduled: true, reason: 'scheduled', id: active.id as string, expires_at: expiresAt }
+    }
+
+    const { data, error: insErr } = await db
+      .from('response_wait_timers')
+      .insert({
+        conversation_id: conversationId,
+        contact_id: contactId,
+        account_id: accountId,
+        status: 'active',
+        delay_minutes: delayMinutes,
+        started_at: startedAt,
+        expires_at: expiresAt,
+      })
+      .select('id')
+      .single()
+    if (insErr || !data) {
+      console.error(
+        `[response-wait] could not arm a timer for conversation ${conversationId}:`,
+        insErr?.message ?? 'no row returned',
+      )
+      return { scheduled: false, reason: 'error', id: null, expires_at: null }
+    }
+    console.log(
+      `[response-wait] timer ${data.id} armed for conversation ${conversationId} → ${expiresAt} (${delayMinutes} min).`,
+    )
+    return { scheduled: true, reason: 'scheduled', id: data.id as string, expires_at: expiresAt }
+  } catch (err) {
+    console.error(
+      `[response-wait] scheduleResponseWaitTimer threw for conversation ${conversationId}:`,
+      err instanceof Error ? err.message : err,
+    )
+    return { scheduled: false, reason: 'error', id: null, expires_at: null }
+  }
+}
+
+/**
+ * Cancel every ACTIVE response-wait timer for a conversation.
+ *
+ * Invoked by the inbound webhook the moment a REAL customer message
+ * lands (the customer answered — the wait is over), and by the
+ * `wait_cancel` route action. Never throws.
+ */
+export async function cancelResponseWaitTimers(
+  db: SupabaseClient,
+  conversationId: string,
+): Promise<void> {
+  try {
+    const { error } = await db
+      .from('response_wait_timers')
+      .update({ status: 'cancelled' })
+      .eq('conversation_id', conversationId)
+      .eq('status', 'active')
+    if (error) {
+      console.error(
+        `[response-wait] could not cancel active timers for conversation ${conversationId}:`,
+        error.message,
+      )
+      return
+    }
+    console.log(
+      `[response-wait] cancelled active timers for conversation ${conversationId} (customer replied).`,
+    )
+  } catch (err) {
+    console.error(
+      `[response-wait] cancelResponseWaitTimers threw for conversation ${conversationId}:`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
+/**
  * Terminal states that permanently close a contact's budget FOR A TYPE.
  * Once a row in one of these states exists for a type, `scheduleFollowUp`
  * refuses to schedule that type again.
@@ -745,6 +912,169 @@ export async function runDueFollowUps(
   return result
 }
 
+export interface RunResponseWaitResult {
+  scanned: number
+  sent: number
+  cancelled: number
+  noResponse: number
+}
+
+/**
+ * The Timer 2 runner: sweep every due ACTIVE response-wait timer and
+ * resolve it.
+ *
+ * For each due row:
+ *   1. AUTO-CANCEL SAFETY NET — if the customer replied AFTER the timer
+ *      started (`started_at`), the row is cancelled and nothing is sent.
+ *      (The inbound webhook already cancelled it, so this covers the
+ *      race where the reply landed just before/after the sweep's scan.)
+ *   2. Otherwise generate a contextual AI follow-up (same builder as
+ *      Timer 1) and send it through `sendMessageToConversation`.
+ *   3. Mark `completed` on success, `no_response` on failure.
+ *
+ * Scoped strictly to `conversation_id`; a missing table or schema glitch
+ * degrades to a logged no-op. Never throws. Idempotent: every state
+ * transition is guarded on `status='active'`.
+ */
+export async function runDueResponseWaitTimers(
+  db: SupabaseClient | null = null,
+  now: Date = new Date(),
+): Promise<RunResponseWaitResult> {
+  const result: RunResponseWaitResult = {
+    scanned: 0,
+    sent: 0,
+    cancelled: 0,
+    noResponse: 0,
+  }
+
+  try {
+    const client = db ?? supabaseAdmin()
+
+    const { data: due, error } = await client
+      .from('response_wait_timers')
+      .select('id, conversation_id, contact_id, account_id, started_at')
+      .eq('status', 'active')
+      .lte('expires_at', now.toISOString())
+      .order('expires_at', { ascending: true })
+      .limit(50)
+    if (error) {
+      if (!/does not exist|42703|PGRST204/i.test(error.message)) {
+        console.error('[response-wait] runner scan failed:', error.message)
+      }
+      return result
+    }
+    if (!due || due.length === 0) return result
+
+    for (const row of due) {
+      const id = row.id as string
+      const conversationId = row.conversation_id as string
+      const accountId = row.account_id as string
+      result.scanned++
+
+      const last = await lastMessage(client, conversationId)
+
+      // AUTO-CANCEL BY REPLY (race safety net): only keep the timer when
+      // the customer's last message predates it. If the customer wrote at
+      // or after `started_at`, the wait is over — drop the reminder.
+      const startedAt = row.started_at ? Date.parse(String(row.started_at)) : NaN
+      const repliedAt = last?.createdAt ? Date.parse(last.createdAt) : NaN
+      const repliedAfterStart =
+        last?.sender === 'customer' &&
+        Number.isFinite(repliedAt) &&
+        Number.isFinite(startedAt) &&
+        repliedAt >= startedAt
+
+      if (repliedAfterStart) {
+        const { error: cancelErr } = await client
+          .from('response_wait_timers')
+          .update({ status: 'cancelled' })
+          .eq('id', id)
+          .eq('status', 'active')
+        if (cancelErr) {
+          console.error(`[response-wait] could not cancel ${id} (reply race):`, cancelErr.message)
+        } else {
+          result.cancelled++
+          console.log(
+            `[response-wait] timer ${id} cancelled — the customer replied for conversation ${conversationId}.`,
+          )
+        }
+        continue
+      }
+
+      const text = await buildFollowUpMessage(client, accountId, conversationId)
+
+      try {
+        await sendMessageToConversation(client, accountId, {
+          conversationId,
+          messageType: 'text',
+          contentText: text,
+          senderType: 'bot',
+          aiGenerated: true,
+        })
+      } catch (err) {
+        console.error(
+          `[response-wait] could not send the follow-up for conversation ${conversationId}:`,
+          err instanceof Error ? err.message : err,
+        )
+        const { error: noRespErr } = await client
+          .from('response_wait_timers')
+          .update({ status: 'no_response' })
+          .eq('id', id)
+          .eq('status', 'active')
+        if (noRespErr) {
+          console.error(`[response-wait] could not mark ${id} as no_response:`, noRespErr.message)
+        } else {
+          result.noResponse++
+        }
+        continue
+      }
+
+      const { error: doneErr } = await client
+        .from('response_wait_timers')
+        .update({ status: 'completed' })
+        .eq('id', id)
+        .eq('status', 'active')
+      if (doneErr) {
+        console.error(`[response-wait] could not mark ${id} as completed:`, doneErr.message)
+        continue
+      }
+      result.sent++
+      console.log(
+        `[response-wait] timer ${id} completed — follow-up delivered for conversation ${conversationId}.`,
+      )
+    }
+  } catch (err) {
+    console.error(
+      '[response-wait] runner threw while draining the queue:',
+      err instanceof Error ? err.message : err,
+    )
+  }
+
+  return result
+}
+
+export interface ScheduledFollowUpsResult {
+  /** Timer 1 results (the classic follow-up queue). */
+  followUps: RunFollowUpsResult
+  /** Timer 2 results (response-wait timers). */
+  responseWait: RunResponseWaitResult
+}
+
+/**
+ * Sweep BOTH timers in one call. Used by the cron endpoints and the
+ * in-process worker so a single scheduler drives both queues.
+ */
+export async function runScheduledFollowUps(
+  db: SupabaseClient | null = null,
+  now: Date = new Date(),
+): Promise<ScheduledFollowUpsResult> {
+  const [followUps, responseWait] = await Promise.all([
+    runDueFollowUps(db, now),
+    runDueResponseWaitTimers(db, now),
+  ])
+  return { followUps, responseWait }
+}
+
 /**
  * In-process runner started by `src/instrumentation.ts` (or a server
  * bootstrap). It runs by DEFAULT; `FOLLOW_UP_WORKER_DISABLED=true` opts
@@ -767,10 +1097,12 @@ export function startFollowUpWorker(opts: {
     if (busy) return
     busy = true
     try {
-      const res = await runDueFollowUps(db)
-      if (res.scanned > 0) {
+      const res = await runScheduledFollowUps(db)
+      const fu = res.followUps
+      const wait = res.responseWait
+      if (fu.scanned > 0 || wait.scanned > 0) {
         console.log(
-          `[follow-up] worker sweep complete — scanned=${res.scanned} sent=${res.sent} cancelled=${res.cancelled} noResponse=${res.noResponse}`,
+          `[follow-up] worker sweep complete — followUps: scanned=${fu.scanned} sent=${fu.sent} cancelled=${fu.cancelled} noResponse=${fu.noResponse} | responseWait: scanned=${wait.scanned} sent=${wait.sent} cancelled=${wait.cancelled} noResponse=${wait.noResponse}`,
         )
       }
     } catch (err) {

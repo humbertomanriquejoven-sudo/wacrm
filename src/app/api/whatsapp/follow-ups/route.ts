@@ -7,6 +7,8 @@ import {
 import { supabaseAdmin } from '@/lib/ai/admin-client'
 import {
   scheduleManualFollowUp,
+  scheduleResponseWaitTimer,
+  cancelResponseWaitTimers,
   type FollowUpType,
 } from '@/lib/whatsapp/follow-up-worker'
 
@@ -23,6 +25,9 @@ import {
  *         - reschedule   push the due time of the PENDING reminder back
  *         - schedule     queue a reminder now (defaults to the 10m stage)
  *         - set_enabled  per-chat override for {conversation_id, enabled}
+ *         - wait_schedule  arm Timer 2 (response-wait) for N minutes
+ *         - wait_reset     cancel the current Timer 2 + re-arm from N
+ *         - wait_cancel    cancel the ACTIVE Timer 2 for the thread
  *
  * Reads use the RLS-scoped user client (members may SELECT follow_ups).
  * Writes use the service-role client AFTER explicit ownership checks —
@@ -127,6 +132,19 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: error.message }, { status: 500 })
     }
 
+    // Timer 2 — the ACTIVE response-wait timer for THIS conversation (at
+    // most one by design). Missing table/column (migration 064 pending)
+    // or any read error degrades to "none" — the banner simply shows an
+    // empty wait row instead of 500-ing the inbox.
+    const { data: waitTimer } = await supabase
+      .from('response_wait_timers')
+      .select('id, conversation_id, status, delay_minutes, started_at, expires_at')
+      .eq('conversation_id', conversationId)
+      .eq('status', 'active')
+      .order('expires_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+
     // Account-wide switch. Missing row / read error ⇒ enabled (the worker
     // shows follow-ups even before the operator visits Settings).
     let globalEnabled = true
@@ -142,6 +160,7 @@ export async function GET(request: Request) {
 
     return NextResponse.json({
       pending: pending ?? [],
+      response_wait: waitTimer ?? null,
       global_enabled: globalEnabled,
       conversation_enabled: owned.conv.follow_up_enabled,
     })
@@ -167,7 +186,17 @@ export async function POST(request: Request) {
         { status: 400 },
       )
     }
-    if (!['cancel', 'reschedule', 'schedule', 'set_enabled'].includes(action)) {
+    if (
+      ![
+        'cancel',
+        'reschedule',
+        'schedule',
+        'set_enabled',
+        'wait_schedule',
+        'wait_reset',
+        'wait_cancel',
+      ].includes(action)
+    ) {
       return NextResponse.json({ error: 'Unknown action' }, { status: 400 })
     }
 
@@ -216,6 +245,44 @@ export async function POST(request: Request) {
         success: true,
         conversation_enabled: value,
       })
+    }
+
+    // Timer 2 — response-wait. Whole minutes, 1..10080, taken EXACTLY as
+    // typed (no defaults/fallbacks). `wait_schedule` and `wait_reset`
+    // both UPSERT the conversation's single ACTIVE row (re-arm instead of
+    // reject), so neither can stack or duplicate; `wait_reset` explicitly
+    // replaces whatever countdown was running with the box's current value.
+    // Timer 2 is independent of the Timer 1 ON/OFF switch (an explicit
+    // agent action must fire even when automation is off).
+    if (action === 'wait_schedule' || action === 'wait_reset') {
+      const rawMinutes = Number(body.delay_minutes)
+      const delayMinutes =
+        Number.isFinite(rawMinutes) && rawMinutes > 0
+          ? Math.min(10080, Math.floor(rawMinutes))
+          : null
+      if (delayMinutes === null) {
+        return NextResponse.json(
+          { error: 'delay_minutes must be a whole number between 1 and 10080' },
+          { status: 400 },
+        )
+      }
+      const res = await scheduleResponseWaitTimer(supabaseAdmin(), {
+        conversationId,
+        contactId: conv.contact_id,
+        accountId,
+        delayMinutes,
+      })
+      return NextResponse.json({
+        success: res.scheduled,
+        scheduled: res.scheduled,
+        id: res.id,
+        expires_at: res.expires_at,
+      })
+    }
+
+    if (action === 'wait_cancel') {
+      await cancelResponseWaitTimers(supabaseAdmin(), conversationId)
+      return NextResponse.json({ success: true })
     }
 
     // Custom delay in minutes — the inbox lets the agent type ANY value

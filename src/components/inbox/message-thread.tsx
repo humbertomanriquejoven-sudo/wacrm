@@ -1186,11 +1186,14 @@ export function MessageThread({
         }}
       />
 
-      {/* Timed follow-up banner — shows the scheduled reminder, lets the
+      {/* Timed follow-up banner — shows the pending reminder, lets the
           agent postpone/cancel it or flip reminders for this chat.
           Renders nothing while loading or when the account switch is
-          off. */}
-      <FollowUpBanner conversationId={conversation.id} />
+          off. Keyed by conversation so switching chats ALWAYS remounts
+          it — each instance is refreshed from the server for that
+          thread only, and local inputs/counters can never bleed across
+          conversations. */}
+      <FollowUpBanner key={conversation.id} conversationId={conversation.id} />
 
       {/* Composer */}
       <MessageComposer
