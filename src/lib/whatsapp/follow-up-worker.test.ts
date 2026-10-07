@@ -6,6 +6,8 @@ const h = vi.hoisted(() => {
     followUps: [] as Record<string, unknown>[],
     messages: [] as Record<string, unknown>[],
     aiConfig: { created_by: 'user-owner' } as Record<string, unknown> | null,
+    // conversations.follow_up_enabled — null = inherit the account switch.
+    conversation: { follow_up_enabled: null } as { follow_up_enabled: boolean | null } | null,
     engineSendText: vi.fn(),
     loadAiConfig: vi.fn(),
     generateReply: vi.fn(),
@@ -82,13 +84,24 @@ vi.mock('@/lib/ai/admin-client', () => ({
             if (status === 'cancelled') h.state.cancelled.push(status)
             if (status === 'completed') h.state.completed.push(status)
             if (status === 'no_response') h.state.noResponse.push(status)
+            // Real client: `.update().eq().eq()` mutates the matching rows.
+            // The runner relies on this to see `completed` before scheduling
+            // the next stage, so the mock must apply the payload.
+            const upFilters: Array<{ key: string; value: unknown }> = []
+            const apply = () => {
+              for (const row of h.state.followUps) {
+                if (upFilters.every((f) => row[f.key] === f.value)) {
+                  Object.assign(row, payload)
+                }
+              }
+            }
             return {
-              eq: () => ({
-                eq: () =>
-                  Promise.resolve({
-                    data: null,
-                    error: null,
-                  }),
+              eq: (key: string, value: unknown) => ({
+                eq: (key2: string, value2: unknown) => {
+                  upFilters.push({ key, value }, { key: key2, value: value2 })
+                  apply()
+                  return Promise.resolve({ data: null, error: null })
+                },
               }),
             }
           },
@@ -126,6 +139,16 @@ vi.mock('@/lib/ai/admin-client', () => ({
           }),
         }
       }
+      if (table === 'conversations') {
+        return {
+          select: () => ({
+            eq: () => ({
+              maybeSingle: () =>
+                Promise.resolve({ data: h.state.conversation, error: null }),
+            }),
+          }),
+        }
+      }
       throw new Error(`unexpected table ${table}`)
     },
   }),
@@ -159,6 +182,7 @@ function resetState() {
   h.state.followUps = []
   h.state.messages = []
   h.state.aiConfig = { created_by: 'user-owner' }
+  h.state.conversation = { follow_up_enabled: null }
   h.state.cancelled = []
   h.state.completed = []
   h.state.noResponse = []
@@ -220,13 +244,14 @@ describe('scheduleFollowUp', () => {
     })
   })
 
-  it('refuses to schedule when the contact already had its one follow-up', async () => {
+  it('refuses to schedule when the contact already had its one follow-up of that type', async () => {
     resetState()
     h.state.followUps = [
       {
         id: 'fu-old',
         status: 'completed',
         contact_id: 'contact-1',
+        type: '10m',
       },
     ]
     const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
@@ -241,6 +266,64 @@ describe('scheduleFollowUp', () => {
       scheduled: false,
       reason: 'already_followed_up',
     })
+  })
+
+  it('allows the 24h stage even after the 10m was already delivered (per-type limit)', async () => {
+    resetState()
+    h.state.followUps = [
+      {
+        id: 'fu-10m',
+        status: 'completed',
+        contact_id: 'contact-1',
+        type: '10m',
+      },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await scheduleFollowUp(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+      type: '24h',
+    })
+
+    expect(res.scheduled).toBe(true)
+    expect(res.reason).toBe('scheduled')
+    expect(h.state.followUps[1]).toMatchObject({
+      type: '24h',
+      status: 'pending',
+      contact_id: 'contact-1',
+    })
+  })
+
+  it('refuses to schedule when the account-wide switch is OFF', async () => {
+    resetState()
+    h.state.aiConfig = { created_by: 'user-owner', follow_up_enabled: false }
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await scheduleFollowUp(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+    })
+
+    expect(res.scheduled).toBe(false)
+    expect(res.reason).toBe('disabled')
+  })
+
+  it('refuses to schedule when the chat override is OFF', async () => {
+    resetState()
+    h.state.conversation = { follow_up_enabled: false }
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await scheduleFollowUp(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+    })
+
+    expect(res.scheduled).toBe(false)
+    expect(res.reason).toBe('disabled')
   })
 
   it('refuses to schedule when the same conversation already has a pending one', async () => {
@@ -302,6 +385,7 @@ describe('runDueFollowUps', () => {
         conversation_id: 'conv-1',
         contact_id: 'contact-1',
         account_id: 'account-1',
+        type: '10m',
         status: 'pending',
         execute_at: '2026-10-06T12:09:00.000Z',
       },
@@ -335,6 +419,7 @@ describe('runDueFollowUps', () => {
         conversation_id: 'conv-1',
         contact_id: 'contact-1',
         account_id: 'account-1',
+        type: '10m',
         status: 'pending',
         execute_at: '2026-10-06T12:09:00.000Z',
       },
@@ -359,6 +444,7 @@ describe('runDueFollowUps', () => {
         conversation_id: 'conv-1',
         contact_id: 'contact-1',
         account_id: 'account-1',
+        type: '10m',
         status: 'pending',
         execute_at: '2026-10-06T12:09:00.000Z',
       },
@@ -385,6 +471,7 @@ describe('runDueFollowUps', () => {
         conversation_id: 'conv-1',
         contact_id: 'contact-1',
         account_id: 'account-1',
+        type: '10m',
         status: 'pending',
         execute_at: '2026-10-06T12:09:00.000Z',
       },
@@ -418,5 +505,56 @@ describe('runDueFollowUps', () => {
 
     expect(res).toMatchObject({ scanned: 0, sent: 0, cancelled: 0, noResponse: 0 })
     expect(h.state.engineSendText).not.toHaveBeenCalled()
+  })
+
+  it('queues the 24h stage after the 10m reminder is delivered', async () => {
+    resetState()
+    h.state.followUps = [
+      {
+        id: 'fu-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        type: '10m',
+        status: 'pending',
+        execute_at: '2026-10-06T12:09:00.000Z',
+      },
+    ]
+    h.state.messages = [{ sender_type: 'bot', content_text: 'hi' }]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
+
+    expect(res).toMatchObject({ scanned: 1, sent: 1, scheduled: 1 })
+    expect(h.state.followUps).toHaveLength(2)
+    expect(h.state.followUps[1]).toMatchObject({
+      type: '24h',
+      status: 'pending',
+      conversation_id: 'conv-1',
+      contact_id: 'contact-1',
+    })
+  })
+
+  it('does not schedule anything after the 24h stage fires', async () => {
+    resetState()
+    h.state.followUps = [
+      {
+        id: 'fu-24',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        type: '24h',
+        status: 'pending',
+        execute_at: '2026-10-07T12:00:00.000Z',
+      },
+    ]
+    h.state.messages = [{ sender_type: 'bot', content_text: 'hi' }]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueFollowUps(db, new Date('2026-10-07T12:00:01.000Z'))
+
+    expect(res).toMatchObject({ scanned: 1, sent: 1, scheduled: 0 })
+    expect(h.state.followUps).toHaveLength(1)
+    expect(h.state.followUps[0]).toMatchObject({ status: 'completed', type: '24h' })
   })
 })

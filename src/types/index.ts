@@ -252,6 +252,30 @@ export interface Conversation {
 }
 
 // ============================================================
+// Timed auto follow-ups (migrations 062 + 063)
+// ============================================================
+
+export type FollowUpStage = '10m' | '24h'
+
+export type FollowUpStatus =
+  | 'pending'
+  | 'completed'
+  | 'cancelled'
+  | 'no_response'
+
+export interface FollowUp {
+  id: string;
+  conversation_id: string;
+  contact_id: string;
+  account_id: string;
+  type: FollowUpStage;
+  status: FollowUpStatus;
+  execute_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// ============================================================
 // Notifications (migration 027)
 // ============================================================
 

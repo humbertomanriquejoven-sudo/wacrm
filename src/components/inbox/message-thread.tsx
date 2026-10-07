@@ -50,6 +50,7 @@ import {
 import { deleteAccountMedia } from "@/lib/storage/upload-media";
 import { TemplatePicker } from "./template-picker";
 import { AiThreadBanner } from "./ai-thread-banner";
+import { FollowUpBanner } from "./follow-up-banner";
 import { buildReplyPreview } from "./reply-quote";
 import { renderTemplateBody } from "@/lib/whatsapp/template-body";
 import { toast } from "sonner";
@@ -1184,6 +1185,12 @@ export function MessageThread({
           }
         }}
       />
+
+      {/* Timed follow-up banner — shows the scheduled reminder, lets the
+          agent postpone/cancel it or flip reminders for this chat.
+          Renders nothing while loading or when the account switch is
+          off. */}
+      <FollowUpBanner conversationId={conversation.id} />
 
       {/* Composer */}
       <MessageComposer

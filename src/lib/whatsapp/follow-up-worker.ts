@@ -7,20 +7,31 @@ import { buildConversationContext } from '@/lib/ai/context'
 
 /**
  * ============================================================
- * TIMED AUTO FOLLOW-UPS — 10 minutes, one per contact, ever.
+ * TIMED AUTO FOLLOW-UPS — 10 minutes AND 24 hours, once per stage.
  * ============================================================
  * When the auto-reply answers an inbound, `scheduleFollowUp` stores a
- * row that is due 10 minutes later. A runner (`runDueFollowUps`,
- * driven by the `/api/whatsapp/follow-ups/cron` endpoint or the
- * optional in-process interval) checks the queue on a cadence, and for
- * each due row verifies the customer truly did NOT reply afterwards —
- * the ANTI-RACE guard: the last message of the conversation must be
- * from the bot/agent, not the customer. Only then does it generate a
- * natural follow-up with the account's AI provider and send it.
+ * `10m` row that is due 10 minutes later. A runner (`runDueFollowUps`,
+ * driven by the `/api/cron/follow-ups` (or legacy
+ * `/api/whatsapp/follow-ups/cron`) endpoint or the optional in-process
+ * interval) checks the queue on a cadence, and for each due row verifies
+ * the customer truly did NOT reply afterwards — the ANTI-RACE guard: the
+ * last message of the conversation must be from the bot/agent, not the
+ * customer. Only then does it generate a natural follow-up with the
+ * account's AI provider and send it.
  *
- * The hard rule: ONE historical follow-up per contact, ever. Once a
- * contact has a row in `completed` or `no_response`, `scheduleFollowUp`
- * refuses to create another — a customer is never chased twice.
+ * After a 10m reminder is delivered, the runner schedules the second
+ * stage: a `24h` reminder. The hard rule is ONE historical follow-up per
+ * contact PER TYPE — once a contact has a `completed`/`no_response` row
+ * for a given type, that type is never scheduled again. So a customer is
+ * chased at most twice (10 minutes, then a day later), and only if they
+ * stayed silent.
+ *
+ * Kill switches, checked in order: `FOLLOW_UP_ENABLED=false` (process),
+ * `ai_configs.follow_up_enabled` (account), and
+ * `conversations.follow_up_enabled` (per chat, NULL = inherit). Any read
+ * failure fails OPEN (reminders stay on) so a missing migration or a
+ * transient DB error never silently disables the feature. See
+ * `isFollowUpEnabled`.
  *
  * All writes run under the service-role client (this code has no
  * `auth.uid()`), and every step is best-effort: a failing provider must
@@ -28,14 +39,25 @@ import { buildConversationContext } from '@/lib/ai/context'
  * that drains the queue.
  */
 
-/** How far in the future a follow-up is born. */
+/** The two reminder stages, in the order they fire. */
+export type FollowUpType = '10m' | '24h'
+
+/** How far in the future the first (10-minute) stage is born. */
 export const FOLLOW_UP_DELAY_MS = 10 * 60 * 1000
+/** How far in the future the second (24-hour) stage is born. */
+export const FOLLOW_UP_24H_DELAY_MS = 24 * 60 * 60 * 1000
 /** Default cadence of the optional in-process runner (ms). */
 export const FOLLOW_UP_INTERVAL_DEFAULT_MS = 60 * 1000
 
+/** Delay for a given stage. */
+export function followUpDelayMs(type: FollowUpType): number {
+  return type === '24h' ? FOLLOW_UP_24H_DELAY_MS : FOLLOW_UP_DELAY_MS
+}
+
 /**
- * Terminal states that permanently close a contact's follow-up budget.
- * Once any exists, `scheduleFollowUp` refuses to schedule again.
+ * Terminal states that permanently close a contact's budget FOR A TYPE.
+ * Once a row in one of these states exists for a type, `scheduleFollowUp`
+ * refuses to schedule that type again.
  */
 const TERMINAL_NO_SCHEDULE: Array<'completed' | 'no_response'> = [
   'completed',
@@ -48,14 +70,77 @@ export interface ScheduleFollowUpResult {
     | 'scheduled'
     | 'already_followed_up'
     | 'duplicate_pending'
+    | 'disabled'
     | 'error'
   id: string | null
 }
 
 /**
- * Schedule a 10-minute follow-up for a conversation, unless the contact
- * has already had their one historic follow-up (completed/no_response)
- * or there is already one pending for this conversation.
+ * Resolve whether follow-ups are enabled for a conversation.
+ *
+ * Precedence: the process-wide kill switch (`FOLLOW_UP_ENABLED=false`)
+ * wins, then the account switch (`ai_configs.follow_up_enabled`), then
+ * the per-chat override (`conversations.follow_up_enabled`, NULL =
+ * inherit the account switch).
+ *
+ * Fail-open: any read error — including migration 063 not yet applied,
+ * when the column does not exist — leaves reminders ON, preserving the
+ * pre-063 behaviour. This function never throws.
+ */
+export async function isFollowUpEnabled(
+  db: SupabaseClient,
+  accountId: string,
+  conversationId: string,
+): Promise<boolean> {
+  if (process.env.FOLLOW_UP_ENABLED === 'false') return false
+
+  try {
+    const { data, error } = await db
+      .from('ai_configs')
+      .select('follow_up_enabled')
+      .eq('account_id', accountId)
+      .maybeSingle()
+    if (
+      !error &&
+      data &&
+      (data as { follow_up_enabled?: boolean | null }).follow_up_enabled === false
+    ) {
+      return false
+    }
+  } catch (err) {
+    console.error(
+      `[follow-up] could not read the account switch for ${accountId} (defaulting to enabled):`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+
+  try {
+    const { data, error } = await db
+      .from('conversations')
+      .select('follow_up_enabled')
+      .eq('id', conversationId)
+      .maybeSingle()
+    if (
+      !error &&
+      data &&
+      (data as { follow_up_enabled?: boolean | null }).follow_up_enabled === false
+    ) {
+      return false
+    }
+  } catch (err) {
+    console.error(
+      `[follow-up] could not read the per-chat switch for ${conversationId} (defaulting to enabled):`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+
+  return true
+}
+
+/**
+ * Schedule a follow-up stage for a conversation, unless the contact has
+ * already had one for this type (completed/no_response), there is already
+ * one pending for this conversation, or reminders are disabled.
  *
  * Never throws: this runs from inside the auto-reply path, where a
  * database hiccup on the INSERT must not surface after the customer
@@ -67,22 +152,34 @@ export async function scheduleFollowUp(
     conversationId: string
     contactId: string
     accountId: string
-    /** Override for tests; defaults to FOLLOW_UP_DELAY_MS. */
+    /** Reminder stage; defaults to the first one ('10m'). */
+    type?: FollowUpType
+    /** Override for tests; defaults to the stage's delay. */
     delayMs?: number
     now?: Date
   },
 ): Promise<ScheduleFollowUpResult> {
   const { conversationId, contactId, accountId } = params
-  const delayMs = params.delayMs ?? FOLLOW_UP_DELAY_MS
+  const type: FollowUpType = params.type ?? '10m'
+  const delayMs = params.delayMs ?? followUpDelayMs(type)
   const now = params.now ?? new Date()
 
   try {
-    // LA REGLA: a contact who already got their one follow-up is never
-    // chased again — regardless of which conversation it happened in.
+    if (!(await isFollowUpEnabled(db, accountId, conversationId))) {
+      console.log(
+        `[follow-up] reminders disabled for conversation ${conversationId} — not scheduling the ${type} stage.`,
+      )
+      return { scheduled: false, reason: 'disabled', id: null }
+    }
+
+    // LA REGLA: a contact who already got a follow-up OF THIS TYPE is
+    // never chased again for that type — regardless of which conversation
+    // it happened in. The other stage is unaffected.
     const { data: historic, error: historicErr } = await db
       .from('follow_ups')
       .select('id')
       .eq('contact_id', contactId)
+      .eq('type', type)
       .in('status', [...TERMINAL_NO_SCHEDULE])
       .limit(1)
       .maybeSingle()
@@ -95,7 +192,7 @@ export async function scheduleFollowUp(
     }
     if (historic) {
       console.log(
-        `[follow-up] contact ${contactId} already had its one follow-up — refusing to schedule another.`,
+        `[follow-up] contact ${contactId} already had the ${type} follow-up — refusing to schedule another of that type.`,
       )
       return { scheduled: false, reason: 'already_followed_up', id: null }
     }
@@ -130,7 +227,7 @@ export async function scheduleFollowUp(
         conversation_id: conversationId,
         contact_id: contactId,
         account_id: accountId,
-        type: '10m',
+        type,
         status: 'pending',
         execute_at: new Date(now.getTime() + delayMs).toISOString(),
       })
@@ -138,14 +235,14 @@ export async function scheduleFollowUp(
       .single()
     if (error) {
       console.error(
-        `[follow-up] could not schedule a follow-up for conversation ${conversationId}:`,
+        `[follow-up] could not schedule the ${type} follow-up for conversation ${conversationId}:`,
         error.message,
       )
       return { scheduled: false, reason: 'duplicate_pending', id: null }
     }
 
     console.log(
-      `[follow-up] scheduled follow-up ${data?.id} for conversation ${conversationId} in ${delayMs / 1000}s.`,
+      `[follow-up] scheduled ${type} follow-up ${data?.id} for conversation ${conversationId} in ${delayMs / 1000}s.`,
     )
     return { scheduled: true, reason: 'scheduled', id: data?.id ?? null }
   } catch (err) {
@@ -283,6 +380,8 @@ export interface RunFollowUpsResult {
   sent: number
   cancelled: number
   noResponse: number
+  /** Second-stage (24h) reminders queued this sweep. */
+  scheduled: number
 }
 
 /**
@@ -311,6 +410,7 @@ export async function runDueFollowUps(
     sent: 0,
     cancelled: 0,
     noResponse: 0,
+    scheduled: 0,
   }
 
   try {
@@ -321,7 +421,7 @@ export async function runDueFollowUps(
 
     const { data: due, error } = await client
       .from('follow_ups')
-      .select('id, conversation_id, contact_id, account_id')
+      .select('id, conversation_id, contact_id, account_id, type')
       .eq('status', 'pending')
       .lte('execute_at', now.toISOString())
       .order('execute_at', { ascending: true })
@@ -338,6 +438,7 @@ export async function runDueFollowUps(
       const conversationId = row.conversation_id as string
       const contactId = row.contact_id as string
       const accountId = row.account_id as string
+      const type: FollowUpType = row.type === '24h' ? '24h' : '10m'
       result.scanned++
 
       const lastSender = await lastMessageSender(client, conversationId)
@@ -357,7 +458,7 @@ export async function runDueFollowUps(
         } else {
           result.cancelled++
           console.log(
-            `[follow-up] follow-up ${id} cancelled (customer replied before the 10-minute window closed).`,
+            `[follow-up] follow-up ${id} cancelled (customer replied before the ${type} window closed).`,
           )
         }
         continue
@@ -416,6 +517,24 @@ export async function runDueFollowUps(
       console.log(
         `[follow-up] follow-up ${id} completed — reminder delivered for conversation ${conversationId}.`,
       )
+
+      // A delivered 10-minute reminder earns the contact ONE more chance,
+      // a day later. The per-type historic rule means the just-completed
+      // 10m doesn't block the 24h, and a silent 24h never triggers a third.
+      if (type === '10m') {
+        const next = await scheduleFollowUp(client, {
+          conversationId,
+          contactId,
+          accountId,
+          type: '24h',
+        })
+        if (next.scheduled) {
+          result.scheduled++
+          console.log(
+            `[follow-up] 10m delivered — 24h stage queued (${next.id}) for conversation ${conversationId}.`,
+          )
+        }
+      }
     }
   } catch (err) {
     // Whole-sweep safety net: an unexpected exception (missing table,

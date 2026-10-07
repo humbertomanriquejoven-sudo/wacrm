@@ -76,6 +76,7 @@ export function AiConfig() {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [isActive, setIsActive] = useState(false);
   const [autoReplyEnabled, setAutoReplyEnabled] = useState(false);
+  const [followUpEnabled, setFollowUpEnabled] = useState(true);
   // 99999 = sin tope efectivo: el bot responde siempre mientras no haya un
   // humano asignado. El valor sólo se usa como referencia para el despacho.
   const [maxPerConversation, setMaxPerConversation] = useState(99999);
@@ -106,6 +107,7 @@ export function AiConfig() {
         setSystemPrompt(data.system_prompt ?? '');
         setIsActive(data.is_active);
         setAutoReplyEnabled(data.auto_reply_enabled);
+        setFollowUpEnabled(data.follow_up_enabled !== false);
         setMaxPerConversation(data.auto_reply_max_per_conversation ?? 99999);
         setHandoffAgentId(data.handoff_agent_id ?? '');
         setHasStoredKey(Boolean(data.has_key));
@@ -158,6 +160,7 @@ export function AiConfig() {
     system_prompt: systemPrompt.trim() || null,
     is_active: isActive,
     auto_reply_enabled: autoReplyEnabled,
+    follow_up_enabled: followUpEnabled,
     auto_reply_max_per_conversation: maxPerConversation,
     handoff_agent_id: handoffAgentId || null,
   });
@@ -226,6 +229,7 @@ export function AiConfig() {
         setKeyEdited(false);
         setIsActive(false);
         setAutoReplyEnabled(false);
+        setFollowUpEnabled(true);
         setSystemPrompt('');
         setHandoffAgentId('');
       } else {
@@ -453,6 +457,22 @@ export function AiConfig() {
               <Switch
                 checked={autoReplyEnabled}
                 onCheckedChange={setAutoReplyEnabled}
+                disabled={disabled || !isActive}
+              />
+            </div>
+
+            <div className="flex items-center justify-between gap-4 rounded-md border border-border p-3">
+              <div>
+                <p className="text-sm font-medium text-foreground">
+                  {t('followUp')}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {t('followUpDesc')}
+                </p>
+              </div>
+              <Switch
+                checked={followUpEnabled}
+                onCheckedChange={setFollowUpEnabled}
                 disabled={disabled || !isActive}
               />
             </div>

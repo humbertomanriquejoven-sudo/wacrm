@@ -66,7 +66,10 @@ const SECURITY_HEADERS = [
 const nextConfig: NextConfig = {
   // Emit a self-contained server bundle (.next/standalone) so the
   // Docker image can run without node_modules or the Next CLI.
-  // Harmless outside Docker: `next start` keeps working as before.
+  // NOTE (Next 16): `next start` refuses to run with this output — it
+  // exits with "does not work with output: standalone". Production is
+  // started from the bundle directly (`node server.js` in the runner
+  // stage of the Dockerfile); local verification is `npm run build`.
   output: "standalone",
 
   /**
