@@ -8,7 +8,7 @@ const h = vi.hoisted(() => {
     aiConfig: { created_by: 'user-owner' } as Record<string, unknown> | null,
     // conversations.follow_up_enabled — null = inherit the account switch.
     conversation: { follow_up_enabled: null } as { follow_up_enabled: boolean | null } | null,
-    engineSendText: vi.fn(),
+    sendMessageToConversation: vi.fn(),
     loadAiConfig: vi.fn(),
     generateReply: vi.fn(),
     buildConversationContext: vi.fn(),
@@ -154,8 +154,8 @@ vi.mock('@/lib/ai/admin-client', () => ({
   }),
 }))
 
-vi.mock('@/lib/flows/meta-send', () => ({
-  engineSendText: h.state.engineSendText,
+vi.mock('@/lib/whatsapp/send-message', () => ({
+  sendMessageToConversation: h.state.sendMessageToConversation,
 }))
 
 vi.mock('@/lib/ai/config', () => ({
@@ -188,8 +188,9 @@ function resetState() {
   h.state.noResponse = []
   h.state.calls = []
   h.state.followUpsBroken = false
-  h.state.engineSendText.mockReset().mockResolvedValue({
-    whatsapp_message_id: 'wamid-fu',
+  h.state.sendMessageToConversation.mockReset().mockResolvedValue({
+    messageId: 'msg-fu',
+    whatsappMessageId: 'wamid-fu',
   })
   h.state.loadAiConfig.mockReset().mockResolvedValue({
     provider: 'openai',
@@ -398,14 +399,16 @@ describe('runDueFollowUps', () => {
     const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
 
     expect(res).toMatchObject({ scanned: 1, sent: 1 })
-    expect(h.state.engineSendText).toHaveBeenCalledTimes(1)
-    expect(h.state.engineSendText).toHaveBeenCalledWith(
+    expect(h.state.sendMessageToConversation).toHaveBeenCalledTimes(1)
+    expect(h.state.sendMessageToConversation).toHaveBeenCalledWith(
+      expect.anything(),
+      'account-1',
       expect.objectContaining({
-        accountId: 'account-1',
         conversationId: 'conv-1',
-        contactId: 'contact-1',
+        messageType: 'text',
+        senderType: 'bot',
         aiGenerated: true,
-        text: '¿Quedó todo claro? Avísame si necesitas algo más.',
+        contentText: '¿Quedó todo claro? Avísame si necesitas algo más.',
       }),
     )
     expect(h.state.completed).toEqual(['completed'])
@@ -439,7 +442,7 @@ describe('runDueFollowUps', () => {
     const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
 
     expect(res).toMatchObject({ scanned: 1, cancelled: 1, sent: 0 })
-    expect(h.state.engineSendText).not.toHaveBeenCalled()
+    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
     expect(h.state.cancelled).toEqual(['cancelled'])
   })
 
@@ -471,7 +474,7 @@ describe('runDueFollowUps', () => {
     const res = await runDueFollowUps(db, new Date('2026-10-06T12:05:01.000Z'))
 
     expect(res).toMatchObject({ scanned: 1, cancelled: 0, sent: 1 })
-    expect(h.state.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.state.sendMessageToConversation).toHaveBeenCalledTimes(1)
     expect(h.state.cancelled).toEqual([])
     expect(h.state.completed).toEqual(['completed'])
   })
@@ -496,8 +499,10 @@ describe('runDueFollowUps', () => {
     const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
 
     expect(res.sent).toBe(1)
-    expect(h.state.engineSendText).toHaveBeenCalledWith(
-      expect.objectContaining({ text: expect.any(String) }),
+    expect(h.state.sendMessageToConversation).toHaveBeenCalledWith(
+      expect.anything(),
+      'account-1',
+      expect.objectContaining({ contentText: expect.any(String) }),
     )
     expect(h.state.generateReply).not.toHaveBeenCalled()
     expect(h.state.completed).toEqual(['completed'])
@@ -505,7 +510,7 @@ describe('runDueFollowUps', () => {
 
   it('marks no_response when the send to WhatsApp fails', async () => {
     resetState()
-    h.state.engineSendText.mockRejectedValue(new Error('Meta 131030'))
+    h.state.sendMessageToConversation.mockRejectedValue(new Error('Meta 131030'))
     h.state.followUps = [
       {
         id: 'fu-1',
@@ -523,7 +528,7 @@ describe('runDueFollowUps', () => {
     const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
 
     expect(res).toMatchObject({ scanned: 1, noResponse: 1, sent: 0 })
-    expect(h.state.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.state.sendMessageToConversation).toHaveBeenCalledTimes(1)
     expect(h.state.noResponse).toEqual(['no_response'])
   })
 
@@ -535,7 +540,7 @@ describe('runDueFollowUps', () => {
     const res = await runDueFollowUps(db, new Date())
 
     expect(res).toMatchObject({ scanned: 0, sent: 0, cancelled: 0 })
-    expect(h.state.engineSendText).not.toHaveBeenCalled()
+    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
   })
 
   it('never throws when the database is unavailable (missing follow_ups table)', async () => {
@@ -545,7 +550,7 @@ describe('runDueFollowUps', () => {
     const res = await runDueFollowUps(null, new Date())
 
     expect(res).toMatchObject({ scanned: 0, sent: 0, cancelled: 0, noResponse: 0 })
-    expect(h.state.engineSendText).not.toHaveBeenCalled()
+    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
   })
 
   it('queues the 24h stage after the 10m reminder is delivered', async () => {

@@ -96,6 +96,18 @@ export interface SendMessageParams {
   /** Structured payload for `messageType === 'interactive'`. */
   interactivePayload?: InteractiveMessagePayload | null;
   replyToMessageId?: string | null;
+  /**
+   * Persisted `messages.sender_type`. Defaults to `'agent'` (a human-style
+   * outbound, exactly as before). The scheduled follow-up path passes
+   * `'bot'` so the Inbox renders the AI nudge like any other bot reply.
+   */
+  senderType?: 'agent' | 'bot';
+  /**
+   * Marks the persisted row `ai_generated = true` so the Inbox badges it.
+   * Only added to the INSERT when true, so a database that predates
+   * migration 033 — and every ordinary send — is byte-identical to before.
+   */
+  aiGenerated?: boolean;
 }
 
 export interface SendMessageResult {
@@ -559,7 +571,7 @@ export async function sendMessageToConversation(
     .from('messages')
     .insert({
       conversation_id: conversationId,
-      sender_type: 'agent',
+      sender_type: params.senderType ?? 'agent',
       content_type: messageType,
       content_text: persistedText,
       media_url: mediaUrl || null,
@@ -569,6 +581,9 @@ export async function sendMessageToConversation(
       message_id: waMessageId,
       status: 'sent',
       reply_to_message_id: replyToMessageId || null,
+      // Only written when true: a pre-033 schema never sees this key, and
+      // manual sends keep relying on the column's `false` default.
+      ...(params.aiGenerated === true ? { ai_generated: true } : {}),
     })
     .select()
     .single();

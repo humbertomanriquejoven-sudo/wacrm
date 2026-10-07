@@ -1,6 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { supabaseAdmin } from '@/lib/ai/admin-client'
-import { engineSendText } from '@/lib/flows/meta-send'
+import { sendMessageToConversation } from '@/lib/whatsapp/send-message'
 import { loadAiConfig } from '@/lib/ai/config'
 import { generateReply, stripInternalReasoning } from '@/lib/ai/generate'
 import { buildConversationContext } from '@/lib/ai/context'
@@ -15,8 +15,11 @@ import { buildConversationContext } from '@/lib/ai/context'
  * ANTI-RACE guard: the customer must NOT have written AFTER the reminder
  * was queued. That check is time-aware (`created_at` comparison) so a
  * manual timer scheduled from the inbox still fires even though the
- * customer's message is the last one. It then generates a natural
- * follow-up with the account's AI provider and sends it.
+ * customer's message is the last one. It then reads that conversation's
+ * own transcript, generates a natural follow-up with the account's AI
+ * provider, and sends it through the SAME core the inbox uses for a
+ * manual message (`sendMessageToConversation`), which resolves the
+ * destination dynamically from the conversation's contact.
  *
  * The runner is triggered by BOTH (a) the `/api/cron/follow-ups` (or
  * legacy `/api/whatsapp/follow-ups/cron`) endpoint for external cron
@@ -505,26 +508,22 @@ export async function runDueFollowUps(
         continue
       }
 
-      // Resolve the audit user for the outbound insert. `created_by` of the
-      // account's ai_configs is the natural owner; fall back to the account
-      // id itself (engineSendText only uses it for logs).
-      let userId = accountId
-      const { data: cfg } = await client
-        .from('ai_configs')
-        .select('created_by')
-        .eq('account_id', accountId)
-        .maybeSingle()
-      if (cfg?.created_by) userId = cfg.created_by as string
-
       const text = await buildFollowUpMessage(client, accountId, conversationId)
 
+      // Send through the SAME core the inbox uses for a manual message
+      // (`sendMessageToConversation`). It resolves the destination
+      // DYNAMICALLY at call time — loading the conversation and its joined
+      // contact and running the shared recipient ladder (phone → recovered
+      // number → wa_id → BSUID → recipient_id → @username) — and, crucially,
+      // anchors opaque-id recipients to the thread's newest inbound wamid so
+      // WhatsApp actually delivers the nudge instead of silently dropping a
+      // 200. Nothing about the destination is hardcoded.
       try {
-        await engineSendText({
-          accountId,
-          userId,
+        await sendMessageToConversation(client, accountId, {
           conversationId,
-          contactId,
-          text,
+          messageType: 'text',
+          contentText: text,
+          senderType: 'bot',
           aiGenerated: true,
         })
       } catch (err) {
