@@ -1147,13 +1147,20 @@ export async function runDueFollowUps(
       // WhatsApp delivers the nudge instead of silently dropping a 200.
       // Nothing about the destination is hardcoded.
       try {
-        await sendMessageToConversation(client, accountId, {
+        const sendResult = await sendMessageToConversation(client, accountId, {
           conversationId,
           messageType: 'text',
           contentText: text,
           senderType: 'bot',
           aiGenerated: true,
         })
+        // The send core resolves the SAME destination the bot/manual sends
+        // use (E.164 phone → wa_id → recipient_id) and only resolves when
+        // Meta answered 2xx — a reject throws into the catch below and is
+        // NEVER recorded as delivered. Log the real wamid for traceability.
+        console.log(
+          `[follow-up] follow-up delivered by the shared send core for conversation ${conversationId} (destination: ${destination ?? 'core-resolved'}, wamid: ${sendResult.whatsappMessageId ?? sendResult.messageId}).`,
+        )
       } catch (err) {
         console.error(
           `[follow-up] could not send the follow-up for conversation ${conversationId} (destination resolved via getRecipientAddress: ${destination ?? 'none'}):`,
@@ -1491,7 +1498,7 @@ export async function runDueResponseWaitTimers(
       }
 
       try {
-        await sendMessageToConversation(client, accountId, {
+        const sendResult = await sendMessageToConversation(client, accountId, {
           conversationId,
           messageType: 'text',
           contentText: text,
@@ -1504,6 +1511,12 @@ export async function runDueResponseWaitTimers(
           // cancelled the row — and without auto-arm no fresh row spawns.
           autoArm: false,
         })
+        // Same shared core as the bot/manual sends; it only resolves when
+        // Meta answered 2xx, so a reject below is never recorded as
+        // delivered. Log the real wamid for traceability.
+        console.log(
+          `[response-wait] "Esperando respuesta" nudge delivered by the shared send core for conversation ${conversationId} (destination: ${destination ?? 'core-resolved'}, wamid: ${sendResult.whatsappMessageId ?? sendResult.messageId}).`,
+        )
       } catch (err) {
         console.error(
           `[response-wait] could not send the follow-up for conversation ${conversationId} (destination resolved via getRecipientAddress: ${destination ?? 'none'}):`,

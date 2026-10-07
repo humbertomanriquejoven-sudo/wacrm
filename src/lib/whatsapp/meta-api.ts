@@ -723,6 +723,31 @@ export async function sendTextMessage(
   args: SendTextMessageArgs
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, text, contextMessageId } = args
+
+  // CREDENTIAL AUDIT — runs for EVERY send path (manual, bot, worker
+  // timers). A missing WABA credential must never be lost as a confusing
+  // network 4xx from Meta (or worse, a latently misconfigured env that
+  // "looks" healthy): name the exact variable and refuse loudly BEFORE any
+  // HTTP request, so a background timer cannot silently never deliver.
+  if (!phoneNumberId || !phoneNumberId.trim()) {
+    console.error(
+      '[send] MISSING CREDENTIAL: META_PHONE_NUMBER_ID (or the account phone row) resolved to an empty value — no HTTP request was sent. Check the env of the process running this task (cron / worker / Next server).',
+    )
+    throw new InvalidRecipientError(
+      '',
+      'phoneNumberId resolved to an empty value (META_PHONE_NUMBER_ID is missing in this process). No HTTP request was sent.',
+    )
+  }
+  if (!accessToken || !accessToken.trim()) {
+    console.error(
+      '[send] MISSING CREDENTIAL: META_ACCESS_TOKEN (or WHATSAPP_TOKEN) resolved to an empty value — no HTTP request was sent. Check the env of the process running this task (cron / worker / Next server).',
+    )
+    throw new InvalidRecipientError(
+      '',
+      'accessToken resolved to an empty value (META_ACCESS_TOKEN / WHATSAPP_TOKEN is missing in this process). No HTTP request was sent.',
+    )
+  }
+
   const recipient = cleanRecipientAddress(to)
   const address = recipient || (to ?? '').trim()
   if (!address) {
@@ -813,7 +838,14 @@ export async function sendTextMessage(
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
   const data = await response.json()
-  console.log('[OUTBOUND WHATSAPP]', data)
+  // Per-attempt delivery log: the exact `to` field that reached Meta (the
+  // same E.164/numeric target a manual or bot send uses), the HTTP status
+  // and the wamid Meta assigned. Errors are logged verbatim by
+  // `throwMetaError` (META_API_SEND_ERROR / META_API_REJECTED) above.
+  console.log(
+    `[OUTBOUND WHATSAPP] delivered to=${targetId} status=${response.status} wamid=${data.messages?.[0]?.id}`,
+    data,
+  )
   return { messageId: data.messages[0].id }
 }
 

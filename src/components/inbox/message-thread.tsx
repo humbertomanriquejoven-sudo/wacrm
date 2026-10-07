@@ -1216,12 +1216,13 @@ export function MessageThread({
 
       {/* Timed follow-up banner — shows the pending reminder, lets the
           agent postpone/cancel it or flip reminders for this chat.
-          Renders nothing while loading or when the account switch is
-          off. Keyed by conversation so switching chats ALWAYS remounts
-          it — each instance is refreshed from the server for that
-          thread only, and local inputs/counters can never bleed across
-          conversations. */}
-      <FollowUpBanner key={conversation.id} conversationId={conversation.id} />
+          Deliberately NOT keyed by conversation: this keeps the banner in
+          the SAME mounted slot when the agent switches chats, so the shell
+          never unmounts/remounts and never flickers out of the layout. The
+          banner itself handles per-chat isolation by resetting its inputs
+          and re-fetching server state when `conversationId` changes, and it
+          renders the shell even while a new chat's data is loading. */}
+      <FollowUpBanner conversationId={conversation.id} />
 
       {/* Composer */}
       <MessageComposer

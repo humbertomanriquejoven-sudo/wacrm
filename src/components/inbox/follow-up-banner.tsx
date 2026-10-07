@@ -63,9 +63,12 @@ import type { FollowUp, ResponseWaitTimer } from "@/types";
 //
 // ISOLATION / CORRECTNESS GUARANTEES:
 //   * NO shared/global React timer state. Every value is loaded from the
-//     server for THIS `conversation_id`; the parent keys the banner by
-//     conversation (`key={conversation.id}`) so switching chats cannot
-//     leak inputs or counters between conversations.
+//     server for THIS `conversation_id`. The PARENT does NOT key this
+//     component, so switching chats never remounts it — the shell stays
+//     fixed in the same DOM slot. Isolation is guaranteed HERE instead:
+//     on every `conversationId` change local inputs/counters/busy flags
+//     are reset and a guard ensures no stale status from the previous chat
+//     is rendered (even for a single frame) while the new chat re-fetches.
 //   * Dynamic remainder: the UI ALWAYS computes `expires_at − NOW()` on a
 //     per-timer 1-second clock. Switch away for 2 minutes and come back: a
 //     5-minute timer honestly shows 3:00, never resets, never borrows
@@ -191,6 +194,26 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       mounted.current = false;
     };
   }, []);
+
+  // When the agent switches conversations the PARENT no longer remounts
+  // this banner (no `key` remount), so per-chat isolation is enforced
+  // here: reset every local input/counter/busy flag the moment the id
+  // changes and re-anchor `lastConvRef` so nothing from the previous chat
+  // can be rendered while the new chat's status is being fetched. The
+  // re-fetch itself fires from the poll effect below (its `refresh`
+  // callback re-creates on `conversationId` change).
+  const lastConvRef = useRef(conversationId);
+  useEffect(() => {
+    lastConvRef.current = conversationId;
+    setStatus(null);
+    setFollowUpMinutes("10");
+    setWaitMinutes("10");
+    waitTouched.current = false;
+    setWaitError(null);
+    setServerSkew(0);
+    setBusyFollow(null);
+    setBusyWait(null);
+  }, [conversationId]);
 
   const refresh = useCallback(async () => {
     try {
@@ -432,12 +455,17 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     }
   }, [waitMinutes, post, refresh, t]);
 
-  if (!status) return null;
-
-  const pending = status.pending[0] ?? null;
-  const enabled = status.conversation_enabled !== false;
-  const waitEnabled = status.response_wait_enabled !== false;
-  const wait = status.response_wait ?? null;
+  // The shell NEVER leaves the DOM — no `return null` while loading, so the
+  // banner stays fixed in the layout. Isolation across chats: only render a
+  // conversation's status once `lastConvRef` has caught up to the id this
+  // render is for, so a stale status can't flash for a frame. While loading
+  // the shell renders with every control disabled and the switches safely
+  // OFF (never falsely implying an active timer).
+  const loading = lastConvRef.current !== conversationId || !status;
+  const pending = loading ? null : (status.pending[0] ?? null);
+  const enabled = loading ? false : status.conversation_enabled !== false;
+  const waitEnabled = loading ? false : status.response_wait_enabled !== false;
+  const wait = loading ? null : (status.response_wait ?? null);
 
   // The ACTIVE BD row is always the source of truth (it is the row the
   // worker fires). Without one, the server-derived anchor keeps the slot
@@ -445,7 +473,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   // from data that did NOT change by merely mounting this component, so
   // leaving the chat and coming back resumes the same value. Switch OFF →
   // nothing to show. Remainders run on the SERVER clock (`serverSkew`).
-  const waitTimer = wait ?? (waitEnabled ? status.response_wait_derived : null);
+  const waitTimer = wait ?? (waitEnabled ? (status?.response_wait_derived ?? null) : null);
 
   const followEta = pending
     ? formatRemaining(pending.execute_at, followNowTs + serverSkew)
@@ -518,7 +546,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
             <Switch
               checked={enabled}
               onCheckedChange={(checked: boolean) => void toggleEnabled(checked)}
-              disabled={busyFollow === "toggle"}
+              disabled={loading || busyFollow === "toggle"}
             />
           </span>
         </div>
@@ -542,7 +570,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
             onKeyDown={(e) => {
               if (e.key === "Enter") void resetWait();
             }}
-            disabled={busyWait !== null}
+            disabled={loading || busyWait !== null}
             aria-label={t("customMinutes")}
             className={INPUT_CLASS}
           />
@@ -550,6 +578,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
           <BannerButton
             onClick={() => void resetWait()}
             busy={busyWait === "wait_reset"}
+            disabled={loading}
             icon={RotateCcw}
           >
             {t("waitReset")}
@@ -579,7 +608,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
             <Switch
               checked={waitEnabled}
               onCheckedChange={(checked: boolean) => void toggleWaitEnabled(checked)}
-              disabled={busyWait === "wait_toggle"}
+              disabled={loading || busyWait === "wait_toggle"}
             />
           </span>
         </div>
