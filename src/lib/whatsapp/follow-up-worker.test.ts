@@ -1062,7 +1062,7 @@ describe('runDueFollowUps', () => {
 })
 
 describe('runDueResponseWaitTimers', () => {
-  it('sends a generated nudge at expiry, then RE-ARMS in place (continuous)', async () => {
+  it('sends ONE generated nudge at expiry, then closes the timer as completed (single execution)', async () => {
     resetState()
     h.state.waitTimers = [
       {
@@ -1096,16 +1096,17 @@ describe('runDueResponseWaitTimers', () => {
         contentText: '¿Quedó todo claro? Avísame si necesitas algo más.',
       }),
     )
-    // NOT completed — the nudge restarts the countdown from the configured
-    // 5 minutes: 12:05:01 + 5 min = 12:10:01, single ACTIVE row, no twins.
-    expect(h.state.waitCompleted).toEqual([])
+    // ONE-SHOT: the nudge went out exactly once; the timer closes as
+    // `completed` and NEVER re-arms by itself. The agent must press
+    // ↻ Reiniciar (or the next outbound) to watch again.
+    expect(h.state.waitCompleted).toEqual(['completed'])
     expect(h.state.waitTimers).toHaveLength(1)
     expect(h.state.waitTimers[0]).toMatchObject({
       id: 'wait-1',
-      status: 'active',
+      status: 'completed',
       delay_minutes: 5,
-      started_at: '2026-10-06T12:05:01.000Z',
-      expires_at: '2026-10-06T12:10:01.000Z',
+      started_at: '2026-10-06T12:00:00.000Z',
+      expires_at: '2026-10-06T12:05:00.000Z',
     })
   })
 
@@ -1207,15 +1208,15 @@ describe('runScheduledFollowUps — both timers run independently', () => {
     expect(res.followUps).toMatchObject({ scanned: 1, sent: 1 })
     expect(res.responseWait).toMatchObject({ scanned: 1, sent: 1 })
     expect(h.state.sendMessageToConversation).toHaveBeenCalledTimes(2)
+    // BOTH timers are one-shot: Timer 1 and Timer 2 each delivered their
+    // single action and closed their rows as `completed`.
     expect(h.state.completed).toEqual(['completed'])
-    // Timer 2 is continuous: its row stays ACTIVE and restarts at 12:10 + 5
-    // min = 12:15 instead of closing. Only Timer 1 produced a `completed`.
-    expect(h.state.waitCompleted).toEqual([])
+    expect(h.state.waitCompleted).toEqual(['completed'])
     expect(h.state.waitTimers[0]).toMatchObject({
       id: 'wait-1',
-      status: 'active',
-      started_at: '2026-10-06T12:10:00.000Z',
-      expires_at: '2026-10-06T12:15:00.000Z',
+      status: 'completed',
+      started_at: '2026-10-06T12:00:00.000Z',
+      expires_at: '2026-10-06T12:05:00.000Z',
     })
   })
 })

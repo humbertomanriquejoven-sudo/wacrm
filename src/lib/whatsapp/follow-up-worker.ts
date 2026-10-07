@@ -4,7 +4,6 @@ import { sendMessageToConversation } from '@/lib/whatsapp/send-message'
 import { loadAiConfig } from '@/lib/ai/config'
 import { generateReply, stripInternalReasoning } from '@/lib/ai/generate'
 import { buildConversationContext } from '@/lib/ai/context'
-import { ARM_DEFAULT_MINUTES } from './response-wait'
 
 /**
  * Timer 2 (`response_wait_timers`) logic — arming, re-arming, auto-arm on
@@ -781,13 +780,13 @@ export interface RunResponseWaitResult {
  *      race where the reply landed just before/after the sweep's scan.)
  *   2. Otherwise generate a contextual AI follow-up and send it through
  *      `sendMessageToConversation` (with `autoArm: false`).
- *   3. RE-ARM IN PLACE — the moment the nudge is dispatched the timer
- *      restarts from its configured `delay_minutes` so the countdown
- *      keeps watching for the client's reply to the NEW message. The
- *      update is guarded on `status='active'`: if the client replied at
- *      the exact moment of expiry, the webhook already cancelled the row
- *      and this sweep does not resurrect it. `no_response` still closes a
- *      row whose nudge never went out (a provider/send failure is
+ *   3. ONE-SHOT EXECUTION — the moment the single nudge is dispatched the
+ *      row closes as `completed`. It never re-arms by itself: the agent
+ *      must press ↻ Reiniciar (or the next outbound auto-arm) to watch
+ *      again. The update is guarded on `status='active'`: if the client
+ *      replied at the exact moment of expiry, the webhook already cancelled
+ *      the row and this sweep does not resurrect it. `no_response` still
+ *      closes a row whose nudge never went out (a provider/send failure is
  *      terminal — the system never retries forever).
  *
  * Scoped strictly to `conversation_id`; a missing table or schema glitch
@@ -810,7 +809,7 @@ export async function runDueResponseWaitTimers(
 
     const { data: due, error } = await client
       .from('response_wait_timers')
-      .select('id, conversation_id, contact_id, account_id, started_at, delay_minutes')
+      .select('id, conversation_id, contact_id, account_id, started_at')
       .eq('status', 'active')
       .lte('expires_at', now.toISOString())
       .order('expires_at', { ascending: true })
@@ -883,8 +882,11 @@ export async function runDueResponseWaitTimers(
           contentText: text,
           senderType: 'bot',
           aiGenerated: true,
-          // The re-arm below is the ONLY Timer 2 arm this path performs —
-          // the send core's auto-arm must not stack a second ACTIVE row.
+          // ONE-SHOT: this nudge opts OUT of the send core's auto-arm so no
+          // second ACTIVE row can stack (the due row is still `active` and
+          // only closes as `completed` AFTER the dispatch below). If the
+          // client replies at the exact moment of expiry the webhook
+          // cancelled the row — and without auto-arm no fresh row spawns.
           autoArm: false,
         })
       } catch (err) {
@@ -905,31 +907,24 @@ export async function runDueResponseWaitTimers(
         continue
       }
 
-      // RE-ARM IN PLACE — the nudge went out, so the countdown restarts
-      // from the configured time ("el temporizador se reinicia
-      // automáticamente") and keeps watching for the client's reply to the
-      // NEW message. Guarded on `status='active'`: if the inbound webhook
-      // cancelled this row at the exact moment of expiry (the client DID
-      // reply), zero rows match and nothing is re-armed — the next send
-      // (agent or bot) hands a fresh countdown instead.
-      const nowIso = now.toISOString()
-      const reArmMinutes = Number(row.delay_minutes)
-      const reArmMs = Number.isFinite(reArmMinutes) && reArmMinutes > 0
-        ? reArmMinutes * 60_000
-        : ARM_DEFAULT_MINUTES * 60_000
-      const nextExpiresAt = new Date(now.getTime() + reArmMs).toISOString()
-      const { error: reArmErr } = await client
+      // ONE-SHOT: the single contextual nudge went out; the timer closes as
+      // `completed`. It NEVER re-arms by itself — the agent must press
+      // ↻ Reiniciar (or the next outbound auto-arm) to watch again. Guarded
+      // on `status='active'`: if the inbound webhook cancelled this row at
+      // the exact moment of expiry (the client DID reply), zero rows match
+      // and nothing is resurrected.
+      const { error: doneErr } = await client
         .from('response_wait_timers')
-        .update({ status: 'active', started_at: nowIso, expires_at: nextExpiresAt })
+        .update({ status: 'completed' })
         .eq('id', id)
         .eq('status', 'active')
-      if (reArmErr) {
-        console.error(`[response-wait] could not re-arm ${id}:`, reArmErr.message)
+      if (doneErr) {
+        console.error(`[response-wait] could not mark ${id} as completed:`, doneErr.message)
         continue
       }
       result.sent++
       console.log(
-        `[response-wait] follow-up delivered for conversation ${conversationId} — timer ${id} re-armed → ${nextExpiresAt} (${Math.round(reArmMs / 60_000)} min).`,
+        `[response-wait] timer ${id} completed — one-shot follow-up delivered for conversation ${conversationId}.`,
       )
     }
   } catch (err) {

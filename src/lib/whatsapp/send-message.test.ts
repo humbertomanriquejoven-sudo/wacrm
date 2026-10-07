@@ -690,9 +690,11 @@ describe('sendMessageToConversation — Timer 2 auto-arm on send', () => {
     );
   });
 
-  it('honors autoArm:false (the Timer 2 runner re-arms itself)', async () => {
-    // The expiry-nudge dispatch opts out so its explicit in-place re-arm
-    // can never stack a second ACTIVE row for the same conversation.
+  it('honors autoArm:false (the one-shot Timer 2 nudge)', async () => {
+    // The expiry-nudge dispatch opts out so its own row write (completed)
+    // can never stack a second ACTIVE row for the same conversation — and
+    // no fresh row spawns if the client replied at the exact moment of
+    // expiry (the webhook already cancelled the due row).
     const captured: CapturedWrites = {};
     await sendMessageToConversation(sendPathDb([], captured), 'acct-1', {
       conversationId: 'cv-1',

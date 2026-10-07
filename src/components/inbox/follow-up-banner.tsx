@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { BellOff, Clock, Loader2, Plus, RotateCcw, Timer as TimerIcon } from "lucide-react";
+import { Loader2, Plus, RotateCcw } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { useTranslations } from "next-intl";
@@ -17,22 +17,21 @@ import type { FollowUp, ResponseWaitTimer } from "@/types";
 //     `follow_ups.pending` (execute_at) → ⏱️ Próximo seguimiento en: MM:SS.
 //     OFF cancels the queued row and the worker refuses to dispatch.
 //
-//   BLOCK 2 — "Esperar respuesta" (Timer 2, response-wait, CONTINUOUS).
-//     [ N ] min  [▶ Iniciar]  [↻ Reiniciar]
+//   BLOCK 2 — "Esperar respuesta" (Timer 2, response-wait, ONE-SHOT).
+//     [ N ] min  [↻ Reiniciar]
 //     `response_wait_timers.active` (started_at + expires_at) → live
-//     countdown "⏱️ Tiempo restante: MM:SS", ALWAYS visible under the row
-//     while the timer is active — it never hides and never skips a tick.
+//     countdown "MM:SS" rendered INLINE on the same row, right after the
+//     controls — it always ticks every second and never hides.
 //
-//     AUTO (never needs the button):
+//     AUTO (never needs a button):
 //       · ANY outbound (agent or bot) with the client silent → auto-arm:
 //         `expires_at = NOW() + N` (N = the chat's configured minutes,
 //         default 10). An active countdown simply continues.
 //       · Client replies → webhook cancels (cancelled_reason='inbound');
-//         the UI shows "💬 Cliente respondió…" and nothing is sent.
-//       · Zero with no reply → the worker sends the contextual AI nudge
-//         and RE-ARMS in place, so the countdown restarts at 10:00 instead
-//         of closing. The only way OUT of `active` is the client replying
-//         (`cancelled`) or the nudge failing to dispatch (`no_response`).
+//         the row closes as `cancelled` and nothing is sent.
+//       · Zero with no reply → the worker sends ONE contextual AI nudge
+//         and closes the row as `completed` (single execution). It never
+//         re-arms by itself.
 //       · After a reply, the next outbound (bot or agent) hands the timer
 //         a fresh start automatically.
 //     ↻ Reiniciar = cancel the current countdown (same row) and rearm it
@@ -52,7 +51,7 @@ import type { FollowUp, ResponseWaitTimer } from "@/types";
 // ------------------------------------------------------------------
 
 type Busy = "schedule" | "toggle" | null;
-type WaitBusy = "wait_set" | "wait_reset" | null;
+type WaitBusy = "wait_reset" | null;
 
 interface WaitLast {
   id?: string;
@@ -263,25 +262,9 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   );
 
   // ---- Timer 2 (esperar respuesta, ONE-SHOT) ------------------------
-  const startWait = useCallback(async () => {
-    const value = parseMinutes(waitMinutes);
-    if (value === null) {
-      toast.error(t("invalidMinutes"));
-      return;
-    }
-    setBusyWait("wait_set");
-    try {
-      const json = await post("wait_schedule", { delay_minutes: value });
-      if (json) {
-        if (json.scheduled === false) toast.error(t("waitFailed"));
-        else toast.success(t("waitScheduledSuccess"));
-      }
-      await refresh();
-    } finally {
-      setBusyWait(null);
-    }
-  }, [waitMinutes, post, refresh, t]);
-
+  // There is NO "▶ Iniciar" button — the timer starts automatically the
+  // moment the agent (or bot) sends an outbound message. ↻ Reiniciar is the
+  // only control here.
   const resetWait = useCallback(async () => {
     const value = parseMinutes(waitMinutes);
     if (value === null) {
@@ -333,143 +316,112 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
           : "border-border bg-muted/40",
       )}
     >
-      <div className="space-y-2 px-3 py-2 sm:px-4">
-        {/* ─── Bloque 1: Seguimiento automático ───────────────────── */}
-        <div className="space-y-1">
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-            <span className={LABEL_CLASS}>
-              {enabled ? (
-                <Clock
-                  className={cn(
-                    "h-3.5 w-3.5 flex-shrink-0",
-                    pending ? "text-primary" : "text-muted-foreground",
-                  )}
-                />
-              ) : (
-                <BellOff className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+      <div className="space-y-1.5 px-3 py-2 sm:px-4">
+        {/* ─── Fila 1: Seguimiento automático ─────────────────────── */}
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+          <span className={LABEL_CLASS}>
+            <span>{t("followRowLabel")}</span>
+          </span>
+
+          <input
+            type="number"
+            min={1}
+            max={MAX_MINUTES}
+            inputMode="numeric"
+            value={followUpMinutes}
+            onChange={(e) => setFollowUpMinutes(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void scheduleFollowUp();
+            }}
+            disabled={!enabled || busyFollow === "schedule"}
+            aria-label={t("customMinutes")}
+            className={INPUT_CLASS}
+          />
+          <span className="text-muted-foreground">{t("minutesUnit")}</span>
+          <BannerButton
+            onClick={() => void scheduleFollowUp()}
+            busy={busyFollow === "schedule"}
+            disabled={!enabled}
+            icon={Plus}
+          >
+            {t("scheduleTimer")}
+          </BannerButton>
+
+          <span
+            className={cn(
+              "min-w-[3.5rem] font-mono text-sm tabular-nums",
+              pending ? "text-foreground" : "text-transparent",
+            )}
+            aria-live="off"
+          >
+            {followEta ?? "00:00"}
+          </span>
+
+          <span className="ml-auto flex items-center gap-1.5">
+            <span
+              className={cn(
+                "font-semibold",
+                enabled
+                  ? "text-emerald-600 dark:text-emerald-400"
+                  : "text-muted-foreground",
               )}
-              <span>{t("followRowLabel")}</span>
-            </span>
-
-            <input
-              type="number"
-              min={1}
-              max={MAX_MINUTES}
-              inputMode="numeric"
-              value={followUpMinutes}
-              onChange={(e) => setFollowUpMinutes(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void scheduleFollowUp();
-              }}
-              disabled={!enabled || busyFollow === "schedule"}
-              aria-label={t("customMinutes")}
-              className={INPUT_CLASS}
-            />
-            <span className="text-muted-foreground">{t("minutesUnit")}</span>
-            <BannerButton
-              onClick={() => void scheduleFollowUp()}
-              busy={busyFollow === "schedule"}
-              disabled={!enabled}
-              icon={Plus}
             >
-              {t("scheduleTimer")}
-            </BannerButton>
-
-            <span className="ml-auto flex items-center gap-1.5">
-              <span
-                className={cn(
-                  "font-semibold",
-                  enabled
-                    ? "text-emerald-600 dark:text-emerald-400"
-                    : "text-muted-foreground",
-                )}
-              >
-                {enabled ? t("active") : t("inactive")}
-              </span>
-              <Switch
-                checked={enabled}
-                onCheckedChange={(checked: boolean) => void toggleEnabled(checked)}
-                disabled={busyFollow === "toggle"}
-              />
+              {enabled ? t("active") : t("inactive")}
             </span>
-          </div>
-
-          {pending && (
-            <p className="text-muted-foreground">
-              {t("followNext", { time: followEta ?? "00:00" })}
-            </p>
-          )}
+            <Switch
+              checked={enabled}
+              onCheckedChange={(checked: boolean) => void toggleEnabled(checked)}
+              disabled={busyFollow === "toggle"}
+            />
+          </span>
         </div>
 
-        {/* ─── Separador ──────────────────────────────────────────── */}
-        <div
-          className={cn(
-            "border-t border-dashed",
-            pending || wait ? "border-primary/20" : "border-border",
-          )}
-        />
+        {/* ─── Fila 2: Esperar respuesta (ONE-SHOT) ────────────────── */}
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+          <span className={LABEL_CLASS}>
+            <span>{t("waitRowLabel")}</span>
+          </span>
 
-        {/* ─── Bloque 2: Esperar respuesta (ONE-SHOT) ─────────────── */}
-        <div className="space-y-1">
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-            <span className={LABEL_CLASS}>
-              <TimerIcon
-                className={cn(
-                  "h-3.5 w-3.5 flex-shrink-0",
-                  wait ? "text-primary" : "text-muted-foreground",
-                )}
-              />
-              <span>{t("waitRowLabel")}</span>
-            </span>
-
-            <input
-              type="number"
-              min={1}
-              max={MAX_MINUTES}
-              inputMode="numeric"
-              value={waitMinutes}
-              onChange={(e) => {
-                waitTouched.current = true;
-                setWaitMinutes(e.target.value);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void startWait();
-              }}
-              disabled={busyWait !== null}
-              aria-label={t("customMinutes")}
-              className={INPUT_CLASS}
-            />
-            <span className="text-muted-foreground">{t("minutesUnit")}</span>
-            <BannerButton
-              onClick={() => void startWait()}
-              busy={busyWait === "wait_set"}
-              icon={Plus}
-            >
-              {t("waitStart")}
-            </BannerButton>
-            <BannerButton
-              onClick={() => void resetWait()}
-              busy={busyWait === "wait_reset"}
-              icon={RotateCcw}
-            >
-              {t("waitReset")}
-            </BannerButton>
-          </div>
-
-          <p
-            className={cn(
-              "text-muted-foreground",
-              waitOutcome === "active" && "text-foreground",
-            )}
+          <input
+            type="number"
+            min={1}
+            max={MAX_MINUTES}
+            inputMode="numeric"
+            value={waitMinutes}
+            onChange={(e) => {
+              waitTouched.current = true;
+              setWaitMinutes(e.target.value);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void resetWait();
+            }}
+            disabled={busyWait !== null}
+            aria-label={t("customMinutes")}
+            className={INPUT_CLASS}
+          />
+          <span className="text-muted-foreground">{t("minutesUnit")}</span>
+          <BannerButton
+            onClick={() => void resetWait()}
+            busy={busyWait === "wait_reset"}
+            icon={RotateCcw}
           >
-            {waitOutcome === "active" && (
-              <span className="font-mono tabular-nums">
-                {t("waitRemaining", { time: waitEta ?? "00:00" })}
-              </span>
-            )}
-            {waitOutcome === "executed" && <>{t("waitExecuted")}</>}
-            {waitOutcome === "replied" && <>{t("waitCancelledByReply")}</>}
-          </p>
+            {t("waitReset")}
+          </BannerButton>
+
+          {waitOutcome === "active" && (
+            <span
+              className="min-w-[3.5rem] font-mono text-sm tabular-nums text-foreground"
+              aria-live="off"
+            >
+              {waitEta ?? "00:00"}
+            </span>
+          )}
+          {waitOutcome === "executed" && (
+            <span className="text-muted-foreground">{t("waitExecuted")}</span>
+          )}
+          {waitOutcome === "replied" && (
+            <span className="text-muted-foreground">{t("waitCancelledByReply")}</span>
+          )}
         </div>
       </div>
     </div>

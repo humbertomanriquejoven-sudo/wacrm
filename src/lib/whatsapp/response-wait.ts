@@ -29,14 +29,15 @@
 //   * AUTO-ARM ON SEND: `armResponseWaitIfIdle` is called right after ANY
 //     outbound (agent or bot/AI) message is persisted. It starts the
 //     countdown immediately ("en cuanto enviamos un mensaje"), continues an
-//     active countdown without restarting it, and re-arms with the chat's
+//     active countdown without restarting it, and arms with the chat's
 //     last-used duration after the customer replied (or 10 min by default).
-//   * ON EXPIRY — CONTINUOUS (not one-shot): while the customer stays
-//     silent the runner sends a contextual follow-up and RE-ARMS the same
-//     row in place (`expires_at = now + delay_minutes`), so `00:00`
-//     cycles back to a fresh 10-minute countdown instead of closing. The
-//     only ways OUT of `active` are a customer reply (webhook cancel →
-//     `cancelled`) or a nudge that failed to dispatch (`no_response`).
+//   * ON EXPIRY — SINGLE EXECUTION (one-shot): while the customer stays
+//     silent the runner sends ONE contextual follow-up and then closes the
+//     row as `completed`. It never re-arms by itself — the agent's
+//     ↻ Reiniciar button (or the next outbound auto-arm) is what starts a
+//     fresh cycle. The only ways OUT of `active` are a customer reply
+//     (webhook cancel → `cancelled`) or a nudge that failed to dispatch
+//     (`no_response`).
 //   * Timer 2 is NOT gated by `conversations.follow_up_enabled`: that
 //     switch belongs to Timer 1 (automation). The wait timer is an
 //     explicit agent action and must fire even when the automation

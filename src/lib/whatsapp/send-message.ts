@@ -102,7 +102,9 @@ export interface SendMessageParams {
    * outbound (agent or bot): sending any message while the client has not
    * replied starts (or continues) this chat's "Esperar respuesta"
    * countdown. The Timer 2 runner passes `false` when it dispatches the
-   * expiry nudge, because it re-arms the row itself right after.
+   * one-shot expiry nudge, so it cannot stack a second ACTIVE row while
+   * the due row is still `active` (or spawn a fresh one if the client
+   * replied at the exact moment of expiry).
    */
   autoArm?: boolean;
   /**
@@ -627,9 +629,9 @@ export async function sendMessageToConversation(
   // BOTH an agent and a bot (AI auto-reply) outbound, so the "Esperar
   // respuesta" countdown is always live after anything we send. Continues an
   // already-active countdown; after the client replied (webhook cancelled
-  // it) re-arms from the chat's last-used duration (10 min by default).
-  // Callers that re-arm themselves — the Timer 2 runner after dispatching
-  // its expiry nudge — opt out with `autoArm: false` so the conversation's
+  // it) arms from the chat's last-used duration (10 min by default).
+  // Callers that must NOT spawn a row — the Timer 2 runner dispatching its
+  // one-shot expiry nudge (autoArm: false) — opt out so the conversation's
   // single ACTIVE row can never be duplicated. Best-effort: a failure here
   // must never fail the send.
   if (autoArm !== false) {
