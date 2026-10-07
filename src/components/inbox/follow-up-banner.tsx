@@ -16,10 +16,14 @@ import type { FollowUp } from "@/types";
 // queue through /api/whatsapp/follow-ups with normal dashboard auth. The
 // agent can:
 //   * see the pending reminder and its live countdown,
-//   * type ANY number of minutes (1, 3, 7, 12, …) or tap a +2/+5/+10
-//     preset — both set `execute_at = now + N min` for this thread,
+//   * type ANY number of minutes (1, 3, 7, 12, …) and press "Set", which
+//     writes `execute_at = now + N min` for this thread,
 //   * cancel the pending reminder,
 //   * flip the per-chat automatic switch inline.
+//
+// The send itself is triggered by the backend (cron or the in-process
+// worker in `src/instrumentation.ts`), never by this component: the
+// countdown is display-only, so closing the tab never loses a reminder.
 //
 // The timer is deliberately independent of the account-wide
 // (`ai_configs.follow_up_enabled`) switch: manual scheduling works even
@@ -36,11 +40,6 @@ interface FollowUpStatus {
 
 /** Minutes cap: 7 days, matching the API's own clamp. */
 const MAX_MINUTES = 10080;
-const PRESETS = [
-  { minutes: 2, label: "plus2m" },
-  { minutes: 5, label: "plus5m" },
-  { minutes: 10, label: "plus10m" },
-] as const;
 
 function clampMinutes(value: number): number {
   if (!Number.isFinite(value)) return 10;
@@ -82,15 +81,15 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   }, [conversationId]);
 
   useEffect(() => {
-    let alive = true;
-    void refresh().then((j) => {
-      if (!alive && !j) setStatus(null);
-    });
-    const interval = setInterval(() => setTick((n) => n + 1), 30_000);
-    return () => {
-      alive = false;
-      clearInterval(interval);
-    };
+    void refresh();
+    // Re-render the countdown AND re-read the queue: once the backend
+    // delivers a due reminder it flips the row to `completed`, so the
+    // banner must refresh to drop the "pending" state on its own.
+    const interval = setInterval(() => {
+      setTick((n) => n + 1);
+      void refresh();
+    }, 30_000);
+    return () => clearInterval(interval);
   }, [refresh]);
 
   const act = useCallback(
@@ -198,7 +197,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
         </span>
       </div>
 
-      {/* Custom minutes + presets + apply */}
+      {/* Custom minutes + apply */}
       <div className="flex flex-shrink-0 items-center gap-1">
         <input
           type="number"
@@ -208,21 +207,13 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
           value={minutes}
           onChange={(e) => setMinutes(Number(e.target.value))}
           onBlur={() => setMinutes((m) => clampMinutes(m))}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") setTimer(minutes);
+          }}
           aria-label={t("customMinutes")}
           className="h-6 w-14 rounded-md border border-border bg-card px-1.5 text-center text-xs text-foreground outline-none focus-visible:ring-1 focus-visible:ring-primary"
         />
         <span className="text-muted-foreground">{t("minutesUnit")}</span>
-        {PRESETS.map((preset) => (
-          <button
-            key={preset.minutes}
-            type="button"
-            disabled={busy !== null}
-            onClick={() => setTimer(preset.minutes)}
-            className="rounded-md border border-border bg-card px-1.5 py-0.5 font-medium text-foreground transition-colors hover:bg-muted disabled:opacity-60"
-          >
-            {t(preset.label)}
-          </button>
-        ))}
         <BannerButton
           onClick={() => setTimer(minutes)}
           busy={busy === "reschedule" || busy === "schedule"}

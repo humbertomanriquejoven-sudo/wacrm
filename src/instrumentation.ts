@@ -3,13 +3,13 @@ import { SUPABASE_CONFIG_ERROR_MARKER } from '@/lib/errors'
 /**
  * Server bootstrap hooks (Next.js instrumentation).
  *
- * The ONLY thing started here is the optional in-process follow-up
- * runner, and it is OFF by default: `docs/docker.md` documents that
- * nothing inside the container is scheduled — production drives all
- * background work via external pingers hitting the `*\/cron` endpoints.
- * Setting `FOLLOW_UP_WORKER_INTERVAL_SECONDS` opts into the internal
- * `setInterval` for deployments (a dedicated long-lived box) where an
- * external scheduler is not worth provisioning.
+ * The ONLY thing started here is the in-process follow-up runner, and it
+ * is ON by default (every 60s). Timed reminders are stored in the DB and
+ * must be delivered even when no external scheduler is configured, so the
+ * standalone container self-drives its own sweep. Operators can opt out
+ * with `FOLLOW_UP_WORKER_DISABLED=true` (then drive the sweep from an
+ * external pinger hitting `*\/cron` instead) or tune the cadence with
+ * `FOLLOW_UP_WORKER_INTERVAL_SECONDS`.
  *
  * HARD RULE: `register()` must NEVER throw. It runs during server
  * bootstrap, so any exception here would take down every request (a
@@ -40,26 +40,40 @@ export async function register() {
     // If the Supabase env is missing the worker's sweeps would all fail
     // against an unreachable DB anyway. Skip it explicitly (and state
     // why in the logs) rather than spinning up a runner that can only
-    // log errors once a minute. Bootstrap never throws either way.
-    if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
+    // log errors once a minute. The worker sends through the service
+    // role, so THAT is the key it needs. Bootstrap never throws either way.
+    if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
       console.warn(
-        `[follow-up] ${SUPABASE_CONFIG_ERROR_MARKER} NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY are missing — in-process runner skipped; the CRM keeps serving and the external cron can still trigger the sweep endpoints.`,
+        `[follow-up] ${SUPABASE_CONFIG_ERROR_MARKER} NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are missing — in-process runner skipped; the CRM keeps serving and an external cron can still trigger the sweep endpoints.`,
       )
       return
     }
 
-    const raw = process.env.FOLLOW_UP_WORKER_INTERVAL_SECONDS
-    const intervalSeconds = raw ? Number(raw) : NaN
-    if (!Number.isFinite(intervalSeconds) || intervalSeconds <= 0) {
+    if (process.env.FOLLOW_UP_WORKER_DISABLED === 'true') {
+      console.log(
+        '[follow-up] in-process runner disabled via FOLLOW_UP_WORKER_DISABLED=true; drive the sweep from an external cron instead.',
+      )
       return
     }
+
+    // Guard against a duplicate interval when `register()` runs more than
+    // once in the same process (dev hot-reload, repeated bootstrap).
+    if ((globalThis as Record<string, unknown>)['__followUpWorkerStop']) {
+      return
+    }
+
+    // Default cadence: one minute. Override with a positive integer.
+    const raw = process.env.FOLLOW_UP_WORKER_INTERVAL_SECONDS
+    const parsed = raw ? Number(raw) : NaN
+    const intervalSeconds =
+      Number.isFinite(parsed) && parsed > 0 ? parsed : 60
 
     const { startFollowUpWorker } = await import('@/lib/whatsapp/follow-up-worker')
     const stop = startFollowUpWorker({ intervalMs: intervalSeconds * 1000 })
     // Keep the handle reachable for tests / graceful shutdown hooks.
     ;(globalThis as Record<string, unknown>)['__followUpWorkerStop'] = stop
     console.log(
-      `[follow-up] in-process runner started (every ${intervalSeconds}s) — driven by FOLLOW_UP_WORKER_INTERVAL_SECONDS.`,
+      `[follow-up] in-process runner started (every ${intervalSeconds}s) — set FOLLOW_UP_WORKER_DISABLED=true to opt out.`,
     )
   } catch (err) {
     // Bootstrap must stay green: the site opens, and the missed sweeps

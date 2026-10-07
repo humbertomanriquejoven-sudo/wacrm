@@ -10,14 +10,22 @@ import { buildConversationContext } from '@/lib/ai/context'
  * TIMED AUTO FOLLOW-UPS — 10 minutes AND 24 hours, once per stage.
  * ============================================================
  * When the auto-reply answers an inbound, `scheduleFollowUp` stores a
- * `10m` row that is due 10 minutes later. A runner (`runDueFollowUps`,
- * driven by the `/api/cron/follow-ups` (or legacy
- * `/api/whatsapp/follow-ups/cron`) endpoint or the optional in-process
- * interval) checks the queue on a cadence, and for each due row verifies
- * the customer truly did NOT reply afterwards — the ANTI-RACE guard: the
- * last message of the conversation must be from the bot/agent, not the
- * customer. Only then does it generate a natural follow-up with the
- * account's AI provider and send it.
+ * `10m` row that is due 10 minutes later. A runner (`runDueFollowUps`)
+ * checks the queue on a cadence and, for each due row, applies the
+ * ANTI-RACE guard: the customer must NOT have written AFTER the reminder
+ * was queued. That check is time-aware (`created_at` comparison) so a
+ * manual timer scheduled from the inbox still fires even though the
+ * customer's message is the last one. It then generates a natural
+ * follow-up with the account's AI provider and sends it.
+ *
+ * The runner is triggered by BOTH (a) the `/api/cron/follow-ups` (or
+ * legacy `/api/whatsapp/follow-ups/cron`) endpoint for external cron
+ * pingers and (b) an in-process `setInterval` started by
+ * `src/instrumentation.ts`, ON by default (60s) so the platform works
+ * without provisioning an external scheduler. Opt out with
+ * `FOLLOW_UP_WORKER_DISABLED=true` or tune with
+ * `FOLLOW_UP_WORKER_INTERVAL_SECONDS`. The frontend countdown is
+ * display-only and never triggers a send.
  *
  * After a 10m reminder is delivered, the runner schedules the second
  * stage: a `24h` reminder. The hard rule is ONE historical follow-up per
@@ -369,20 +377,32 @@ async function buildFollowUpMessage(
   }
 }
 
-/** The last message of a conversation, or null when there is none. */
-async function lastMessageSender(
+/**
+ * The last message of a conversation (sender + timestamp), or null.
+ *
+ * `created_at` is what makes the anti-race check time-aware: a manual
+ * timer is set while the customer's last message is USUALLY still theirs
+ * (the agent schedules "chase them in 5 min" right after reading it), so
+ * we must only drop the reminder when the customer wrote AFTER the
+ * reminder itself was queued.
+ */
+async function lastMessage(
   db: SupabaseClient,
   conversationId: string,
-): Promise<'customer' | 'agent' | 'bot' | null> {
+): Promise<{ sender: 'customer' | 'agent' | 'bot'; createdAt: string | null } | null> {
   const { data, error } = await db
     .from('messages')
-    .select('sender_type')
+    .select('sender_type, created_at')
     .eq('conversation_id', conversationId)
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle()
   if (error || !data) return null
-  return (data as { sender_type: 'customer' | 'agent' | 'bot' }).sender_type
+  const row = data as {
+    sender_type: 'customer' | 'agent' | 'bot'
+    created_at?: string | null
+  }
+  return { sender: row.sender_type, createdAt: row.created_at ?? null }
 }
 
 export interface RunFollowUpsResult {
@@ -431,7 +451,7 @@ export async function runDueFollowUps(
 
     const { data: due, error } = await client
       .from('follow_ups')
-      .select('id, conversation_id, contact_id, account_id, type')
+      .select('id, conversation_id, contact_id, account_id, type, created_at')
       .eq('status', 'pending')
       .lte('execute_at', now.toISOString())
       .order('execute_at', { ascending: true })
@@ -451,13 +471,24 @@ export async function runDueFollowUps(
       const type: FollowUpType = row.type === '24h' ? '24h' : '10m'
       result.scanned++
 
-      const lastSender = await lastMessageSender(client, conversationId)
+      const last = await lastMessage(client, conversationId)
 
-      // ANTI-RACE: the customer replied within the window, so the
-      // "are you still there?" reminder is obsolete. Cancel — the
-      // webhook has already scheduled/cancelled through its own path, but
-      // a message that arrived between scans lands here.
-      if (lastSender === 'customer') {
+      // ANTI-RACE (time-aware): only drop the reminder when the customer
+      // wrote AFTER this reminder was queued. That is the true signal that
+      // they answered on their own — and it is what lets a MANUAL timer
+      // fire even though the last message was (and still is) the
+      // customer's, which is the normal case when an agent schedules a
+      // chase from the inbox. When either timestamp is missing we cannot
+      // prove a late reply, so we deliver rather than silently drop it.
+      const scheduledAt = row.created_at ? Date.parse(String(row.created_at)) : NaN
+      const repliedAt = last?.createdAt ? Date.parse(last.createdAt) : NaN
+      const repliedAfterSchedule =
+        last?.sender === 'customer' &&
+        Number.isFinite(repliedAt) &&
+        Number.isFinite(scheduledAt) &&
+        repliedAt > scheduledAt
+
+      if (repliedAfterSchedule) {
         const { error: cancelErr } = await client
           .from('follow_ups')
           .update({ status: 'cancelled' })
@@ -561,8 +592,9 @@ export async function runDueFollowUps(
 }
 
 /**
- * Optional in-process runner started by `src/instrumentation.ts` (or a
- * server bootstrap) when `FOLLOW_UP_WORKER_INTERVAL_SECONDS` is set.
+ * In-process runner started by `src/instrumentation.ts` (or a server
+ * bootstrap). It runs by DEFAULT; `FOLLOW_UP_WORKER_DISABLED=true` opts
+ * out and `FOLLOW_UP_WORKER_INTERVAL_SECONDS` overrides the cadence.
  *
  * Returns a stop handle. A single in-flight guard makes overlapping
  * ticks (or a tick firing while the previous sweep is still running)
@@ -599,6 +631,11 @@ export function startFollowUpWorker(opts: {
   }
 
   timer = setInterval(tick, intervalMs)
+  // Never hold the event loop open on the interval alone: the HTTP server
+  // keeps the process alive, and this lets a short-lived process (tests,
+  // CLI) exit cleanly.
+  const handle = timer as unknown as { unref?: () => void }
+  if (typeof handle.unref === 'function') handle.unref()
   // Fire once immediately so a just-deployed worker drains without
   // waiting a full interval.
   void tick()

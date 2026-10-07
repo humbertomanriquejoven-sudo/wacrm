@@ -411,7 +411,7 @@ describe('runDueFollowUps', () => {
     expect(h.state.completed).toEqual(['completed'])
   })
 
-  it('cancels instead of sending when the customer has already replied', async () => {
+  it('cancels instead of sending when the customer replied AFTER it was scheduled', async () => {
     resetState()
     h.state.followUps = [
       {
@@ -421,11 +421,19 @@ describe('runDueFollowUps', () => {
         account_id: 'account-1',
         type: '10m',
         status: 'pending',
+        created_at: '2026-10-06T12:00:00.000Z',
         execute_at: '2026-10-06T12:09:00.000Z',
       },
     ]
-    // The customer DID reply within the window — the last message is theirs.
-    h.state.messages = [{ sender_type: 'customer', content_text: 'gracias' }]
+    // The customer DID reply within the window — and wrote after the
+    // reminder was queued, so it is obsolete.
+    h.state.messages = [
+      {
+        sender_type: 'customer',
+        content_text: 'gracias',
+        created_at: '2026-10-06T12:05:00.000Z',
+      },
+    ]
     const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
 
     const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
@@ -433,6 +441,39 @@ describe('runDueFollowUps', () => {
     expect(res).toMatchObject({ scanned: 1, cancelled: 1, sent: 0 })
     expect(h.state.engineSendText).not.toHaveBeenCalled()
     expect(h.state.cancelled).toEqual(['cancelled'])
+  })
+
+  it('sends a MANUAL timer even when the customer message is the last one (reply predates scheduling)', async () => {
+    resetState()
+    h.state.followUps = [
+      {
+        id: 'fu-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        type: '10m',
+        status: 'pending',
+        // Agent scheduled the chase at 12:00, while the customer's last
+        // message (11:50) was still unanswered.
+        created_at: '2026-10-06T12:00:00.000Z',
+        execute_at: '2026-10-06T12:05:00.000Z',
+      },
+    ]
+    h.state.messages = [
+      {
+        sender_type: 'customer',
+        content_text: 'info por favor',
+        created_at: '2026-10-06T11:50:00.000Z',
+      },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueFollowUps(db, new Date('2026-10-06T12:05:01.000Z'))
+
+    expect(res).toMatchObject({ scanned: 1, cancelled: 0, sent: 1 })
+    expect(h.state.engineSendText).toHaveBeenCalledTimes(1)
+    expect(h.state.cancelled).toEqual([])
+    expect(h.state.completed).toEqual(['completed'])
   })
 
   it('falls back to a generic reminder when no AI config exists', async () => {
