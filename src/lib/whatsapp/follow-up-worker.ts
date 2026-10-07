@@ -4,7 +4,6 @@ import { sendMessageToConversation } from '@/lib/whatsapp/send-message'
 import { loadAiConfig } from '@/lib/ai/config'
 import { generateReply, stripInternalReasoning } from '@/lib/ai/generate'
 import { buildConversationContext } from '@/lib/ai/context'
-import { contactHasPublicHandle } from './response-wait'
 
 /**
  * Timer 2 (`response_wait_timers`) logic — arming, re-arming, auto-arm on
@@ -100,7 +99,6 @@ export interface ScheduleFollowUpResult {
     | 'already_followed_up'
     | 'duplicate_pending'
     | 'disabled'
-    | 'not_handle'
     | 'error'
   id: string | null
 }
@@ -209,17 +207,13 @@ export async function scheduleFollowUp(
       return { scheduled: false, reason: 'disabled', id: null }
     }
 
-    // ONLY contacts with a public @user / @lid handle may receive automated
-    // follow-ups: a phone-only (or bare-BSUID) contact must never get a bot
-    // nudge. FAIL-CLOSED (contactHasPublicHandle) — a read error means "do
-    // not schedule", never "message this stranger". Enforced again at
-    // dispatch time by the runner, covering legacy rows.
-    if (!(await contactHasPublicHandle(db, contactId))) {
-      console.log(
-        `[follow-up] contact ${contactId} has no public @handle — not scheduling the ${type} stage for conversation ${conversationId}.`,
-      )
-      return { scheduled: false, reason: 'not_handle', id: null }
-    }
+    // A timed follow-up is a BOT message the system sends later without
+    // the agent re-confirming, so it must work for ANY registered contact
+    // — a phone, a `wa_id`/BSUID, a hidden id or an `@username` — because
+    // the destination is resolved at SEND time by the shared ladder
+    // (phone → recovered → wa_id → wa_user_id → recipient_id → username).
+    // There is deliberately NO public-@handle requirement here: identity
+    // lives in the contact's own row, not in a cosmetic `@user`.
 
     // LA REGLA: a contact who already got a follow-up OF THIS TYPE is
     // never chased again for that type — regardless of which conversation
@@ -596,6 +590,37 @@ async function lastMessage(
   return { sender: row.sender_type, createdAt: row.created_at ?? null }
 }
 
+/**
+ * Re-verify a claimed row is STILL mid-dispatch before the network call.
+ *
+ * The atomic claim guards overlaps between sweeps, but an agent can turn
+ * the chat OFF (or the webhook can cancel on a customer reply) AFTER the
+ * claim and BEFORE the send lands. Both cancellations flip the row to
+ * `cancelled`, so this read is the authoritative "may I still fire?"
+ * check — if the row is no longer `processing`, the message must NOT go
+ * out ("switch OFF stops the send").
+ */
+async function stillProcessing(
+  db: SupabaseClient,
+  table: 'follow_ups' | 'response_wait_timers',
+  id: string,
+): Promise<boolean> {
+  try {
+    const { data } = await db
+      .from(table)
+      .select('status')
+      .eq('id', id)
+      .maybeSingle()
+    return (data as { status?: string } | null)?.status === 'processing'
+  } catch (err) {
+    console.error(
+      `[follow-up] could not re-check claim of ${id} (${table}); treating as not processing:`,
+      err instanceof Error ? err.message : err,
+    )
+    return false
+  }
+}
+
 export interface RunFollowUpsResult {
   scanned: number
   sent: number
@@ -687,27 +712,10 @@ export async function runDueFollowUps(
         continue
       }
 
-      // PUBLIC-HANDLE GATE: only @user / @lid contacts may receive the
-      // automated nudge. FAIL-CLOSED (contactHasPublicHandle): if the row
-      // cannot be proven handle-backed it is dropped, so a phone-only or
-      // bare-BSUID contact is never sent to. Covers legacy pending rows
-      // created before the gate was introduced.
-      if (!(await contactHasPublicHandle(client, contactId))) {
-        const { error: cancelErr } = await client
-          .from('follow_ups')
-          .update({ status: 'cancelled' })
-          .eq('id', id)
-          .eq('status', 'processing')
-        if (cancelErr) {
-          console.error(`[follow-up] could not cancel ${id} (no public @handle):`, cancelErr.message)
-        } else {
-          result.cancelled++
-          console.log(
-            `[follow-up] follow-up ${id} cancelled — contact ${contactId} has no public @handle.`,
-          )
-        }
-        continue
-      }
+      // NO public-@handle gate: a due reminder fires for ANY registered
+      // contact. The destination is resolved at send time by the shared
+      // sender ladder (phone → recovered → wa_id → wa_user_id →
+      // recipient_id → username), never from a cosmetic `@user`.
 
       // PER-CHAT SWITCH: a chat in OFF must never dispatch. The inbox route
       // also cancels pending rows the moment the switch flips off, but this
@@ -725,6 +733,19 @@ export async function runDueFollowUps(
           result.cancelled++
           console.log(`[follow-up] follow-up ${id} cancelled (chat switched OFF).`)
         }
+        continue
+      }
+
+      // ROW-STATE RE-CHECK: a switch-Off or an inbound reply that landed
+      // AFTER the claim already flipped this row to `cancelled` even
+      // though this sweep still holds it in memory. Firing anyway would
+      // send a message the agent explicitly stopped — abort without
+      // sending. (`stillProcessing` reads the live row.)
+      if (!(await stillProcessing(client, 'follow_ups', id))) {
+        console.log(
+          `[follow-up] follow-up ${id} cancelled after the claim — not sending.`,
+        )
+        result.cancelled++
         continue
       }
 
@@ -858,15 +879,13 @@ export interface RunResponseWaitResult {
  * For each due row:
  *   1. ATOMIC CLAIM (`active` → `processing`) so an overlapping sweep can
  *      never dispatch the same timer twice.
- *   2. @HANDLE GATE — only contacts with a public @user / @lid handle may
- *      be nudged; anything else is cancelled (reason `not_handle`).
- *   3. AUTO-CANCEL SAFETY NET — if the customer replied AFTER the timer
+ *   2. AUTO-CANCEL SAFETY NET — if the customer replied AFTER the timer
  *      started (`started_at`), the row is cancelled and nothing is sent.
  *      (The inbound webhook already cancelled it, so this covers the
  *      race where the reply landed just before/after the sweep's scan.)
- *   4. Otherwise generate a contextual AI follow-up and send it through
+ *   3. Otherwise generate a contextual AI follow-up and send it through
  *      `sendMessageToConversation` (with `autoArm: false`).
- *   5. ONE-SHOT EXECUTION — the moment the single nudge is dispatched the
+ *   4. ONE-SHOT EXECUTION — the moment the single nudge is dispatched the
  *      row closes as `completed` AND the conversation's "Esperar
  *      respuesta" switch (`response_wait_enabled`) flips OFF, so the
  *      cycle strictly never re-enters a loop. The agent must press ↻
@@ -913,7 +932,6 @@ export async function runDueResponseWaitTimers(
     for (const row of due) {
       const id = row.id as string
       const conversationId = row.conversation_id as string
-      const contactId = row.contact_id as string
       const accountId = row.account_id as string
       result.scanned++
 
@@ -939,38 +957,30 @@ export async function runDueResponseWaitTimers(
         continue
       }
 
-      // PUBLIC-HANDLE GATE: only @user / @lid contacts may receive the
-      // automated nudge. FAIL-CLOSED (contactHasPublicHandle): a timer that
-      // cannot be proven handle-backed is dropped, so a phone-only or
-      // bare-BSUID contact is never nudged. Covers legacy active rows armed
-      // before the gate was introduced.
-      if (!(await contactHasPublicHandle(client, contactId))) {
+      // NO public-@handle gate: a due nudge fires for ANY registered
+      // contact. The destination is resolved at send time by the shared
+      // sender ladder (phone → recovered → wa_id → wa_user_id →
+      // recipient_id → username), never from a cosmetic `@user`.
+
+      // ROW-STATE RE-CHECK: a switch-Off or an inbound reply that landed
+      // AFTER the claim already flipped this row to `cancelled` (the
+      // inbox toggle and the webhook both cancel rows) even though this
+      // sweep still holds it in memory. Firing anyway would nudge a chat
+      // the agent explicitly stopped — abort without sending, and re-close
+      // the row if something left it in limbo.
+      if (!(await stillProcessing(client, 'response_wait_timers', id))) {
         const { error: cancelErr } = await client
           .from('response_wait_timers')
-          .update({ status: 'cancelled', cancelled_reason: 'not_handle' })
+          .update({ status: 'cancelled', cancelled_reason: 'manual' })
           .eq('id', id)
           .eq('status', 'processing')
         if (cancelErr) {
-          if (/column .* does not exist|42703|PGRST204|schema cache/i.test(cancelErr.message)) {
-            const { error: legacyErr } = await client
-              .from('response_wait_timers')
-              .update({ status: 'cancelled' })
-              .eq('id', id)
-              .eq('status', 'processing')
-            if (legacyErr) {
-              console.error(`[response-wait] could not cancel ${id} (no @handle):`, legacyErr.message)
-            } else {
-              result.cancelled++
-            }
-          } else {
-            console.error(`[response-wait] could not cancel ${id} (no @handle):`, cancelErr.message)
-          }
-        } else {
-          result.cancelled++
-          console.log(
-            `[response-wait] timer ${id} cancelled — contact ${contactId} has no public @handle.`,
-          )
+          console.error(`[response-wait] could not close ${id} after post-claim cancel:`, cancelErr.message)
         }
+        result.cancelled++
+        console.log(
+          `[response-wait] timer ${id} cancelled after the claim — not sending.`,
+        )
         continue
       }
 

@@ -391,7 +391,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       const json = await post("wait_reset", { delay_minutes: value });
       if (json) {
         if (json.scheduled === false) {
-          toast.error(t("waitFailed"));
+          toast.error((json.error as string) ?? t("waitFailed"));
         } else {
           toast.success(t("waitResetSuccess"));
           // OPTIMISTIC: show the fresh full-minutes countdown NOW (from the

@@ -13,9 +13,10 @@ const h = vi.hoisted(() => {
       follow_up_enabled: null,
       response_wait_enabled: true,
     } as { follow_up_enabled: boolean | null; response_wait_enabled: boolean } | null,
-    // contacts — identity fields used by the public-@handle gate. Keyed by
-    // contact id. `contact-1` defaults to a handle contact so every legacy
-    // test still passes the gate; gate tests swap/remove the entry.
+    // contacts — identity fields. Follow-ups no longer require a public
+    // @handle, so the harness only needs these when a test exercises the
+    // send/destination side. `contact-1` defaults to a handle contact for
+    // backward-compat; identity-focused tests override/clear the entry.
     contacts: {} as Record<
       string,
       {
@@ -1364,8 +1365,8 @@ describe('runScheduledFollowUps — both timers run independently', () => {
   })
 })
 
-describe('public-@handle gate', () => {
-  it('scheduleFollowUp refuses a contact with no public handle (reason: not_handle)', async () => {
+describe('follow-ups do NOT depend on a public @handle', () => {
+  it('scheduleFollowUp schedules for a phone-only contact (no @user/@lid)', async () => {
     resetState()
     h.state.contacts['contact-1'] = {
       username: null,
@@ -1375,22 +1376,26 @@ describe('public-@handle gate', () => {
       recipient_id: null,
     }
     const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+    const now = new Date('2026-10-06T12:00:00.000Z')
 
     const res = await scheduleFollowUp(db, {
       conversationId: 'conv-1',
       contactId: 'contact-1',
       accountId: 'account-1',
+      now,
     })
 
-    expect(res).toMatchObject({
-      scheduled: false,
-      reason: 'not_handle',
-      id: null,
+    expect(res.scheduled).toBe(true)
+    expect(h.state.followUps).toHaveLength(1)
+    expect(h.state.followUps[0]).toMatchObject({
+      contact_id: 'contact-1',
+      type: '10m',
+      status: 'pending',
+      execute_at: '2026-10-06T12:10:00.000Z',
     })
-    expect(h.state.followUps).toHaveLength(0)
   })
 
-  it('armResponseWaitIfIdle refuses a contact with no public handle', async () => {
+  it('armResponseWaitIfIdle arms Timer 2 for a phone-only contact', async () => {
     resetState()
     h.state.contacts['contact-1'] = {
       username: null,
@@ -1408,11 +1413,16 @@ describe('public-@handle gate', () => {
       now: new Date('2026-10-06T12:00:00.000Z'),
     })
 
-    expect(res).toMatchObject({ scheduled: false, reason: 'not_handle' })
-    expect(h.state.waitTimers).toHaveLength(0)
+    expect(res.reason).toBe('armed')
+    expect(h.state.waitTimers).toHaveLength(1)
+    expect(h.state.waitTimers[0]).toMatchObject({
+      status: 'active',
+      delay_minutes: 10,
+      expires_at: '2026-10-06T12:10:00.000Z',
+    })
   })
 
-  it('runDueFollowUps cancels (never sends) a due reminder for a handle-less contact', async () => {
+  it('runDueFollowUps SENDS the reminder for a phone-only contact', async () => {
     resetState()
     h.state.contacts['contact-1'] = {
       username: null,
@@ -1432,17 +1442,17 @@ describe('public-@handle gate', () => {
         execute_at: '2026-10-06T12:09:00.000Z',
       },
     ]
-    h.state.messages = [{ sender_type: 'bot', content_text: 'hi' }]
+    h.state.messages = [{ sender_type: 'bot', content_text: '¡Hola! ¿En qué te ayudo?' }]
     const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
 
     const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
 
-    expect(res).toMatchObject({ scanned: 1, sent: 0, cancelled: 1 })
-    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
-    expect(h.state.followUps[0]).toMatchObject({ status: 'cancelled' })
+    expect(res).toMatchObject({ scanned: 1, sent: 1, cancelled: 0 })
+    expect(h.state.sendMessageToConversation).toHaveBeenCalledTimes(1)
+    expect(h.state.followUps[0]).toMatchObject({ status: 'completed' })
   })
 
-  it('runDueResponseWaitTimers cancels (never sends) a due timer for a handle-less contact', async () => {
+  it('runDueResponseWaitTimers SENDS the nudge for a phone-only contact', async () => {
     resetState()
     h.state.contacts['contact-1'] = {
       username: null,
@@ -1463,17 +1473,35 @@ describe('public-@handle gate', () => {
         expires_at: '2026-10-06T12:05:00.000Z',
       },
     ]
-    h.state.messages = [{ sender_type: 'bot', content_text: 'hi' }]
+    h.state.messages = [{ sender_type: 'bot', content_text: '¡Hola! ¿En qué te ayudo?' }]
     const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
 
     const res = await runDueResponseWaitTimers(db, new Date('2026-10-06T12:05:01.000Z'))
 
-    expect(res).toMatchObject({ scanned: 1, sent: 0, cancelled: 1 })
-    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
-    expect(h.state.waitTimers[0]).toMatchObject({
-      status: 'cancelled',
-      cancelled_reason: 'not_handle',
+    expect(res).toMatchObject({ scanned: 1, sent: 1 })
+    expect(h.state.sendMessageToConversation).toHaveBeenCalledTimes(1)
+    expect(h.state.waitTimers[0]).toMatchObject({ status: 'completed' })
+  })
+
+  it('still schedules a contact row with NO identifiers at all', async () => {
+    resetState()
+    h.state.contacts['contact-1'] = {
+      username: null,
+      phone: null,
+      wa_id: null,
+      wa_user_id: null,
+      recipient_id: null,
+    }
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await scheduleFollowUp(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
     })
+
+    expect(res.scheduled).toBe(true)
+    expect(h.state.followUps).toHaveLength(1)
   })
 
   it('accepts a contact whose phone still carries a legacy @handle', async () => {

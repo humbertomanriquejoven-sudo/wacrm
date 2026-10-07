@@ -5,7 +5,6 @@ import {
   toErrorResponse,
 } from '@/lib/auth/account'
 import { supabaseAdmin } from '@/lib/ai/admin-client'
-import { hasPublicUserHandle } from '@/lib/whatsapp/phone-utils'
 import { ARM_DEFAULT_MINUTES } from '@/lib/whatsapp/response-wait'
 import {
   scheduleManualFollowUp,
@@ -429,9 +428,23 @@ export async function POST(request: Request) {
         accountId,
         delayMinutes,
       })
+      if (!res.scheduled) {
+        console.error(
+          `[follow-up] ${action} could not arm the "Esperar respuesta" timer for conversation ${conversationId}:`,
+          res.reason,
+        )
+        return NextResponse.json({
+          success: false,
+          scheduled: false,
+          id: null,
+          expires_at: null,
+          reason: res.reason,
+          error: `Could not start the "Esperar respuesta" timer (${res.reason}). Please try again.`,
+        })
+      }
       return NextResponse.json({
-        success: res.scheduled,
-        scheduled: res.scheduled,
+        success: true,
+        scheduled: true,
         id: res.id,
         expires_at: res.expires_at,
         delay_minutes: delayMinutes,
@@ -471,49 +484,13 @@ export async function POST(request: Request) {
           reason: 'disabled',
         })
       }
-      // PUBLIC-HANDLE GATE: a timed follow-up is a BOT message the system
-      // sends later without the agent re-confirming, so only contacts with
-      // a public @user / @lid handle may be automatable — a phone-only or
-      // bare-BSUID contact must never get one. FAIL-CLOSED: an unreadable
-      // contact blocks scheduling rather than risk a send. (The worker
-      // enforces the same gate again at dispatch.)
-      const { data: contact, error: contactErr } = await supabaseAdmin()
-        .from('contacts')
-        .select('username, phone, wa_id, wa_user_id, recipient_id')
-        .eq('id', conv.contact_id)
-        .maybeSingle()
-      if (
-        contactErr ||
-        !contact ||
-        !hasPublicUserHandle(
-          contact as {
-            username?: string | null
-            phone?: string | null
-            wa_id?: string | null
-            wa_user_id?: string | null
-            recipient_id?: string | null
-          },
-        )
-      ) {
-        if (contactErr) {
-          console.error(
-            `[follow-up] could not read contact ${conv.contact_id} identity:`,
-            contactErr.message,
-          )
-        }
-        return NextResponse.json({
-          success: false,
-          scheduled: false,
-          id: null,
-          reason: 'not_handle',
-        })
-      }
       // Manual scheduling is bound to the CONVERSATION and always upserts
-      // its one pending row. It deliberately bypasses the automatic
-      // per-type historic budget, so an agent can re-chase ANY contact —
-      // on any channel shape (@username, hidden id, BSUID…) — without
-      // hitting "Couldn't schedule a follow-up for this contact". The
-      // destination is resolved at send time by the shared sender.
+      // its one pending row. It deliberately bypasses the automatic per-type
+      // historic budget, so an agent can re-chase ANY contact — with a
+      // phone, a recovered wa_id/BSUID or nothing but an internal id — no
+      // public @handle required. The destination is resolved at send time
+      // by the shared sender ladder (phone → recovered → wa_id →
+      // wa_user_id → recipient_id → username).
       const res = await scheduleManualFollowUp(supabaseAdmin(), {
         conversationId,
         contactId: conv.contact_id,

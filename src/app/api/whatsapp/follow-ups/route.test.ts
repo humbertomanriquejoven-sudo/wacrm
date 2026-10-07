@@ -55,7 +55,8 @@ const state = {
     follow_up_enabled: null,
     response_wait_enabled: true,
   } as Record<string, unknown> | null,
-  // Contact identity read by the `schedule` handle gate (public @handle).
+  // Contact identity — no longer read by the `schedule` action (a follow-up
+  // may target ANY contact, handle or not). Kept for harness completeness.
   contact: {
     id: 'contact-1',
     username: '@contact',
@@ -269,7 +270,7 @@ describe('POST /api/whatsapp/follow-ups — custom minutes', () => {
     expect(mocks.scheduleManualFollowUp).not.toHaveBeenCalled();
   });
 
-  it('refuses to schedule for a contact with no public @handle (reason: not_handle)', async () => {
+  it('schedules for a contact with no public @handle (phone-only)', async () => {
     state.contact = {
       id: 'contact-1',
       username: null,
@@ -285,9 +286,8 @@ describe('POST /api/whatsapp/follow-ups — custom minutes', () => {
     });
     const body = await res.json();
     expect(res.status).toBe(200);
-    expect(body.scheduled).toBe(false);
-    expect(body.reason).toBe('not_handle');
-    expect(mocks.scheduleManualFollowUp).not.toHaveBeenCalled();
+    expect(body.scheduled).toBe(true);
+    expect(mocks.scheduleManualFollowUp).toHaveBeenCalledTimes(1);
   });
 });
 
