@@ -165,6 +165,26 @@ function assertDialableRecipient(address: string): string {
     console.warn('[send] blocked: empty recipient, no HTTP request was made to Meta.')
     throw new InvalidRecipientError(value)
   }
+  // `contacts.phone` is NOT NULL, so the webhook stores the literal string
+  // 'unknown' for a sender that disclosed no number. Sending THAT to Meta
+  // is forbidden: the request would carry `to: "unknown"`, which Meta either
+  // answers with an opaque (#100) or — worse — accepts with a 200 and
+  // silently drops. The deliverable destination for such a contact is the
+  // `wa_id` / `recipient_id` the webhook persisted (see the recipient
+  // ladder in `resolveRecipient`), so failing here with a typed
+  // `InvalidRecipientError` (recipientInvalid = true) routes the failure
+  // into the existing retry/park machinery instead of losing the message.
+  if (isPlaceholderValue(value)) {
+    console.warn(
+      '[send] blocked: recipient is the placeholder "unknown" — send to the contact\'s stored wa_id / recipient_id instead. No HTTP request was made to Meta.',
+    )
+    throw new InvalidRecipientError(
+      value,
+      'phone holds the placeholder value "unknown": use the wa_id / ' +
+        'recipient_id Meta recorded for this contact as the destination. ' +
+        'No HTTP request was sent.',
+    )
+  }
   // A '@'-prefixed handle is display data: the destination Meta expects
   // is the bare numeric id, so strip the prefix rather than sending the
   // human-facing form.
@@ -208,7 +228,11 @@ function recipientFields(address: string): Record<string, string> {
  */
 export function recipientAddressField(destination: string): Record<string, string> {
   const value = (destination ?? '').trim()
-  if (!value) return { to: '' }
+  // Empty AND the 'unknown' placeholder are both undeliverable: they yield
+  // the same empty `to`, so the caller raises a typed
+  // InvalidRecipientError instead of putting `unknown` on the wire (Meta
+  // answers #100 — or silently drops after a 200).
+  if (!value || isPlaceholderValue(value)) return { to: '' }
   // Case A — namespaced BSUID: keep the prefix and dot intact.
   if (/^[A-Za-z]+\.[\w.-]+$/.test(value)) {
     return { recipient: value }
@@ -663,6 +687,26 @@ export async function sendTextMessage(
       '',
       'no destination is available for this contact: `phone`, `wa_id`, ' +
         '`wa_user_id` and `recipient_id` are all empty or "unknown". ' +
+        'No HTTP request was sent.',
+    )
+  }
+  // The second refusal: the destination IS the webhook's 'unknown'
+  // placeholder (contacts.phone is NOT NULL, so that literal is what a
+  // contact with no disclosed number holds). Forwarding it puts
+  // `to: "unknown"` on the wire, which Meta has been observed to ACK with
+  // 200 while dropping the message — indistinguishable from success here.
+  // The address for such a contact must be the `wa_id` / `recipient_id`
+  // persisted by the webhook; refusing with a typed error (recipientInvalid
+  // = true) hands the senders' retry/park machinery a real cause instead of
+  // a silent loss.
+  if (isPlaceholderValue(address)) {
+    console.warn(
+      '[send] blocked: recipient is the placeholder "unknown" — send to the contact\'s stored wa_id / recipient_id instead. No HTTP request was made to Meta.',
+    )
+    throw new InvalidRecipientError(
+      address,
+      'phone holds the placeholder value "unknown": use the wa_id / ' +
+        'recipient_id Meta recorded for this contact as the destination. ' +
         'No HTTP request was sent.',
     )
   }

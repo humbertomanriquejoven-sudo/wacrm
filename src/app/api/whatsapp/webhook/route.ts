@@ -4,7 +4,11 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
 import { getMediaUrl, downloadMedia, sendTypingIndicator } from '@/lib/whatsapp/meta-api'
 import { mirrorInboundMedia } from '@/lib/whatsapp/mirror-inbound-media'
-import { extractPhoneFromText, normalizePhone } from '@/lib/whatsapp/phone-utils'
+import {
+  extractPhoneFromText,
+  isPlaceholderValue,
+  normalizePhone,
+} from '@/lib/whatsapp/phone-utils'
 import { flushPendingReplies } from '@/lib/whatsapp/pending-reply'
 import * as recipientResolver from '@/lib/whatsapp/recipient-resolver'
 import {
@@ -885,6 +889,25 @@ async function processMessage(
   )
   const senderName = contact.profile.name?.trim() || null
 
+  // Meta's DELIVERABLE id for this sender, extracted obligatorily from
+  // `entry.changes.value.contacts[0].wa_id` first and then from
+  // `messages[0].from` (falling back to the BSUID fields), skipping Meta's
+  // own 'unknown' placeholder.
+  //
+  // This value MUST survive into `contacts.wa_id` / `contacts.recipient_id`.
+  // It is the destination every outbound ladder consults the moment
+  // `phone` is 'unknown' — which is exactly the state a @username-only
+  // contact lives in. When only `wa_id` was recorded (and only when it
+  // looked like a BSUID), the id Meta actually sent in `messages[0].from`
+  // was dropped on the floor: `recipient_id` stayed NULL, the row resolved
+  // to its `@handle`, and Meta answered (#100) Invalid parameter for every
+  // send — the "@humbertomanriquejoven fails while @juanpablo22222 works"
+  // split, decided purely by which identity fields happened to be filled.
+  const metaSendId =
+    [trimmedWaId, trimmedFrom, senderUserId].find(
+      (value) => value && !isPlaceholderValue(value),
+    ) ?? null
+
   // RECEPTOR_ENVIO: 'phone' holds ONLY a real E.164 number — never a
   // '@' handle and never a long BSUID. Priority: `messages[0].from`,
   // `contacts[0].wa_id`, `contacts[0].profile.phone`, first dialable one
@@ -918,6 +941,10 @@ async function processMessage(
   )
   console.log('-> [EXTRACTED DATA]', {
     effectivePhone: senderPhone,
+    // Meta's id captured from wa_id / messages[0].from — the value that
+    // lands in contacts.wa_id + contacts.recipient_id and becomes the
+    // outbound destination when phone is 'unknown'.
+    meta_wa_id: metaSendId,
     extractedUser: senderUsername || senderUserId || senderName,
     hasRealPhone: Boolean(rawPhone && rawPhone !== 'unknown'),
     idType: isPhoneLike(senderPhone)
@@ -975,17 +1002,22 @@ async function processMessage(
   // persisting THAT would poison the destination tier it feeds and pollute
   // `idx_contacts_wa_id`, which treats any non-empty value as a real id.
   const metaIdentity = {
-    // Meta's own id for this contact, verbatim — including the phone-shaped
-    // case, where it merely duplicates `phone`. A phone-shaped `wa_id` is
-    // inert as a destination (`contactPhone` wins first) but it is still the
-    // id Meta used to reach this contact, so that is what the column records.
-    wa_id: trimmedWaId && trimmedWaId !== 'unknown' ? trimmedWaId : undefined,
+    // Meta's own id for this contact, captured from `contacts[0].wa_id`
+    // and then `messages[0].from` — the value metaSendId resolved above.
+    // Both columns are hydrated from it because BOTH are read by the
+    // outbound address ladders; leaving one empty is what made a hidden-
+    // number contact undeliverable on one send path and fine on another.
+    // Including the phone-shaped case, where it merely duplicates
+    // `phone`: a phone-shaped `wa_id` is inert as a destination
+    // (`contact.phone` wins first) but it is still the id Meta used to
+    // reach this contact, so that is what the column records.
+    wa_id: metaSendId ?? undefined,
     // Our business line that received the message, not the sender's id.
     phone_number_id: phoneNumberId || undefined,
     identity_type: classifyIdentityType({
       phone: rawPhone,
       opaqueId: senderUserId,
-      waId: trimmedWaId,
+      waId: metaSendId,
       username: senderUsername,
     }),
     display_name: senderName ?? undefined,
@@ -2644,21 +2676,35 @@ async function findOrCreateContact(
     if (waUserId && !existingContact.wa_user_id) updates.wa_user_id = waUserId
 
     // Meta Cloud API v26.0 identity columns (migration 053)
-    if (metaIdentity?.wa_id && !existingContact.wa_id) updates.wa_id = metaIdentity.wa_id
     if (metaIdentity?.phone_number_id && !existingContact.phone_number_id) updates.phone_number_id = metaIdentity.phone_number_id
     if (metaIdentity?.identity_type && !existingContact.identity_type) updates.identity_type = metaIdentity.identity_type
     if (metaIdentity?.display_name && !existingContact.display_name) updates.display_name = metaIdentity.display_name
 
-    // Same hydration rule as the insert path: an existing row that already
-    // knows the BSUID but is missing `wa_id` / `recipient_id` gets them
-    // filled the first time a later message proves the id. These were the two
-    // columns the broadcast resolver checks first, so leaving them empty is
-    // what made a contact look undeliverable on the first attempt and fine
-    // after the next inbound filled them in — the "works after a refresh"
-    // symptom. Never overwrites an existing value.
-    if (waUserId) {
-      if (!existingContact.wa_id) updates.wa_id = metaIdentity?.wa_id ?? waUserId
-      if (!existingContact.recipient_id) updates.recipient_id = waUserId
+    // Same hydration rule as the insert path: an existing row that is
+    // missing `wa_id` / `recipient_id` gets them filled the first time a
+    // later message proves the id. These were the two columns the broadcast
+    // and inbox resolvers check first, so leaving them empty is what made a
+    // contact look undeliverable on the first attempt and fine after the
+    // next inbound filled them in — the "works after a refresh" symptom.
+    //
+    // Filled from `metaIdentity.wa_id` — Meta's `contacts[0].wa_id` /
+    // `messages[0].from`, NOT only the BSUID: gating this on `waUserId`
+    // alone meant a hidden-number sender whose id was not BSUID-shaped
+    // never got a destination here at all, and every send fell through to
+    // the `@handle`, which Meta rejects with (#100) Invalid parameter.
+    //
+    // A stored value that is itself Meta's 'unknown' placeholder counts as
+    // missing: the placeholder is truthy, so a plain `!existingContact.wa_id`
+    // test would block the fill forever on a row written before the filter
+    // existed. Never overwrites a REAL existing value.
+    const storedWaId = (existingContact.wa_id ?? '').trim()
+    const storedRecipientId = (existingContact.recipient_id ?? '').trim()
+    const metaIdForContact = metaIdentity?.wa_id ?? waUserId
+    if (metaIdForContact && (!storedWaId || isPlaceholderValue(storedWaId))) {
+      updates.wa_id = metaIdForContact
+    }
+    if (metaIdForContact && (!storedRecipientId || isPlaceholderValue(storedRecipientId))) {
+      updates.recipient_id = metaIdForContact
     }
 
     if (Object.keys(updates).length > 0) {
@@ -2710,7 +2756,13 @@ async function findOrCreateContact(
       // tier, and dependent on migration 059 to catch up later. Writing the
       // three columns together means the row is complete the moment it
       // exists: no migration, no second pass, and nothing to re-read.
-      recipient_id: waUserId ?? undefined,
+      // BOTH columns carry the same Meta id: `contacts[0].wa_id` /
+      // `messages[0].from` as captured by the webhook (metaIdentity.wa_id),
+      // falling back to the BSUID. `recipient_id` used to be written from
+      // the BSUID alone, so a hidden-number sender whose id was not
+      // BSUID-shaped was born with a NULL recipient_id and no destination
+      // once `phone` held 'unknown'.
+      recipient_id: metaIdentity?.wa_id ?? waUserId ?? undefined,
       // OUTSIDE the metaIdentity spread on purpose: the BSUID fallback must
       // apply even when there is no metaIdentity object at all, which is the
       // common case for a hidden-number sender.
