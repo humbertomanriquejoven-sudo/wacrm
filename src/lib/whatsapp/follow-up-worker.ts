@@ -155,18 +155,19 @@ export async function rearmResponseWaitTimer(
 }
 
 /**
- * Inbound-webhook reset (Timer 2): every fresh message the CUSTOMER writes
+ * Inbound-webhook reset (Timer 2): a fresh message the CUSTOMER writes
  * RESETS the countdown — the ACTIVE timer is re-armed from
  * `NOW() + N minutes` using the chat's last-used duration (or the 10-minute
- * default), so an actively replying customer never hits 00:00.
+ * default). A customer who keeps replying DURING an active wait never hits
+ * 00:00 (the nudge waits until they truly go quiet).
  *
  * Gated on the per-chat switch (`conversations.response_wait_enabled`):
- *   - enabled  → reset/re-arm. After a completed one-shot cycle the switch is
- *                LEFT ON (the runner no longer flips it OFF), so the next
- *                inbound re-arms a fresh countdown — the cycle restarts
- *                exactly when the customer writes again (or ↻ Reiniciar).
- *   - disabled → the feature is OFF for the chat: no reset AND any stray
- *                ACTIVE row is cancelled, so a detached timer never nudges.
+ *   - enabled  → reset/re-arm the current countdown.
+ *   - disabled → the feature is OFF for the chat (either the agent turned
+ *                it off OR a one-shot cycle already completed and the runner
+ *                flipped the switch OFF): no reset AND any stray ACTIVE row
+ *                is cancelled, so a detached timer never nudges. The cycle
+ *                restarts only when the agent presses ↻ Reiniciar.
  *
  * Never throws; an unreadable row degrades to a logged no-op so the inbound
  * message itself is never blocked by a wait-timer hiccup.
@@ -1112,14 +1113,15 @@ export interface RunResponseWaitResult {
  *   3. Otherwise generate a contextual AI follow-up and send it through
  *      `sendMessageToConversation` (with `autoArm: false`).
  *   4. ONE-SHOT EXECUTION — the moment the single nudge is dispatched the
- *      row closes as `completed`. The per-chat switch (`response_wait_enabled`)
- *      is LEFT ON: the cycle only restarts when the customer writes again
- *      (the inbound webhook re-arms `NOW() + N`) or the agent presses ↻
- *      Reiniciar. The update is guarded on `status='processing'`: if the
- *      client replied at the exact moment of dispatch, the webhook already
- *      re-armed/cancelled the row and this sweep does not resurrect it.
- *      `no_response` still closes a row whose nudge never went out (a
- *      provider/send failure is terminal — the system never retries forever).
+ *      row closes as `completed` AND the conversation's "Esperar
+ *      respuesta" switch (`response_wait_enabled`) flips OFF, so the
+ *      cycle strictly never re-enters a loop. The agent must press ↻
+ *      Reiniciar (or re-enable the switch) to watch again. The update is
+ *      guarded on `status='processing'`: if the client replied at the exact
+ *      moment of dispatch, the webhook already cancelled the row and this
+ *      sweep does not resurrect it. `no_response` still closes a row whose
+ *      nudge never went out (a provider/send failure is terminal — the
+ *      system never retries forever).
  *
  * Scoped strictly to `conversation_id`; a missing table or schema glitch
  * degrades to a logged no-op. Never throws. Idempotent: every state
@@ -1292,11 +1294,11 @@ export async function runDueResponseWaitTimers(
       }
 
       // ONE-SHOT: the single contextual nudge went out; the timer closes as
-      // `completed`. The per-chat switch is LEFT ON so the cycle restarts
-      // only when the customer writes again (inbound-webhook reset) or the
-      // agent presses ↻ Reiniciar — NOT automatically. Guarded on
-      // `status='processing'`: if the inbound webhook re-armed/cancelled
-      // this row at the exact moment of dispatch (the client DID reply),
+      // `completed` AND the conversation's "Esperar respuesta" switch flips
+      // to OFF — a finished cycle strictly never re-enters a loop. The agent
+      // must press ↻ Reiniciar (or re-enable the switch) to watch again.
+      // Guarded on `status='processing'`: if the inbound webhook cancelled
+      // an active wait at the exact moment of dispatch (the client DID reply),
       // zero rows match and nothing is resurrected.
       const { error: doneErr } = await client
         .from('response_wait_timers')
@@ -1307,9 +1309,28 @@ export async function runDueResponseWaitTimers(
         console.error(`[response-wait] could not mark ${id} as completed:`, doneErr.message)
         continue
       }
+      // Best-effort — flip the Timer 2 ON/OFF switch to OFF so no future
+      // send auto-arms this conversation until the agent re-enables it.
+      try {
+        const { error: switchErr } = await client
+          .from('conversations')
+          .update({ response_wait_enabled: false })
+          .eq('id', conversationId)
+        if (switchErr) {
+          console.error(
+            `[response-wait] could not turn the switch OFF for conversation ${conversationId}:`,
+            switchErr.message,
+          )
+        }
+      } catch (err) {
+        console.error(
+          `[response-wait] switch-off threw for conversation ${conversationId}:`,
+          err instanceof Error ? err.message : err,
+        )
+      }
       result.sent++
       console.log(
-        `[response-wait] timer ${id} completed — one-shot follow-up delivered for conversation ${conversationId}, switch left ON (waits for inbound / ↻ Reiniciar).`,
+        `[response-wait] timer ${id} completed — one-shot follow-up delivered for conversation ${conversationId}, switch OFF.`,
       )
     }
   } catch (err) {
