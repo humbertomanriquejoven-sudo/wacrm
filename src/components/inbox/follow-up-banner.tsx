@@ -529,7 +529,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
             )}
             aria-live="off"
           >
-            {followEta ?? "00:00"}
+            {loading ? "…" : (followEta ?? "00:00")}
           </span>
 
           <span className="ml-auto flex items-center gap-1.5">
@@ -591,7 +591,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
             )}
             aria-live="off"
           >
-            {waitEta ?? "00:00"}
+            {loading ? "…" : (waitEta ?? "00:00")}
           </span>
 
           <span className="ml-auto flex items-center gap-1.5">
