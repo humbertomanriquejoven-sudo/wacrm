@@ -1269,11 +1269,12 @@ async function processMessage(
   // respuesta en vez de cancelarla (NO cancela: si el switch del chat está
   // habilitado, la cuenta regresiva vuelve a partir de NOW + N minutos —
   // el cliente que sigue escribiendo nunca llega a 00:00). La duración N
-  // se relee de la última fila del chat (o el default de 10 min), y el flip
-  // del switch post-disparo ya NO ocurre, así el ciclo reanuda exactamente
-  // cuando el cliente vuelve a escribir (o el agente presiona ↻ Reiniciar).
-  // Si el switch está OFF, cancela cualquier timer ACTIVO residual.
-  // Best-effort: no puede bloquear el inbound.
+  // se relee de la última fila del chat (o el default de 10 min). Cuando la
+  // espera completa su ciclo, el RUNNER apaga el switch él mismo
+  // (`response_wait_enabled → false`), así que aquí solo se resetea
+  // MIENTRAS el switch está habilitado — al agotarse el ciclo, solo el botón
+  // "↻ Reiniciar" re-arma el timer. Si el switch está OFF, cancela cualquier
+  // timer ACTIVO residual. Best-effort: no puede bloquear el inbound.
   await resetResponseWaitOnInbound(supabaseAdmin(), conversation.id)
 
   // Update conversation. The unread bump is done DB-side (migration 037's

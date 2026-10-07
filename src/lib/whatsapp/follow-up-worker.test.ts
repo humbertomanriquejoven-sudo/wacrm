@@ -534,7 +534,7 @@ describe('scheduleFollowUp', () => {
     })
   })
 
-  it('refuses to schedule when the account-wide switch is OFF', async () => {
+  it('refuses to schedule when the account-wide switch is OFF (force still respects it)', async () => {
     resetState()
     h.state.aiConfig = { created_by: 'user-owner', follow_up_enabled: false }
     const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
@@ -543,13 +543,14 @@ describe('scheduleFollowUp', () => {
       conversationId: 'conv-1',
       contactId: 'contact-1',
       accountId: 'account-1',
+      force: true,
     })
 
     expect(res.scheduled).toBe(false)
     expect(res.reason).toBe('disabled')
   })
 
-  it('refuses to schedule when the chat override is OFF', async () => {
+  it('refuses to schedule when the chat override is OFF (force still respects it)', async () => {
     resetState()
     h.state.conversation = { follow_up_enabled: false, response_wait_enabled: true }
     const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
@@ -558,6 +559,7 @@ describe('scheduleFollowUp', () => {
       conversationId: 'conv-1',
       contactId: 'contact-1',
       accountId: 'account-1',
+      force: true,
     })
 
     expect(res.scheduled).toBe(false)

@@ -419,10 +419,11 @@ export async function scheduleFollowUp(
     delayMs?: number
     now?: Date
     /**
-     * Bypass the kill switches (process/account/per-chat). Used by the
-     * inbox "schedule" button so a MANUAL reminder can be queued even when
-     * the automatic path is disabled — the switches only govern automation.
-     * The historic and duplicate-pending limits are always enforced.
+     * Escape hatch used ONLY by tests: a forced call skips the manual-only
+     * gate and drives the real scheduling internals below. The
+     * account/process switch is STILL enforced, as are the historic and
+     * duplicate-pending limits. Production never passes `force` — the inbox
+     * "+ Programar" button arms Timer 1 through `scheduleManualFollowUp`.
      */
     force?: boolean
   },
@@ -438,8 +439,9 @@ export async function scheduleFollowUp(
     // (the `schedule` action), NOT this function. The automatic path that
     // answers an inbound (the AI auto-reply) and the 10m → 24h escalation
     // must NEVER arm it, or a single inbound would light up BOTH timers at
-    // once. `force` is the only escape hatch (the manual scheduler passes
-    // it so the account/per-chat automation switches are bypassed).
+    // once. `force` is the only escape hatch, used exclusively by tests to
+    // exercise the shared internals — production arms via
+    // `scheduleManualFollowUp` instead.
     if (!params.force) {
       console.log(
         `[follow-up] automatic ${type} stage skipped for conversation ${conversationId} — Timer 1 is manual-only (arm via "+ Programar").`,
