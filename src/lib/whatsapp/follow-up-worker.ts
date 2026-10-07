@@ -872,6 +872,56 @@ async function stillProcessing(
   }
 }
 
+/**
+ * A claimed row can never fire if a sweep crashes between the claim and its
+ * terminal update — it sits in `processing` forever, invisible to every
+ * future scan (they only select `pending`/`active`). This reclaims rows that
+ * have been stuck for longer than a CLAIM lease (~5 min, far beyond any
+ * single send's lifetime), restoring them to their schedulable state so the
+ * next sweep (cron, in-process, or a client-triggered `process_now`) can
+ * dispatch them instead of leaving the countdown at 00:00 with no message.
+ *
+ * gracefully degraded: a missing `updated_at` column just skips the table.
+ */
+const CLAIM_LEASE_MS = 5 * 60_000
+
+async function reclaimStaleClaims(db: SupabaseClient): Promise<void> {
+  const cutoff = new Date(Date.now() - CLAIM_LEASE_MS).toISOString()
+  const reclaim = async (
+    table: 'follow_ups' | 'response_wait_timers',
+    toStatus: 'pending' | 'active',
+  ): Promise<number> => {
+    try {
+      const { data, error } = await db
+        .from(table)
+        .update({ status: toStatus })
+        .eq('status', 'processing')
+        .lt('updated_at', cutoff)
+        .select('id')
+      if (error) {
+        console.error(
+          `[follow-up] stale-claim reclaim on ${table} skipped (${error.message}); the row may stay stuck until a manual fix.`,
+        )
+        return 0
+      }
+      return data?.length ?? 0
+    } catch (err) {
+      console.error(
+        `[follow-up] stale-claim reclaim on ${table} threw:`,
+        err instanceof Error ? err.message : err,
+      )
+      return 0
+    }
+  }
+  const followUps = await reclaim('follow_ups', 'pending')
+  const wait = await reclaim('response_wait_timers', 'active')
+  if (followUps > 0 || wait > 0) {
+    console.log(
+      `[follow-up] reclaimed ${followUps} follow-up + ${wait} response-wait stale claim(s) older than ${cutoff} — re-queued for the next sweep.`,
+    )
+  }
+}
+
 export interface RunFollowUpsResult {
   scanned: number
   sent: number
@@ -918,6 +968,11 @@ export async function runDueFollowUps(
     // no-op for the cron, never a 500.
     const client = db ?? supabaseAdmin()
 
+    // A previous sweep may have crashed mid-claim; any row still `processing`
+    // beyond the claim lease is re-queued so it can actually fire (never
+    // stranded at 00:00). Cheap and idempotent — reclaims zero rows normally.
+    await reclaimStaleClaims(client)
+
     const { data: due, error } = await client
       .from('follow_ups')
       .select('id, conversation_id, contact_id, account_id, type, created_at')
@@ -931,6 +986,7 @@ export async function runDueFollowUps(
       return result
     }
     if (!due || due.length === 0) return result
+    console.log(`[follow-up] runner found ${due.length} due follow-up(s) to dispatch.`)
 
     for (const row of due) {
       const id = row.id as string
@@ -962,6 +1018,9 @@ export async function runDueFollowUps(
         // Lost the race — another sweep owns this row. Never send twice.
         continue
       }
+      console.log(
+        `[follow-up] dispatching follow-up ${id} for conversation ${conversationId} (contact ${contactId}).`,
+      )
 
       // NO public-@handle gate: a due reminder fires for ANY registered
       // contact. The destination is resolved at send time by the shared
@@ -1274,6 +1333,10 @@ export async function runDueResponseWaitTimers(
   try {
     const client = db ?? supabaseAdmin()
 
+    // Reclaim any previous crash's stale claims before scanning (see
+    // `reclaimStaleClaims`) so an abandoned `processing` row can still fire.
+    await reclaimStaleClaims(client)
+
     const { data: due, error } = await client
       .from('response_wait_timers')
       .select('id, conversation_id, contact_id, account_id, started_at')
@@ -1288,6 +1351,9 @@ export async function runDueResponseWaitTimers(
       return result
     }
     if (!due || due.length === 0) return result
+    console.log(
+      `[response-wait] runner found ${due.length} expired "Esperando respuesta" timer(s) to dispatch.`,
+    )
 
     for (const row of due) {
       const id = row.id as string
@@ -1317,6 +1383,9 @@ export async function runDueResponseWaitTimers(
         // Lost the race — another sweep owns this row. Never send twice.
         continue
       }
+      console.log(
+        `[response-wait] dispatching expired timer ${id} for conversation ${conversationId} (contact ${contactId}).`,
+      )
 
       // NO public-@handle gate: a due nudge fires for ANY registered
       // contact. The destination is resolved at send time by the shared

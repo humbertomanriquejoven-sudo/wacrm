@@ -10,6 +10,8 @@ import {
   scheduleManualFollowUp,
   scheduleResponseWaitTimer,
   cancelResponseWaitTimers,
+  runDueFollowUps,
+  runDueResponseWaitTimers,
   type FollowUpType,
 } from '@/lib/whatsapp/follow-up-worker'
 
@@ -31,6 +33,10 @@ import {
  *         - wait_schedule  arm Timer 2 (response-wait) for N minutes
  *         - wait_reset     cancel the current Timer 2 + re-arm from N
  *         - wait_cancel    cancel the ACTIVE Timer 2 for the thread
+ *         - process_now    drain BOTH queues like the cron would (client
+ *                          fallback fired by the banner the moment a
+ *                          countdown hits 00:00, so delivery never depends
+ *                          solely on an external schedule)
  *
  * IMPORTANT — READS NEVER WRITE: GET (and the whole mount path of the
  * banner) is strictly read-only. A countdown's timestamp may only enter
@@ -305,6 +311,7 @@ export async function POST(request: Request) {
         'wait_schedule',
         'wait_reset',
         'wait_cancel',
+        'process_now',
       ].includes(action)
     ) {
       return NextResponse.json({ error: 'Unknown action' }, { status: 400 })
@@ -315,6 +322,28 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: owned.error }, { status: owned.status })
     }
     const { conv } = owned
+
+    // Client fallback for the worker: the banner fires this the instant a
+    // countdown hits 00:00 so an expired "Esperando respuesta" / follow-up
+    // timer is dispatched even if no external cron is pinging the server.
+    // The runners are idempotent (atomic claim), scoped to DB truth, and
+    // run with the SAME service-role client the cron route uses — so a
+    // browser-triggered sweep behaves exactly like a scheduled one.
+    if (action === 'process_now') {
+      const now = new Date()
+      const [follow, wait] = await Promise.all([
+        runDueFollowUps(supabaseAdmin(), now),
+        runDueResponseWaitTimers(supabaseAdmin(), now),
+      ])
+      console.log(
+        `[follow-up] client-triggered sweep for conversation ${conversationId} — follow_ups: ${follow.sent}/${follow.scanned} sent (${follow.cancelled} cancelled, ${follow.noResponse} no_response), response-wait: ${wait.sent}/${wait.scanned} sent (${wait.cancelled} cancelled, ${wait.noResponse} no_response).`,
+      )
+      return NextResponse.json({
+        success: true,
+        scanned: { follow_ups: follow.scanned, response_wait: wait.scanned },
+        sent: { follow_ups: follow.sent, response_wait: wait.sent },
+      })
+    }
 
     if (action === 'set_enabled') {
       // Per-chat override. `enabled: null` resets to "inherit the account".

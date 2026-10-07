@@ -178,6 +178,13 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   // Once the agent types in the box, the server's assigned value stops
   // overriding it (the box is the single source of what they type).
   const waitTouched = useRef(false);
+  // One-shot guard per ACTIVE timer id: the moment a countdown hits 00:00,
+  // this component POSTs a `process_now` sweep exactly ONCE for that id, so
+  // delivery never depends solely on an external cron / in-process tick.
+  const firedExpiryRef = useRef<{ follow: string | null; wait: string | null }>({
+    follow: null,
+    wait: null,
+  });
   // Server − client clock offset, captured from each poll's `server_now`.
   // Every remainder below is evaluated against the SERVER's wall clock
   // (`expires_at − (Date.now() + skew)`), so a drifted laptop clock can
@@ -325,6 +332,36 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     },
     [conversationId, t],
   );
+
+  // CLIENT-TRIGGERED DISPATCH: every 1-second clock tick, an ACTIVE timer
+  // whose server-derived remainder has reached 00:00 asks the backend to
+  // drain the queues (`process_now` — the same idempotent worker the cron
+  // runs). Guarded by `firedExpiryRef` so a given row fires only once; once
+  // the worker completes/cancels it, the poll refresh removes it from
+  // `status` and the effect no-ops. A chat-level or account-level OFF is
+  // respected by the runner itself (it cancels instead of sending).
+  useEffect(() => {
+    if (!status) return;
+    const nowMs = Date.now() + serverSkew;
+    const pendingRow = status.pending[0] ?? null;
+    const waitRow = status.response_wait;
+    if (
+      pendingRow &&
+      Date.parse(pendingRow.execute_at) <= nowMs &&
+      firedExpiryRef.current.follow !== pendingRow.id
+    ) {
+      firedExpiryRef.current.follow = pendingRow.id;
+      void post("process_now", {});
+    }
+    if (
+      waitRow &&
+      Date.parse(waitRow.expires_at) <= nowMs &&
+      firedExpiryRef.current.wait !== waitRow.id
+    ) {
+      firedExpiryRef.current.wait = waitRow.id;
+      void post("process_now", {});
+    }
+  }, [status, serverSkew, followNowTs, waitNowTs, post]);
 
   // ---- Timer 1 (seguimiento automático) -----------------------------
   const scheduleFollowUp = useCallback(async () => {
