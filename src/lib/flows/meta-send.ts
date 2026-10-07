@@ -19,6 +19,7 @@ import {
 } from '@/lib/whatsapp/phone-utils'
 import { splitAiReply } from '@/lib/ai/split-reply'
 import { supabaseAdmin } from './admin-client'
+import { armResponseWaitIfIdle } from '@/lib/whatsapp/response-wait'
 import {
   resolveRecipient,
   isRecipientRejection,
@@ -458,6 +459,23 @@ export async function engineSendAiReply(
       updated_at: new Date().toISOString(),
     })
     .eq('id', args.conversationId)
+
+  // TIMER 2 AUTO-ARM — the BOT answered the client, so "Esperar respuesta"
+  // starts counting (the inbound that triggered this reply cancelled the
+  // old countdown; the next 10 minutes are watched from here). Best-effort:
+  // the reply itself ALREADY went out — an arm failure must not throw.
+  try {
+    await armResponseWaitIfIdle(db, {
+      conversationId: args.conversationId,
+      contactId: args.contactId,
+      accountId: args.accountId,
+    })
+  } catch (err) {
+    console.error(
+      '[ai reply] response-wait auto-arm threw:',
+      err instanceof Error ? err.message : err,
+    )
+  }
 
   return { whatsapp_message_id: waMessageId }
 }

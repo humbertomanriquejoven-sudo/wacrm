@@ -1062,7 +1062,7 @@ describe('runDueFollowUps', () => {
 })
 
 describe('runDueResponseWaitTimers', () => {
-  it('sends a generated nudge at expiry when the customer stayed silent', async () => {
+  it('sends a generated nudge at expiry, then RE-ARMS in place (continuous)', async () => {
     resetState()
     h.state.waitTimers = [
       {
@@ -1092,10 +1092,21 @@ describe('runDueResponseWaitTimers', () => {
         messageType: 'text',
         senderType: 'bot',
         aiGenerated: true,
+        autoArm: false,
         contentText: '¿Quedó todo claro? Avísame si necesitas algo más.',
       }),
     )
-    expect(h.state.waitCompleted).toEqual(['completed'])
+    // NOT completed — the nudge restarts the countdown from the configured
+    // 5 minutes: 12:05:01 + 5 min = 12:10:01, single ACTIVE row, no twins.
+    expect(h.state.waitCompleted).toEqual([])
+    expect(h.state.waitTimers).toHaveLength(1)
+    expect(h.state.waitTimers[0]).toMatchObject({
+      id: 'wait-1',
+      status: 'active',
+      delay_minutes: 5,
+      started_at: '2026-10-06T12:05:01.000Z',
+      expires_at: '2026-10-06T12:10:01.000Z',
+    })
   })
 
   it('cancels without sending when the customer replied AT/AFTER started_at', async () => {
@@ -1197,6 +1208,14 @@ describe('runScheduledFollowUps — both timers run independently', () => {
     expect(res.responseWait).toMatchObject({ scanned: 1, sent: 1 })
     expect(h.state.sendMessageToConversation).toHaveBeenCalledTimes(2)
     expect(h.state.completed).toEqual(['completed'])
-    expect(h.state.waitCompleted).toEqual(['completed'])
+    // Timer 2 is continuous: its row stays ACTIVE and restarts at 12:10 + 5
+    // min = 12:15 instead of closing. Only Timer 1 produced a `completed`.
+    expect(h.state.waitCompleted).toEqual([])
+    expect(h.state.waitTimers[0]).toMatchObject({
+      id: 'wait-1',
+      status: 'active',
+      started_at: '2026-10-06T12:10:00.000Z',
+      expires_at: '2026-10-06T12:15:00.000Z',
+    })
   })
 })

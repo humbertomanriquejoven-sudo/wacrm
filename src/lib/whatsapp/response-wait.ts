@@ -26,15 +26,17 @@
 //     `cancelResponseWaitTimers`. Independently, at dispatch time the
 //     runner re-checks the thread's last message and drops the reminder
 //     if the customer replied AFTER `started_at` — the race safety net.
-//   * ON EXPIRY (`NOW() >= expires_at`, status still `active`,
-//     customer silent): the runner generates a contextual AI follow-up
-//     and sends it through the SAME core the inbox uses
-//     (`sendMessageToConversation`).
-//   * AUTO-ARM ON SEND: `armResponseWaitIfIdle` is called right after a
-//     HUMAN agent's outbound message is persisted. It starts the countdown
-//     immediately ("en cuanto enviamos un mensaje"), continues an active
-//     countdown without restarting it, and re-arms with the chat's
+//   * AUTO-ARM ON SEND: `armResponseWaitIfIdle` is called right after ANY
+//     outbound (agent or bot/AI) message is persisted. It starts the
+//     countdown immediately ("en cuanto enviamos un mensaje"), continues an
+//     active countdown without restarting it, and re-arms with the chat's
 //     last-used duration after the customer replied (or 10 min by default).
+//   * ON EXPIRY — CONTINUOUS (not one-shot): while the customer stays
+//     silent the runner sends a contextual follow-up and RE-ARMS the same
+//     row in place (`expires_at = now + delay_minutes`), so `00:00`
+//     cycles back to a fresh 10-minute countdown instead of closing. The
+//     only ways OUT of `active` are a customer reply (webhook cancel →
+//     `cancelled`) or a nudge that failed to dispatch (`no_response`).
 //   * Timer 2 is NOT gated by `conversations.follow_up_enabled`: that
 //     switch belongs to Timer 1 (automation). The wait timer is an
 //     explicit agent action and must fire even when the automation
@@ -214,8 +216,9 @@ export async function cancelResponseWaitTimers(
 }
 
 /**
- * AUTO-ARM ON SEND — start Timer 2 the moment an outbound HUMAN message
- * is persisted, without waiting for the agent to press ▶ Iniciar.
+ * AUTO-ARM ON SEND — start Timer 2 the moment an OUTBOUND message is
+ * persisted ("en cuanto enviamos un mensaje, agente o bot"), without
+ * waiting for the agent to press ▶ Iniciar.
  *
  * Semantics ("comienza/continúa", strictly per conversation, no stacking):
  *   1. If an ACTIVE countdown already exists → DO NOTHING (continue). A

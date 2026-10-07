@@ -666,16 +666,41 @@ describe('sendMessageToConversation — Timer 2 auto-arm on send', () => {
     );
   });
 
-  it('does NOT re-arm for bot/automation sends (no nudge loops)', async () => {
-    // The scheduled-flow sender (Timer 1 / Timer 2 execution, AI replies)
-    // passes senderType 'bot' — sending is NOT "us waiting for a reply",
-    // so it must never start/restart the countdown.
-    await sendMessageToConversation(sendPathDb([], {}), 'acct-1', {
+  it('auto-arms for BOT outbounds too (en cuanto el bot responde, vuelve a vigilar)', async () => {
+    // The AI/bot answering the client hands the "Esperar respuesta" timer
+    // a fresh start — after the inbound cancelled it, the bot's reply is
+    // the new "we sent a message and are waiting" moment.
+    const captured: CapturedWrites = {};
+    await sendMessageToConversation(sendPathDb([], captured), 'acct-1', {
       conversationId: 'cv-1',
       messageType: 'text',
       contentText: 'nudge',
       senderType: 'bot',
       aiGenerated: true,
+    });
+
+    expect(armResponseWaitIfIdle).toHaveBeenCalledTimes(1);
+    expect(armResponseWaitIfIdle).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        conversationId: 'cv-1',
+        contactId: 'ct-1',
+        accountId: 'acct-1',
+      })
+    );
+  });
+
+  it('honors autoArm:false (the Timer 2 runner re-arms itself)', async () => {
+    // The expiry-nudge dispatch opts out so its explicit in-place re-arm
+    // can never stack a second ACTIVE row for the same conversation.
+    const captured: CapturedWrites = {};
+    await sendMessageToConversation(sendPathDb([], captured), 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'nudge',
+      senderType: 'bot',
+      aiGenerated: true,
+      autoArm: false,
     });
 
     expect(armResponseWaitIfIdle).not.toHaveBeenCalled();

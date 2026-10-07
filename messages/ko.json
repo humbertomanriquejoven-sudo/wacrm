@@ -438,7 +438,6 @@
       "waitReset": "↻ Reiniciar",
       "waitCancel": "취소",
       "waitNone": "대기 타이머 없음",
-      "waitActiveStatus": "🟢 Esperando respuesta",
       "waitRemaining": "⏱️ Tiempo restante: {time}",
       "waitExecuted": "✅ Tiempo de espera finalizado (Acción ejecutada)",
       "waitCancelledByReply": "💬 Cliente respondió (Temporizador cancelado)",

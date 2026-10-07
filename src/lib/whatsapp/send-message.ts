@@ -98,6 +98,14 @@ export interface SendMessageParams {
   interactivePayload?: InteractiveMessagePayload | null;
   replyToMessageId?: string | null;
   /**
+   * Skip Timer 2's auto-arm for THIS send. Defaults to `true` for every
+   * outbound (agent or bot): sending any message while the client has not
+   * replied starts (or continues) this chat's "Esperar respuesta"
+   * countdown. The Timer 2 runner passes `false` when it dispatches the
+   * expiry nudge, because it re-arms the row itself right after.
+   */
+  autoArm?: boolean;
+  /**
    * Persisted `messages.sender_type`. Defaults to `'agent'` (a human-style
    * outbound, exactly as before). The scheduled follow-up path passes
    * `'bot'` so the Inbox renders the AI nudge like any other bot reply.
@@ -222,6 +230,7 @@ export async function sendMessageToConversation(
     templateMessageParams,
     interactivePayload,
     replyToMessageId,
+    autoArm,
   } = params;
 
   if (!conversationId) {
@@ -612,15 +621,18 @@ export async function sendMessageToConversation(
     })
     .eq('id', conversationId);
 
-  // TIMER 2 AUTO-ARM — a HUMAN outbound means "we sent a message and are
+  // TIMER 2 AUTO-ARM — an OUTBOUND message means "we sent a message and are
   // now waiting for the client's reply", so start this chat's response-wait
-  // countdown immediately ("en cuanto enviamos un mensaje"). Continues an
+  // countdown immediately ("en cuanto enviamos un mensaje"). It fires for
+  // BOTH an agent and a bot (AI auto-reply) outbound, so the "Esperar
+  // respuesta" countdown is always live after anything we send. Continues an
   // already-active countdown; after the client replied (webhook cancelled
-  // it) re-arms with the chat's last-used duration. Best-effort: a failure
-  // here must never fail the send. Only HUMAN sends arm — bot/automation
-  // sends (AI auto-replies, Timer 1/Timer 2 nudges) never re-arm, which is
-  // what stops the countdown from chaining after its own nudge.
-  if ((params.senderType ?? 'agent') === 'agent') {
+  // it) re-arms from the chat's last-used duration (10 min by default).
+  // Callers that re-arm themselves — the Timer 2 runner after dispatching
+  // its expiry nudge — opt out with `autoArm: false` so the conversation's
+  // single ACTIVE row can never be duplicated. Best-effort: a failure here
+  // must never fail the send.
+  if (autoArm !== false) {
     try {
       await armResponseWaitIfIdle(supabaseAdmin(), {
         conversationId,

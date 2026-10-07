@@ -10,6 +10,7 @@ const h = vi.hoisted(() => {
     messageInserts: [] as Record<string, unknown>[],
     conversationUpdates: [] as Record<string, unknown>[],
     contactUpdates: [] as Record<string, unknown>[],
+    armResponseWaitIfIdle: vi.fn(),
   }
   return {
     state,
@@ -78,6 +79,10 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
   decrypt: vi.fn(() => 'tok'),
 }))
 
+vi.mock('@/lib/whatsapp/response-wait', () => ({
+  armResponseWaitIfIdle: h.state.armResponseWaitIfIdle,
+}))
+
 import { sendTextMessage, sendTypingIndicator } from '@/lib/whatsapp/meta-api'
 import { engineSendAiReply } from './meta-send'
 
@@ -103,6 +108,8 @@ beforeEach(() => {
   mockSendTypingIndicator.mockReset()
   mockSendTextMessage.mockResolvedValue({ messageId: 'wamid.frag' })
   mockSendTypingIndicator.mockResolvedValue(undefined)
+  h.state.armResponseWaitIfIdle.mockReset()
+  h.state.armResponseWaitIfIdle.mockResolvedValue({ scheduled: true, reason: 'armed', id: 'wait-9', expires_at: 'x' })
 })
 afterEach(() => {
   vi.clearAllMocks()
@@ -130,6 +137,20 @@ describe('engineSendAiReply', () => {
     expect(h.state.conversationUpdates).toHaveLength(1)
     expect(h.state.conversationUpdates[0].last_message_text).toBe(
       'Primero\n\nSegundo\n\nTercero',
+    )
+  })
+
+  it('auto-arms Timer 2 after the reply (bot answering = a fresh wait starts)', async () => {
+    await engineSendAiReply(ARGS)
+
+    expect(h.state.armResponseWaitIfIdle).toHaveBeenCalledTimes(1)
+    expect(h.state.armResponseWaitIfIdle).toHaveBeenCalledWith(
+      expect.anything(),
+      {
+        conversationId: 'conv-1',
+        contactId: 'contact-1',
+        accountId: 'acct-1',
+      },
     )
   })
 

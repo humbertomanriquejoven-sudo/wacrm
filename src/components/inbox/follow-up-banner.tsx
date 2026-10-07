@@ -9,31 +9,34 @@ import { Switch } from "@/components/ui/switch";
 import type { FollowUp, ResponseWaitTimer } from "@/types";
 
 // ------------------------------------------------------------------
-// Per-conversation timer banner — TWO fully independent, persistent,
-// one-shot timers per chat:
+// Per-conversation timer banner — TWO fully independent, persistent
+// timers per chat:
 //
 //   BLOCK 1 — "Seguimiento automático" (Timer 1, the programmed reminder).
 //     [ N ] min  [Programar]  [ ON/OFF switch ]
 //     `follow_ups.pending` (execute_at) → ⏱️ Próximo seguimiento en: MM:SS.
 //     OFF cancels the queued row and the worker refuses to dispatch.
 //
-//   BLOCK 2 — "Esperar respuesta" (Timer 2, response-wait, ONE-SHOT).
+//   BLOCK 2 — "Esperar respuesta" (Timer 2, response-wait, CONTINUOUS).
 //     [ N ] min  [▶ Iniciar]  [↻ Reiniciar]
 //     `response_wait_timers.active` (started_at + expires_at) → live
-//     countdown "⏱️ Tiempo restante: MM:SS".
+//     countdown "⏱️ Tiempo restante: MM:SS", ALWAYS visible under the row
+//     while the timer is active — it never hides and never skips a tick.
 //
-//     ONE-SHOT (strictly non-recurrent):
-//       · Escenario A — el cliente responde antes de 00:00 → la webhook
-//         cancela el timer (cancelled_reason='inbound'/'anti_race');
-//         la UI muestra "💬 Cliente respondió (Temporizador cancelado)" y
-//         NO se envía nada.
-//       · Escenario B — llega a 00:00 sin respuesta → el worker envía el
-//         seguimiento UNA sola vez y el timer pasa a `completed`
-//         (desactivado). La UI muestra "✅ Tiempo de espera finalizado
-//         (Acción ejecutada)". NUNCA se reinicia solo: el agente debe
-//         pulsar ▶ Iniciar / ↻ Reiniciar para volver a usarlo.
-//     ↻ Reiniciar = cancelar la cuenta regresiva actual (misma fila) y
-//     rearmarla desde los minutos EXACTOS del campo, sin duplicados.
+//     AUTO (never needs the button):
+//       · ANY outbound (agent or bot) with the client silent → auto-arm:
+//         `expires_at = NOW() + N` (N = the chat's configured minutes,
+//         default 10). An active countdown simply continues.
+//       · Client replies → webhook cancels (cancelled_reason='inbound');
+//         the UI shows "💬 Cliente respondió…" and nothing is sent.
+//       · Zero with no reply → the worker sends the contextual AI nudge
+//         and RE-ARMS in place, so the countdown restarts at 10:00 instead
+//         of closing. The only way OUT of `active` is the client replying
+//         (`cancelled`) or the nudge failing to dispatch (`no_response`).
+//       · After a reply, the next outbound (bot or agent) hands the timer
+//         a fresh start automatically.
+//     ↻ Reiniciar = cancel the current countdown (same row) and rearm it
+//     from the EXACT minutes of the field, without duplicates.
 //
 // ISOLATION / CORRECTNESS GUARANTEES:
 //   * NO shared/global React timer state. Every value is loaded from the
@@ -41,9 +44,9 @@ import type { FollowUp, ResponseWaitTimer } from "@/types";
 //     conversation (`key={conversation.id}`) so switching chats cannot
 //     leak inputs or counters between conversations.
 //   * Dynamic remainder: the UI ALWAYS computes `expires_at − NOW()` on a
-//     1-second clock. Switch away for 2 minutes and come back: a 5-minute
-//     timer honestly shows 3:00, never resets, never borrows another
-//     chat's values, and survives an F5 (the row lives in the DB).
+//     per-timer 1-second clock. Switch away for 2 minutes and come back: a
+//     5-minute timer honestly shows 3:00, never resets, never borrows
+//     another chat's values, and survives an F5 (the row lives in the DB).
 //   * The send is triggered by the backend (cron / in-process worker),
 //     never by this component — the countdown is display-only.
 // ------------------------------------------------------------------
@@ -460,14 +463,9 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
             )}
           >
             {waitOutcome === "active" && (
-              <>
-                <span className="font-medium text-foreground">
-                  {t("waitActiveStatus")}
-                </span>
-                <span className="ml-2 font-mono tabular-nums">
-                  {t("waitRemaining", { time: waitEta ?? "00:00" })}
-                </span>
-              </>
+              <span className="font-mono tabular-nums">
+                {t("waitRemaining", { time: waitEta ?? "00:00" })}
+              </span>
             )}
             {waitOutcome === "executed" && <>{t("waitExecuted")}</>}
             {waitOutcome === "replied" && <>{t("waitCancelledByReply")}</>}
