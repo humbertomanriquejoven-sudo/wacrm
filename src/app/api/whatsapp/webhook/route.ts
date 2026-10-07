@@ -28,7 +28,7 @@ import {
   clearStaleFlowRuns,
 } from '@/lib/ai/unblock'
 import { transcribeAudio } from '@/lib/ai/transcribe'
-import { cancelPendingFollowUps, cancelResponseWaitTimers } from '@/lib/whatsapp/follow-up-worker'
+import { cancelPendingFollowUps, resetResponseWaitOnInbound } from '@/lib/whatsapp/follow-up-worker'
 import {
   describeInboundContent,
   normalizeContentType,
@@ -1265,11 +1265,16 @@ async function processMessage(
   // Timer 1 — cancel any PENDING follow-up for the thread.
   await cancelPendingFollowUps(supabaseAdmin(), conversation.id)
 
-  // Timer 2 — REGLA CRÍTICA: el cliente respondió, así que la espera de
-  // respuesta termina AHORA: cancela el response-wait timer ACTIVO de
-  // esta conversación para que el worker nunca envíe un seguimiento a
-  // alguien que ya contestó.
-  await cancelResponseWaitTimers(supabaseAdmin(), conversation.id)
+  // Timer 2 — REGLA CRÍTICA: cada mensaje entrante REINICIA la espera de
+  // respuesta en vez de cancelarla (NO cancela: si el switch del chat está
+  // habilitado, la cuenta regresiva vuelve a partir de NOW + N minutos —
+  // el cliente que sigue escribiendo nunca llega a 00:00). La duración N
+  // se relee de la última fila del chat (o el default de 10 min), y el flip
+  // del switch post-disparo ya NO ocurre, así el ciclo reanuda exactamente
+  // cuando el cliente vuelve a escribir (o el agente presiona ↻ Reiniciar).
+  // Si el switch está OFF, cancela cualquier timer ACTIVO residual.
+  // Best-effort: no puede bloquear el inbound.
+  await resetResponseWaitOnInbound(supabaseAdmin(), conversation.id)
 
   // Update conversation. The unread bump is done DB-side (migration 037's
   // bump_conversation_on_inbound) rather than as a read-modify-write of the

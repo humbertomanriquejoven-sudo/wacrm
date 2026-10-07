@@ -411,7 +411,8 @@ export async function POST(request: Request) {
         )
       }
       // Turn the switch back ON so the armed countdown is reflected by the
-      // banner's Switch 2 (the worker turned it OFF after the last cycle).
+      // banner's Switch 2 (arming this feature always implies enabling it;
+      // the worker no longer flips the switch OFF after a completed cycle).
       const { error: switchErr } = await supabaseAdmin()
         .from('conversations')
         .update({ response_wait_enabled: true })

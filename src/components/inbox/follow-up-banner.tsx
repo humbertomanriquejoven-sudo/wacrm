@@ -180,6 +180,10 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   // (`expires_at − (Date.now() + skew)`), so a drifted laptop clock can
   // never distort — or visibly jump — a countdown recovered from BD.
   const [serverSkew, setServerSkew] = useState(0);
+  // Last failure of an "Esperar respuesta" action (Timer 2), shown inline on
+  // its row. Cleared on any successful reset OR on any healthy server poll —
+  // ↻ Reiniciar always wipes a previous error state.
+  const [waitError, setWaitError] = useState<string | null>(null);
 
   useEffect(() => {
     mounted.current = true;
@@ -202,6 +206,9 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
           typeof j.server_now === "string" ? Date.parse(j.server_now) : NaN;
         if (Number.isFinite(serverTs)) setServerSkew(serverTs - Date.now());
         setStatus(j);
+        // A healthy poll means the last failure is stale — drop it so the
+        // row returns to the normal countdown/switch UI.
+        setWaitError(null);
       }
       return j;
     } catch {
@@ -389,8 +396,10 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       const json = await post("wait_reset", { delay_minutes: value });
       if (json) {
         if (json.scheduled === false) {
+          setWaitError((json.error as string) ?? t("waitFailed"));
           toast.error((json.error as string) ?? t("waitFailed"));
         } else {
+          setWaitError(null);
           toast.success(t("waitResetSuccess"));
           // OPTIMISTIC: show the fresh full-minutes countdown NOW (from the
           // server's own `expires_at` + `delay_minutes`) and flip Switch 2
@@ -574,6 +583,17 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
             />
           </span>
         </div>
+
+        {/* Last "Esperar respuesta" failure (e.g. the timer could not be
+            started). ↻ Reiniciar / a healthy poll clears it immediately. */}
+        {waitError ? (
+          <p
+            className="text-[11px] font-medium text-red-600 dark:text-red-400"
+            role="alert"
+          >
+            {waitError}
+          </p>
+        ) : null}
       </div>
     </div>
   );

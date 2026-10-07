@@ -4,6 +4,7 @@ import { sendMessageToConversation } from '@/lib/whatsapp/send-message'
 import { loadAiConfig } from '@/lib/ai/config'
 import { generateReply, stripInternalReasoning } from '@/lib/ai/generate'
 import { buildConversationContext } from '@/lib/ai/context'
+import { ARM_DEFAULT_MINUTES, cancelResponseWaitTimers } from './response-wait'
 
 /**
  * Timer 2 (`response_wait_timers`) logic — arming, re-arming, auto-arm on
@@ -15,12 +16,237 @@ export {
   armResponseWaitIfIdle,
   ARM_DEFAULT_MINUTES,
   cancelResponseWaitTimers,
-  scheduleResponseWaitTimer,
   type ArmResponseWaitResult,
   type ResponseWaitCancelReason,
   type ResponseWaitScheduleResult,
   type ResponseWaitStatus,
 } from './response-wait'
+
+// `scheduleResponseWaitTimer` now points at the robust `rearmResponseWaitTimer`
+// implementation below (an ARRAY read that always wins with the NEWEST ACTIVE
+// row) instead of response-wait's `.maybeSingle()` read — so a stale duplicate
+// ACTIVE row can never surface the "Could not start the 'Esperar respuesta'
+// timer (error)" toast path again. Callers/tests keep the stable import name.
+export const scheduleResponseWaitTimer = rearmResponseWaitTimer
+
+/**
+ * Militant re-arm for "Esperar respuesta" (Timer 2), shared by the inbox
+ * route (`wait_schedule` / `wait_reset`) and the inbound-webhook reset.
+ *
+ * Unlike `scheduleResponseWaitTimer` (response-wait.ts) — which reads the
+ * active row with `.maybeSingle()` and STOPS re-arming as soon as the same
+ * conversation accumulates TWO active rows (a PostgREST "multiple (or no)
+ * rows" error → `scheduled:false` → the agent sees
+ * "Could not start the 'Esperar respuesta' timer (error)") — this walks the
+ * NEWEST active row through an ARRAY read (`.order().limit(1)` + `[0]`), so
+ * the current countdown is always the winner and a stale duplicate can never
+ * wedge the endpoint again. The single-active-row invariant still holds
+ * because an eventual re-arm UPDATES one exact row id.
+ *
+ * Never throws; every DB failure degrades to a logged `scheduled:false`.
+ */
+export interface RearmResponseWaitResult {
+  scheduled: boolean
+  reason: 'scheduled' | 'error'
+  id: string | null
+  expires_at: string | null
+}
+
+export async function rearmResponseWaitTimer(
+  db: SupabaseClient,
+  params: {
+    conversationId: string
+    contactId: string
+    accountId: string
+    /** Whole minutes (1..max), validated by the caller. */
+    delayMinutes: number
+    now?: Date
+  },
+): Promise<RearmResponseWaitResult> {
+  const { conversationId, contactId, accountId, delayMinutes } = params
+  const now = params.now ?? new Date()
+  const startedAt = now.toISOString()
+  const expiresAt = new Date(now.getTime() + delayMinutes * 60_000).toISOString()
+
+  try {
+    // NEWEST active row via an ARRAY read — a `maybeSingle` here would turn
+    // a stale duplicate row into a hard, permanent `scheduled:false`.
+    const { data: rows, error: findErr } = await db
+      .from('response_wait_timers')
+      .select('id')
+      .eq('conversation_id', conversationId)
+      .eq('status', 'active')
+      .order('expires_at', { ascending: false })
+      .limit(1)
+
+    if (findErr) {
+      console.error(
+        `[response-wait] could not find the active timer for conversation ${conversationId}:`,
+        findErr.message,
+      )
+      return { scheduled: false, reason: 'error', id: null, expires_at: null }
+    }
+
+    const newest = rows?.[0] as { id: string } | undefined
+    if (newest) {
+      const { error: upErr } = await db
+        .from('response_wait_timers')
+        .update({
+          delay_minutes: delayMinutes,
+          started_at: startedAt,
+          expires_at: expiresAt,
+        })
+        .eq('id', newest.id)
+        .eq('status', 'active')
+      if (upErr) {
+        console.error(
+          `[response-wait] could not re-arm the timer for conversation ${conversationId}:`,
+          upErr.message,
+        )
+        return { scheduled: false, reason: 'error', id: null, expires_at: null }
+      }
+      console.log(
+        `[response-wait] timer ${newest.id} re-armed for conversation ${conversationId} → ${expiresAt} (${delayMinutes} min).`,
+      )
+      return {
+        scheduled: true,
+        reason: 'scheduled',
+        id: newest.id,
+        expires_at: expiresAt,
+      }
+    }
+
+    const { data, error: insErr } = await db
+      .from('response_wait_timers')
+      .insert({
+        conversation_id: conversationId,
+        contact_id: contactId,
+        account_id: accountId,
+        status: 'active',
+        delay_minutes: delayMinutes,
+        started_at: startedAt,
+        expires_at: expiresAt,
+      })
+      .select('id')
+      .single()
+    if (insErr || !data) {
+      console.error(
+        `[response-wait] could not arm a timer for conversation ${conversationId}:`,
+        insErr?.message ?? 'no row returned',
+      )
+      return { scheduled: false, reason: 'error', id: null, expires_at: null }
+    }
+    console.log(
+      `[response-wait] timer ${data.id} armed for conversation ${conversationId} → ${expiresAt} (${delayMinutes} min).`,
+    )
+    return {
+      scheduled: true,
+      reason: 'scheduled',
+      id: data.id,
+      expires_at: expiresAt,
+    }
+  } catch (err) {
+    console.error(
+      `[response-wait] rearmResponseWaitTimer threw for conversation ${conversationId}:`,
+      err instanceof Error ? err.message : err,
+    )
+    return { scheduled: false, reason: 'error', id: null, expires_at: null }
+  }
+}
+
+/**
+ * Inbound-webhook reset (Timer 2): every fresh message the CUSTOMER writes
+ * RESETS the countdown — the ACTIVE timer is re-armed from
+ * `NOW() + N minutes` using the chat's last-used duration (or the 10-minute
+ * default), so an actively replying customer never hits 00:00.
+ *
+ * Gated on the per-chat switch (`conversations.response_wait_enabled`):
+ *   - enabled  → reset/re-arm. After a completed one-shot cycle the switch is
+ *                LEFT ON (the runner no longer flips it OFF), so the next
+ *                inbound re-arms a fresh countdown — the cycle restarts
+ *                exactly when the customer writes again (or ↻ Reiniciar).
+ *   - disabled → the feature is OFF for the chat: no reset AND any stray
+ *                ACTIVE row is cancelled, so a detached timer never nudges.
+ *
+ * Never throws; an unreadable row degrades to a logged no-op so the inbound
+ * message itself is never blocked by a wait-timer hiccup.
+ */
+export async function resetResponseWaitOnInbound(
+  db: SupabaseClient,
+  conversationId: string,
+  now?: Date,
+): Promise<{ reset: boolean; reason: string; expires_at: string | null }> {
+  const MISSING =
+    /column .* does not exist|42703|PGRST204|schema cache|does not exist/i
+  try {
+    const { data, error } = await db
+      .from('conversations')
+      .select('id, contact_id, account_id, response_wait_enabled')
+      .eq('id', conversationId)
+      .maybeSingle()
+    let row = (data as Record<string, unknown> | null) ?? null
+    if (error && MISSING.test(error.message)) {
+      // Migration for `response_wait_enabled` not applied → treat as enabled.
+      const legacy = await db
+        .from('conversations')
+        .select('id, contact_id, account_id')
+        .eq('id', conversationId)
+        .maybeSingle()
+      if (!legacy.error) {
+        row = (legacy.data as Record<string, unknown> | null) ?? null
+      }
+    } else if (error) {
+      console.error(
+        `[response-wait] could not read conversation ${conversationId} for the inbound reset:`,
+        error.message,
+      )
+      return { reset: false, reason: 'unreadable', expires_at: null }
+    }
+    if (!row) return { reset: false, reason: 'no_conversation', expires_at: null }
+
+    const enabled =
+      (row as { response_wait_enabled?: boolean }).response_wait_enabled !== false
+    if (!enabled) {
+      await cancelResponseWaitTimers(db, conversationId, 'manual')
+      return { reset: false, reason: 'disabled', expires_at: null }
+    }
+
+    // Duration to re-arm from: the chat's last-used minutes (any prior row
+    // carries the assigned value) or the shared 10-minute default.
+    const last = await db
+      .from('response_wait_timers')
+      .select('delay_minutes')
+      .eq('conversation_id', conversationId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+    let delayMinutes = ARM_DEFAULT_MINUTES
+    const lastRow = last.error
+      ? null
+      : (last.data as { delay_minutes?: number }[] | null)?.[0]
+    if (
+      lastRow &&
+      typeof lastRow.delay_minutes === 'number' &&
+      lastRow.delay_minutes > 0
+    ) {
+      delayMinutes = Math.floor(lastRow.delay_minutes)
+    }
+
+    const res = await rearmResponseWaitTimer(db, {
+      conversationId,
+      contactId: row.contact_id as string,
+      accountId: row.account_id as string,
+      delayMinutes,
+      now,
+    })
+    return { reset: res.scheduled, reason: res.reason, expires_at: res.expires_at }
+  } catch (err) {
+    console.error(
+      `[response-wait] resetResponseWaitOnInbound threw for conversation ${conversationId}:`,
+      err instanceof Error ? err.message : err,
+    )
+    return { reset: false, reason: 'error', expires_at: null }
+  }
+}
 
 /**
  * ============================================================
@@ -886,15 +1112,14 @@ export interface RunResponseWaitResult {
  *   3. Otherwise generate a contextual AI follow-up and send it through
  *      `sendMessageToConversation` (with `autoArm: false`).
  *   4. ONE-SHOT EXECUTION — the moment the single nudge is dispatched the
- *      row closes as `completed` AND the conversation's "Esperar
- *      respuesta" switch (`response_wait_enabled`) flips OFF, so the
- *      cycle strictly never re-enters a loop. The agent must press ↻
- *      Reiniciar (or re-enable the switch) to watch again. The update is
- *      guarded on `status='processing'`: if the client replied at the exact
- *      moment of dispatch, the webhook already cancelled the row and this
- *      sweep does not resurrect it. `no_response` still closes a row whose
- *      nudge never went out (a provider/send failure is terminal — the
- *      system never retries forever).
+ *      row closes as `completed`. The per-chat switch (`response_wait_enabled`)
+ *      is LEFT ON: the cycle only restarts when the customer writes again
+ *      (the inbound webhook re-arms `NOW() + N`) or the agent presses ↻
+ *      Reiniciar. The update is guarded on `status='processing'`: if the
+ *      client replied at the exact moment of dispatch, the webhook already
+ *      re-armed/cancelled the row and this sweep does not resurrect it.
+ *      `no_response` still closes a row whose nudge never went out (a
+ *      provider/send failure is terminal — the system never retries forever).
  *
  * Scoped strictly to `conversation_id`; a missing table or schema glitch
  * degrades to a logged no-op. Never throws. Idempotent: every state
@@ -986,9 +1211,12 @@ export async function runDueResponseWaitTimers(
 
       const last = await lastMessage(client, conversationId)
 
-      // AUTO-CANCEL BY REPLY (race safety net): only keep the timer when
-      // the customer's last message predates it. If the customer wrote at
-      // or after `started_at`, the wait is over — drop the reminder.
+      // AUTO-CANCEL BY REPLY (micro-race safety net): the inbound webhook
+      // normally RE-ARMS the timer when the customer writes, refreshing
+      // `started_at` in the same DB. If the reply landed between THIS sweep's
+      // claim and the send (a race), the webhook has already re-armed a fresh
+      // ACTIVE row — so the stale claimed row must NOT dispatch: close it as
+      // `cancelled/anti_race` instead of sending an obsolete nudge.
       const startedAt = row.started_at ? Date.parse(String(row.started_at)) : NaN
       const repliedAt = last?.createdAt ? Date.parse(last.createdAt) : NaN
       const repliedAfterStart =
@@ -1064,12 +1292,12 @@ export async function runDueResponseWaitTimers(
       }
 
       // ONE-SHOT: the single contextual nudge went out; the timer closes as
-      // `completed` AND the conversation's "Esperar respuesta" switch flips
-      // to OFF — a finished cycle strictly never re-enters a loop. The
-      // agent must press ↻ Reiniciar (or re-enable the switch) to watch
-      // again. Guarded on `status='processing'`: if the inbound webhook
-      // cancelled this row at the exact moment of dispatch (the client DID
-      // reply), zero rows match and nothing is resurrected.
+      // `completed`. The per-chat switch is LEFT ON so the cycle restarts
+      // only when the customer writes again (inbound-webhook reset) or the
+      // agent presses ↻ Reiniciar — NOT automatically. Guarded on
+      // `status='processing'`: if the inbound webhook re-armed/cancelled
+      // this row at the exact moment of dispatch (the client DID reply),
+      // zero rows match and nothing is resurrected.
       const { error: doneErr } = await client
         .from('response_wait_timers')
         .update({ status: 'completed' })
@@ -1079,28 +1307,9 @@ export async function runDueResponseWaitTimers(
         console.error(`[response-wait] could not mark ${id} as completed:`, doneErr.message)
         continue
       }
-      // Best-effort — flip the Timer 2 ON/OFF switch to OFF so no future
-      // send auto-arms this conversation until the agent re-enables it.
-      try {
-        const { error: switchErr } = await client
-          .from('conversations')
-          .update({ response_wait_enabled: false })
-          .eq('id', conversationId)
-        if (switchErr) {
-          console.error(
-            `[response-wait] could not turn the switch OFF for conversation ${conversationId}:`,
-            switchErr.message,
-          )
-        }
-      } catch (err) {
-        console.error(
-          `[response-wait] switch-off threw for conversation ${conversationId}:`,
-          err instanceof Error ? err.message : err,
-        )
-      }
       result.sent++
       console.log(
-        `[response-wait] timer ${id} completed — one-shot follow-up delivered for conversation ${conversationId}, switch OFF.`,
+        `[response-wait] timer ${id} completed — one-shot follow-up delivered for conversation ${conversationId}, switch left ON (waits for inbound / ↻ Reiniciar).`,
       )
     }
   } catch (err) {
