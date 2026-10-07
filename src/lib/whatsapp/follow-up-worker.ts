@@ -393,9 +393,15 @@ export async function isFollowUpEnabled(
 }
 
 /**
- * Schedule a follow-up stage for a conversation, unless the contact has
- * already had one for this type (completed/no_response), there is already
- * one pending for this conversation, or reminders are disabled.
+ * Schedule a follow-up stage for a conversation — the AUTOMATIC path of
+ * Timer 1 ("Seguimiento automático").
+ *
+ * Timer 1 is MANUAL-ONLY: it is armed EXCLUSIVELY by the inbox
+ * "+ Programar" button through `scheduleManualFollowUp` (the `schedule`
+ * action). This function only ever returns `{ reason: 'disabled' }` unless
+ * `force` is passed, so the AI auto-reply that answers an inbound and the
+ * 10m → 24h escalation can never arm it — an inbound message must light up
+ * the "Esperar respuesta" timer, never plus "Seguimiento automático".
  *
  * Never throws: this runs from inside the auto-reply path, where a
  * database hiccup on the INSERT must not surface after the customer
@@ -427,7 +433,21 @@ export async function scheduleFollowUp(
   const now = params.now ?? new Date()
 
   try {
-    if (!params.force && !(await isFollowUpEnabled(db, accountId, conversationId))) {
+    // TIMER 1 IS MANUAL-ONLY: it may be armed EXCLUSIVELY by the inbox
+    // "+ Programar" button — which goes through `scheduleManualFollowUp`
+    // (the `schedule` action), NOT this function. The automatic path that
+    // answers an inbound (the AI auto-reply) and the 10m → 24h escalation
+    // must NEVER arm it, or a single inbound would light up BOTH timers at
+    // once. `force` is the only escape hatch (the manual scheduler passes
+    // it so the account/per-chat automation switches are bypassed).
+    if (!params.force) {
+      console.log(
+        `[follow-up] automatic ${type} stage skipped for conversation ${conversationId} — Timer 1 is manual-only (arm via "+ Programar").`,
+      )
+      return { scheduled: false, reason: 'disabled', id: null }
+    }
+
+    if (!(await isFollowUpEnabled(db, accountId, conversationId))) {
       console.log(
         `[follow-up] reminders disabled for conversation ${conversationId} — not scheduling the ${type} stage.`,
       )
@@ -976,7 +996,21 @@ export async function runDueFollowUps(
         continue
       }
 
-      const last = await lastMessage(client, conversationId)
+      // The anti-race read must never STOP delivery because of a DB hiccup:
+      // if we cannot read the last message we cannot prove a late reply, so
+      // we deliver (fail-open) instead of silently dropping the reminder.
+      let last: {
+        sender: 'customer' | 'agent' | 'bot'
+        createdAt: string | null
+      } | null = null
+      try {
+        last = await lastMessage(client, conversationId)
+      } catch (err) {
+        console.error(
+          `[follow-up] could not read the last message for conversation ${conversationId}; delivering without the anti-race check:`,
+          err instanceof Error ? err.message : err,
+        )
+      }
 
       // ANTI-RACE (time-aware): only drop the reminder when the customer
       // wrote AFTER this reminder was queued. That is the true signal that
@@ -1010,16 +1044,43 @@ export async function runDueFollowUps(
         continue
       }
 
-      const text = await buildFollowUpMessage(client, accountId, conversationId)
+      // Generate the nudge text. A failure here (AI context/DB hiccup) must
+      // NEVER strand the row in `processing` — a stuck claimed row can never
+      // be delivered by another sweep AND it blocks re-scheduling for the
+      // conversation — nor abort the whole run: resolve it exactly like a
+      // send failure so the reminder is closed as `no_response`.
+      let text: string
+      try {
+        text = await buildFollowUpMessage(client, accountId, conversationId)
+      } catch (err) {
+        console.error(
+          `[follow-up] could not build the follow-up text for conversation ${conversationId}:`,
+          err instanceof Error ? err.message : err,
+        )
+        const { error: noRespErr } = await client
+          .from('follow_ups')
+          .update({ status: 'no_response' })
+          .eq('id', id)
+          .eq('status', 'processing')
+        if (noRespErr) {
+          console.error(`[follow-up] could not mark ${id} as no_response:`, noRespErr.message)
+        } else {
+          result.noResponse++
+        }
+        continue
+      }
 
       // Send through the SAME core the inbox uses for a manual message
-      // (`sendMessageToConversation`). It resolves the destination
-      // DYNAMICALLY at call time — loading the conversation and its joined
-      // contact and running the shared recipient ladder (phone → recovered
-      // number → wa_id → BSUID → recipient_id → @username) — and, crucially,
+      // (`sendMessageToConversation`), so the OFFICIAL Meta API is hit and a
+      // follow-up to a phone-less contact still reaches them. It resolves the
+      // destination DYNAMICALLY at call time with the normalized rule: a
+      // valid `phone` is used as-is; when `phone` is `'unknown'` or empty it
+      // falls back to the identifiers Meta persisted on the contact row
+      // (`wa_id` / `recipient_id`) — the ladder actually runs phone →
+      // recovered number → wa_id → BSUID → recipient_id → @username — and
       // anchors opaque-id recipients to the thread's newest inbound wamid so
-      // WhatsApp actually delivers the nudge instead of silently dropping a
-      // 200. Nothing about the destination is hardcoded.
+      // WhatsApp delivers the nudge instead of silently dropping a 200.
+      // Nothing about the destination is hardcoded.
       try {
         await sendMessageToConversation(client, accountId, {
           conversationId,

@@ -438,7 +438,23 @@ afterEach(() => {
 })
 
 describe('scheduleFollowUp', () => {
-  it('inserts a pending follow-up due exactly 10 minutes out', async () => {
+  it('is MANUAL-ONLY: a non-forced (automatic) call never arms Timer 1', async () => {
+    resetState()
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await scheduleFollowUp(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+    })
+
+    // The AI auto-reply (which answers an inbound) must never light up
+    // "Seguimiento automático" — only "+ Programar" (force) may arm it.
+    expect(res).toMatchObject({ scheduled: false, reason: 'disabled' })
+    expect(h.state.followUps).toHaveLength(0)
+  })
+
+  it('arms a pending follow-up due exactly 10 minutes out (force = the manual scheduler)', async () => {
     resetState()
     const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
     const now = new Date('2026-10-06T12:00:00.000Z')
@@ -449,6 +465,7 @@ describe('scheduleFollowUp', () => {
       accountId: 'account-1',
       delayMs: FOLLOW_UP_DELAY_MS,
       now,
+      force: true,
     })
 
     expect(res.scheduled).toBe(true)
@@ -463,7 +480,7 @@ describe('scheduleFollowUp', () => {
     })
   })
 
-  it('refuses to schedule when the contact already had its one follow-up of that type', async () => {
+  it('refuses to schedule when the contact already had its one follow-up of that type (force does NOT bypass the historic limit)', async () => {
     resetState()
     h.state.followUps = [
       {
@@ -479,6 +496,7 @@ describe('scheduleFollowUp', () => {
       conversationId: 'conv-1',
       contactId: 'contact-1',
       accountId: 'account-1',
+      force: true,
     })
 
     expect(res).toMatchObject({
@@ -504,6 +522,7 @@ describe('scheduleFollowUp', () => {
       contactId: 'contact-1',
       accountId: 'account-1',
       type: '24h',
+      force: true,
     })
 
     expect(res.scheduled).toBe(true)
@@ -545,7 +564,7 @@ describe('scheduleFollowUp', () => {
     expect(res.reason).toBe('disabled')
   })
 
-  it('refuses to schedule when the same conversation already has a pending one', async () => {
+  it('refuses to schedule when the same conversation already has a pending one (force does NOT bypass duplicate-pending)', async () => {
     resetState()
     h.state.followUps = [
       {
@@ -560,6 +579,7 @@ describe('scheduleFollowUp', () => {
       conversationId: 'conv-1',
       contactId: 'contact-1',
       accountId: 'account-1',
+      force: true,
     })
 
     expect(res).toMatchObject({
@@ -577,6 +597,7 @@ describe('scheduleFollowUp', () => {
       conversationId: 'conv-1',
       contactId: 'contact-1',
       accountId: 'account-1',
+      force: true,
     })
 
     expect(res.scheduled).toBe(false)
@@ -1150,7 +1171,7 @@ describe('runDueFollowUps', () => {
     expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
   })
 
-  it('queues the 24h stage after the 10m reminder is delivered', async () => {
+  it('does NOT auto-queue a 24h stage after the automatic 10m fires (Timer 1 escalation is manual-only)', async () => {
     resetState()
     h.state.followUps = [
       {
@@ -1168,13 +1189,14 @@ describe('runDueFollowUps', () => {
 
     const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
 
-    expect(res).toMatchObject({ scanned: 1, sent: 1, scheduled: 1 })
-    expect(h.state.followUps).toHaveLength(2)
-    expect(h.state.followUps[1]).toMatchObject({
-      type: '24h',
-      status: 'pending',
-      conversation_id: 'conv-1',
-      contact_id: 'contact-1',
+    // The 10m reminder IS delivered, but the automatic 10m → 24h escalation
+    // must NOT happen: the next "Seguimiento automático" only comes from
+    // "+ Programar" (scheduleManualFollowUp).
+    expect(res).toMatchObject({ scanned: 1, sent: 1, scheduled: 0 })
+    expect(h.state.followUps).toHaveLength(1)
+    expect(h.state.followUps[0]).toMatchObject({
+      type: '10m',
+      status: 'completed',
     })
   })
 
@@ -1383,6 +1405,7 @@ describe('follow-ups do NOT depend on a public @handle', () => {
       contactId: 'contact-1',
       accountId: 'account-1',
       now,
+      force: true,
     })
 
     expect(res.scheduled).toBe(true)
@@ -1498,6 +1521,7 @@ describe('follow-ups do NOT depend on a public @handle', () => {
       conversationId: 'conv-1',
       contactId: 'contact-1',
       accountId: 'account-1',
+      force: true,
     })
 
     expect(res.scheduled).toBe(true)
@@ -1519,6 +1543,7 @@ describe('follow-ups do NOT depend on a public @handle', () => {
       conversationId: 'conv-1',
       contactId: 'contact-1',
       accountId: 'account-1',
+      force: true,
     })
 
     expect(res.scheduled).toBe(true)
@@ -1539,6 +1564,7 @@ describe('follow-ups do NOT depend on a public @handle', () => {
       conversationId: 'conv-1',
       contactId: 'contact-1',
       accountId: 'account-1',
+      force: true,
     })
 
     expect(res.scheduled).toBe(true)
