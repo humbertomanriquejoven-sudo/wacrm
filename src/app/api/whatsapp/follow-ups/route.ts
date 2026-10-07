@@ -33,6 +33,16 @@ import {
 
 type Ctx = Awaited<ReturnType<typeof getCurrentAccount>>
 
+/**
+ * PostgREST rejects the WHOLE projection when a named column is unknown
+ * (`42703` / `PGRST204` / "… does not exist"). The per-chat switch lives
+ * in migration 063, so an un-migrated database must still be able to load
+ * the inbox: detect that and fall back to the legacy columns.
+ */
+function isMissingColumnError(message: string): boolean {
+  return /column .* does not exist|42703|PGRST204|schema cache/i.test(message)
+}
+
 interface ResolvedConversation {
   ok: true
   conv: {
@@ -49,11 +59,30 @@ async function resolveConversation(
   conversationId: string,
   accountId: string,
 ): Promise<Resolved> {
-  const { data, error } = await supabase
+  const full = await supabase
     .from('conversations')
     .select('id, account_id, contact_id, follow_up_enabled')
     .eq('id', conversationId)
     .maybeSingle()
+
+  let data = (full.data as Record<string, unknown> | null) ?? null
+  let error = full.error
+  // Migration 063 not applied → retry without the per-chat switch. The
+  // thread still loads (switch treated as "inherit"), instead of the whole
+  // banner 500-ing and the inbox appearing to hang.
+  if (error && isMissingColumnError(error.message)) {
+    console.warn(
+      '[follow-ups] conversations.follow_up_enabled is absent (migration 063 pending) — serving the legacy projection.',
+    )
+    const legacy = await supabase
+      .from('conversations')
+      .select('id, account_id, contact_id')
+      .eq('id', conversationId)
+      .maybeSingle()
+    data = (legacy.data as Record<string, unknown> | null) ?? null
+    error = legacy.error
+  }
+
   if (error) return { ok: false, status: 500, error: error.message }
   if (!data) return { ok: false, status: 404, error: 'Conversation not found' }
   if (data.account_id !== accountId) {
@@ -62,9 +91,9 @@ async function resolveConversation(
   return {
     ok: true,
     conv: {
-      id: data.id,
+      id: data.id as string,
       contact_id: data.contact_id as string,
-      follow_up_enabled: data.follow_up_enabled as boolean | null,
+      follow_up_enabled: (data.follow_up_enabled as boolean | null | undefined) ?? null,
     },
   }
 }
@@ -176,11 +205,15 @@ export async function POST(request: Request) {
     const type = (body.type === '24h' ? '24h' : '10m') as FollowUpType
 
     if (action === 'schedule') {
+      // `force: true` — this is an explicit agent action, so it must work
+      // independently of the account-wide automation switch and the
+      // per-chat override (both of which only govern the AUTOMATIC path).
       const res = await scheduleFollowUp(supabaseAdmin(), {
         conversationId,
         contactId: conv.contact_id,
         accountId,
         type,
+        force: true,
       })
       return NextResponse.json({
         success: res.scheduled,

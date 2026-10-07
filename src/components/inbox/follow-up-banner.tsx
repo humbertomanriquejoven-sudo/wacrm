@@ -107,9 +107,10 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     [conversationId, refresh, t],
   );
 
-  // Loading or account-wide off ⇒ nothing to show.
+  // Loading ⇒ nothing yet. The banner is deliberately NOT hidden by the
+  // account-wide switch (`global_enabled`): the inbox timer is a manual
+  // tool and must stay usable even when automatic follow-ups are off.
   if (!status) return null;
-  if (!status.global_enabled) return null;
 
   const pending = status.pending[0] ?? null;
   const disabledHere = status.conversation_enabled === false;

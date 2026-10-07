@@ -16,6 +16,24 @@ function bad(message: string) {
 }
 
 /**
+ * Every column BEFORE migration 063. Kept in one place so the tolerant
+ * reads/writes below can retry without the post-063 `follow_up_enabled`
+ * switch on a database that has not been migrated yet.
+ */
+const AI_CONFIG_COLUMNS =
+  'provider, model, system_prompt, is_active, auto_reply_enabled, auto_reply_max_per_conversation, handoff_agent_id, api_key, embeddings_api_key'
+
+/**
+ * PostgREST rejects the WHOLE projection/update when any named column is
+ * unknown — `42703` ("column … does not exist"), `PGRST204` ("Could not
+ * find the '…' column … in the schema cache"). Detecting that lets the
+ * endpoint degrade to the pre-063 shape instead of 500-ing.
+ */
+function isMissingColumnError(message: string): boolean {
+  return /column .* does not exist|42703|PGRST204|schema cache/i.test(message)
+}
+
+/**
  * GET /api/ai/config
  *
  * Any member may read the config so the inbox/settings can reflect
@@ -30,15 +48,34 @@ export async function GET() {
     // decrypt() on this server throws, so the bot can never read its key.
     const encryptionKeySet = Boolean(process.env.ENCRYPTION_KEY)
 
-    const { data, error } = await supabase
+    // `api_key` is selected only to derive `has_key`; it is stripped out
+    // below and never returned to the client.
+    //
+    // Newest schema first (`+ follow_up_enabled`, migration 063), with a
+    // one-shot fallback to the pre-063 projection. Without the fallback, a
+    // database that hasn't applied 063 rejects the whole select and this
+    // endpoint used to answer 500 "Failed to load AI configuration" — the
+    // Setup page then couldn't show the model/prompt at all.
+    const full = await supabase
       .from('ai_configs')
-      // `api_key` is selected only to derive `has_key` — it is stripped
-      // out below and never returned to the client.
-      .select(
-        'provider, model, system_prompt, is_active, auto_reply_enabled, auto_reply_max_per_conversation, handoff_agent_id, api_key, embeddings_api_key, follow_up_enabled',
-      )
+      .select(`${AI_CONFIG_COLUMNS}, follow_up_enabled`)
       .eq('account_id', accountId)
       .maybeSingle()
+
+    let data = (full.data as Record<string, unknown> | null) ?? null
+    let error = full.error
+    if (error && isMissingColumnError(error.message)) {
+      console.warn(
+        '[ai/config GET] ai_configs.follow_up_enabled is absent (migration 063 pending) — serving the legacy projection.',
+      )
+      const legacy = await supabase
+        .from('ai_configs')
+        .select(AI_CONFIG_COLUMNS)
+        .eq('account_id', accountId)
+        .maybeSingle()
+      data = (legacy.data as Record<string, unknown> | null) ?? null
+      error = legacy.error
+    }
 
     if (error) {
       console.error('[ai/config GET] fetch error:', error)
@@ -59,6 +96,9 @@ export async function GET() {
       has_key: !!api_key,
       has_embeddings_key: !!embeddings_api_key,
       encryption_key_set: encryptionKeySet,
+      // New field with a fail-open default so the Setup form always has a
+      // boolean even when the column (migration 063) is not there yet.
+      follow_up_enabled: safe.follow_up_enabled !== false,
       ...safe,
     })
   } catch (err) {
@@ -229,9 +269,22 @@ export async function POST(request: Request) {
     }
     // The follow-up master switch is touched only when the form sends it,
     // so a partial save (e.g. just flipping auto-reply) never silently
-    // turns the reminders off.
+    // turns the reminders off. It is ALSO skipped when migration 063 has
+    // not been applied: PostgREST rejects the whole write with 42703 for
+    // one unknown column, which used to make "Save" fail on every Setup
+    // edit even though the rest of the config was valid.
     if ('follow_up_enabled' in body) {
-      shared.follow_up_enabled = body.follow_up_enabled === true
+      const probe = await supabase
+        .from('ai_configs')
+        .select('follow_up_enabled')
+        .limit(1)
+      if (probe.error) {
+        console.warn(
+          '[ai/config POST] ai_configs.follow_up_enabled is absent (migration 063 pending) — skipping the switch, saving the rest of the config.',
+        )
+      } else {
+        shared.follow_up_enabled = body.follow_up_enabled === true
+      }
     }
     // Only touch the handoff target when the form actually sent the field,
     // so a partial save (e.g. flipping a toggle) doesn't wipe it.

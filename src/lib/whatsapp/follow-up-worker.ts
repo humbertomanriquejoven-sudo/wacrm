@@ -157,6 +157,13 @@ export async function scheduleFollowUp(
     /** Override for tests; defaults to the stage's delay. */
     delayMs?: number
     now?: Date
+    /**
+     * Bypass the kill switches (process/account/per-chat). Used by the
+     * inbox "schedule" button so a MANUAL reminder can be queued even when
+     * the automatic path is disabled — the switches only govern automation.
+     * The historic and duplicate-pending limits are always enforced.
+     */
+    force?: boolean
   },
 ): Promise<ScheduleFollowUpResult> {
   const { conversationId, contactId, accountId } = params
@@ -165,7 +172,7 @@ export async function scheduleFollowUp(
   const now = params.now ?? new Date()
 
   try {
-    if (!(await isFollowUpEnabled(db, accountId, conversationId))) {
+    if (!params.force && !(await isFollowUpEnabled(db, accountId, conversationId))) {
       console.log(
         `[follow-up] reminders disabled for conversation ${conversationId} — not scheduling the ${type} stage.`,
       )
