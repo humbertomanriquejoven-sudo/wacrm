@@ -191,6 +191,22 @@ export async function POST(request: Request) {
         .update({ follow_up_enabled: value })
         .eq('id', conversationId)
       if (upErr) return NextResponse.json({ error: upErr.message }, { status: 500 })
+      // Turning the chat OFF also drops anything already queued so "off"
+      // really means "no more reminders for this thread". A later MANUAL
+      // schedule still works (it is independent of the switch).
+      if (value === false) {
+        const { error: cancelErr } = await supabaseAdmin()
+          .from('follow_ups')
+          .update({ status: 'cancelled' })
+          .eq('conversation_id', conversationId)
+          .eq('status', 'pending')
+        if (cancelErr) {
+          console.error(
+            `[follow-up] could not clear pending reminders for conversation ${conversationId}:`,
+            cancelErr.message,
+          )
+        }
+      }
       console.log(
         `[follow-up] ${userId} set per-chat switch to ${
           value === null ? 'inherit' : value
@@ -202,7 +218,21 @@ export async function POST(request: Request) {
       })
     }
 
-    const type = (body.type === '24h' ? '24h' : '10m') as FollowUpType
+    // Custom delay in minutes — the inbox lets the agent type ANY value
+    // (1, 3, 7, 12, 15, …). When present it wins over the stage default and
+    // its stage `type` is inferred so the historic "one per type" budget
+    // still lines up (≥ 24 h is the 24h stage, everything else the 10m one).
+    const rawMinutes = Number(body.delay_minutes)
+    const customMinutes =
+      Number.isFinite(rawMinutes) && rawMinutes > 0
+        ? Math.min(10080, Math.max(1, Math.floor(rawMinutes)))
+        : null
+    const type = (
+      body.type === '24h' ||
+      (customMinutes !== null && customMinutes >= 24 * 60)
+        ? '24h'
+        : '10m'
+    ) as FollowUpType
 
     if (action === 'schedule') {
       // `force: true` — this is an explicit agent action, so it must work
@@ -214,6 +244,9 @@ export async function POST(request: Request) {
         accountId,
         type,
         force: true,
+        ...(customMinutes !== null
+          ? { delayMs: customMinutes * 60 * 1000 }
+          : {}),
       })
       return NextResponse.json({
         success: res.scheduled,
@@ -233,14 +266,9 @@ export async function POST(request: Request) {
       return NextResponse.json({ success: true })
     }
 
-    // reschedule — push the pending reminder back by delay_minutes
+    // reschedule — move the pending reminder to NOW() + delay_minutes
     // (default keeps the stage's own cadence: 10m → 10m, 24h → 24h).
-    const rawMinutes = Number(body.delay_minutes)
-    const delayMinutes = Number.isFinite(rawMinutes)
-      ? Math.min(10080, Math.max(1, Math.floor(rawMinutes)))
-      : type === '24h'
-        ? 24 * 60
-        : 10
+    const delayMinutes = customMinutes ?? (type === '24h' ? 24 * 60 : 10)
     const { data: grab } = await supabaseAdmin()
       .from('follow_ups')
       .select('id')

@@ -342,12 +342,15 @@ async function buildFollowUpMessage(
 
   const systemPrompt =
     'You are a WhatsApp CRM assistant writing ONE short, natural check-in ' +
-    'message because the customer has not replied in a while. Rules: ' +
-    'refer to the LAST topic of the transcript without repeating the exact ' +
-    'words of the previous assistant message; never invent facts, dates, ' +
-    'links or appointments; no greetings beyond one word; write in the ' +
-    'language the customer used; end with a single open question; keep it ' +
-    'under ~30 words.'
+    'message because the customer has not replied in a while. Read the ' +
+    'recent transcript and follow up on the PENDING topic: if the last ' +
+    'assistant message was a proposal, a quote or a question, briefly check ' +
+    'whether it was clear and whether they want to move forward; otherwise ' +
+    'ask about the open point. Rules: do not repeat the exact words of the ' +
+    'previous assistant message and never sound like a rigid bot; never ' +
+    'invent facts, dates, prices, links or appointments; no greetings ' +
+    'beyond one word; write in the language the customer used; end with a ' +
+    'single open question; keep it under ~30 words.'
 
   try {
     const result = await generateReply({

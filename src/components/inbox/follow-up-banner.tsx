@@ -1,23 +1,29 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Clock, Loader2, Bell, BellOff, Check, Plus } from "lucide-react";
+import { Clock, Loader2, BellOff, Check, X, Plus } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { useTranslations } from "next-intl";
+import { Switch } from "@/components/ui/switch";
 import type { FollowUp } from "@/types";
 
 // ------------------------------------------------------------------
-// Follow-up banner — CRM visibility for the timed reminders.
+// Follow-up banner — CRM visibility AND manual control for the timed
+// reminders.
 //
 // The runner itself is service-role; this banner reads and manages the
-// queue through /api/whatsapp/follow-ups with normal dashboard auth, so
-// the agent can see "a reminder is scheduled in N min", postpone/cancel
-// it, queue one on demand, or disable reminders for this chat.
+// queue through /api/whatsapp/follow-ups with normal dashboard auth. The
+// agent can:
+//   * see the pending reminder and its live countdown,
+//   * type ANY number of minutes (1, 3, 7, 12, …) or tap a +2/+5/+10
+//     preset — both set `execute_at = now + N min` for this thread,
+//   * cancel the pending reminder,
+//   * flip the per-chat automatic switch inline.
 //
-// Renders nothing while loading or when the account-wide switch
-// (ai_configs.follow_up_enabled) is OFF — same "feature off ⇒ silence"
-// convention as AiThreadBanner.
+// The timer is deliberately independent of the account-wide
+// (`ai_configs.follow_up_enabled`) switch: manual scheduling works even
+// when automatic follow-ups are off.
 // ------------------------------------------------------------------
 
 type Busy = "cancel" | "reschedule" | "schedule" | "toggle" | null;
@@ -26,6 +32,19 @@ interface FollowUpStatus {
   pending: (Pick<FollowUp, "id" | "type" | "execute_at"> & { status: string })[];
   global_enabled: boolean;
   conversation_enabled: boolean | null;
+}
+
+/** Minutes cap: 7 days, matching the API's own clamp. */
+const MAX_MINUTES = 10080;
+const PRESETS = [
+  { minutes: 2, label: "plus2m" },
+  { minutes: 5, label: "plus5m" },
+  { minutes: 10, label: "plus10m" },
+] as const;
+
+function clampMinutes(value: number): number {
+  if (!Number.isFinite(value)) return 10;
+  return Math.min(MAX_MINUTES, Math.max(1, Math.floor(value)));
 }
 
 function remainingParts(executeAt: string): {
@@ -43,6 +62,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   const t = useTranslations("Inbox.followUp");
   const [status, setStatus] = useState<FollowUpStatus | null>(null);
   const [busy, setBusy] = useState<Busy>(null);
+  const [minutes, setMinutes] = useState(10);
   // Tick every 30s so the "reminder in N min" label stays live.
   const [, setTick] = useState(0);
 
@@ -86,9 +106,19 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
             ...extra,
           }),
         });
+        const json = (await res.json().catch(() => ({}))) as {
+          error?: string;
+          scheduled?: boolean;
+        };
         if (!res.ok) {
-          const j = await res.json().catch(() => ({}));
-          toast.error(j?.error ?? t("updateError"));
+          toast.error(json?.error ?? t("updateError"));
+          return;
+        }
+        // A manual schedule can be declined (the contact already had this
+        // stage) — surface it instead of a false "scheduled" toast.
+        if (action === "schedule" && json?.scheduled === false) {
+          toast.error(t("scheduleFailed"));
+          await refresh();
           return;
         }
         await refresh();
@@ -107,94 +137,125 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     [conversationId, refresh, t],
   );
 
-  // Loading ⇒ nothing yet. The banner is deliberately NOT hidden by the
-  // account-wide switch (`global_enabled`): the inbox timer is a manual
-  // tool and must stay usable even when automatic follow-ups are off.
+  // Set the timer to NOW() + minutes: reschedule the pending one, or queue
+  // a fresh one when the thread has none.
+  const setTimer = useCallback(
+    (rawMinutes: number) => {
+      const value = clampMinutes(rawMinutes);
+      setMinutes(value);
+      if (status?.pending.length) {
+        void act("reschedule", { delay_minutes: value }, "reschedule");
+      } else {
+        void act("schedule", { delay_minutes: value }, "schedule");
+      }
+    },
+    [act, status?.pending.length],
+  );
+
+  // Loading ⇒ nothing yet.
   if (!status) return null;
 
   const pending = status.pending[0] ?? null;
-  const disabledHere = status.conversation_enabled === false;
+  const enabled = status.conversation_enabled !== false;
 
-  // Disabled per-chat ⇒ muted banner with a re-activate button.
-  if (disabledHere) {
-    return (
-      <Banner tone="muted">
-        <div className="flex min-w-0 flex-1 items-center gap-1.5">
-          <BellOff className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
-          <span className="truncate text-muted-foreground">{t("off")}</span>
-        </div>
-        <BannerButton
-          onClick={() => act("set_enabled", { enabled: true }, "toggle")}
-          busy={busy === "toggle"}
-          icon={Bell}
-        >
-          {t("enable")}
-        </BannerButton>
-      </Banner>
-    );
+  let eta = "";
+  if (pending) {
+    const parts = remainingParts(pending.execute_at);
+    eta = parts.done
+      ? t("now")
+      : pending.type === "24h"
+        ? t("etaHours", { hours: parts.hours, minutes: parts.minutes })
+        : t("etaMinutes", { minutes: parts.minutes });
   }
 
-  // A reminder is pending ⇒ the badge + postpone/cancel.
-  if (pending) {
-    const is24h = pending.type === "24h";
-    const { hours, minutes, done } = remainingParts(pending.execute_at);
-    const eta = done
-      ? t("now")
-      : is24h
-        ? t("etaHours", { hours, minutes })
-        : t("etaMinutes", { minutes });
-    return (
-      <Banner tone="primary">
-        <div className="flex min-w-0 flex-1 items-center gap-1.5">
-          <Clock className="h-3.5 w-3.5 flex-shrink-0 text-primary" />
-          <span className="truncate font-medium text-foreground">
-            {is24h ? t("pending24hTitle") : t("pending10mTitle")}
-            <span className="ml-1.5 font-normal text-muted-foreground">
-              · {eta}
+  return (
+    <Banner tone={pending ? "primary" : "muted"}>
+      {/* Status line */}
+      <div className="flex min-w-0 flex-1 items-center gap-1.5">
+        {enabled ? (
+          <Clock
+            className={cn(
+              "h-3.5 w-3.5 flex-shrink-0",
+              pending ? "text-primary" : "text-muted-foreground",
+            )}
+          />
+        ) : (
+          <BellOff className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+        )}
+        <span className="truncate">
+          {!enabled ? (
+            <span className="text-muted-foreground">{t("off")}</span>
+          ) : pending ? (
+            <span className="font-medium text-foreground">
+              {pending.type === "24h" ? t("pending24hTitle") : t("pending10mTitle")}
+              <span className="ml-1.5 font-normal text-muted-foreground">
+                · {eta}
+              </span>
             </span>
-          </span>
-        </div>
+          ) : (
+            <span className="text-muted-foreground">{t("none")}</span>
+          )}
+        </span>
+      </div>
+
+      {/* Custom minutes + presets + apply */}
+      <div className="flex flex-shrink-0 items-center gap-1">
+        <input
+          type="number"
+          min={1}
+          max={MAX_MINUTES}
+          inputMode="numeric"
+          value={minutes}
+          onChange={(e) => setMinutes(Number(e.target.value))}
+          onBlur={() => setMinutes((m) => clampMinutes(m))}
+          aria-label={t("customMinutes")}
+          className="h-6 w-14 rounded-md border border-border bg-card px-1.5 text-center text-xs text-foreground outline-none focus-visible:ring-1 focus-visible:ring-primary"
+        />
+        <span className="text-muted-foreground">{t("minutesUnit")}</span>
+        {PRESETS.map((preset) => (
+          <button
+            key={preset.minutes}
+            type="button"
+            disabled={busy !== null}
+            onClick={() => setTimer(preset.minutes)}
+            className="rounded-md border border-border bg-card px-1.5 py-0.5 font-medium text-foreground transition-colors hover:bg-muted disabled:opacity-60"
+          >
+            {t(preset.label)}
+          </button>
+        ))}
         <BannerButton
-          onClick={() =>
-            act("reschedule", { delay_minutes: is24h ? 24 * 60 : 10 }, "reschedule")
-          }
-          busy={busy === "reschedule"}
-          icon={Plus}
+          onClick={() => setTimer(minutes)}
+          busy={busy === "reschedule" || busy === "schedule"}
+          icon={pending ? Check : Plus}
         >
-          {is24h ? t("plus24h") : t("plus10m")}
+          {pending ? t("setTimer") : t("scheduleTimer")}
         </BannerButton>
+      </div>
+
+      {/* Cancel the pending reminder */}
+      {pending && (
         <BannerButton
           onClick={() => act("cancel", {}, "cancel")}
           busy={busy === "cancel"}
-          icon={Check}
+          icon={X}
         >
           {t("cancel")}
         </BannerButton>
-      </Banner>
-    );
-  }
+      )}
 
-  // Enabled but nothing queued ⇒ offer one + a per-chat kill switch.
-  return (
-    <Banner tone="muted">
-      <div className="flex min-w-0 flex-1 items-center gap-1.5">
-        <Clock className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
-        <span className="truncate text-muted-foreground">{t("none")}</span>
+      {/* Inline per-chat switch, independent of the account-wide setting */}
+      <div className="flex flex-shrink-0 items-center gap-1.5">
+        <span className="text-muted-foreground">
+          {enabled ? t("active") : t("paused")}
+        </span>
+        <Switch
+          checked={enabled}
+          onCheckedChange={(checked: boolean) =>
+            act("set_enabled", { enabled: checked }, "toggle")
+          }
+          disabled={busy === "toggle"}
+        />
       </div>
-      <BannerButton
-        onClick={() => act("schedule", { type: "10m" }, "schedule")}
-        busy={busy === "schedule"}
-        icon={Plus}
-      >
-        {t("schedule10m")}
-      </BannerButton>
-      <BannerButton
-        onClick={() => act("set_enabled", { enabled: false }, "toggle")}
-        busy={busy === "toggle"}
-        icon={BellOff}
-      >
-        {t("disable")}
-      </BannerButton>
     </Banner>
   );
 }
@@ -209,7 +270,7 @@ function Banner({
   return (
     <div
       className={cn(
-        "flex items-center gap-3 border-b px-3 py-2 text-xs sm:px-4",
+        "flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b px-3 py-2 text-xs sm:px-4",
         tone === "primary"
           ? "border-primary/20 bg-primary/5"
           : "border-border bg-muted/40",
