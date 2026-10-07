@@ -276,6 +276,142 @@ export async function scheduleFollowUp(
 }
 
 /**
+ * Whether THIS conversation may receive reminders, judged by the per-chat
+ * switch ALONE (plus the process kill switch). Unlike `isFollowUpEnabled`,
+ * it deliberately ignores the account-wide `ai_configs.follow_up_enabled`:
+ * that switch governs AUTOMATION, while a manual timer scheduled from the
+ * inbox must keep working for an agent who turned automation off globally.
+ * Fail-open (missing column / read error ⇒ enabled). Never throws.
+ */
+export async function isConversationFollowUpEnabled(
+  db: SupabaseClient,
+  conversationId: string,
+): Promise<boolean> {
+  if (process.env.FOLLOW_UP_ENABLED === 'false') return false
+  try {
+    const { data, error } = await db
+      .from('conversations')
+      .select('follow_up_enabled')
+      .eq('id', conversationId)
+      .maybeSingle()
+    if (
+      !error &&
+      data &&
+      (data as { follow_up_enabled?: boolean | null }).follow_up_enabled === false
+    ) {
+      return false
+    }
+  } catch (err) {
+    console.error(
+      `[follow-up] could not read the per-chat switch for ${conversationId} (defaulting to enabled):`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+  return true
+}
+
+/**
+ * Queue or move a MANUAL reminder for a conversation, on behalf of an agent.
+ *
+ * Differences from `scheduleFollowUp` (the automatic path), and why they
+ * matter:
+ *   * It does NOT enforce the per-type historic budget. That "one per
+ *     contact per type" rule exists to stop the BOT from chasing someone
+ *     twice; applying it to manual schedules is exactly what produced
+ *     "Couldn't schedule a follow-up for this contact" — a contact who
+ *     already got its automatic reminder could never be chased by hand.
+ *   * It UPSERTS: an existing PENDING row is moved to the new `execute_at`
+ *     instead of rejected as `duplicate_pending`. So re-Scheduling is
+ *     idempotent — one pending row per conversation, no stacking, no
+ *     duplicates.
+ *   * It binds purely to the conversation id, so an `@username`, a hidden
+ *     / BSUID contact or any channel shape is scheduled identically. The
+ *     destination is resolved later, at send time, by the shared sender.
+ *
+ * Never throws: the inbox shows a toast on `scheduled: false`.
+ */
+export async function scheduleManualFollowUp(
+  db: SupabaseClient,
+  params: {
+    conversationId: string
+    contactId: string
+    accountId: string
+    type?: FollowUpType
+    /** Exact delay in ms; defaults to the stage's own cadence. */
+    delayMs?: number
+    now?: Date
+  },
+): Promise<ScheduleFollowUpResult> {
+  const { conversationId, contactId, accountId } = params
+  const type: FollowUpType = params.type ?? '10m'
+  const delayMs = params.delayMs ?? followUpDelayMs(type)
+  const now = params.now ?? new Date()
+  const executeAt = new Date(now.getTime() + delayMs).toISOString()
+
+  try {
+    // Reuse the single pending row for this conversation, if any.
+    const { data: pending, error: pendingErr } = await db
+      .from('follow_ups')
+      .select('id')
+      .eq('conversation_id', conversationId)
+      .eq('status', 'pending')
+      .order('execute_at', { ascending: true })
+      .limit(1)
+      .maybeSingle()
+
+    if (!pendingErr && pending?.id) {
+      const { error: upErr } = await db
+        .from('follow_ups')
+        .update({ execute_at: executeAt, type })
+        .eq('id', pending.id as string)
+        .eq('status', 'pending')
+      if (upErr) {
+        console.error(
+          `[follow-up] could not move the pending reminder for conversation ${conversationId}:`,
+          upErr.message,
+        )
+        return { scheduled: false, reason: 'error', id: null }
+      }
+      console.log(
+        `[follow-up] manual reminder for conversation ${conversationId} moved to ${executeAt}.`,
+      )
+      return { scheduled: true, reason: 'scheduled', id: pending.id as string }
+    }
+
+    // No pending row ⇒ insert, bypassing the automatic historic budget.
+    const { data, error } = await db
+      .from('follow_ups')
+      .insert({
+        conversation_id: conversationId,
+        contact_id: contactId,
+        account_id: accountId,
+        type,
+        status: 'pending',
+        execute_at: executeAt,
+      })
+      .select('id')
+      .single()
+    if (error) {
+      console.error(
+        `[follow-up] could not schedule a manual reminder for conversation ${conversationId}:`,
+        error.message,
+      )
+      return { scheduled: false, reason: 'error', id: null }
+    }
+    console.log(
+      `[follow-up] manual ${type} reminder ${data?.id} scheduled for conversation ${conversationId} in ${delayMs / 1000}s.`,
+    )
+    return { scheduled: true, reason: 'scheduled', id: data?.id ?? null }
+  } catch (err) {
+    console.error(
+      `[follow-up] scheduleManualFollowUp threw for conversation ${conversationId}:`,
+      err instanceof Error ? err.message : err,
+    )
+    return { scheduled: false, reason: 'error', id: null }
+  }
+}
+
+/**
  * Cancel every PENDING follow-up for a conversation.
  *
  * Invoked by the inbound webhook the moment a REAL customer message
@@ -473,6 +609,25 @@ export async function runDueFollowUps(
       const accountId = row.account_id as string
       const type: FollowUpType = row.type === '24h' ? '24h' : '10m'
       result.scanned++
+
+      // PER-CHAT SWITCH: a chat in OFF must never dispatch. The inbox route
+      // also cancels pending rows the moment the switch flips off, but this
+      // is the authoritative check at SEND time — it covers the ON→OFF race
+      // where a row came due at (or after) the instant the agent flipped it.
+      if (!(await isConversationFollowUpEnabled(client, conversationId))) {
+        const { error: cancelErr } = await client
+          .from('follow_ups')
+          .update({ status: 'cancelled' })
+          .eq('id', id)
+          .eq('status', 'pending')
+        if (cancelErr) {
+          console.error(`[follow-up] could not cancel ${id} (chat OFF):`, cancelErr.message)
+        } else {
+          result.cancelled++
+          console.log(`[follow-up] follow-up ${id} cancelled (chat switched OFF).`)
+        }
+        continue
+      }
 
       const last = await lastMessage(client, conversationId)
 

@@ -6,7 +6,7 @@ import {
 } from '@/lib/auth/account'
 import { supabaseAdmin } from '@/lib/ai/admin-client'
 import {
-  scheduleFollowUp,
+  scheduleManualFollowUp,
   type FollowUpType,
 } from '@/lib/whatsapp/follow-up-worker'
 
@@ -235,15 +235,28 @@ export async function POST(request: Request) {
     ) as FollowUpType
 
     if (action === 'schedule') {
-      // `force: true` — this is an explicit agent action, so it must work
-      // independently of the account-wide automation switch and the
-      // per-chat override (both of which only govern the AUTOMATIC path).
-      const res = await scheduleFollowUp(supabaseAdmin(), {
+      // The per-chat switch is the master ON/OFF for this thread. While it
+      // is OFF the backend refuses to queue (and the worker refuses to
+      // dispatch) — so OFF really means "no reminders for this chat".
+      if (conv.follow_up_enabled === false) {
+        return NextResponse.json({
+          success: false,
+          scheduled: false,
+          id: null,
+          reason: 'disabled',
+        })
+      }
+      // Manual scheduling is bound to the CONVERSATION and always upserts
+      // its one pending row. It deliberately bypasses the automatic
+      // per-type historic budget, so an agent can re-chase ANY contact —
+      // on any channel shape (@username, hidden id, BSUID…) — without
+      // hitting "Couldn't schedule a follow-up for this contact". The
+      // destination is resolved at send time by the shared sender.
+      const res = await scheduleManualFollowUp(supabaseAdmin(), {
         conversationId,
         contactId: conv.contact_id,
         accountId,
         type,
-        force: true,
         ...(customMinutes !== null
           ? { delayMs: customMinutes * 60 * 1000 }
           : {}),

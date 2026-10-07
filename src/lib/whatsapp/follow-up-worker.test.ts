@@ -173,6 +173,7 @@ vi.mock('@/lib/ai/context', () => ({
 
 import {
   scheduleFollowUp,
+  scheduleManualFollowUp,
   cancelPendingFollowUps,
   runDueFollowUps,
   FOLLOW_UP_DELAY_MS,
@@ -366,6 +367,70 @@ describe('scheduleFollowUp', () => {
   })
 })
 
+describe('scheduleManualFollowUp', () => {
+  it('schedules the EXACT typed delay, bypassing the automatic historic budget', async () => {
+    resetState()
+    // The contact already consumed its one automatic 10m reminder; a manual
+    // schedule must still succeed (this is the "Couldn't schedule" bug).
+    h.state.followUps = [
+      {
+        id: 'fu-old',
+        status: 'completed',
+        contact_id: 'contact-1',
+        type: '10m',
+      },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+    const now = new Date('2026-10-06T12:00:00.000Z')
+
+    const res = await scheduleManualFollowUp(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+      delayMs: 1 * 60 * 1000,
+      now,
+    })
+
+    expect(res).toMatchObject({ scheduled: true, reason: 'scheduled' })
+    const created = h.state.followUps.find((r) => r.status === 'pending')
+    expect(created).toMatchObject({
+      conversation_id: 'conv-1',
+      execute_at: '2026-10-06T12:01:00.000Z',
+      status: 'pending',
+    })
+  })
+
+  it('moves the existing pending row instead of stacking a duplicate', async () => {
+    resetState()
+    h.state.followUps = [
+      {
+        id: 'fu-pending',
+        status: 'pending',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        type: '10m',
+        execute_at: '2026-10-06T12:10:00.000Z',
+      },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await scheduleManualFollowUp(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+      delayMs: 1 * 60 * 1000,
+      now: new Date('2026-10-06T12:00:00.000Z'),
+    })
+
+    expect(res).toMatchObject({ scheduled: true, reason: 'scheduled' })
+    expect(h.state.followUps).toHaveLength(1)
+    expect(h.state.followUps[0]).toMatchObject({
+      execute_at: '2026-10-06T12:01:00.000Z',
+      status: 'pending',
+    })
+  })
+})
+
 describe('cancelPendingFollowUps', () => {
   it('marks pending follow-ups of the conversation as cancelled', async () => {
     resetState()
@@ -477,6 +542,58 @@ describe('runDueFollowUps', () => {
     expect(h.state.sendMessageToConversation).toHaveBeenCalledTimes(1)
     expect(h.state.cancelled).toEqual([])
     expect(h.state.completed).toEqual(['completed'])
+  })
+
+  it('fires a manually scheduled 1-minute timer exactly once at T+1min', async () => {
+    resetState()
+    h.state.messages = [{ sender_type: 'bot', content_text: 'hi' }]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+    const now = new Date('2026-10-06T12:00:00.000Z')
+
+    const sched = await scheduleManualFollowUp(db, {
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      accountId: 'account-1',
+      delayMs: 60 * 1000,
+      now,
+    })
+    expect(sched.scheduled).toBe(true)
+
+    // Not due yet at T+30s.
+    const early = await runDueFollowUps(db, new Date('2026-10-06T12:00:30.000Z'))
+    expect(early.sent).toBe(0)
+
+    // Due exactly at T+1min: one send, and only one.
+    const due = await runDueFollowUps(db, new Date('2026-10-06T12:01:00.000Z'))
+    expect(due).toMatchObject({ scanned: 1, sent: 1 })
+
+    const again = await runDueFollowUps(db, new Date('2026-10-06T12:02:00.000Z'))
+    expect(again.sent).toBe(0)
+    expect(h.state.sendMessageToConversation).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels instead of sending when the per-chat switch is OFF', async () => {
+    resetState()
+    h.state.conversation = { follow_up_enabled: false }
+    h.state.followUps = [
+      {
+        id: 'fu-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        type: '10m',
+        status: 'pending',
+        execute_at: '2026-10-06T12:09:00.000Z',
+      },
+    ]
+    h.state.messages = [{ sender_type: 'bot', content_text: 'hi' }]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
+
+    expect(res).toMatchObject({ scanned: 1, sent: 0, cancelled: 1 })
+    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
+    expect(h.state.cancelled).toEqual(['cancelled'])
   })
 
   it('falls back to a generic reminder when no AI config exists', async () => {

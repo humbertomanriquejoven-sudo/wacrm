@@ -11,7 +11,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   getCurrentAccount: vi.fn(),
   requireRole: vi.fn(),
-  scheduleFollowUp: vi.fn(),
+  scheduleManualFollowUp: vi.fn(),
   supabaseAdmin: vi.fn(),
 }));
 
@@ -27,7 +27,7 @@ vi.mock('@/lib/auth/account', () => ({
 }));
 
 vi.mock('@/lib/whatsapp/follow-up-worker', () => ({
-  scheduleFollowUp: mocks.scheduleFollowUp,
+  scheduleManualFollowUp: mocks.scheduleManualFollowUp,
 }));
 
 vi.mock('@/lib/ai/admin-client', () => ({
@@ -107,7 +107,7 @@ beforeEach(() => {
     userId: 'user-1',
   });
   mocks.supabaseAdmin.mockReturnValue(db);
-  mocks.scheduleFollowUp.mockResolvedValue({
+  mocks.scheduleManualFollowUp.mockResolvedValue({
     scheduled: true,
     reason: 'scheduled',
     id: 'fu-1',
@@ -115,7 +115,7 @@ beforeEach(() => {
 });
 
 describe('POST /api/whatsapp/follow-ups — custom minutes', () => {
-  it('schedules at now + N minutes, forced and inferred as the 10m stage', async () => {
+  it('schedules at exactly now + N minutes, inferred as the 10m stage', async () => {
     const res = await post({
       conversation_id: 'conv-1',
       action: 'schedule',
@@ -124,14 +124,13 @@ describe('POST /api/whatsapp/follow-ups — custom minutes', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.scheduled).toBe(true);
-    expect(mocks.scheduleFollowUp).toHaveBeenCalledWith(
+    expect(mocks.scheduleManualFollowUp).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
         conversationId: 'conv-1',
         contactId: 'contact-1',
         accountId: 'acc-1',
         type: '10m',
-        force: true,
         delayMs: 7 * 60 * 1000,
       }),
     );
@@ -143,7 +142,7 @@ describe('POST /api/whatsapp/follow-ups — custom minutes', () => {
       action: 'schedule',
       delay_minutes: 24 * 60,
     });
-    expect(mocks.scheduleFollowUp).toHaveBeenCalledWith(
+    expect(mocks.scheduleManualFollowUp).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ type: '24h', delayMs: 24 * 60 * 60 * 1000 }),
     );
@@ -155,16 +154,16 @@ describe('POST /api/whatsapp/follow-ups — custom minutes', () => {
       action: 'schedule',
       delay_minutes: 999999,
     });
-    expect(mocks.scheduleFollowUp).toHaveBeenCalledWith(
+    expect(mocks.scheduleManualFollowUp).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ delayMs: 10080 * 60 * 1000 }),
     );
   });
 
   it('surfaces a false schedule result instead of pretending success', async () => {
-    mocks.scheduleFollowUp.mockResolvedValue({
+    mocks.scheduleManualFollowUp.mockResolvedValue({
       scheduled: false,
-      reason: 'already_followed_up',
+      reason: 'error',
       id: null,
     });
     const res = await post({
@@ -175,6 +174,24 @@ describe('POST /api/whatsapp/follow-ups — custom minutes', () => {
     const body = await res.json();
     expect(body.success).toBe(false);
     expect(body.scheduled).toBe(false);
+  });
+
+  it('refuses to schedule while the per-chat switch is OFF', async () => {
+    state.conversation = {
+      id: 'conv-1',
+      account_id: 'acc-1',
+      contact_id: 'contact-1',
+      follow_up_enabled: false,
+    };
+    const res = await post({
+      conversation_id: 'conv-1',
+      action: 'schedule',
+      delay_minutes: 5,
+    });
+    const body = await res.json();
+    expect(body.scheduled).toBe(false);
+    expect(body.reason).toBe('disabled');
+    expect(mocks.scheduleManualFollowUp).not.toHaveBeenCalled();
   });
 });
 
