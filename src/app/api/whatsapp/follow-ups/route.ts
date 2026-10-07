@@ -443,8 +443,9 @@ export async function POST(request: Request) {
         )
       }
       // Turn the switch back ON so the armed countdown is reflected by the
-      // banner's Switch 2 (arming this feature always implies enabling it;
-      // the worker no longer flips the switch OFF after a completed cycle).
+      // banner's Switch 2. Arming this feature always implies enabling it:
+      // after a one-shot completion the worker flips the switch OFF, so the
+      // ↻ Reiniciar / Programar action is what revives the cycle.
       const { error: switchErr } = await supabaseAdmin()
         .from('conversations')
         .update({ response_wait_enabled: true })
@@ -475,6 +476,11 @@ export async function POST(request: Request) {
           error: `Could not start the "Esperar respuesta" timer (${res.reason}). Please try again.`,
         })
       }
+      console.log(
+        `[RESET BUTTON] ${
+          action === 'wait_reset' ? 'Resetting timer' : 'Scheduling timer'
+        } for conversation ${conversationId} -> New due_at: ${res.expires_at}`,
+      )
       return NextResponse.json({
         success: true,
         scheduled: true,

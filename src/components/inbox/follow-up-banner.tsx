@@ -391,6 +391,11 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
           );
         } else {
           toast.success(t("scheduleSuccess"));
+          // The work ran through the central dispatcher and shaped the
+          // follow_ups row; a FRESH 00:00 must be able to trigger again, so
+          // drop the once-per-row guard (a reschedule may reuse the SAME row
+          // id, which previously blocked the second fire).
+          firedExpiryRef.current.follow = null;
         }
       }
       await refresh();
@@ -493,6 +498,10 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
                 }
               : s,
           );
+          // ↻ Reiniciar = a brand-new cycle: the once-per-row trigger guard
+          // must not survive it, or the next 00:00 would be swallowed by
+          // the previous (fired) row's id.
+          firedExpiryRef.current.wait = null;
         }
       }
       await refresh();

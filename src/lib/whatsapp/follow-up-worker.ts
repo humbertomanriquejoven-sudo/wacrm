@@ -1048,6 +1048,7 @@ export async function runDueFollowUps(
         `[follow-up] dispatching follow-up ${id} for conversation ${conversationId} (contact ${contactId}).`,
       )
       console.log(`[TIMER EXPIRED] Processing conversation_id: ${conversationId}`)
+      console.log(`[TIMER EXECUTE] Triggered for conversation ${conversationId}`)
 
       // NO public-@handle gate: a due reminder fires for ANY registered
       // contact. The destination is resolved at send time by the shared
@@ -1165,6 +1166,9 @@ export async function runDueFollowUps(
               `[follow-up] destination for conversation ${conversationId} resolved via getRecipientAddress: ${destination}.`,
             )
             console.log(`[TIMER RECIPIENT] Target phone resolved: ${destination}`)
+            console.log(
+              `[TIMER PARAMETERS] Phone: ${contact.phone ?? 'n/a'}, RecipientID: ${contact.recipient_id ?? 'n/a'}`,
+            )
           } else if (usernameBare && !isPlaceholderValue(usernameBare)) {
             console.warn(
               `[follow-up] conversation ${conversationId} has no phone/wa_id/recipient_id — leaving the username/@handle last resort to the send core.`,
@@ -1226,7 +1230,7 @@ export async function runDueFollowUps(
         `[FOLLOW-UP EXEC] Message text generated for conversation ${conversationId}: "${text}"`,
       )
       console.log(
-        `[TIMER DISPATCH] Calling central send function (sendMessageToConversation) for conversation ${conversationId}...`,
+        `[TIMER CENTRAL SEND] Calling central send function (sendMessageToConversation) for conversation ${conversationId}...`,
       )
 
       // Send through the SAME core the inbox uses for a manual message
@@ -1269,7 +1273,7 @@ export async function runDueFollowUps(
         // otherwise); the exact status code is printed by the adjacent
         // `[OUTBOUND WHATSAPP] … status=<n>` log in the send core.
         console.log(
-          `[TIMER META RESULT] Meta API response status: 2xx, wamid: ${sendResult.whatsappMessageId ?? 'n/a'}`,
+          `[TIMER META RESULT] Success status: 2xx, wamid: ${sendResult.whatsappMessageId ?? 'n/a'}`,
         )
       } catch (err) {
         console.error(
@@ -1451,6 +1455,7 @@ export async function runDueResponseWaitTimers(
         `[response-wait] dispatching expired timer ${id} for conversation ${conversationId} (contact ${contactId}).`,
       )
       console.log(`[TIMER EXPIRED] Processing conversation_id: ${conversationId}`)
+      console.log(`[TIMER EXECUTE] Triggered for conversation ${conversationId}`)
 
       // NO public-@handle gate: a due nudge fires for ANY registered
       // contact. The destination is resolved at send time by the shared
@@ -1574,6 +1579,9 @@ export async function runDueResponseWaitTimers(
               `[response-wait] destination for conversation ${conversationId} resolved via getRecipientAddress: ${destination}.`,
             )
             console.log(`[TIMER RECIPIENT] Target phone resolved: ${destination}`)
+            console.log(
+              `[TIMER PARAMETERS] Phone: ${contact.phone ?? 'n/a'}, RecipientID: ${contact.recipient_id ?? 'n/a'}`,
+            )
           } else if (usernameBare && !isPlaceholderValue(usernameBare)) {
             console.warn(
               `[response-wait] conversation ${conversationId} has no phone/wa_id/recipient_id — leaving the username/@handle last resort to the send core.`,
@@ -1636,7 +1644,7 @@ export async function runDueResponseWaitTimers(
         `[FOLLOW-UP EXEC] Message text generated for conversation ${conversationId}: "${text}"`,
       )
       console.log(
-        `[TIMER DISPATCH] Calling central send function (sendMessageToConversation) for conversation ${conversationId}...`,
+        `[TIMER CENTRAL SEND] Calling central send function (sendMessageToConversation) for conversation ${conversationId}...`,
       )
 
       try {
@@ -1672,7 +1680,7 @@ export async function runDueResponseWaitTimers(
         // otherwise); the exact status code is printed by the adjacent
         // `[OUTBOUND WHATSAPP] … status=<n>` log in the send core.
         console.log(
-          `[TIMER META RESULT] Meta API response status: 2xx, wamid: ${sendResult.whatsappMessageId ?? 'n/a'}`,
+          `[TIMER META RESULT] Success status: 2xx, wamid: ${sendResult.whatsappMessageId ?? 'n/a'}`,
         )
       } catch (err) {
         console.error(
