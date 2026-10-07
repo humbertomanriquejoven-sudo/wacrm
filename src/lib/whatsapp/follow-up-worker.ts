@@ -1338,7 +1338,23 @@ export async function runDueResponseWaitTimers(
         continue
       }
 
-      const last = await lastMessage(client, conversationId)
+      // The anti-race read must never STOP the nudge because of a DB hiccup:
+      // if we cannot read the last message we cannot prove the customer
+      // replied since the countdown started, so we send (fail-open) instead
+      // of stranding the claimed row in `processing` — a stuck row is never
+      // delivered and blocks any retry of the "Esperar respuesta" cycle.
+      let last: {
+        sender: 'customer' | 'agent' | 'bot'
+        createdAt: string | null
+      } | null = null
+      try {
+        last = await lastMessage(client, conversationId)
+      } catch (err) {
+        console.error(
+          `[response-wait] could not read the last message for conversation ${conversationId}; sending the nudge without the anti-race check:`,
+          err instanceof Error ? err.message : err,
+        )
+      }
 
       // AUTO-CANCEL BY REPLY (micro-race safety net): the inbound webhook
       // normally RE-ARMS the timer when the customer writes, refreshing
@@ -1447,7 +1463,32 @@ export async function runDueResponseWaitTimers(
         )
       }
 
-      const text = await buildFollowUpMessage(client, accountId, conversationId)
+      // Generate the nudge text. A failure here (AI context/DB hiccup) must
+      // NEVER strand the row in `processing` — a stuck claimed row can never
+      // be sent by another sweep and blocks future cycles for the
+      // conversation — nor abort the whole run: close it exactly like a send
+      // failure so the timer is marked `no_response` instead of hanging at
+      // 00:00 and never dispatching the "Esperando respuesta" message.
+      let text: string
+      try {
+        text = await buildFollowUpMessage(client, accountId, conversationId)
+      } catch (err) {
+        console.error(
+          `[response-wait] could not build the nudge text for conversation ${conversationId}:`,
+          err instanceof Error ? err.message : err,
+        )
+        const { error: noRespErr } = await client
+          .from('response_wait_timers')
+          .update({ status: 'no_response' })
+          .eq('id', id)
+          .eq('status', 'processing')
+        if (noRespErr) {
+          console.error(`[response-wait] could not mark ${id} as no_response:`, noRespErr.message)
+        } else {
+          result.noResponse++
+        }
+        continue
+      }
 
       try {
         await sendMessageToConversation(client, accountId, {
