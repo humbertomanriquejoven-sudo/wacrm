@@ -311,9 +311,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
           toast.error(
             json.reason === "disabled"
               ? t("scheduleDisabled")
-              : json.reason === "not_handle"
-                ? t("noHandle")
-                : t("scheduleFailed"),
+              : t("scheduleFailed"),
           );
         } else {
           toast.success(t("scheduleSuccess"));
