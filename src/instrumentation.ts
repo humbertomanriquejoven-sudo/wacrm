@@ -1,4 +1,3 @@
-import { startFollowUpWorker } from '@/lib/whatsapp/follow-up-worker'
 import { SUPABASE_CONFIG_ERROR_MARKER } from '@/lib/errors'
 
 /**
@@ -19,7 +18,24 @@ import { SUPABASE_CONFIG_ERROR_MARKER } from '@/lib/errors'
  * runner cannot start, the CRM keeps serving pages and the external cron
  * (or a later restart) picks the work up.
  */
-export function register() {
+export async function register() {
+  // Node.js runtime only. `register()` is invoked in BOTH the Node and
+  // Edge runtimes, and Next compiles this file into the Edge
+  // instrumentation bundle too. The follow-up runner transitively
+  // imports Node built-ins (`crypto`, through the WhatsApp token
+  // decryptor). Importing it at the top of this module pulls that graph
+  // into the Edge bundle, where `crypto` compiles to a call to an
+  // undefined `__import_unsupported` helper — the edge bundle then
+  // throws `ReferenceError: __import_unsupported is not defined` while
+  // it is evaluated, before any request is routed, so EVERY page
+  // (including / and /login) returns a bare HTTP 500.
+  //
+  // Guard on the runtime and import lazily so the Edge bundle never
+  // evaluates it. See Next.js docs → "Importing runtime-specific code".
+  if (process.env.NEXT_RUNTIME !== 'nodejs') {
+    return
+  }
+
   try {
     // If the Supabase env is missing the worker's sweeps would all fail
     // against an unreachable DB anyway. Skip it explicitly (and state
@@ -38,6 +54,7 @@ export function register() {
       return
     }
 
+    const { startFollowUpWorker } = await import('@/lib/whatsapp/follow-up-worker')
     const stop = startFollowUpWorker({ intervalMs: intervalSeconds * 1000 })
     // Keep the handle reachable for tests / graceful shutdown hooks.
     ;(globalThis as Record<string, unknown>)['__followUpWorkerStop'] = stop
