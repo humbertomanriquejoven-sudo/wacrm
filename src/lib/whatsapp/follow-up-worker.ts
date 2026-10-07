@@ -885,6 +885,14 @@ async function stillProcessing(
  */
 const CLAIM_LEASE_MS = 5 * 60_000
 
+/**
+ * Small tolerance used ONLY by a per-conversation trigger (`process_now`):
+ * the browser fires when ITS countdown (server-clock-anchored via `server_now`)
+ * shows `00:00`, and a few seconds of clock skew / due-boundary skitter must
+ * not let the whole scan skip the row. A global cron sweep stays exact.
+ */
+const DUE_GRACE_MS = 5_000
+
 async function reclaimStaleClaims(db: SupabaseClient): Promise<void> {
   const cutoff = new Date(Date.now() - CLAIM_LEASE_MS).toISOString()
   const reclaim = async (
@@ -953,6 +961,7 @@ export interface RunFollowUpsResult {
 export async function runDueFollowUps(
   db: SupabaseClient | null = null,
   now: Date = new Date(),
+  conversationId?: string,
 ): Promise<RunFollowUpsResult> {
   const result: RunFollowUpsResult = {
     scanned: 0,
@@ -971,15 +980,32 @@ export async function runDueFollowUps(
     // A previous sweep may have crashed mid-claim; any row still `processing`
     // beyond the claim lease is re-queued so it can actually fire (never
     // stranded at 00:00). Cheap and idempotent — reclaims zero rows normally.
-    await reclaimStaleClaims(client)
+    // A per-conversation trigger (client `process_now`) stays focused and
+    // does NOT touch other conversations' claims.
+    if (!conversationId) await reclaimStaleClaims(client)
 
-    const { data: due, error } = await client
+    // A per-conversation scan (client-triggered `process_now`) is allowed a
+    // small DUE GRACE so a countdown the browser already showed at 00:00 is
+    // never skipped: the server clock can trail the client's (or the two
+    // clocks can disagree by microseconds on the due boundary) and the row
+    // would otherwise be silently omitted by the exact `<= NOW()` sweep.
+    const dueCutoff = new Date(
+      now.getTime() + (conversationId ? DUE_GRACE_MS : 0),
+    ).toISOString()
+
+    const base = client
       .from('follow_ups')
       .select('id, conversation_id, contact_id, account_id, type, created_at')
       .eq('status', 'pending')
-      .lte('execute_at', now.toISOString())
+      .lte('execute_at', dueCutoff)
       .order('execute_at', { ascending: true })
       .limit(50)
+    // FOCUSED TRIGGER: only the rows of THIS conversation. The shared claim
+    // logic below (atomic `pending`→`processing`, anti-race, send, terminal
+    // state) runs identically, so a client-hit timer goes through the exact
+    // same delivery path as a cron sweep.
+    const query = conversationId ? base.eq('conversation_id', conversationId) : base
+    const { data: due, error } = await query
 
     if (error) {
       console.error('[follow-up] runner scan failed:', error.message)
@@ -1194,6 +1220,10 @@ export async function runDueFollowUps(
         continue
       }
 
+      console.log(
+        `[FOLLOW-UP EXEC] Message text generated for conversation ${conversationId}: "${text}"`,
+      )
+
       // Send through the SAME core the inbox uses for a manual message
       // (`sendMessageToConversation`), so the OFFICIAL Meta API is hit and a
       // follow-up to a phone-less contact still reaches them. It resolves the
@@ -1219,6 +1249,16 @@ export async function runDueFollowUps(
         // NEVER recorded as delivered. Log the real wamid for traceability.
         console.log(
           `[follow-up] follow-up delivered by the shared send core for conversation ${conversationId} (destination: ${destination ?? 'core-resolved'}, wamid: ${sendResult.whatsappMessageId ?? sendResult.messageId}).`,
+        )
+        // Task-mandated diagnostic logs: Meta's answer (reaching here means
+        // 2xx — the send core only resolves after Meta accepted) and the DB
+        // insert the shared send core persists so the bubble renders in the
+        // inbox thread (`messageId` is the stored `messages` row id).
+        console.log(
+          `[FOLLOW-UP META] Response from Meta API for conversation ${conversationId}: accepted (2xx), wamid ${sendResult.whatsappMessageId ?? 'n/a'}.`,
+        )
+        console.log(
+          `[FOLLOW-UP DB] Message stored in DB: ${sendResult.messageId} (conversation ${conversationId}, wamid ${sendResult.whatsappMessageId ?? 'n/a'}).`,
         )
       } catch (err) {
         console.error(
@@ -1322,6 +1362,7 @@ export interface RunResponseWaitResult {
 export async function runDueResponseWaitTimers(
   db: SupabaseClient | null = null,
   now: Date = new Date(),
+  conversationId?: string,
 ): Promise<RunResponseWaitResult> {
   const result: RunResponseWaitResult = {
     scanned: 0,
@@ -1335,15 +1376,27 @@ export async function runDueResponseWaitTimers(
 
     // Reclaim any previous crash's stale claims before scanning (see
     // `reclaimStaleClaims`) so an abandoned `processing` row can still fire.
-    await reclaimStaleClaims(client)
+    // A per-conversation trigger (client `process_now`) stays focused.
+    if (!conversationId) await reclaimStaleClaims(client)
 
-    const { data: due, error } = await client
+    // FOCUSED TRIGGER grace: a per-conversation scan (`process_now` from the
+    // banner at 00:00) tolerates a small clock/`<= NOW()` skitter so the row
+    // the browser already showed expired is never silently omitted.
+    const dueCutoff = new Date(
+      now.getTime() + (conversationId ? DUE_GRACE_MS : 0),
+    ).toISOString()
+
+    const base = client
       .from('response_wait_timers')
       .select('id, conversation_id, contact_id, account_id, started_at')
       .eq('status', 'active')
-      .lte('expires_at', now.toISOString())
+      .lte('expires_at', dueCutoff)
       .order('expires_at', { ascending: true })
       .limit(50)
+    // FOCUSED TRIGGER: only the rows of THIS conversation (same shared claim
+    // + send + anti-race logic below as a cron sweep).
+    const query = conversationId ? base.eq('conversation_id', conversationId) : base
+    const { data: due, error } = await query
     if (error) {
       if (!/does not exist|42703|PGRST204/i.test(error.message)) {
         console.error('[response-wait] runner scan failed:', error.message)
@@ -1566,6 +1619,10 @@ export async function runDueResponseWaitTimers(
         continue
       }
 
+      console.log(
+        `[FOLLOW-UP EXEC] Message text generated for conversation ${conversationId}: "${text}"`,
+      )
+
       try {
         const sendResult = await sendMessageToConversation(client, accountId, {
           conversationId,
@@ -1585,6 +1642,15 @@ export async function runDueResponseWaitTimers(
         // delivered. Log the real wamid for traceability.
         console.log(
           `[response-wait] "Esperando respuesta" nudge delivered by the shared send core for conversation ${conversationId} (destination: ${destination ?? 'core-resolved'}, wamid: ${sendResult.whatsappMessageId ?? sendResult.messageId}).`,
+        )
+        // Task-mandated diagnostic logs: Meta's accepted answer (2xx) with
+        // the wamid, and the DB insert persisted by the shared send core
+        // (the inbox bubble reads from the same `messages` table).
+        console.log(
+          `[FOLLOW-UP META] Response from Meta API for conversation ${conversationId}: accepted (2xx), wamid ${sendResult.whatsappMessageId ?? 'n/a'}.`,
+        )
+        console.log(
+          `[FOLLOW-UP DB] Message stored in DB: ${sendResult.messageId} (conversation ${conversationId}, wamid ${sendResult.whatsappMessageId ?? 'n/a'}).`,
         )
       } catch (err) {
         console.error(

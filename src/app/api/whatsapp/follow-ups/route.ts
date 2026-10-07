@@ -326,20 +326,23 @@ export async function POST(request: Request) {
     // Client fallback for the worker: the banner fires this the instant a
     // countdown hits 00:00 so an expired "Esperando respuesta" / follow-up
     // timer is dispatched even if no external cron is pinging the server.
-    // The runners are idempotent (atomic claim), scoped to DB truth, and
-    // run with the SAME service-role client the cron route uses — so a
-    // browser-triggered sweep behaves exactly like a scheduled one.
+    // FOCUSED: the runners are asked to process ONLY this conversation (the
+    // banner's own countdown already reached 00:00, so a small due-grace in
+    // the worker absorbs clock skitter instead of the global exact-`<=NOW()`
+    // scan skipping the row by microseconds). Same idempotent claim logic
+    // and service-role client as the cron route.
     if (action === 'process_now') {
       const now = new Date()
       const [follow, wait] = await Promise.all([
-        runDueFollowUps(supabaseAdmin(), now),
-        runDueResponseWaitTimers(supabaseAdmin(), now),
+        runDueFollowUps(supabaseAdmin(), now, conversationId),
+        runDueResponseWaitTimers(supabaseAdmin(), now, conversationId),
       ])
       console.log(
-        `[follow-up] client-triggered sweep for conversation ${conversationId} — follow_ups: ${follow.sent}/${follow.scanned} sent (${follow.cancelled} cancelled, ${follow.noResponse} no_response), response-wait: ${wait.sent}/${wait.scanned} sent (${wait.cancelled} cancelled, ${wait.noResponse} no_response).`,
+        `[follow-up] client-triggered FOCUSED sweep for conversation ${conversationId} — follow_ups: ${follow.sent}/${follow.scanned} sent (${follow.cancelled} cancelled, ${follow.noResponse} no_response), response-wait: ${wait.sent}/${wait.scanned} sent (${wait.cancelled} cancelled, ${wait.noResponse} no_response).`,
       )
       return NextResponse.json({
         success: true,
+        conversation_id: conversationId,
         scanned: { follow_ups: follow.scanned, response_wait: wait.scanned },
         sent: { follow_ups: follow.sent, response_wait: wait.sent },
       })

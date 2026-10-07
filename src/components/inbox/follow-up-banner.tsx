@@ -351,6 +351,12 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       firedExpiryRef.current.follow !== pendingRow.id
     ) {
       firedExpiryRef.current.follow = pendingRow.id;
+      // The POST carries `{ action: "process_now", conversation_id, … }`
+      // (the shared `post` envelope always includes the conversation id) —
+      // the backend processes THIS conversation specifically.
+      console.log(
+        `[FOLLOW-UP TRIGGER] Triggered for conversation ${conversationId} — follow-up ${pendingRow.id} reached 00:00.`,
+      );
       void post("process_now", {});
     }
     if (
@@ -359,6 +365,9 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       firedExpiryRef.current.wait !== waitRow.id
     ) {
       firedExpiryRef.current.wait = waitRow.id;
+      console.log(
+        `[FOLLOW-UP TRIGGER] Triggered for conversation ${conversationId} — "Esperar respuesta" timer ${waitRow.id} reached 00:00.`,
+      );
       void post("process_now", {});
     }
   }, [status, serverSkew, followNowTs, waitNowTs, post]);
