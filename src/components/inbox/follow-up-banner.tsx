@@ -333,6 +333,52 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     [conversationId, t],
   );
 
+  // 00:00 DISPATCH — a dedicated fetch so any server rejection surfaces
+  // VERBATIM in the browser console (the generic `post` swallows the body
+  // into a toast). The route is session-authorized (no cron token), so a
+  // non-200 here is a real backend failure worth logging with `res.text()`.
+  const fireProcessNow = useCallback(async () => {
+    try {
+      const res = await fetch("/api/whatsapp/follow-ups", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          conversation_id: conversationId,
+          action: "process_now",
+        }),
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        const body = await res.text();
+        console.error("Error enviando seguimiento:", body || `HTTP ${res.status}`);
+        return;
+      }
+      const json = (await res.json().catch(() => ({}))) as {
+        success?: boolean;
+        message_id?: string | null;
+        sent?: { follow_ups?: number; response_wait?: number };
+      };
+      if (json.success === false) {
+        console.error("Error enviando seguimiento:", JSON.stringify(json));
+        return;
+      }
+      if (json.message_id) {
+        console.log(
+          `[TIMER FIRE] Follow-up dispatched — message_id: ${json.message_id}`,
+        );
+      } else if (
+        json.sent &&
+        (json.sent.follow_ups ?? 0) + (json.sent.response_wait ?? 0) === 0
+      ) {
+        console.warn(
+          "[TIMER FIRE] Sweep executed but nothing was delivered to this conversation.",
+        );
+      }
+    } catch (err) {
+      console.error("Error enviando seguimiento:", err);
+    }
+  }, [conversationId]);
+
   // CLIENT-TRIGGERED DISPATCH: every 1-second clock tick, an ACTIVE timer
   // whose server-derived remainder has reached 00:00 asks the backend to
   // drain the queues (`process_now` — the same idempotent worker the cron
@@ -357,7 +403,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       console.log(
         `[FOLLOW-UP TRIGGER] Triggered for conversation ${conversationId} — follow-up ${pendingRow.id} reached 00:00.`,
       );
-      void post("process_now", {});
+      void fireProcessNow();
     }
     if (
       waitRow &&
@@ -368,9 +414,9 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       console.log(
         `[FOLLOW-UP TRIGGER] Triggered for conversation ${conversationId} — "Esperar respuesta" timer ${waitRow.id} reached 00:00.`,
       );
-      void post("process_now", {});
+      void fireProcessNow();
     }
-  }, [status, serverSkew, followNowTs, waitNowTs, post]);
+  }, [status, serverSkew, followNowTs, waitNowTs, fireProcessNow]);
 
   // ---- Timer 1 (seguimiento automático) -----------------------------
   const scheduleFollowUp = useCallback(async () => {

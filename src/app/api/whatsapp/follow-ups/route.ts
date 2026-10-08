@@ -323,16 +323,20 @@ export async function POST(request: Request) {
     }
     const { conv } = owned
 
-    // Client fallback for the worker: the banner fires this the instant a
-    // countdown hits 00:00 so an expired "Esperando respuesta" / follow-up
-    // timer is dispatched even if no external cron is pinging the server.
-    // FOCUSED: the runners are asked to process ONLY this conversation (the
-    // banner's own countdown already reached 00:00, so a small due-grace in
-    // the worker absorbs clock skitter instead of the global exact-`<=NOW()`
-    // scan skipping the row by microseconds). Same idempotent claim logic
-    // and service-role client as the cron route.
+    // THE 00:00 DISPATCH — fired by the banner the instant any countdown
+    // hits zero. IMPORTANT — NO CRON-SECRET GATE HERE: this route is
+    // authorized by the `requireRole('agent')` dashboard session above,
+    // exactly like `/api/whatsapp/send`; `AUTOMATION_CRON_SECRET` guards
+    // only the EXTERNAL scheduler (`/api/cron/follow-ups`). So an
+    // authenticated inbox request is processed directly, never rejected
+    // with 401/403 for lacking a cron token. The focused runners ARE the
+    // direct send: they resolve the contact and call the SAME
+    // `sendMessageToConversation` core as `/send` (manual) and the webhook
+    // (bot) — same recipient ladder, same Meta call, same `messages` row
+    // that renders the bubble in the chat.
     if (action === 'process_now') {
       const now = new Date()
+      const epoch = now.toISOString()
       const [follow, wait] = await Promise.all([
         runDueFollowUps(supabaseAdmin(), now, conversationId),
         runDueResponseWaitTimers(supabaseAdmin(), now, conversationId),
@@ -340,8 +344,51 @@ export async function POST(request: Request) {
       console.log(
         `[follow-up] client-triggered FOCUSED sweep for conversation ${conversationId} — follow_ups: ${follow.sent}/${follow.scanned} sent (${follow.cancelled} cancelled, ${follow.noResponse} no_response), response-wait: ${wait.sent}/${wait.scanned} sent (${wait.cancelled} cancelled, ${wait.noResponse} no_response).`,
       )
+
+      // Read back the outbound message the sweep just persisted (the send
+      // core INSERTs into `messages`, which is what makes the bubble render)
+      // and echo its id, mirroring `/api/whatsapp/send`'s response shape.
+      let messageId: string | null = null
+      const { data: sentMsg } = await supabaseAdmin()
+        .from('messages')
+        .select('id')
+        .eq('conversation_id', conversationId)
+        .in('sender_type', ['agent', 'bot'])
+        .gte('created_at', epoch)
+        .order('created_at', { ascending: true })
+        .limit(1)
+        .maybeSingle()
+      if (sentMsg?.id) {
+        messageId = sentMsg.id
+      } else {
+        // Found due work but neither delivered nor cleanly closed any row
+        // (nothing sent, nothing cancelled, nothing `no_response`) — the
+        // runner was stopped mid-flight. Surface it as a clear error JSON
+        // instead of a silently-empty 200, so the frontend can log it.
+        const stuck =
+          follow.scanned +
+          wait.scanned -
+          follow.cancelled -
+          wait.cancelled -
+          follow.noResponse -
+          wait.noResponse
+        if (stuck > 0) {
+          console.error(
+            `[follow-up] process_now left ${stuck} row(s) in flight for conversation ${conversationId} — nothing delivered or closed.`,
+          )
+          return NextResponse.json(
+            {
+              success: false,
+              error: `El seguimiento no pudo entregarse ni cerrarse (${stuck} fila(s) en vuelo). Revisa los logs del servidor.`,
+              conversation_id: conversationId,
+            },
+            { status: 502 },
+          )
+        }
+      }
       return NextResponse.json({
         success: true,
+        message_id: messageId,
         conversation_id: conversationId,
         scanned: { follow_ups: follow.scanned, response_wait: wait.scanned },
         sent: { follow_ups: follow.sent, response_wait: wait.sent },
