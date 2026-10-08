@@ -53,6 +53,7 @@ import { AiThreadBanner } from "./ai-thread-banner";
 import { FollowUpBanner } from "./follow-up-banner";
 import { buildReplyPreview } from "./reply-quote";
 import { renderTemplateBody } from "@/lib/whatsapp/template-body";
+import { sendFailureToastMessage } from "@/lib/whatsapp/send-failure-toast";
 import { toast } from "sonner";
 
 interface ReplyDraft {
@@ -507,7 +508,7 @@ export function MessageThread({
         if (!res.ok) {
           const reason = payload?.error || `HTTP ${res.status}`;
           console.error("Failed to send message:", reason);
-          toast.error(`Failed to send: ${reason}`);
+          toast.error(sendFailureToastMessage(payload, `Failed to send: ${reason}`));
           // Mark the optimistic bubble as failed so the user sees what happened
           onUpdateMessage(tempId, { status: "failed" });
           return;
@@ -580,7 +581,7 @@ export function MessageThread({
         if (!res.ok) {
           const reason = data?.error || `HTTP ${res.status}`;
           console.error("Failed to send media:", reason);
-          toast.error(`Failed to send: ${reason}`);
+          toast.error(sendFailureToastMessage(data, `Failed to send: ${reason}`));
           onUpdateMessage(tempId, { status: "failed" });
           // The upload never reached the recipient — GC the orphaned
           // object rather than leaving it in the public bucket forever.
@@ -644,7 +645,7 @@ export function MessageThread({
         if (!res.ok) {
           const reason = data?.error || `HTTP ${res.status}`;
           console.error("Failed to send interactive message:", reason);
-          toast.error(`Failed to send: ${reason}`);
+          toast.error(sendFailureToastMessage(data, `Failed to send: ${reason}`));
           onUpdateMessage(tempId, { status: "failed" });
           return;
         }
@@ -740,7 +741,9 @@ export function MessageThread({
         if (!res.ok) {
           const reason = payload?.error || `HTTP ${res.status}`;
           console.error("Failed to send template:", reason);
-          toast.error(`Failed to send template: ${reason}`);
+          toast.error(
+            sendFailureToastMessage(payload, `Failed to send template: ${reason}`)
+          );
           onUpdateMessage(tempId, { status: "failed" });
           return;
         }

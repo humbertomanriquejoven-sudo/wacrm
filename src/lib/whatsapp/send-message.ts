@@ -43,7 +43,6 @@ import {
   sanitizePhoneForMeta,
   phoneVariants,
   toDialable,
-  passthroughMetaId,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils';
 import {
@@ -167,17 +166,6 @@ export interface SendMessageResult {
   messageId: string;
   /** Meta's `wamid` for the delivered message. */
   whatsappMessageId: string;
-}
-
-/**
- * True when a Meta `to` value must never reach the Graph API: an `@handle`
- * or a letter-bearing display name — Meta answers both with (#131009)
- * "Parameter value is not valid". Namespaced Meta ids (`CO.…`, `WAID.…`,
- * `LID.…`) deliberately contain a prefix + dot and ARE valid destinations,
- * so they are passed through.
- */
-function isForbiddenMetaTo(to: string): boolean {
-  return to.startsWith('@') || (!passthroughMetaId(to) && /[a-zA-Z]/.test(to));
 }
 
 /**
@@ -585,37 +573,15 @@ export async function sendMessageToConversation(
   // is addressed directly and is left completely untouched, so the ordinary
   // case is byte-identical to before. A NUMERIC BSUID / wa_id is still sent
   // even when the thread has no inbound wamid to quote — the anchor improves
-  // the send when present, but its absence is no longer fatal. Only a
-  // NON-numeric address (username / @handle) is refused outright, because Meta
-  // rejects it with (#131009) even as a bare `to`.
+  // the send when present, but its absence is no longer fatal. Nothing is
+  // refused here: any other address simply anchors to the inbound wamid, or
+  // Meta rejects it and the mapping returns the structured 422.
   if (!contextMessageId && resolved.to && !resolved.isPhone) {
-    // VALIDACIÓN PREVENTIVA DE `to`: Meta rechaza con (#131009) cualquier
-    // destinatario que sea un @handle o que contenga letras. Si la escalera
-    // solo pudo resolver algo así NO se gasta la llamada HTTP — ni siquiera
-    // para intentar anclarlo — y se responde 422 para que el operador guarde
-    // el número. (Los BSUID/wa_id numéricos siguen siendo CAMINO B legítimo.)
-    if (isForbiddenMetaTo(resolved.to)) {
-      const technical =
-        `Recipient "${resolved.to}" (source: ${resolved.source}) starts with @ or contains letters; ` +
-        `Meta refuses such a destination with (#131009) "Parameter value is not valid". ` +
-        `No HTTP request was sent to Meta. Save a dialable phone on the contact and retry.`;
-      console.error(
-        `[send-message] INVALID RECIPIENT for conversation ${conversationId} / contact ${contact.id}: ${technical}`,
-      );
-      await recordSendFailure(db, {
-        conversationId,
-        senderType: params.senderType ?? 'agent',
-        messageType,
-        contentText: contentText ?? null,
-        mediaUrl: mediaUrl || null,
-        errorDetail: technical,
-      });
-      throw new SendMessageError(
-        'contact_no_phone',
-        'El contacto no tiene un teléfono válido guardado en la base de datos. Por favor guarda el número antes de enviar.',
-        422,
-      );
-    }
+    // Meta rechaza un `@handle`/letras con (#131009), pero la escalera ya solo
+    // emite destinos numéricos; cualquier no-numérico que llegue aquí se ancla
+    // al wamid entrante (abajo) o la propia Meta lo rechaza y el mapeo lo
+    // convierte en el 422 estructurado con `how_to_fix`. (Los BSUID/wa_id
+    // numéricos siguen siendo CAMINO B legítimo.)
     // `messages` can be RLS-blocked for a user-scoped client, so the anchor is
     // read with the service role — the lookup must never be held hostage by RLS.
     contextMessageId =
@@ -628,10 +594,8 @@ export async function sendMessageToConversation(
     } else {
       // No inbound wamid to quote, but the address is a strictly numeric
       // BSUID / wa_id: Meta accepts such a bare id as `to`, so the send is
-      // ALLOWED to go cold (no `context`). At this point the preventive check
-      // above has already rejected every non-numeric address, so the 422
-      // surface left for "no phone + no numeric id" is that @/letters guard —
-      // there is nothing else to refuse here.
+      // ALLOWED to go cold (no `context`). A genuinely bad destination is
+      // rejected by Meta itself and mapped to a structured 422.
       console.warn(
         `[send-message] contact ${contact.id} is addressed by the numeric id ${resolved.to} (source: ${resolved.source}) ` +
           `and conversation ${conversationId} has NO inbound wamid to quote — sending WITHOUT a context anchor`
@@ -676,20 +640,6 @@ export async function sendMessageToConversation(
   );
 
   const attempt = async (phone: string): Promise<string> => {
-    // VALIDACIÓN PREVENTIVA DE `to`: Meta rechaza con (#131009) cualquier
-    // destinatario que sea un @handle o contenga letras. Si la escalera solo
-    // pudo resolver algo así, NO se gasta la llamada HTTP — se responde 422 a
-    // la interfaz para que el operador guarde el número del contacto.
-    if (isForbiddenMetaTo(phone)) {
-      console.error(
-        `[send-message] refusing to send to invalid Meta recipient "${phone}" (contains @ or letters) — no HTTP call made`,
-      );
-      throw new SendMessageError(
-        'contact_no_phone',
-        'El contacto no tiene un teléfono válido guardado en la base de datos. Por favor guarda el número antes de enviar.',
-        422,
-      );
-    }
     const anchor = await anchorFor(phone);
     if (messageType === 'template') {
       const result = await sendTemplateMessage({

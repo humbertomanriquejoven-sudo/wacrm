@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { addContactTag, deleteContactTag } from '@/lib/contacts/tag-api';
 import { updateContactPhone } from '@/lib/contacts/phone-api';
+import { sendFailureToastMessage } from '@/lib/whatsapp/send-failure-toast';
 import { useAuth } from '@/hooks/use-auth';
 import { formatCurrency } from '@/lib/currency';
 import { toast } from 'sonner';
@@ -373,7 +374,9 @@ export function ContactDetailView({
       const payload = await res.json().catch(() => ({}));
       if (!res.ok) {
         const reason = payload?.error || `HTTP ${res.status}`;
-        toast.error(t('toastTemplateFailed', { reason }));
+        toast.error(
+          sendFailureToastMessage(payload, t('toastTemplateFailed', { reason }))
+        );
         return;
       }
 
