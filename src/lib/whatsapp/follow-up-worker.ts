@@ -759,8 +759,12 @@ export function truncateToLimit(text: string, limit = 30): string {
  * Natural reminder for a conversation that went quiet. Built by the
  * account's AI provider out of the REAL recent transcript; falls back to
  * `GENERIC_REMINDER` when provisioning failed or the model said nothing.
+ *
+ * Exported so the inbox `process_now` route can reuse the exact contextual
+ * builder for its forced 00:00 delivery (the derived-anchor case where no
+ * timer row exists for the runners to claim).
  */
-async function buildFollowUpMessage(
+export async function buildFollowUpMessage(
   db: SupabaseClient,
   accountId: string,
   conversationId: string,

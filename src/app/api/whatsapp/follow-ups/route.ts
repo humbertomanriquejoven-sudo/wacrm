@@ -12,8 +12,10 @@ import {
   cancelResponseWaitTimers,
   runDueFollowUps,
   runDueResponseWaitTimers,
+  buildFollowUpMessage,
   type FollowUpType,
 } from '@/lib/whatsapp/follow-up-worker'
+import { sendMessageToConversation } from '@/lib/whatsapp/send-message'
 
 /**
  * CRM-facing follow-ups API — the UI companion to the runner.
@@ -358,32 +360,120 @@ export async function POST(request: Request) {
         .order('created_at', { ascending: true })
         .limit(1)
         .maybeSingle()
-      if (sentMsg?.id) {
-        messageId = sentMsg.id
-      } else {
-        // Found due work but neither delivered nor cleanly closed any row
-        // (nothing sent, nothing cancelled, nothing `no_response`) — the
-        // runner was stopped mid-flight. Surface it as a clear error JSON
-        // instead of a silently-empty 200, so the frontend can log it.
-        const stuck =
-          follow.scanned +
-          wait.scanned -
-          follow.cancelled -
-          wait.cancelled -
-          follow.noResponse -
-          wait.noResponse
-        if (stuck > 0) {
-          console.error(
-            `[follow-up] process_now left ${stuck} row(s) in flight for conversation ${conversationId} — nothing delivered or closed.`,
-          )
-          return NextResponse.json(
-            {
-              success: false,
-              error: `El seguimiento no pudo entregarse ni cerrarse (${stuck} fila(s) en vuelo). Revisa los logs del servidor.`,
-              conversation_id: conversationId,
-            },
-            { status: 502 },
-          )
+      if (sentMsg?.id) messageId = sentMsg.id
+
+      const delivered = follow.sent + wait.sent
+      const hadWork = follow.scanned + wait.scanned > 0
+      const closedClean =
+        follow.cancelled +
+        follow.noResponse +
+        wait.cancelled +
+        wait.noResponse
+
+      // The runner succeeded but the timestamp-window read-back missed the
+      // row (clock skitter between insert and `epoch`) — re-read by sender
+      // alone rather than force anything.
+      if (!messageId && delivered > 0) {
+        const { data: anyMsg } = await supabaseAdmin()
+          .from('messages')
+          .select('id')
+          .eq('conversation_id', conversationId)
+          .in('sender_type', ['agent', 'bot'])
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle()
+        if (anyMsg?.id) messageId = anyMsg.id
+      }
+
+      // STUCK ROWS: due work was found but nothing was delivered and nothing
+      // was cleanly closed — the runner stopped mid-flight. Surface a clear
+      // error JSON instead of a silently-empty 200 (the frontend logs it).
+      if (!messageId && hadWork && delivered === 0 && closedClean === 0) {
+        const stuck = follow.scanned + wait.scanned
+        console.error(
+          `[follow-up] process_now left ${stuck} row(s) in flight for conversation ${conversationId} — nothing delivered or closed.`,
+        )
+        return NextResponse.json(
+          {
+            success: false,
+            error: `El seguimiento no pudo entregarse ni cerrarse (${stuck} fila(s) en vuelo). Revisa los logs del servidor.`,
+            conversation_id: conversationId,
+          },
+          { status: 502 },
+        )
+      }
+
+      // FORCED 00:00 DELIVERY — the DERIVED-ANCHOR case. The banner can
+      // count down a server-computed remainder even when NO
+      // `response_wait_timers` row exists (the send core never auto-armed
+      // this conversation — e.g. the "Esperar respuesta" switch was flipped
+      // ON *after* the agent's message had already gone out, when the arm
+      // step was skipped). The runners scan ZERO rows, so to honor the
+      // countdown the UI just showed at 00:00 we deliver the message
+      // DIRECTLY through the exact same central function the manual send
+      // (`/api/whatsapp/send`) and the bot webhook use — same contextual
+      // builder, same recipient ladder, same `messages` insert that renders
+      // the bubble — instead of only resolving timer state.
+      if (!messageId && !hadWork && owned.conv.response_wait_enabled) {
+        // Never double-send: if any ACTIVE/`processing` timer row exists a
+        // concurrent sweep owns this conversation, and if the CUSTOMER has
+        // since replied the last message is no longer outbound (and the
+        // banner would have dropped the countdown) — both skip the nudge.
+        const { data: inFlight } = await supabaseAdmin()
+          .from('response_wait_timers')
+          .select('id')
+          .eq('conversation_id', conversationId)
+          .in('status', ['active', 'processing'])
+          .limit(1)
+          .maybeSingle()
+        if (!inFlight?.id) {
+          const { data: lastMsg } = await supabaseAdmin()
+            .from('messages')
+            .select('sender_type, created_at')
+            .eq('conversation_id', conversationId)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle()
+          const anchor = lastMsg as {
+            sender_type?: string | null
+            created_at?: string | null
+          } | null
+          if (anchor?.sender_type === 'agent' || anchor?.sender_type === 'bot') {
+            try {
+              const forceText = await buildFollowUpMessage(
+                supabaseAdmin(),
+                accountId,
+                conversationId,
+              )
+              console.log(
+                `[TIMER FORCE-SEND] No timer row existed (derived countdown) — delivering a contextual nudge for conversation ${conversationId} through the shared send core: "${forceText}"`,
+              )
+              const forced = await sendMessageToConversation(
+                supabaseAdmin(),
+                accountId,
+                {
+                  conversationId,
+                  messageType: 'text',
+                  contentText: forceText,
+                  senderType: 'bot',
+                  aiGenerated: true,
+                  autoArm: false,
+                },
+              )
+              messageId = forced.messageId
+              console.log(
+                `[TIMER META RESULT] Success status: 2xx, wamid: ${forced.whatsappMessageId ?? 'n/a'} (forced 00:00 delivery for conversation ${conversationId})`,
+              )
+            } catch (err) {
+              // Meta rejected it or the send core could not resolve a
+              // destination — recorded EXPLICITLY (console.error) so the
+              // failure is traceable server-side and in the frontend log.
+              console.error(
+                `[TIMER FORCE-SEND] forced contextual send failed for conversation ${conversationId}:`,
+                err instanceof Error ? err.message : err,
+              )
+            }
+          }
         }
       }
       return NextResponse.json({
