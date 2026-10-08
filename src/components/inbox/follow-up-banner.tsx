@@ -14,8 +14,6 @@ import type { FollowUp, ResponseWaitTimer } from "@/types";
 // HTML error page — `res.json()` would throw. We always read the raw text,
 // verify the `Content-Type`, and surface the HTML separately instead of
 // letting it render or bubble up as an uncaught parse error.
-const SERVER_ERROR_COPY = "Error en el servidor al enviar seguimiento";
-
 type SafeFollowUpsBody = { ok: boolean; json: Record<string, unknown>; text: string };
 
 async function parseFollowUpsResponse(res: Response): Promise<SafeFollowUpsBody> {
@@ -358,11 +356,15 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
           }),
         });
         const parsed = await parseFollowUpsResponse(res);
-        if (!res.ok || !parsed.ok) {
-          // A JSON error reveals the server's own message; an HTML/non-JSON
-          // body is the proxy's "service down" page — never render it, just
-          // toast the clean copy.
-          toast.error((parsed.json?.error as string) ?? SERVER_ERROR_COPY);
+        const data = parsed.json as Record<string, unknown>;
+        // A JSON error reveals the server's own message; an HTML/non-JSON
+        // body is the proxy's "service down" page — never render it as
+        // content, always log what actually came back and toast the detail.
+        if (!res.ok || !parsed.ok || data.success === false) {
+          console.error("[FOLLOW-UP DETAILED ERROR]:", data);
+          toast.error(
+            `Error de seguimiento: ${(data.error as string) || "Fallo desconocido"}`,
+          );
           return null;
         }
         return parsed.json;
@@ -390,20 +392,17 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
         cache: "no-store",
       });
       const parsed = await parseFollowUpsResponse(res);
-      if (!res.ok || !parsed.ok) {
-        console.error("[TRIGGER 00:00 ERROR]:", res.status, parsed.text || "");
-        toast.error((parsed.json?.error as string) ?? SERVER_ERROR_COPY);
-        return;
-      }
       const json = parsed.json as {
         success?: boolean;
         message_id?: string | null;
         sent?: { follow_ups?: number; response_wait?: number };
+        error?: string;
       };
-      if (json.success === false) {
-        console.error("[TRIGGER 00:00 ERROR]:", JSON.stringify(json));
+      if (!res.ok || !parsed.ok || json.success === false) {
+        console.error("[TRIGGER 00:00 ERROR]:", res.status, parsed.text || "");
+        console.error("[FOLLOW-UP DETAILED ERROR]:", json);
         toast.error(
-          (json as { error?: string }).error ?? t("updateError"),
+          `Error de seguimiento: ${json.error || "Fallo desconocido"}`,
         );
         return;
       }

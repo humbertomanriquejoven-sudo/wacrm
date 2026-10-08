@@ -13,6 +13,7 @@ import {
   runDueFollowUps,
   runDueResponseWaitTimers,
   buildFollowUpMessage,
+  GENERIC_REMINDER,
   type FollowUpType,
 } from '@/lib/whatsapp/follow-up-worker'
 import { sendMessageToConversation, SendMessageError } from '@/lib/whatsapp/send-message'
@@ -481,14 +482,40 @@ export async function POST(request: Request) {
                 .eq('id', owned.conv.contact_id)
                 .maybeSingle()
               if (forcedContact) target = getRecipientAddress(forcedContact)
-              if (target) {
-                console.log(`[TIMER RECIPIENT RESOLVED] Target: ${target}`)
+              if (!target) {
+                // No resolvable delivery address (no phone, no wa_id/BSUID,
+                // no recipient_id): there is literally nothing to send to.
+                // Answer a cleaned 400 instead of letting the send core fail
+                // with an opaque error.
+                return NextResponse.json(
+                  {
+                    success: false,
+                    error: 'La conversación no tiene un número de teléfono válido',
+                    conversation_id: conversationId,
+                  },
+                  { status: 400 },
+                )
               }
-              const forceText = await buildFollowUpMessage(
-                supabaseAdmin(),
-                accountId,
-                conversationId,
-              )
+              console.log(`[TIMER RECIPIENT RESOLVED] Target: ${target}`)
+              // AI FALLBACK — the forced delivery must NEVER be cancelled by
+              // a failing provider: `buildFollowUpMessage` degrades to the
+              // generic reminder internally, and this second barrier keeps
+              // the nudge flowing even if an exception ever escapes.
+              let forceText = GENERIC_REMINDER
+              try {
+                const built = await buildFollowUpMessage(
+                  supabaseAdmin(),
+                  accountId,
+                  conversationId,
+                )
+                forceText = built || GENERIC_REMINDER
+              } catch (err) {
+                console.error(
+                  '[FOLLOW-UP AI FALLBACK]',
+                  err instanceof Error ? err.message : err,
+                )
+                forceText = GENERIC_REMINDER
+              }
               console.log(
                 `[TIMER FORCE-SEND] No timer row existed (derived countdown) — delivering a contextual nudge for conversation ${conversationId} through the shared send core: "${forceText}"`,
               )

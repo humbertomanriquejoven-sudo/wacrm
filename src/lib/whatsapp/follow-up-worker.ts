@@ -735,8 +735,8 @@ export async function cancelPendingFollowUps(
  * vague — it must never re-raise a specific topic the model would have
  * to summarize, and never promise a human is waiting.
  */
-const GENERIC_REMINDER =
-  '¡Hola! Quería confirmar si quedó pendiente algo por tu parte. Quedo atento para ayudarte.'
+export const GENERIC_REMINDER =
+  'Hola, quedo atento a tus comentarios si necesitas ayuda con alguna duda.'
 
 /**
  * Hard cap for the AI-generated reminder text. The model is told to stay
