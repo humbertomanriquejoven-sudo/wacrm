@@ -643,7 +643,7 @@ async function postMessagesPayload(
   accessToken: string,
   body: Record<string, unknown>,
 ): Promise<Response> {
-  console.log('[META_PAYLOAD_OUTBOUND]', JSON.stringify(body, null, 2))
+  console.log('[META_PAYLOAD_ENVIADO]', JSON.stringify(body, null, 2))
   return fetch(url, {
     method: 'POST',
     headers: {

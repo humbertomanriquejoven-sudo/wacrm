@@ -42,6 +42,7 @@ import { supabaseAdmin } from '@/lib/flows/admin-client';
 import {
   sanitizePhoneForMeta,
   phoneVariants,
+  toDialable,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils';
 import {
@@ -98,6 +99,15 @@ export interface SendMessageParams {
   /** Structured payload for `messageType === 'interactive'`. */
   interactivePayload?: InteractiveMessagePayload | null;
   replyToMessageId?: string | null;
+  /**
+   * A phone number supplied by the caller next to `conversationId`
+   * (e.g. the UI knows the customer's number even if it was never
+   * persisted). Sanitized to digits; if it is a valid number and the
+   * contact row has no usable `phone`, it is persisted with the service
+   * role BEFORE the recipient is resolved, so the send goes straight on
+   * CAMINO A and the DB is corrected permanently.
+   */
+  phone?: string | null;
   /**
    * Skip Timer 2's auto-arm for THIS send. Defaults to `true` for every
    * outbound (agent or bot): sending any message while the client has not
@@ -360,6 +370,34 @@ export async function sendMessageToConversation(
     contact = adminContact as typeof contact;
   }
 
+  // TAREA 1 — AUTO-PERSISTENCIA INCONDICIONAL DEL TELÉFONO. El número puede
+  // venir del payload (`phone`), del embed o del override por service role.
+  // Si hay un número válido (>= 8 dígitos tras sanitizar espacios/guiones/
+  // '+', '/@') y la columna `contacts.phone` está vacía o no es usable, se
+  // persiste AHORA con la service role — la BD queda corregida sin depender
+  // de que nadie presione "Guardar" en la UI, y la resolución baja por el
+  // CAMINO A (teléfono directo, sin `context`).
+  const payloadPhone = toDialable(params.phone ?? null);
+  if (payloadPhone && !toDialable(contact.phone ?? null)) {
+    console.log(
+      `[send-message] persisting payload phone "${payloadPhone}" for contact ${contact.id} ` +
+        `(contacts.phone was "${contact.phone ?? ''}") via service role`,
+    );
+    const { error: persistErr } = await supabaseAdmin()
+      .from('contacts')
+      .update({ phone: payloadPhone })
+      .eq('id', contact.id);
+    if (persistErr) {
+      console.warn(
+        '[send-message] failed to persist payload phone',
+        payloadPhone,
+        '- sending with the in-memory value',
+        persistErr.message,
+      );
+    }
+    contact = { ...contact, phone: payloadPhone };
+  }
+
   // WhatsApp config, account-scoped.
   const { data: config, error: configError } = await db
     .from('whatsapp_config')
@@ -475,7 +513,7 @@ export async function sendMessageToConversation(
       // message the UI shows is the operator-facing rule; the console keeps
       // the technical detail.
       const detail =
-        `No es posible enviar mensaje a este usuario de Meta sin un mensaje previo de entrada o un teléfono registrado.`;
+        `No es posible enviar un mensaje a este usuario sin un número de teléfono o un mensaje de entrada previo.`;
       const technical =
         `Recipient "${resolved.to}" (source: ${resolved.source}) has no dialable phone number and conversation ` +
         `${conversationId} has no inbound wamid to quote, so WhatsApp cannot address it — an opaque id sent ` +

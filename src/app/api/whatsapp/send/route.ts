@@ -48,6 +48,7 @@ export async function POST(request: Request) {
       // yet (Contact detail → Send template) — we find-or-create one below.
       conversation_id: conversationIdInput,
       contact_id,
+      phone,
       message_type,
       content_text,
       media_url,
@@ -168,6 +169,7 @@ export async function POST(request: Request) {
         templateMessageParams: template_message_params,
         interactivePayload: interactive_payload,
         replyToMessageId: reply_to_message_id,
+        phone,
       })
 
       return NextResponse.json({

@@ -204,6 +204,7 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
 const adminRead = vi.hoisted(() => ({
   inboundRows: [] as unknown[],
   contactRow: null as Record<string, unknown> | null,
+  persistedPhones: [] as string[],
 }));
 
 vi.mock('@/lib/flows/admin-client', () => ({
@@ -230,9 +231,14 @@ vi.mock('@/lib/flows/admin-client', () => ({
           select: vi.fn(() => read()),
           eq: vi.fn(() => read()),
           single: async () => ({ data: adminRead.contactRow, error: null }),
-          update: () => ({
-            eq: async () => ({ error: null }),
-          }),
+          update: (value: Record<string, unknown>) => {
+            if (value && typeof value.phone === 'string') {
+              adminRead.persistedPhones.push(value.phone);
+            }
+            return {
+              eq: async () => ({ error: null }),
+            };
+          },
         });
         return read();
       }
@@ -611,6 +617,76 @@ describe('sendMessageToConversation - strict service-role contact override', () 
 
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
     expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: '15551234567' })
+    );
+  });
+});
+
+// ============================================================
+// TAREA 1 — auto-persistencia del teléfono que viene en el payload.
+// El editor de la interfaz puede NO haber guardado el número: si el payload
+// trae un `phone` válido y `contacts.phone` está vacío/no usable, el core
+// debe persistirlo con la service role y enviar directo (CAMINO A, sin
+// `context`), dejando la BD corregida permanentemente.
+// ============================================================
+describe('sendMessageToConversation - TAREA 1: payload phone auto-persists via service role', () => {
+  it('persists a payload phone and sends DIRECTLY to it without context', async () => {
+    adminRead.persistedPhones = [];
+    // Neither the embed nor the service-role row carry a usable number:
+    // `phone` holds the @user. The caller still hands us the real number.
+    adminRead.contactRow = {
+      id: 'ct-1',
+      phone: '@humbertomanriquejoven',
+      wa_user_id: '1008477715690681',
+      username: '@humbertomanriquejoven',
+    };
+    const db = sendPathDb(
+      [],
+      {},
+      { contact: { id: 'ct-1', phone: null } }
+    );
+
+    await sendMessageToConversation(db, 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'Hola Humberto',
+      phone: '  +57 316 707 1066 ',
+    });
+
+    expect(adminRead.persistedPhones).toContain('573167071066');
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: '573167071066' })
+    );
+    const call = vi.mocked(sendTextMessage).mock.calls[0][0] as {
+      to: string;
+      contextMessageId?: string;
+    };
+    expect(call.to).not.toMatch(/@humbertomanriquejoven|1008477715690681/);
+    expect(call.contextMessageId).toBeUndefined();
+  });
+
+  it('does not overwrite a stored, dialable phone with the payload one', async () => {
+    adminRead.persistedPhones = [];
+    adminRead.contactRow = { id: 'ct-1', phone: '15551234567' };
+    const db = sendPathDb(
+      [],
+      {},
+      { contact: { id: 'ct-1', phone: '+15551234567' } }
+    );
+
+    await sendMessageToConversation(db, 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'Hola',
+      phone: '573167071066',
+    });
+
+    // The payload number must NOT win over the already-stored one: nothing
+    // may write '573167071066' into `contacts.phone` nor aim the payload at it.
+    expect(adminRead.persistedPhones).not.toContain('573167071066');
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toBeCalledWith(
       expect.objectContaining({ to: '15551234567' })
     );
   });
