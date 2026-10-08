@@ -386,54 +386,6 @@ export function cleanRecipientAddress(address: string): string {
   return bare
 }
 
-/**
- * The contact columns the unified destination resolver reads + what each
- * one means. Only the three routable identifiers; the worker timers re-read
- * this shape so Seguimiento Automático / Esperar respuesta resolve to the
- * SAME address as a manual inbox send or the bot auto-reply.
- */
-export interface RecipientAddressContact {
-  /** NOT NULL in the DB; the webhook writes the literal `'unknown'` when the sender disclosed no number. */
-  phone?: string | null
-  /** Meta's `wa_id` for the sender, when disclosed. */
-  wa_id?: string | null
-  /** Meta's `recipient_id` for the sender, when disclosed. */
-  recipient_id?: string | null
-}
-
-/**
- * THE unified destination rule every WhatsApp sender resolves a contact
- * through — the manual inbox send, the bot auto-reply and the worker timers
- * (`runDueFollowUps` / `runDueResponseWaitTimers`).
- *
- * Priority:
- *   1. A real `phone`: present, not the `'unknown'` placeholder and with at
- *      least one digit → returned with every non-numeric character stripped
- *      (E.164-ready). A legacy `@handle` stored in phone yields no digits,
- *      so it is treated as absent instead of fabricating a number.
- *   2. The `wa_id` Meta persisted on the contact row.
- *   3. The `recipient_id` Meta persisted on the contact row.
- *
- * Returns `null` when none of the three holds a usable value. That is the
- * signal for the caller to fail fast (typed `InvalidRecipientError` /
- * `no_response`) instead of sending Meta a request that reads like a
- * malformed API call — or worse, a 200 that Meta silently drops. It never
- * invents anything: the value returned is exactly what the row says, and the
- * send path (`canonicalToField`) normalizes it for the wire.
- */
-export function getRecipientAddress(contact: RecipientAddressContact): string | null {
-  const phone = cleanRecipientAddress(contact?.phone ?? '')
-  if (phone && !isPlaceholderValue(phone)) {
-    const digits = phone.replace(/\D/g, '')
-    if (digits) return digits
-  }
-  const waId = cleanRecipientAddress(contact?.wa_id ?? '')
-  if (waId && !isPlaceholderValue(waId)) return waId
-  const recipientId = cleanRecipientAddress(contact?.recipient_id ?? '')
-  if (recipientId && !isPlaceholderValue(recipientId)) return recipientId
-  return null
-}
-
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
   let message = fallback
   let code: number | null = null
@@ -695,29 +647,30 @@ export interface SendTextMessageArgs {
  * Send a free-form WhatsApp text message.
  * Only works inside the 24-hour customer service window.
  *
- * Three recipient shapes are handled, because a contact reached through a
- * `@user` / `@lid` display id is a different problem from a phone number:
+ * Two destination classes decide the payload, because a contact reached
+ * through a `@user` / `@lid` display id is a different problem from a phone
+ * number:
  *
- *   1. A dialable E.164 number → `{ to: "573167071066" }`.
- *   2. An opaque Meta id (`CO.…`, `WAID.…`, `LID.…`, or a >14-digit run) →
- *      `{ recipient: "<id>" }`. Meta knows the destination; no context needed.
- *   3. Anything else — a short digit run scraped out of `@lid`, a bare
- *      handle, the literal `unknown` — is not a usable destination. Such a
- *      send cannot be rescued by quoting: an earlier version of this docblock
- *      claimed a QUOTED REPLY anchored on the inbound `wamid` was "the only
- *      supported way" to reach these contacts and that `context` "authorizes"
- *      delivery. Both were wrong. Meta answers (#100) Invalid parameter for a
- *      bare `@handle` in `to` whether or not `context` is present — quoting
- *      makes the send a reply, it does not make the destination addressable —
- *      and the Inbox proves the working path is simply putting the numerical
- *      id in `to` (see `resolveRecipient`). `context` is therefore
- *      presentational here and is set only for an explicit reply.
+ *   1. A dialable E.164 number → `{ to: "573167071066" }`. No anchor needed:
+ *      Meta addresses the number on its own.
+ *   2. An opaque Meta id (`CO.…`, `WAID.…`, `LID.…`, a >14-digit wa_id/BSUID
+ *      run, a short digit run out of `@lid`) → the digits in `to` WITH
+ *      `context.message_id` MANDATORY. Sent as a cold destination such a
+ *      request has been observed in production to come back as (#131009)
+ *      "Recipient phone number not in allowed list" while the message is
+ *      dropped — Meta accepts an opaque id only as a REPLY to a message that
+ *      person wrote. Every caller therefore anchors the send to the
+ *      conversation's newest customer wamid (`latestInboundAnchorId`), and a
+ *      non-dialable destination that arrives WITHOUT an anchor is refused
+ *      here, before any HTTP request.
  *
- * So the only thing refused locally is an EMPTY address. A non-addressable
- * value is forwarded as-is: the caller (`resolveRecipient` /
- * `resolveBroadcastAddress`) is responsible for never producing one, and it
- * records an actionable failure locally rather than letting Meta answer with
- * something that looks like success.
+ * Refused locally: an EMPTY address, the `unknown` placeholder, and any
+ * non-dialable destination without a `contextMessageId` (the #131009 guard).
+ * One thing quoting still does NOT rescue is a bare `@handle`: Meta answers
+ * (#100) Invalid parameter for a handle in `to` whether or not `context` is
+ * present, so the resolvers (`resolveRecipient` / `resolveBroadcastAddress`)
+ * remain responsible for never producing one — a handle that DOES arrive
+ * with an anchor is forwarded and judged by Meta.
  */
 export async function sendTextMessage(
   args: SendTextMessageArgs
@@ -784,6 +737,29 @@ export async function sendTextMessage(
     )
   }
 
+  // #131009 guard: an opaque id (BSUID / wa_id / `@lid` run) is not a cold
+  // destination — Meta accepts it only as a REPLY to a message that person
+  // wrote, and has been observed to answer a bare send with (#131009)
+  // "Recipient phone number not in allowed list" while dropping the message.
+  // Without an anchor there is nothing to quote, so the send is refused
+  // here, before any HTTP request, instead of pretending an attempt was
+  // made. Callers resolve the anchor from the thread (`latestInboundAnchorId`
+  // / `findInboundWamid`) and are expected to fail with their own typed
+  // error first; this is the choke point that keeps a doomed request off
+  // the wire for any caller that misses it.
+  if (!contextMessageId && !isDialablePhone(address)) {
+    console.error(
+      `[send] MISSING CONTEXT (#131009 guard): destination "${address}" is not a dialable phone number and no contextMessageId was supplied — no HTTP request was sent. Anchor the send to this conversation's newest customer wamid.`,
+    )
+    throw new InvalidRecipientError(
+      address,
+      'destination is an opaque Meta id (BSUID / wa_id / @lid) and no ' +
+        'inbound wamid was supplied to quote: WhatsApp only accepts such a ' +
+        'contact as a reply to one of their own messages (#131009). ' +
+        'No HTTP request was sent.',
+    )
+  }
+
   // Primary shape, per Meta's documented payload: the destination always
   // travels in `to`, carrying the numeric id with any namespace and `@`
   // removed (`CO.1486998326437295` -> `1486998326437295`) — exactly what
@@ -816,25 +792,18 @@ export async function sendTextMessage(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    // `addressField` is what authorizes delivery, `context` or not. A previous
-    // version of this comment claimed the opposite — that the `context` block
-    // is what authorizes delivery to an unaddressable contact and `to` is
-    // "only a thread hint". That is wrong, and believing it is costly twice
-    // over:
+    // `addressField` carries the destination; `context` is what makes Meta
+    // accept an OPAQUE one. An E.164 number needs no anchor. A BSUID / wa_id /
+    // `@lid` id sent bare has been observed to come back as (#131009)
+    // "Recipient phone number not in allowed list", so every caller anchors
+    // it to the contact's own inbound wamid — and the guard above refuses an
+    // opaque destination that arrives without one, keeping the doomed
+    // request off the wire.
     //
-    //   * It is contradicted by the Inbox, which reaches every id-only contact
-    //     today. `flows/meta-send.ts` calls `sendTextMessage` with no
-    //     `contextMessageId` at all and succeeds, because `resolveRecipient`
-    //     puts the BSUID in `to`.
-    //   * It was already disproved on the broadcast side: a bare `@handle` in
-    //     `to` is rejected with (#100) Invalid parameter, and adding
-    //     `context.message_id` does NOT make it addressable — quoting makes the
-    //     send a reply, it does not make the destination valid.
-    //
-    // `context` is therefore purely presentational here: it renders the
-    // message as a quoted reply. It is set only when a caller is explicitly
-    // replying to a known message (`replyToMessageId`), never as a delivery
-    // workaround.
+    // What quoting still does NOT do is make a bare `@handle` addressable:
+    // Meta answers (#100) Invalid parameter for a handle in `to` whether or
+    // not `context` is present. Resolvers are responsible for never
+    // producing one.
     ...addressField,
     type: 'text',
     text: { preview_url: false, body: text },

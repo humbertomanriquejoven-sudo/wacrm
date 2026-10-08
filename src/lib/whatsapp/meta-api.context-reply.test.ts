@@ -162,12 +162,14 @@ describe('sendTextMessage recipient shapes', () => {
       accessToken: 'TOKEN',
       to: 'CO.1008477715690681',
       text: 'hola',
+      contextMessageId: 'wamid.HBgL_INBOUND',
     })
     const body = sentBody(fetchMock)
     // Meta rejects letters and dots in `to`; the digits are the real id.
     expect(body.to).toBe('1008477715690681')
     expect(body.recipient).toBeUndefined()
-    expect(body.context).toBeUndefined()
+    // …and the reply anchor is mandatory for that id (#131009 guard).
+    expect(body.context).toEqual({ message_id: 'wamid.HBgL_INBOUND' })
   })
 
   it('supports the alternate "recipient" field as an explicit retry', async () => {
@@ -176,27 +178,30 @@ describe('sendTextMessage recipient shapes', () => {
       accessToken: 'TOKEN',
       to: 'CO.1008477715690681',
       text: 'hola',
+      contextMessageId: 'wamid.HBgL_INBOUND',
       recipientField: 'recipient',
     })
     const body = sentBody(fetchMock)
     // Escape hatch keeps the address intact for Meta's alternate shape.
     expect(body.recipient).toBe('CO.1008477715690681')
     expect(body.to).toBeUndefined()
+    expect(body.context).toEqual({ message_id: 'wamid.HBgL_INBOUND' })
   })
 
-  it('reaches the network for an @lid id instead of refusing it locally', async () => {
-    // Regression guard for the production bug: a contact whose phone is
-    // "unknown" must never be dropped by a local assertion. Meta is the
-    // authority on whether the destination is deliverable.
-    await sendTextMessage({
-      phoneNumberId: 'PNID',
-      accessToken: 'TOKEN',
-      to: '123456@lid',
-      text: 'se enviaría',
-    })
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-    const body = sentBody(fetchMock)
-    expect(body.to).toBe('123456')
+  it('refuses an @lid id with no anchor to quote instead of firing a doomed request', async () => {
+    // #131009 guard: a destination Meta accepts only as a reply, sent cold,
+    // comes back as "Recipient phone number not in allowed list" while the
+    // message is dropped. With no wamid to quote there is nothing safe to
+    // send — refuse locally (InvalidRecipientError) and never hit the network.
+    await expect(
+      sendTextMessage({
+        phoneNumberId: 'PNID',
+        accessToken: 'TOKEN',
+        to: '123456@lid',
+        text: 'se enviaría',
+      }),
+    ).rejects.toBeInstanceOf(InvalidRecipientError)
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it('still refuses only when there is no destination at all', async () => {
@@ -264,6 +269,7 @@ describe('sendTextMessage recipient shapes', () => {
       accessToken: 'TOKEN',
       to: '1486998326437295',
       text: 'x',
+      contextMessageId: 'wamid.HBgL_INBOUND',
     }).catch((e: unknown) => e)
 
     expect(err).toBeInstanceOf(MetaApiError)

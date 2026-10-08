@@ -132,12 +132,13 @@ async function findInboundWamid(
     .limit(10)
 
   // `sender_type` distinguishes the customer's messages from our own; only
-  // the customer's wamid is valid in `context`.
+  // the customer's wamid is valid in `context` (same strict filter as the
+  // send core's `latestInboundAnchorId` — `'agent'` is our own outbound).
   for (const row of (data ?? []) as Array<{
     message_id?: string | null
     sender_type?: string | null
   }>) {
-    if (row.message_id && row.sender_type !== 'bot') return row.message_id
+    if (row.message_id && row.sender_type === 'customer') return row.message_id
   }
   return undefined
 }
@@ -293,6 +294,20 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
 
   const contextMessageId =
     input.contextMessageId ?? (await findInboundWamid(db, input.conversationId))
+
+  // #131009 guard: an opaque id (BSUID / wa_id / @lid) is deliverable only
+  // as a reply to the contact's own message. Neither the caller nor the
+  // thread supplied an anchor, so there is no addressable recipient — fail
+  // here, loudly and before any HTTP request, rather than firing a bare send
+  // Meta will only drop with "Recipient phone number not in allowed list".
+  if (!isPhone && !contextMessageId) {
+    const detail =
+      `cannot send to the opaque id "${recipient.to}" for conversation ${input.conversationId}: ` +
+      `no inbound wamid to quote, so WhatsApp cannot address it (#131009 guard) — ` +
+      `no HTTP request was sent`
+    console.error(`[meta-send] ${detail}`)
+    throw new Error(detail)
+  }
 
   const attemptSend = async (
     address: string,

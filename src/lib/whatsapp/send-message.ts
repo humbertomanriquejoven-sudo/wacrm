@@ -29,7 +29,6 @@ import {
   sendInteractiveList,
   InvalidRecipientError,
   MetaApiError,
-  cleanRecipientAddress,
   type MediaKind,
 } from '@/lib/whatsapp/meta-api';
 import {
@@ -217,32 +216,6 @@ export function validateSendMessageParams(params: {
 }
 
 /**
- * Can this address travel in Meta's `to` on its own?
- *
- *   A. a dialable E.164 number            → yes (`isDialablePhone`)
- *   B. a namespaced BSUID (`CO.…`, `WAID.`, `LID.`) or a pure digit run
- *      (a wa_id / BSUID such as `1008477715690681`) → yes
- *   C. anything else — a bare `@handle`, a display id, `unknown` → NO: Meta
- *      answers (#100) Invalid parameter, and the ONLY form such a contact is
- *      reachable in is a QUOTE of one of their own inbound messages.
- *
- * The classification is made on the CLEANED address (`cleanRecipientAddress`
- * drops `@user` / `@lid` suffixes and a leading `@`), so `123456@lid` and
- * `CO.1486998326437295` classify as B while `jjuanpablo22222` classifies as C.
- * It never invents digits — that is exactly the `toMetaTargetId('@handle')`
- * fabrication that aimed `22222` at a stranger.
- */
-function isNumericRecipientAddress(address: string): boolean {
-  const bare = cleanRecipientAddress(address);
-  if (!bare) return false;
-  return (
-    isDialablePhone(bare) ||
-    /^[A-Za-z]+\.[\w.-]+$/.test(bare) ||
-    /^\+?\d+$/.test(bare)
-  );
-}
-
-/**
  * Persist a send we refused BEFORE any HTTP request, so the thread shows a
  * real `failed` bubble instead of silently swallowing the operator's message.
  * Best-effort by design: a failure to record the failure must never mask the
@@ -410,8 +383,10 @@ export async function sendMessageToConversation(
   // The parity fix.
   //
   // A contact we can only identify by an opaque id — a `@user` display id, a
-  // BSUID, a `WAID.`/`LID.` id — CANNOT be addressed directly in Meta's `to`.
-  // WhatsApp only accepts such a message as a QUOTE of one of that person's own
+  // BSUID, a `WAID.`/`LID.` id — CANNOT be addressed as a cold destination in
+  // Meta's `to`: sent bare it has been observed to come back as (#131009)
+  // "Recipient phone number not in allowed list" while the message is dropped.
+  // WhatsApp accepts such a message only as a QUOTE of one of that person's own
   // messages. The AI path always supplied that anchor, which is why the bot
   // could answer these contacts while an operator typing the same thing in the
   // INBOX got a 200 and no delivery.
@@ -420,7 +395,10 @@ export async function sendMessageToConversation(
   // in this thread — exactly what `engineSendAiReply` does with the inbound it
   // was answering. Only for opaque addresses: a contact with a dialable number
   // is addressed directly and is left completely untouched, so the ordinary
-  // case is byte-identical to before.
+  // case is byte-identical to before. And when the thread has NO inbound wamid
+  // to quote there is no way to address this contact at all, so the send is
+  // refused locally with a typed 422 and a recorded failed bubble instead of
+  // firing a request Meta will only drop.
   if (!contextMessageId) {
     const resolved = await resolveRecipient(contact, accountId, conversationId);
     if (resolved.to && !resolved.isPhone) {
@@ -431,26 +409,16 @@ export async function sendMessageToConversation(
           `[send-message] contact ${contact.id} is addressed by an opaque id (${resolved.source}); ` +
             `anchoring the send to inbound message ${contextMessageId} so WhatsApp accepts it`
         );
-      } else if (isNumericRecipientAddress(resolved.to)) {
-        // Scenario B — a wa_id / BSUID / namespaced id. It is a real Meta id,
-        // so it travels in `to` on its own: the send is attempted directly
-        // rather than refused.
-        console.warn(
-          `[send-message] contact ${contact.id} has no dialable number and this conversation has ` +
-            `no inbound wamid to quote; sending to the raw id ${resolved.to} anyway and letting Meta judge it`
-        );
       } else {
-        // Scenario C — a bare `@handle` (or any other non-numeric display id)
-        // with nothing to quote. Meta rejects such a `to` with (#100) whether
-        // or not `context` is present, and the fabricated-digit fallback used
-        // to aim that rejection at a number invented from someone's display
-        // name. Fail HERE, loudly and locally, instead of putting a request on
-        // the wire that either bounces or lands with the wrong person.
+        // No anchor and no dialable number: an opaque id sent bare comes back
+        // as (#131009) "Recipient phone number not in allowed list". Fail
+        // HERE, loudly and locally, instead of putting a request on the wire
+        // that bounces or — worse — lands as a 200 that never delivered.
         const detail =
-          `Recipient "${resolved.to}" (source: ${resolved.source}) is not a phone number, ` +
-          `wa_id or BSUID, and conversation ${conversationId} has no inbound wamid to quote. ` +
-          `WhatsApp only accepts such a contact as a reply to one of their own messages, ` +
-          `so no HTTP request was sent to Meta.`;
+          `Recipient "${resolved.to}" (source: ${resolved.source}) has no dialable phone number and conversation ` +
+          `${conversationId} has no inbound wamid to quote, so WhatsApp cannot address it — an opaque id sent ` +
+          `without a reply anchor is refused by Meta with (#131009). ` +
+          `No HTTP request was sent to Meta.`;
         console.error(
           `[send-message] INVALID RECIPIENT for conversation ${conversationId} / contact ${contact.id}: ${detail}`,
         );

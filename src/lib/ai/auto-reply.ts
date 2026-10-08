@@ -1489,10 +1489,14 @@ export async function dispatchInboundToAiReply(
     console.log('[AUTO-REPLY] Mensaje enviado con éxito a WhatsApp:', enviado);
     replyDispatched = true;
 
-    // SISTEMA DE SEGUIMIENTOS: el bot acaba de responder — si el cliente
-    // no replica en 10 minutos, un runner enviará un recordatorio natural.
-    // Bandera explícita (igual que el auto-unblock) para que el operador
-    // pueda apagar los recordatorios sin tocar el auto-reply.
+    // SISTEMA DE SEGUIMIENTOS: el bot acaba de responder. Timer 1 es
+    // manual-only: esta llamada SIEMPRE queda en `disabled` (lo registra
+    // scheduleFollowUp en el log) y no programa nada — el recordatorio de
+    // 10 minutos se arma únicamente desde el botón "+ Programar" del
+    // banner de la conversación. La llamada se mantiene para que el log
+    // deje constancia de que el seguimiento fue considerado y suprimido
+    // por diseño. Bandera explícita (igual que el auto-unblock) para que
+    // el operador pueda apagar los recordatorios sin tocar el auto-reply.
     if (process.env.FOLLOW_UP_ENABLED !== 'false') {
       await scheduleFollowUp(db, {
         conversationId,

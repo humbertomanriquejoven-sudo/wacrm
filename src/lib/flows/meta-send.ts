@@ -25,6 +25,7 @@ import {
   isRecipientRejection,
   isDialablePhone,
   recipientAddressQueue,
+  latestInboundAnchorId,
 } from '@/lib/whatsapp/recipient-resolver'
 import type { RecipientCandidate } from '@/lib/whatsapp/recipient-resolver'
 
@@ -179,11 +180,30 @@ export async function engineSendText(
   if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-  const { to: target, sanitized } = await prepareRecipient(
+  const { to: target, sanitized, isPhone } = await prepareRecipient(
     contact,
     args.accountId,
     args.conversationId,
   )
+
+  // #131009 anchor: an opaque id (BSUID / wa_id / @lid) is only accepted by
+  // Meta as a reply to a message that contact wrote — a bare send comes back
+  // as "Recipient phone number not in allowed list" and is dropped. Resolve
+  // the thread's newest customer wamid now; with no anchor there is no way to
+  // address this contact, so fail before any HTTP request instead of letting
+  // Meta drop the message. Dialable numbers are untouched: no anchor needed.
+  let anchorMessageId: string | undefined
+  if (!isPhone) {
+    anchorMessageId =
+      (await latestInboundAnchorId(db, args.conversationId)) ?? undefined
+    if (!anchorMessageId) {
+      throw new Error(
+        `cannot send to the opaque id "${target}" for conversation ${args.conversationId}: ` +
+          `the thread has no inbound wamid to quote, so WhatsApp cannot address it (#131009 guard) — ` +
+          `no HTTP request was sent`,
+      )
+    }
+  }
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
@@ -324,11 +344,30 @@ export async function engineSendAiReply(
   if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-  const { to: target, sanitized } = await prepareRecipient(
+  const { to: target, sanitized, isPhone } = await prepareRecipient(
     contact,
     args.accountId,
     args.conversationId,
   )
+
+  // #131009 anchor: an opaque id is deliverable only as a reply to the
+  // contact's own message. `composeMessageId` (the inbound being answered)
+  // is the natural anchor; without one, fall back to the thread's newest
+  // customer wamid. No anchor + opaque destination = no addressable
+  // recipient: refuse before the first fragment rather than fire a request
+  // Meta drops. Dialable numbers need no anchor and stay untouched.
+  let anchorMessageId = args.composeMessageId
+  if (!isPhone && !anchorMessageId) {
+    anchorMessageId =
+      (await latestInboundAnchorId(db, args.conversationId)) ?? undefined
+  }
+  if (!isPhone && !anchorMessageId) {
+    throw new Error(
+      `cannot reply to the opaque id "${target}" for conversation ${args.conversationId}: ` +
+        `the thread has no inbound wamid to quote, so WhatsApp cannot address it (#131009 guard) — ` +
+        `no HTTP request was sent`,
+    )
+  }
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
@@ -388,14 +427,13 @@ export async function engineSendAiReply(
         accessToken,
         to: phone,
         text: fragments[i],
-        // Quote the inbound message. This is what makes the reply deliverable
-        // to a contact we cannot address directly: a sender known only by a
-        // `@user` / `@lid` display id, or any id Cloud API will not accept in
-        // `to`, is reachable ONLY as a context-anchored reply on their wamid.
-        // Previously it was threaded through purely to refresh the typing
-        // indicator and never reached the payload, so every such reply was
-        // silently dropped by Meta despite a 200.
-        contextMessageId: args.composeMessageId,
+        // Quote the contact's own inbound message. For an opaque id
+        // (`@user` / `@lid` / BSUID) this is not optional: Meta accepts such
+        // a destination only as a context-anchored reply on their wamid, and
+        // a bare send comes back as (#131009) "Recipient phone number not in
+        // allowed list". `anchorMessageId` prefers the message being answered
+        // and falls back to the thread's newest customer wamid.
+        contextMessageId: anchorMessageId,
       })
       return r.messageId
     }

@@ -1,8 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { supabaseAdmin } from '@/lib/ai/admin-client'
 import { sendMessageToConversation } from '@/lib/whatsapp/send-message'
-import { cleanRecipientAddress, getRecipientAddress } from '@/lib/whatsapp/meta-api'
-import { isPlaceholderValue } from '@/lib/whatsapp/phone-utils'
+import { resolveRecipient } from '@/lib/whatsapp/recipient-resolver'
 import { loadAiConfig } from '@/lib/ai/config'
 import { generateReply, stripInternalReasoning } from '@/lib/ai/generate'
 import { buildConversationContext } from '@/lib/ai/context'
@@ -253,19 +252,24 @@ export async function resetResponseWaitOnInbound(
 
 /**
  * ============================================================
- * TIMED AUTO FOLLOW-UPS — 10 minutes AND 24 hours, once per stage.
+ * TIMED REMINDERS — 10 minutes AND 24 hours, once per stage.
  * ============================================================
- * When the auto-reply answers an inbound, `scheduleFollowUp` stores a
- * `10m` row that is due 10 minutes later. A runner (`runDueFollowUps`)
- * checks the queue on a cadence and, for each due row, applies the
- * ANTI-RACE guard: the customer must NOT have written AFTER the reminder
- * was queued. That check is time-aware (`created_at` comparison) so a
- * manual timer scheduled from the inbox still fires even though the
- * customer's message is the last one. It then reads that conversation's
- * own transcript, generates a natural follow-up with the account's AI
- * provider, and sends it through the SAME core the inbox uses for a
- * manual message (`sendMessageToConversation`), which resolves the
- * destination dynamically from the conversation's contact.
+ * Timer 1 is MANUAL-ONLY: a row is stored EXCLUSIVELY from the inbox
+ * ("+ Programar" and the related schedule actions) through
+ * `scheduleManualFollowUp`. `scheduleFollowUp` — the automatic entry
+ * point the AI auto-reply and the 10m → 24h escalation call — refuses
+ * without `force`, so an inbound message never arms "Seguimiento
+ * automático" (it arms "Esperar respuesta", Timer 2, instead). The
+ * runner (`runDueFollowUps`) checks the queue on a cadence and, for
+ * each due row, applies the ANTI-RACE guard: the customer must NOT
+ * have written AFTER the reminder was queued. That check is
+ * time-aware (`created_at` comparison) so a manual timer scheduled
+ * from the inbox still fires even though the customer's message is
+ * the last one. It then reads that conversation's own transcript,
+ * generates a natural follow-up with the account's AI provider, and
+ * sends it through the SAME core the inbox uses for a manual message
+ * (`sendMessageToConversation`), which resolves the destination
+ * dynamically from the conversation's contact.
  *
  * The runner is triggered by BOTH (a) the `/api/cron/follow-ups` (or
  * legacy `/api/whatsapp/follow-ups/cron`) endpoint for external cron
@@ -276,12 +280,12 @@ export async function resetResponseWaitOnInbound(
  * `FOLLOW_UP_WORKER_INTERVAL_SECONDS`. The frontend countdown is
  * display-only and never triggers a send.
  *
- * After a 10m reminder is delivered, the runner schedules the second
- * stage: a `24h` reminder. The hard rule is ONE historical follow-up per
- * contact PER TYPE — once a contact has a `completed`/`no_response` row
- * for a given type, that type is never scheduled again. So a customer is
- * chased at most twice (10 minutes, then a day later), and only if they
- * stayed silent.
+ * The second stage (a `24h` reminder) follows the same manual-only
+ * rule: it is armed from the inbox, never queued automatically after a
+ * 10m fires. The hard rule is ONE historical follow-up per contact PER
+ * TYPE — once a contact has a `completed`/`no_response` row for a
+ * given type, that type is never scheduled again, so each stage can
+ * only fire once per contact.
  *
  * Kill switches, checked in order: `FOLLOW_UP_ENABLED=false` (process),
  * `ai_configs.follow_up_enabled` (account), and
@@ -312,6 +316,18 @@ export function followUpDelayMs(type: FollowUpType): number {
 }
 
 /**
+ * The ONLY values the `follow_ups.type` CHECK accepts — the two reminder
+ * stages. Enforced inside the scheduling functions (the last code before an
+ * INSERT/UPDATE writes the column) so a caller that forwards anything else —
+ * the legacy `'follow_up'` action name, a typo, an unmigrated client — is
+ * refused with a typed reason instead of dying on the constraint and
+ * reporting a generic error.
+ */
+export function isStrictFollowUpType(value: unknown): value is FollowUpType {
+  return value === '10m' || value === '24h'
+}
+
+/**
  * Terminal states that permanently close a contact's budget FOR A TYPE.
  * Once a row in one of these states exists for a type, `scheduleFollowUp`
  * refuses to schedule that type again.
@@ -328,6 +344,7 @@ export interface ScheduleFollowUpResult {
     | 'already_followed_up'
     | 'duplicate_pending'
     | 'disabled'
+    | 'invalid_type'
     | 'error'
   id: string | null
 }
@@ -434,6 +451,16 @@ export async function scheduleFollowUp(
   const type: FollowUpType = params.type ?? '10m'
   const delayMs = params.delayMs ?? followUpDelayMs(type)
   const now = params.now ?? new Date()
+
+  // `follow_ups.type` only accepts '10m' | '24h'. A non-stage value would
+  // die on the CHECK constraint deep inside the INSERT — refuse here with
+  // the exact offending value instead.
+  if (params.type !== undefined && !isStrictFollowUpType(params.type)) {
+    console.error(
+      `[follow-up] INVALID TYPE "${String(params.type)}" for conversation ${conversationId} — refusing to schedule; follow_ups.type only accepts '10m' | '24h'.`,
+    )
+    return { scheduled: false, reason: 'invalid_type', id: null }
+  }
 
   try {
     // TIMER 1 IS MANUAL-ONLY: it may be armed EXCLUSIVELY by the inbox
@@ -625,6 +652,16 @@ export async function scheduleManualFollowUp(
   const delayMs = params.delayMs ?? followUpDelayMs(type)
   const now = params.now ?? new Date()
   const executeAt = new Date(now.getTime() + delayMs).toISOString()
+
+  // Same strict gate as `scheduleFollowUp`: this is the endpoint-backed
+  // write ("+ Programar"), and a non-stage value must never reach the
+  // `follow_ups.type` CHECK.
+  if (params.type !== undefined && !isStrictFollowUpType(params.type)) {
+    console.error(
+      `[follow-up] INVALID TYPE "${String(params.type)}" for conversation ${conversationId} — refusing to schedule; follow_ups.type only accepts '10m' | '24h'.`,
+    )
+    return { scheduled: false, reason: 'invalid_type', id: null }
+  }
 
   try {
     // Reuse the single pending row for this conversation, if any.
@@ -1139,22 +1176,24 @@ export async function runDueFollowUps(
         continue
       }
 
-      // UNIFIED DESTINATION — the same getRecipientAddress a manual inbox
-      // send and the bot auto-reply walk through: a valid `phone` wins (with
-      // non-numeric characters stripped); when `phone` is `'unknown'`/empty
-      // the `wa_id` / `recipient_id` Meta persisted on the contact row kick
-      // in. Resolve FIRST so a failed delivery's log carries the exact
-      // address this send was aimed at, and fail fast when there is
-      // genuinely nothing Meta could route to. A DB hiccup reading the
-      // contact is fail-open: the send core re-resolves at dispatch time
-      // anyway. The username/@handle last-resort stays available to the
-      // core, so we only close the row early when it holds NO phone /
-      // wa_id / recipient_id AND no username either.
+      // UNIFIED DESTINATION — the SAME `resolveRecipient` ladder the send
+      // core walks at dispatch time (manual inbox send, bot auto-reply and
+      // these timers): dialable `phone` → a number recovered from this
+      // contact's OWN thread → `wa_id` → `wa_user_id` (BSUID) →
+      // `recipient_id` → `@username`. Resolve FIRST so a failed delivery's
+      // log carries the exact address this send was aimed at, and fail fast
+      // when there is genuinely nothing Meta could route to. A DB hiccup
+      // reading the contact is fail-open: the send core re-resolves at
+      // dispatch time anyway. With the ladder applied here, an empty `to`
+      // is exactly the condition under which the core throws
+      // `InvalidRecipientError`, so closing the row early now matches what
+      // dispatch itself would have done — it can no longer close a row the
+      // core was able to deliver.
       let destination: string | null = null
       try {
         const { data: contact, error: contactErr } = await client
           .from('contacts')
-          .select('phone, wa_id, recipient_id, username')
+          .select('id, phone, wa_id, wa_user_id, recipient_id, username')
           .eq('id', contactId)
           .maybeSingle()
         if (contactErr) {
@@ -1163,24 +1202,20 @@ export async function runDueFollowUps(
             contactErr.message,
           )
         } else if (contact) {
-          destination = getRecipientAddress(contact)
-          const usernameBare = cleanRecipientAddress(contact?.username ?? '')
+          destination =
+            (await resolveRecipient(contact, accountId, conversationId)).to || null
           if (destination) {
             console.log(
-              `[follow-up] destination for conversation ${conversationId} resolved via getRecipientAddress: ${destination}.`,
+              `[follow-up] destination for conversation ${conversationId} resolved via resolveRecipient: ${destination}.`,
             )
             console.log(`[TIMER RECIPIENT] Target phone resolved: ${destination}`)
             console.log(`[TIMER RECIPIENT RESOLVED] Target: ${destination}`)
             console.log(
               `[TIMER PARAMETERS] Phone: ${contact.phone ?? 'n/a'}, RecipientID: ${contact.recipient_id ?? 'n/a'}`,
             )
-          } else if (usernameBare && !isPlaceholderValue(usernameBare)) {
-            console.warn(
-              `[follow-up] conversation ${conversationId} has no phone/wa_id/recipient_id — leaving the username/@handle last resort to the send core.`,
-            )
           } else {
             console.warn(
-              `[follow-up] conversation ${conversationId} has NO resolvable destination (no phone, wa_id, recipient_id or username) — closing the timer so it is never retried.`,
+              `[follow-up] conversation ${conversationId} has NO resolvable destination (resolveRecipient found no phone, wa_id, wa_user_id, recipient_id or username) — closing the timer so it is never retried.`,
             )
             const { error: noAddrErr } = await client
               .from('follow_ups')
@@ -1304,7 +1339,7 @@ export async function runDueFollowUps(
         )
       } catch (err) {
         console.error(
-          `[follow-up] could not send the follow-up for conversation ${conversationId} (destination resolved via getRecipientAddress: ${destination ?? 'none'}):`,
+          `[follow-up] could not send the follow-up for conversation ${conversationId} (destination resolved via resolveRecipient: ${destination ?? 'none'}):`,
           err instanceof Error ? err.message : err,
         )
         const metaErr =
@@ -1348,9 +1383,12 @@ export async function runDueFollowUps(
         `[follow-up] follow-up ${id} completed — reminder delivered for conversation ${conversationId}.`,
       )
 
-      // A delivered 10-minute reminder earns the contact ONE more chance,
-      // a day later. The per-type historic rule means the just-completed
-      // 10m doesn't block the 24h, and a silent 24h never triggers a third.
+      // 10m → 24h second stage. Timer 1 is manual-only (see the
+      // scheduleFollowUp doc): this non-forced call always returns
+      // reason 'disabled' and logs the skip, so the 24h stage never
+      // arms automatically — it is armed from the inbox banner. The
+      // call is kept so every 10m dispatch shows in the log that the
+      // second stage was considered and suppressed by design.
       if (type === '10m') {
         const next = await scheduleFollowUp(client, {
           conversationId,
@@ -1589,22 +1627,23 @@ export async function runDueResponseWaitTimers(
         continue
       }
 
-      // UNIFIED DESTINATION — the same getRecipientAddress used by the manual
-      // inbox send, the bot auto-reply and the follow-up runner: a valid
-      // `phone` wins (non-numeric characters stripped); when `phone` is
-      // `'unknown'`/empty the `wa_id` / `recipient_id` Meta persisted on the
-      // contact row kick in. Resolve FIRST so a failed nudge's log carries
-      // the exact address it was aimed at, and fail fast when there is
-      // genuinely nothing Meta could route to. A DB hiccup reading the
+      // UNIFIED DESTINATION — the SAME `resolveRecipient` ladder the send
+      // core walks at dispatch time (manual inbox send, bot auto-reply and
+      // these timers): dialable `phone` → a number recovered from this
+      // contact's OWN thread → `wa_id` → `wa_user_id` (BSUID) →
+      // `recipient_id` → `@username`. Resolve FIRST so a failed nudge's log
+      // carries the exact address it was aimed at, and fail fast when there
+      // is genuinely nothing Meta could route to. A DB hiccup reading the
       // contact is fail-open: the send core re-resolves at dispatch time
-      // anyway, and the username/@handle last-resort stays available to it —
-      // we only close the row early when it holds NO phone / wa_id /
-      // recipient_id AND no username either.
+      // anyway. With the ladder applied here, an empty `to` is exactly the
+      // condition under which the core throws `InvalidRecipientError`, so
+      // closing the row early now matches what dispatch itself would have
+      // done — it can no longer close a timer the core was able to deliver.
       let destination: string | null = null
       try {
         const { data: contact, error: contactErr } = await client
           .from('contacts')
-          .select('phone, wa_id, recipient_id, username')
+          .select('id, phone, wa_id, wa_user_id, recipient_id, username')
           .eq('id', contactId)
           .maybeSingle()
         if (contactErr) {
@@ -1613,24 +1652,20 @@ export async function runDueResponseWaitTimers(
             contactErr.message,
           )
         } else if (contact) {
-          destination = getRecipientAddress(contact)
-          const usernameBare = cleanRecipientAddress(contact?.username ?? '')
+          destination =
+            (await resolveRecipient(contact, accountId, conversationId)).to || null
           if (destination) {
             console.log(
-              `[response-wait] destination for conversation ${conversationId} resolved via getRecipientAddress: ${destination}.`,
+              `[response-wait] destination for conversation ${conversationId} resolved via resolveRecipient: ${destination}.`,
             )
             console.log(`[TIMER RECIPIENT] Target phone resolved: ${destination}`)
             console.log(`[TIMER RECIPIENT RESOLVED] Target: ${destination}`)
             console.log(
               `[TIMER PARAMETERS] Phone: ${contact.phone ?? 'n/a'}, RecipientID: ${contact.recipient_id ?? 'n/a'}`,
             )
-          } else if (usernameBare && !isPlaceholderValue(usernameBare)) {
-            console.warn(
-              `[response-wait] conversation ${conversationId} has no phone/wa_id/recipient_id — leaving the username/@handle last resort to the send core.`,
-            )
           } else {
             console.warn(
-              `[response-wait] conversation ${conversationId} has NO resolvable destination (no phone, wa_id, recipient_id or username) — closing the timer so it is never retried.`,
+              `[response-wait] conversation ${conversationId} has NO resolvable destination (resolveRecipient found no phone, wa_id, wa_user_id, recipient_id or username) — closing the timer so it is never retried.`,
             )
             const { error: noAddrErr } = await client
               .from('response_wait_timers')
@@ -1746,7 +1781,7 @@ export async function runDueResponseWaitTimers(
         )
       } catch (err) {
         console.error(
-          `[response-wait] could not send the follow-up for conversation ${conversationId} (destination resolved via getRecipientAddress: ${destination ?? 'none'}):`,
+          `[response-wait] could not send the follow-up for conversation ${conversationId} (destination resolved via resolveRecipient: ${destination ?? 'none'}):`,
           err instanceof Error ? err.message : err,
         )
         const metaErr =
