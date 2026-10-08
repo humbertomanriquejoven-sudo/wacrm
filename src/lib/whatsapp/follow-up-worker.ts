@@ -1052,7 +1052,7 @@ export async function runDueFollowUps(
         `[follow-up] dispatching follow-up ${id} for conversation ${conversationId} (contact ${contactId}).`,
       )
       console.log(`[TIMER EXPIRED] Processing conversation_id: ${conversationId}`)
-      console.log(`[TIMER EXECUTE] Triggered for conversation ${conversationId}`)
+      console.log(`[TIMER 00:00 EXECUTE] Type: follow_up | Conversation: ${conversationId}`)
 
       // NO public-@handle gate: a due reminder fires for ANY registered
       // contact. The destination is resolved at send time by the shared
@@ -1170,6 +1170,7 @@ export async function runDueFollowUps(
               `[follow-up] destination for conversation ${conversationId} resolved via getRecipientAddress: ${destination}.`,
             )
             console.log(`[TIMER RECIPIENT] Target phone resolved: ${destination}`)
+            console.log(`[TIMER RECIPIENT RESOLVED] Target: ${destination}`)
             console.log(
               `[TIMER PARAMETERS] Phone: ${contact.phone ?? 'n/a'}, RecipientID: ${contact.recipient_id ?? 'n/a'}`,
             )
@@ -1293,8 +1294,9 @@ export async function runDueFollowUps(
             : null
         if (metaErr?.status && metaErr.code) {
           console.error(
-            `[META REJECTION AT 00:00]: status ${metaErr.status}, code ${metaErr.code} —`,
-            metaErr.message ?? '',
+            `[TIMER META RESPONSE ERROR] Status: ${metaErr.status} | Error: ${metaErr.code} - ${
+              metaErr.message ?? ''
+            }`,
           )
         }
         const { error: noRespErr } = await client
@@ -1472,7 +1474,7 @@ export async function runDueResponseWaitTimers(
         `[response-wait] dispatching expired timer ${id} for conversation ${conversationId} (contact ${contactId}).`,
       )
       console.log(`[TIMER EXPIRED] Processing conversation_id: ${conversationId}`)
-      console.log(`[TIMER EXECUTE] Triggered for conversation ${conversationId}`)
+      console.log(`[TIMER 00:00 EXECUTE] Type: response_wait | Conversation: ${conversationId}`)
 
       // NO public-@handle gate: a due nudge fires for ANY registered
       // contact. The destination is resolved at send time by the shared
@@ -1596,6 +1598,7 @@ export async function runDueResponseWaitTimers(
               `[response-wait] destination for conversation ${conversationId} resolved via getRecipientAddress: ${destination}.`,
             )
             console.log(`[TIMER RECIPIENT] Target phone resolved: ${destination}`)
+            console.log(`[TIMER RECIPIENT RESOLVED] Target: ${destination}`)
             console.log(
               `[TIMER PARAMETERS] Phone: ${contact.phone ?? 'n/a'}, RecipientID: ${contact.recipient_id ?? 'n/a'}`,
             )
@@ -1713,8 +1716,9 @@ export async function runDueResponseWaitTimers(
             : null
         if (metaErr?.status && metaErr.code) {
           console.error(
-            `[META REJECTION AT 00:00]: status ${metaErr.status}, code ${metaErr.code} —`,
-            metaErr.message ?? '',
+            `[TIMER META RESPONSE ERROR] Status: ${metaErr.status} | Error: ${metaErr.code} - ${
+              metaErr.message ?? ''
+            }`,
           )
         }
         const { error: noRespErr } = await client

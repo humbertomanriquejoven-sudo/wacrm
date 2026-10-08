@@ -16,6 +16,7 @@ import {
   type FollowUpType,
 } from '@/lib/whatsapp/follow-up-worker'
 import { sendMessageToConversation, SendMessageError } from '@/lib/whatsapp/send-message'
+import { getRecipientAddress } from '@/lib/whatsapp/meta-api'
 
 /**
  * CRM-facing follow-ups API — the UI companion to the runner.
@@ -339,9 +340,22 @@ export async function POST(request: Request) {
     if (action === 'process_now') {
       const now = new Date()
       const epoch = now.toISOString()
+      // Independent per-type trigger: `type` may be sent as "follow_up" or
+      // "response_wait" to force ONE queue; the default forces BOTH (the
+      // banner fires without a type and gets the same drain as the cron).
+      // Each timer type is claimed atomically and dispatched through the
+      // shared send core below — no early return can skip a due row.
+      const onlyType =
+        body.type === 'follow_up' || body.type === 'response_wait'
+          ? (body.type as 'follow_up' | 'response_wait')
+          : null
       const [follow, wait] = await Promise.all([
-        runDueFollowUps(supabaseAdmin(), now, conversationId),
-        runDueResponseWaitTimers(supabaseAdmin(), now, conversationId),
+        onlyType === 'response_wait'
+          ? Promise.resolve({ sent: 0, scanned: 0, cancelled: 0, noResponse: 0 })
+          : runDueFollowUps(supabaseAdmin(), now, conversationId),
+        onlyType === 'follow_up'
+          ? Promise.resolve({ sent: 0, scanned: 0, cancelled: 0, noResponse: 0 })
+          : runDueResponseWaitTimers(supabaseAdmin(), now, conversationId),
       ])
       console.log(
         `[follow-up] client-triggered FOCUSED sweep for conversation ${conversationId} — follow_ups: ${follow.sent}/${follow.scanned} sent (${follow.cancelled} cancelled, ${follow.noResponse} no_response), response-wait: ${wait.sent}/${wait.scanned} sent (${wait.cancelled} cancelled, ${wait.noResponse} no_response).`,
@@ -440,6 +454,21 @@ export async function POST(request: Request) {
           } | null
           if (anchor?.sender_type === 'agent' || anchor?.sender_type === 'bot') {
             try {
+              console.log(
+                `[TIMER 00:00 EXECUTE] Type: response_wait | Conversation: ${conversationId}`,
+              )
+              // Same recipient ladder the manual / bot sends use — resolved
+              // up front so the trace shows the exact delivery address.
+              let target: string | null = null
+              const { data: forcedContact } = await supabaseAdmin()
+                .from('contacts')
+                .select('phone, wa_id, recipient_id, username')
+                .eq('id', owned.conv.contact_id)
+                .maybeSingle()
+              if (forcedContact) target = getRecipientAddress(forcedContact)
+              if (target) {
+                console.log(`[TIMER RECIPIENT RESOLVED] Target: ${target}`)
+              }
               const forceText = await buildFollowUpMessage(
                 supabaseAdmin(),
                 accountId,
@@ -483,8 +512,7 @@ export async function POST(request: Request) {
                       meta_status: 500,
                     }
               console.error(
-                '[META REJECTION AT 00:00]:',
-                JSON.stringify({ ...detail, conversation_id: conversationId }),
+                `[TIMER META RESPONSE ERROR] Status: ${detail.meta_status} | Error: ${detail.code} - ${detail.message}`,
               )
               return NextResponse.json(
                 {
