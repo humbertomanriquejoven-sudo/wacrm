@@ -29,6 +29,7 @@ import {
   sendInteractiveList,
   InvalidRecipientError,
   MetaApiError,
+  cleanRecipientAddress,
   type MediaKind,
 } from '@/lib/whatsapp/meta-api';
 import {
@@ -215,6 +216,77 @@ export function validateSendMessageParams(params: {
   }
 }
 
+/**
+ * Can this address travel in Meta's `to` on its own?
+ *
+ *   A. a dialable E.164 number            → yes (`isDialablePhone`)
+ *   B. a namespaced BSUID (`CO.…`, `WAID.`, `LID.`) or a pure digit run
+ *      (a wa_id / BSUID such as `1008477715690681`) → yes
+ *   C. anything else — a bare `@handle`, a display id, `unknown` → NO: Meta
+ *      answers (#100) Invalid parameter, and the ONLY form such a contact is
+ *      reachable in is a QUOTE of one of their own inbound messages.
+ *
+ * The classification is made on the CLEANED address (`cleanRecipientAddress`
+ * drops `@user` / `@lid` suffixes and a leading `@`), so `123456@lid` and
+ * `CO.1486998326437295` classify as B while `jjuanpablo22222` classifies as C.
+ * It never invents digits — that is exactly the `toMetaTargetId('@handle')`
+ * fabrication that aimed `22222` at a stranger.
+ */
+function isNumericRecipientAddress(address: string): boolean {
+  const bare = cleanRecipientAddress(address);
+  if (!bare) return false;
+  return (
+    isDialablePhone(bare) ||
+    /^[A-Za-z]+\.[\w.-]+$/.test(bare) ||
+    /^\+?\d+$/.test(bare)
+  );
+}
+
+/**
+ * Persist a send we refused BEFORE any HTTP request, so the thread shows a
+ * real `failed` bubble instead of silently swallowing the operator's message.
+ * Best-effort by design: a failure to record the failure must never mask the
+ * original cause (it is logged and swallowed), exactly like the bot path's
+ * `recordFailedSend`.
+ */
+async function recordSendFailure(
+  db: SupabaseClient,
+  args: {
+    conversationId: string;
+    senderType: 'agent' | 'bot';
+    messageType: string;
+    contentText: string | null;
+    mediaUrl: string | null;
+    errorDetail: string;
+  }
+): Promise<void> {
+  try {
+    const { error } = await db.from('messages').insert({
+      conversation_id: args.conversationId,
+      sender_type: args.senderType,
+      content_type: args.messageType,
+      content_text: args.contentText,
+      media_url: args.mediaUrl,
+      status: 'failed',
+      message_id: null,
+      error_detail: args.errorDetail,
+    });
+    if (error) {
+      console.error(
+        '[send-message] could not record the refused send:',
+        error.message,
+        error.code ?? '',
+        error.details ?? ''
+      );
+    }
+  } catch (err) {
+    console.error(
+      '[send-message] could not record the refused send:',
+      err instanceof Error ? err.message : err
+    );
+  }
+}
+
 export async function sendMessageToConversation(
   db: SupabaseClient,
   accountId: string,
@@ -359,11 +431,38 @@ export async function sendMessageToConversation(
           `[send-message] contact ${contact.id} is addressed by an opaque id (${resolved.source}); ` +
             `anchoring the send to inbound message ${contextMessageId} so WhatsApp accepts it`
         );
-      } else {
+      } else if (isNumericRecipientAddress(resolved.to)) {
+        // Scenario B — a wa_id / BSUID / namespaced id. It is a real Meta id,
+        // so it travels in `to` on its own: the send is attempted directly
+        // rather than refused.
         console.warn(
           `[send-message] contact ${contact.id} has no dialable number and this conversation has ` +
-            `no inbound wamid to quote; the send may be rejected by WhatsApp`
+            `no inbound wamid to quote; sending to the raw id ${resolved.to} anyway and letting Meta judge it`
         );
+      } else {
+        // Scenario C — a bare `@handle` (or any other non-numeric display id)
+        // with nothing to quote. Meta rejects such a `to` with (#100) whether
+        // or not `context` is present, and the fabricated-digit fallback used
+        // to aim that rejection at a number invented from someone's display
+        // name. Fail HERE, loudly and locally, instead of putting a request on
+        // the wire that either bounces or lands with the wrong person.
+        const detail =
+          `Recipient "${resolved.to}" (source: ${resolved.source}) is not a phone number, ` +
+          `wa_id or BSUID, and conversation ${conversationId} has no inbound wamid to quote. ` +
+          `WhatsApp only accepts such a contact as a reply to one of their own messages, ` +
+          `so no HTTP request was sent to Meta.`;
+        console.error(
+          `[send-message] INVALID RECIPIENT for conversation ${conversationId} / contact ${contact.id}: ${detail}`,
+        );
+        await recordSendFailure(db, {
+          conversationId,
+          senderType: params.senderType ?? 'agent',
+          messageType,
+          contentText: contentText ?? null,
+          mediaUrl: mediaUrl || null,
+          errorDetail: detail,
+        });
+        throw new SendMessageError('invalid_recipient', detail, 422);
       }
     }
   }

@@ -12,16 +12,54 @@ import {
   cancelResponseWaitTimers,
   runDueFollowUps,
   runDueResponseWaitTimers,
-  buildFollowUpMessage,
-  GENERIC_REMINDER,
   type FollowUpType,
+  type RunFollowUpsResult,
+  type RunResponseWaitResult,
 } from '@/lib/whatsapp/follow-up-worker'
-import { sendMessageToConversation, SendMessageError } from '@/lib/whatsapp/send-message'
 
 type Ctx = Awaited<ReturnType<typeof getCurrentAccount>>
 
 function isMissingColumnError(message: string): boolean {
   return /column .* does not exist|42703|PGRST204|schema cache/i.test(message)
+}
+
+/**
+ * The reminder stages the `follow_ups.type` CHECK accepts, in the order a
+ * conversation walks them. Anything else — most importantly the legacy
+ * `'follow_up'` action name the `schedule` action used to forward verbatim —
+ * is not a stage and must never reach an INSERT (it used to die on the
+ * constraint and report success anyway).
+ */
+const FOLLOW_UP_TYPES: FollowUpType[] = ['10m', '24h']
+
+/**
+ * Map an arbitrary delay onto the stage that owns it. A manual "+ Programar"
+ * takes ANY number of minutes from the inbox, so the stage is derived from
+ * the delay: everything under a day is the first (10-minute) reminder, a day
+ * or more is the second (24-hour) one.
+ */
+function followUpTypeForDelay(delayMinutes: number): FollowUpType {
+  return delayMinutes >= 24 * 60 ? '24h' : '10m'
+}
+
+/** Clamp a caller-supplied minute count to the range the schema supports. */
+function clampDelayMinutes(value: unknown, fallback: number): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback
+  return Math.max(1, Math.min(10080, Math.floor(parsed)))
+}
+
+/**
+ * Strict boolean parser for the two inbox toggles. A body that carries no
+ * `enabled` flag (or one that is neither a boolean nor 'true'/'false') is a
+ * malformed request, not "off": it is rejected with a 400 so a typo can never
+ * flip a switch or cancel a queue by accident.
+ */
+function parseToggle(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value
+  if (value === 'true') return true
+  if (value === 'false') return false
+  return null
 }
 
 interface ResolvedConversation {
@@ -289,11 +327,19 @@ export async function POST(request: Request) {
     }
 
     if (action === 'cancel') {
-      await supabaseAdmin()
+      // Both `pending` (queued) and `processing` (claimed by a sweep) are
+      // cleared: an explicit cancel must win over an in-flight dispatch.
+      const { error: cancelErr } = await supabaseAdmin()
         .from('follow_ups')
         .update({ status: 'cancelled' })
         .eq('conversation_id', conversationId)
-        .eq('status', 'pending')
+        .in('status', ['pending', 'processing'])
+      if (cancelErr) {
+        return NextResponse.json(
+          { success: false, error: cancelErr.message },
+          { status: 500 },
+        )
+      }
       return NextResponse.json({ success: true })
     }
 
@@ -331,42 +377,131 @@ export async function POST(request: Request) {
     }
 
     if (action === 'schedule') {
-      const delayMinutes = Math.max(1, Math.min(10080, Number((body as Record<string, unknown>).delay_minutes) || 10))
-      const type = ((body as Record<string, unknown>).type as FollowUpType) || 'follow_up'
-      const id = await scheduleManualFollowUp(supabaseAdmin(), {
+      const delayMinutes = clampDelayMinutes(
+        (body as Record<string, unknown>).delay_minutes,
+        10,
+      )
+
+      // The per-chat switch is authoritative for MANUAL scheduling too: the
+      // agent turned "Seguimiento automático" OFF for this thread, so a
+      // "+ Programar" must refuse instead of queueing a reminder the runner
+      // would later cancel. The account-wide/automatic kill switches stay
+      // bypassed — this is a hand-timed reminder.
+      if (owned.conv.follow_up_enabled === false) {
+        console.warn(
+          `[follow-up] schedule refused for conversation ${conversationId}: the per-chat switch is OFF.`,
+        )
+        return NextResponse.json(
+          {
+            success: false,
+            scheduled: false,
+            id: null,
+            reason: 'disabled',
+            error:
+              'Seguimiento automático está desactivado para esta conversación. Actívalo para programar un recordatorio.',
+          },
+          { status: 400 },
+        )
+      }
+
+      // The stage MUST be one of the values `follow_ups.type` accepts.
+      // Forwarding the raw action name here ('follow_up') is what made every
+      // manual schedule fail its CHECK while the route still answered
+      // `{ success: true }`.
+      const type = followUpTypeForDelay(delayMinutes)
+      const result = await scheduleManualFollowUp(supabaseAdmin(), {
         conversationId,
         contactId: owned.conv.contact_id,
         accountId,
         delayMs: delayMinutes * 60 * 1000,
         type,
       })
-      return NextResponse.json({ success: true, id })
+
+      if (!result?.scheduled) {
+        const reason = result?.reason ?? 'error'
+        console.error(
+          `[follow-up] schedule FAILED for conversation ${conversationId} (type=${type}, delay=${delayMinutes}m): ${reason}`,
+        )
+        return NextResponse.json(
+          {
+            success: false,
+            scheduled: false,
+            id: null,
+            reason,
+            error: `No se pudo programar el recordatorio (${reason}). Revisa los registros del servidor.`,
+          },
+          { status: 400 },
+        )
+      }
+
+      console.log(
+        `[follow-up] ${userId} scheduled a manual ${type} reminder for conversation ${conversationId} in ${delayMinutes} min (row ${result.id}).`,
+      )
+      return NextResponse.json({
+        success: true,
+        scheduled: true,
+        id: result.id,
+        type,
+        delay_minutes: delayMinutes,
+      })
     }
 
     if (action === 'set_enabled') {
-      const enabled = (body as Record<string, unknown>).enabled === true || (body as Record<string, unknown>).enabled === 'true'
-      await supabaseAdmin()
+      const enabled = parseToggle((body as Record<string, unknown>).enabled)
+      if (enabled === null) {
+        return NextResponse.json(
+          { success: false, error: 'Falta un valor booleano para `enabled`' },
+          { status: 400 },
+        )
+      }
+      const { error: toggleErr } = await supabaseAdmin()
         .from('conversations')
         .update({ follow_up_enabled: enabled })
         .eq('id', conversationId)
         .eq('account_id', accountId)
+      if (toggleErr) {
+        return NextResponse.json(
+          { success: false, error: toggleErr.message },
+          { status: 500 },
+        )
+      }
       if (!enabled) {
-        await supabaseAdmin()
+        // `processing` included: a switch OFF must beat a sweep that already
+        // claimed the row, or the reminder still goes out mid-dispatch.
+        const { error: queueErr } = await supabaseAdmin()
           .from('follow_ups')
           .update({ status: 'cancelled' })
           .eq('conversation_id', conversationId)
-          .eq('status', 'pending')
+          .in('status', ['pending', 'processing'])
+        if (queueErr) {
+          console.error(
+            `[follow-up] could not clear the queue for conversation ${conversationId} on switch OFF:`,
+            queueErr.message,
+          )
+        }
       }
       return NextResponse.json({ success: true, follow_up_enabled: enabled })
     }
 
     if (action === 'wait_enabled') {
-      const enabled = (body as Record<string, unknown>).enabled === true || (body as Record<string, unknown>).enabled === 'true'
-      await supabaseAdmin()
+      const enabled = parseToggle((body as Record<string, unknown>).enabled)
+      if (enabled === null) {
+        return NextResponse.json(
+          { success: false, error: 'Falta un valor booleano para `enabled`' },
+          { status: 400 },
+        )
+      }
+      const { error: waitToggleErr } = await supabaseAdmin()
         .from('conversations')
         .update({ response_wait_enabled: enabled })
         .eq('id', conversationId)
         .eq('account_id', accountId)
+      if (waitToggleErr) {
+        return NextResponse.json(
+          { success: false, error: waitToggleErr.message },
+          { status: 500 },
+        )
+      }
       if (!enabled) {
         await cancelResponseWaitTimers(supabaseAdmin(), conversationId, 'manual')
       }
@@ -374,10 +509,23 @@ export async function POST(request: Request) {
     }
 
     if (action === 'wait_schedule' || action === 'wait_reset' || action === 'reset') {
-      const delayMinutes = Math.max(
-        1,
-        Math.min(10080, Number((body as Record<string, unknown>).delay_minutes) || ARM_DEFAULT_MINUTES),
-      )
+      // The countdown length is REQUIRED: defaulting a missing value to 10
+      // minutes used to arm a timer the agent never asked for, and a malformed
+      // body came back 200. Reject it so the box's own validation is the only
+      // source of truth.
+      const rawDelay = (body as Record<string, unknown>).delay_minutes
+      const parsedDelay = Number(rawDelay)
+      if (rawDelay === undefined || rawDelay === null || rawDelay === '' ||
+          !Number.isFinite(parsedDelay) || parsedDelay <= 0) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: 'delay_minutes es obligatorio y debe ser un número de minutos mayor que 0',
+          },
+          { status: 400 },
+        )
+      }
+      const delayMinutes = clampDelayMinutes(rawDelay, ARM_DEFAULT_MINUTES)
       if (action !== 'wait_schedule') {
         await cancelResponseWaitTimers(supabaseAdmin(), conversationId, 'manual')
       }
@@ -423,90 +571,73 @@ export async function POST(request: Request) {
     }
 
     if (action === 'process_now') {
+      // The 00:00 dispatcher. The inbox clock decides a row is due and asks
+      // the backend to drain THIS conversation — the same idempotent worker
+      // the cron and the in-process interval run, scoped to one thread.
+      //
+      // It used to build a generic text and force-send it FIRST, then invoke
+      // the runners with an argument order they do not accept (the calls threw
+      // immediately). That produced two bugs at once: a duplicate message that
+      // no timer had asked for, and a sweep that never actually ran. Now the
+      // runners own the whole decision — they claim the row atomically, run
+      // the anti-race check, generate the copy and send through
+      // `sendMessageToConversation`, exactly as the cron does.
       const admin = supabaseAdmin()
-      let forceText: string = GENERIC_REMINDER
+      const now = new Date()
 
-      const buildWithTimeout = async (): Promise<string> => {
-        const timeoutMs = 10000
-        const buildPromise = buildFollowUpMessage(admin, accountId, conversationId).catch(
-          (err) => {
-            console.error('[FOLLOW-UP AI FALLBACK]', err instanceof Error ? err.message : err)
-            return null
-          },
+      let followUps: RunFollowUpsResult = {
+        scanned: 0,
+        sent: 0,
+        cancelled: 0,
+        noResponse: 0,
+        scheduled: 0,
+      }
+      let responseWait: RunResponseWaitResult = {
+        scanned: 0,
+        sent: 0,
+        cancelled: 0,
+        noResponse: 0,
+      }
+
+      try {
+        followUps = await runDueFollowUps(admin, now, conversationId)
+      } catch (err) {
+        console.error(
+          `[process_now] runDueFollowUps threw for conversation ${conversationId}:`,
+          err,
         )
-        const timeoutPromise = new Promise<null>((resolve) => {
-          setTimeout(() => resolve(null), timeoutMs)
-        })
-        const built = await Promise.race([buildPromise, timeoutPromise])
-        return built || GENERIC_REMINDER
       }
-
       try {
-        forceText = await buildWithTimeout()
+        responseWait = await runDueResponseWaitTimers(admin, now, conversationId)
       } catch (err) {
-        console.error('[FOLLOW-UP AI FALLBACK]', err instanceof Error ? err.message : err)
-        forceText = GENERIC_REMINDER
-      }
-
-      let forcedSent = false
-      try {
-        const convRes = await admin
-          .from('conversations')
-          .select('id, account_id, contact_id')
-          .eq('id', conversationId)
-          .maybeSingle()
-        if (convRes.error) throw convRes.error
-        if (!convRes.data) throw new Error('Conversation not found')
-
-        const contactRes = await admin
-          .from('contacts')
-          .select(
-            'id, phone, wa_id, wa_user_id, recipient_id, username, name, profile_name, display_name',
-          )
-          .eq('id', (convRes.data as Record<string, unknown>).contact_id)
-          .maybeSingle()
-        if (contactRes.error) throw contactRes.error
-        if (contactRes.data) {
-          await (sendMessageToConversation as unknown as (arg: unknown) => Promise<unknown>)({
-            supabase: admin,
-            accountId,
-            conversationId,
-            text: forceText,
-            contact: contactRes.data as unknown,
-            autoArm: false,
-          })
-          forcedSent = true
-        }
-      } catch (err) {
-        if (err instanceof SendMessageError) {
-          console.error('[TIMER FORCE-SEND ERROR]', err.code, err.message)
-          return NextResponse.json(
-            { success: false, error: err.message, code: err.code },
-            { status: 400 },
-          )
-        }
-        console.error('[TIMER FORCE-SEND ERROR]', err)
-        return NextResponse.json(
-          { success: false, error: err instanceof Error ? err.message : String(err) },
-          { status: 500 },
+        console.error(
+          `[process_now] runDueResponseWaitTimers threw for conversation ${conversationId}:`,
+          err,
         )
       }
 
-      try {
-        await (runDueFollowUps as unknown as (a: string, s: unknown) => Promise<void>)(accountId, admin)
-      } catch (err) {
-        console.error('[process_now runDueFollowUps]', err)
+      const sent = {
+        follow_ups: followUps.sent,
+        response_wait: responseWait.sent,
       }
-      try {
-        await (runDueResponseWaitTimers as unknown as (a: string, s: unknown) => Promise<void>)(accountId, admin)
-      } catch (err) {
-        console.error('[process_now runDueResponseWaitTimers]', err)
+      console.log(
+        `[process_now] conversation ${conversationId} swept — followUps: scanned=${followUps.scanned} sent=${followUps.sent} cancelled=${followUps.cancelled} noResponse=${followUps.noResponse} | responseWait: scanned=${responseWait.scanned} sent=${responseWait.sent} cancelled=${responseWait.cancelled} noResponse=${responseWait.noResponse}`,
+      )
+      if (sent.follow_ups + sent.response_wait === 0) {
+        // Not an error on its own (the row may already be claimed, or the
+        // anti-race check may have cancelled it), but it must be visible:
+        // a "successful" sweep that delivered nothing is exactly the kind of
+        // silent failure this endpoint exists to surface.
+        console.warn(
+          `[process_now] conversation ${conversationId}: sweep executed but nothing was delivered to this conversation (followUps.scanned=${followUps.scanned}, responseWait.scanned=${responseWait.scanned}).`,
+        )
       }
 
       return NextResponse.json({
         success: true,
-        forced_sent: forcedSent,
-        message: forceText,
+        sent,
+        message_id: null,
+        server_now: now.toISOString(),
       })
     }
 
@@ -515,12 +646,30 @@ export async function POST(request: Request) {
       if (!id || typeof id !== 'string') {
         return NextResponse.json({ error: 'id required' }, { status: 400 })
       }
-      const type = ((body as Record<string, unknown>).type as FollowUpType) || 'follow_up'
-      await supabaseAdmin()
+      const requested = (body as Record<string, unknown>).type as FollowUpType
+      // Only a real stage may be written: the CHECK on `follow_ups.type`
+      // rejects everything else, and a rejected update used to be reported
+      // as a success.
+      if (!FOLLOW_UP_TYPES.includes(requested)) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: `type must be one of: ${FOLLOW_UP_TYPES.join(', ')}`,
+          },
+          { status: 400 },
+        )
+      }
+      const { error: typeErr } = await supabaseAdmin()
         .from('follow_ups')
-        .update({ type })
+        .update({ type: requested })
         .eq('id', id)
         .eq('conversation_id', conversationId)
+      if (typeErr) {
+        return NextResponse.json(
+          { success: false, error: typeErr.message },
+          { status: 500 },
+        )
+      }
       return NextResponse.json({ success: true })
     }
 

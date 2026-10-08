@@ -109,6 +109,16 @@ export async function scheduleResponseWaitTimer(
       .limit(1)
       .maybeSingle()
 
+    if (findErr) {
+      // A failed lookup must never be silent — it is usually the missing
+      // table (42P01 / PGRST205) reaching us before migration 064. We keep
+      // going (the INSERT below will either work or report the same cause).
+      console.error(
+        `[response-wait] could not look up an active timer for conversation ${conversationId}: ` +
+          `[code=${findErr.code ?? 'n/a'}] ${findErr.message} details=${findErr.details ?? 'n/a'}`,
+      )
+    }
+
     if (!findErr && active?.id) {
       const { error: upErr } = await db
         .from('response_wait_timers')
@@ -121,8 +131,9 @@ export async function scheduleResponseWaitTimer(
         .eq('status', 'active')
       if (upErr) {
         console.error(
-          `[response-wait] could not re-arm the timer for conversation ${conversationId}:`,
-          upErr.message,
+          `[response-wait] could not re-arm the timer for conversation ${conversationId}: ` +
+            `[code=${upErr.code ?? 'n/a'}] ${upErr.message} ` +
+            `details=${upErr.details ?? 'n/a'} hint=${upErr.hint ?? 'n/a'}`,
         )
         return { scheduled: false, reason: 'error', id: null, expires_at: null }
       }
@@ -146,9 +157,19 @@ export async function scheduleResponseWaitTimer(
       .select('id')
       .single()
     if (insErr || !data) {
+      // The timer table has shipped in migration 064 but a database that has
+      // never received it answers 42P01 / PGRST205 ("relation ... does not
+      // exist" / "Could not find the table"). Surface that shape verbatim:
+      // this used to collapse into `{ scheduled: false, reason: 'error' }`
+      // and nothing in the logs told the operator the table was missing.
+      const code = insErr?.code ?? 'n/a'
       console.error(
-        `[response-wait] could not arm a timer for conversation ${conversationId}:`,
-        insErr?.message ?? 'no row returned',
+        `[response-wait] could not arm a timer for conversation ${conversationId}: ` +
+          `[code=${code}] ${insErr?.message ?? 'no row returned'} ` +
+          `details=${insErr?.details ?? 'n/a'} hint=${insErr?.hint ?? 'n/a'}` +
+          (code === '42P01' || code === 'PGRST205'
+            ? ' — the response_wait_timers table is absent from this database; apply migration 064.'
+            : ''),
       )
       return { scheduled: false, reason: 'error', id: null, expires_at: null }
     }
@@ -261,11 +282,17 @@ export async function armResponseWaitIfIdle(
   const now = params.now ?? new Date()
   try {
     // Timer 2 ON/OFF switch gate. Missing column (066 pending) → enabled.
-    const { data: convRow } = await db
+    const { data: convRow, error: convErr } = await db
       .from('conversations')
       .select('response_wait_enabled')
       .eq('id', conversationId)
       .maybeSingle()
+    if (convErr) {
+      console.error(
+        `[response-wait] could not read the switch for conversation ${conversationId}: ` +
+          `[code=${convErr.code ?? 'n/a'}] ${convErr.message} details=${convErr.details ?? 'n/a'}`,
+      )
+    }
     const switchOn = convRow?.response_wait_enabled !== false
     if (!switchOn) {
       console.log(
@@ -274,7 +301,7 @@ export async function armResponseWaitIfIdle(
       return { scheduled: false, reason: 'disabled', id: null, expires_at: null }
     }
 
-    const { data: active } = await db
+    const { data: active, error: activeErr } = await db
       .from('response_wait_timers')
       .select('id, expires_at')
       .eq('conversation_id', conversationId)
@@ -282,6 +309,15 @@ export async function armResponseWaitIfIdle(
       .order('expires_at', { ascending: false })
       .limit(1)
       .maybeSingle()
+    if (activeErr) {
+      // Usually 42P01/PGRST205 — the timers table has not been created yet.
+      // Never silent: the send itself carries on, but the countdown silently
+      // does not start, and that must be diagnosable from the logs alone.
+      console.error(
+        `[response-wait] could not read active timers for conversation ${conversationId}: ` +
+          `[code=${activeErr.code ?? 'n/a'}] ${activeErr.message} details=${activeErr.details ?? 'n/a'}`,
+      )
+    }
     if (active?.id) {
       // Already counting for THIS chat — continue, never restart/duplicate.
       return {
@@ -295,13 +331,20 @@ export async function armResponseWaitIfIdle(
     // Reuse the chat's assigned value: the most recently written row
     // (any status) carries the `delay_minutes` the agent configured.
     let minutes = ARM_DEFAULT_MINUTES
-    const { data: last } = await db
+    const { data: last, error: lastErr } = await db
       .from('response_wait_timers')
       .select('delay_minutes')
       .eq('conversation_id', conversationId)
       .order('updated_at', { ascending: false })
       .limit(1)
       .maybeSingle()
+    if (lastErr) {
+      console.error(
+        `[response-wait] could not read the last delay for conversation ${conversationId} ` +
+          `(falling back to ${ARM_DEFAULT_MINUTES} min): ` +
+          `[code=${lastErr.code ?? 'n/a'}] ${lastErr.message}`,
+      )
+    }
     const lastMinutes = last?.delay_minutes
     if (typeof lastMinutes === 'number' && lastMinutes > 0 && lastMinutes <= 10080) {
       minutes = lastMinutes
@@ -323,9 +366,14 @@ export async function armResponseWaitIfIdle(
       .select('id')
       .single()
     if (insErr || !data) {
+      const code = insErr?.code ?? 'n/a'
       console.error(
-        `[response-wait] auto-arm failed for conversation ${conversationId}:`,
-        insErr?.message ?? 'no row returned',
+        `[response-wait] auto-arm failed for conversation ${conversationId}: ` +
+          `[code=${code}] ${insErr?.message ?? 'no row returned'} ` +
+          `details=${insErr?.details ?? 'n/a'} hint=${insErr?.hint ?? 'n/a'}` +
+          (code === '42P01' || code === 'PGRST205'
+            ? ' — the response_wait_timers table is absent from this database; apply migration 064.'
+            : ''),
       )
       return { scheduled: false, reason: 'error', id: null, expires_at: null }
     }

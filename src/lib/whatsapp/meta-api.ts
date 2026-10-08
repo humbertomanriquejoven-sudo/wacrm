@@ -786,15 +786,31 @@ export async function sendTextMessage(
 
   // Primary shape, per Meta's documented payload: the destination always
   // travels in `to`, carrying the numeric id with any namespace and `@`
-  // removed (`CO.1486998326437295` -> `1486998326437295`). Letters and `@`
-  // are NOT legal in `to`; Meta rejects them outright.
-  const targetId = toMetaTargetId(address)
+  // removed (`CO.1486998326437295` -> `1486998326437295`) — exactly what
+  // `canonicalToField` produces.
+  //
+  // A bare handle is deliberately NOT run through `toMetaTargetId`: that
+  // function returns only digits, so it reduced `@jjuanpablo22222` to
+  // `22222` — a number invented from someone's display name, aimed at
+  // whoever owns it. The handle is forwarded exactly as held, so Meta's
+  // (#100) (when it declines it) is a truthful statement about the contact
+  // instead of a delivery attempt addressed to a stranger.
   const addressField: Record<string, string> =
     args.recipientField === 'recipient'
       ? // Escape hatch for the alternate Meta shape (an unstripped id in
         // `recipient`). Used as a RETRY when Meta rejects the `to` form.
         { recipient: address }
-      : { to: targetId }
+      : canonicalToField(address)
+  const targetId = addressField.to || address
+  if (!targetId) {
+    // `canonicalToField` yields `{ to: '' }` only for an empty address or the
+    // `unknown` placeholder — both refused above, so this is the guard that
+    // keeps an empty `to` off the wire.
+    throw new InvalidRecipientError(
+      address,
+      'no destination is available for this contact after normalization. No HTTP request was sent.',
+    )
+  }
 
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
   const body: Record<string, unknown> = {
