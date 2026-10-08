@@ -184,8 +184,19 @@ export async function POST(request: Request) {
       // for a genuine Meta outage. The machine `code` rides along so the
       // UI can branch on the cause instead of parsing the message.
       if (err instanceof SendMessageError) {
+        // The destination cascade surfaces `diagnostic_report` + `how_to_fix`
+        // (+ Meta's verbatim body) so the operator sees which sources held
+        // what and how to repair the contact — not just a terse message.
         return NextResponse.json(
-          { error: err.message, code: err.code },
+          {
+            error: err.message,
+            code: err.code,
+            ...(err.diagnosticReport
+              ? { diagnostic_report: err.diagnosticReport }
+              : {}),
+            ...(err.howToFix ? { how_to_fix: err.howToFix } : {}),
+            ...(err.metaResponse ? { meta_response: err.metaResponse } : {}),
+          },
           { status: err.status }
         )
       }

@@ -471,17 +471,28 @@ export async function sendWithRecipientFallback<T>(args: {
   send: (to: string) => Promise<T>
   /** Persist a recovered number so the stale value stops recurring. */
   onRecovered?: (phone: string) => void | Promise<void>
+  /**
+   * The address this send starts from, when an external resolver (the
+   * destination cascade) already chose it. Without it, the queue head is
+   * resolved from the contact row by `resolveRecipient`. Provided, it skips
+   * the ladder and sends to this value FIRST — the retry queue is otherwise
+   * identical — which lets a conversational source the contact row does not
+   * carry (a `conversations.wa_id`, a channel BSUID, the last inbound
+   * `from`) become the leading destination.
+   */
+  first?: ResolvedRecipient
 }): Promise<T> {
-  const { contact, accountId, conversationId, send, onRecovered } = args
+  const { contact, accountId, conversationId, send, onRecovered, first } = args
 
-  const first = await resolveRecipient(contact, accountId, conversationId)
+  const head =
+    first ?? (await resolveRecipient(contact, accountId, conversationId))
   // A contact the ladder cannot resolve at all — no dialable number, no
   // wa_id/BSUID/recipient_id, no handle. TYPED rather than a bare Error so
   // the HTTP layer maps it to a 422 explaining the contact has no usable
   // address, instead of collapsing into a generic 502 that looks like a
   // Meta outage. Still `recipientInvalid`, so any retry/park machinery
   // downstream treats it as "this address does not work".
-  if (!first.to) {
+  if (!head.to) {
     throw new InvalidRecipientError(
       '',
       'the contact has no dialable number, wa_id, wa_user_id, recipient_id ' +
@@ -489,8 +500,8 @@ export async function sendWithRecipientFallback<T>(args: {
     )
   }
 
-  if (first.source === 'recovered' && first.isPhone && onRecovered) {
-    await Promise.resolve(onRecovered(first.to)).catch(() => undefined)
+  if (head.source === 'recovered' && head.isPhone && onRecovered) {
+    await Promise.resolve(onRecovered(head.to)).catch(() => undefined)
   }
 
   // One list, shared with the AI reply path. It used to be rebuilt inline here,
@@ -499,15 +510,15 @@ export async function sendWithRecipientFallback<T>(args: {
   const queue = await recipientAddressQueue(
     contact,
     accountId,
-    first.to,
+    head.to,
     conversationId,
     { onRecovered },
   )
   // Everything after the address we already tried.
-  const alternatives = queue.filter((to) => to !== first.to)
+  const alternatives = queue.filter((to) => to !== head.to)
 
   try {
-    return await send(first.to)
+    return await send(head.to)
   } catch (err) {
     if (!isRecipientRejection(err)) throw err
     if (alternatives.length === 0) throw err

@@ -140,7 +140,16 @@ export async function POST(request: Request) {
     );
   } catch (err) {
     if (err instanceof SendMessageError) {
-      return fail(err.code, err.message, err.status);
+      // The destination cascade surfaces `diagnostic_report` + `how_to_fix`
+      // (and Meta's verbatim body) on the send failure — pass them through
+      // so the caller can act on the cause instead of guessing.
+      return fail(err.code, err.message, err.status, undefined, {
+        ...(err.diagnosticReport
+          ? { diagnostic_report: err.diagnosticReport }
+          : {}),
+        ...(err.howToFix ? { how_to_fix: err.howToFix } : {}),
+        ...(err.metaResponse ? { meta_response: err.metaResponse } : {}),
+      });
     }
     return toApiErrorResponse(err);
   }

@@ -7,6 +7,7 @@ import {
   type SendMessageParams,
 } from './send-message';
 import { InvalidRecipientError, MetaApiError } from './meta-api';
+import { HOW_TO_FIX_DESTINATION } from './recipient-cascade';
 
 // A db that explodes if touched — these tests cover the param
 // validation that MUST short-circuit before any query runs.
@@ -204,12 +205,26 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
 const adminRead = vi.hoisted(() => ({
   inboundRows: [] as unknown[],
   contactRow: null as Record<string, unknown> | null,
+  conversationRow: null as Record<string, unknown> | null,
   persistedPhones: [] as string[],
 }));
 
 vi.mock('@/lib/flows/admin-client', () => ({
   supabaseAdmin: () => ({
     from: (table: string) => {
+      if (table === 'conversations') {
+        // The destination cascade re-reads the conversation row (S3/S4) with
+        // the service role so RLS can never hide the wamid it resolved to.
+        const read = () => ({
+          select: vi.fn(() => read()),
+          eq: vi.fn(() => read()),
+          maybeSingle: async () => ({
+            data: adminRead.conversationRow,
+            error: null,
+          }),
+        });
+        return read();
+      }
       if (table === 'messages') {
         // The service-role client serves the inbound-anchor lookups so the
         // send path is never blocked by RLS on `messages`.
@@ -269,6 +284,8 @@ function sendPathDb(
   opts?: {
     contact?: Record<string, unknown>;
     inboundRows?: unknown[];
+    /** Extra conversation fields (e.g. `wa_id`) the cascade may resolve from. */
+    conversation?: Record<string, unknown>;
     /** Row returned when the send resolves an explicit `reply_to_message_id`. */
     replyParent?: { message_id?: string | null };
   }
@@ -276,6 +293,7 @@ function sendPathDb(
   const conversation = {
     id: 'cv-1',
     contact: opts?.contact ?? { id: 'ct-1', phone: '+15551234567' },
+    ...(opts?.conversation ?? {}),
   };
   const config = {
     id: 'cfg-1',
@@ -294,6 +312,12 @@ function sendPathDb(
     id: 'ct-1',
     phone: '+15551234567',
   }) as Record<string, unknown>;
+  // Mirror the conversation embed into the service-role read the cascade uses.
+  adminRead.conversationRow = {
+    id: 'cv-1',
+    contact: opts?.contact ?? { id: 'ct-1', phone: '+15551234567' },
+    ...(opts?.conversation ?? {}),
+  };
 
   return {
     from(table: string) {
@@ -694,13 +718,12 @@ describe('sendMessageToConversation - TAREA 1: payload phone auto-persists via s
 });
 
 // ============================================================
-// VALIDACIÓN PREVENTIVA DE `to` — Meta rechaza con (#131009) cualquier
-// destinatario que sea un @handle o contenga letras. Si la escalera solo
-// pudo resolver algo así, el core DEBE responder 422 SIN gastar la llamada
-// HTTP a Meta.
+// CASCADA DE DESTINATARIO — sin número en ninguna de las cinco fuentes, el
+// core responde 422 `no_delivery_destination` con el `diagnostic_report`
+// (valor por fuente) + `how_to_fix`, SIN gastar la llamada HTTP a Meta.
 // ============================================================
-describe('sendMessageToConversation - @handle/preventive 422 (no phone, no BSUID)', () => {
-  it('never calls Meta with an @username recipient and answers 422', async () => {
+describe('sendMessageToConversation - destination cascade 422 (no phone, no BSUID, no wamid)', () => {
+  it('answers a structured 422 with diagnostic_report and how_to_fix and never calls Meta', async () => {
     adminRead.persistedPhones = [];
     const db = sendPathDb(
       [],
@@ -721,12 +744,140 @@ describe('sendMessageToConversation - @handle/preventive 422 (no phone, no BSUID
     }).catch((e: Error) => e);
 
     expect(err).toBeInstanceOf(SendMessageError);
-    expect((err as SendMessageError).status).toBe(422);
-    expect((err as SendMessageError).message).toBe(
-      'El contacto no tiene un teléfono válido guardado en la base de datos. Por favor guarda el número antes de enviar.'
+    const sendError = err as SendMessageError;
+    expect(sendError.status).toBe(422);
+    expect(sendError.code).toBe('no_delivery_destination');
+    expect(sendError.message).toBe(
+      'No fue posible determinar un destinatario válido para WhatsApp'
     );
+    // Every cascade source must be reported empty — including the metadata
+    // and the conversation-level columns that the legacy resolver never looked at.
+    expect(sendError.diagnosticReport).toEqual({
+      contacts_phone: '',
+      contacts_metadata: '',
+      conversations_wa_id: '',
+      channel_bsuid: '',
+      latest_inbound_from: '',
+    });
+    expect(sendError.howToFix).toBe(HOW_TO_FIX_DESTINATION);
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
     expect(sendTextMessage).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================
+// CASCADA: las fuentes conversacionales (3, 4, 5) que la resolución legada
+// NUNCA consultaba (solo `contacts.phone`/BSUID) sí pueden destinar el envío.
+// El primer VALIDO (>= 8 dígitos puros) gana, EN ORDEN ESTRICTO.
+// ============================================================
+describe('sendMessageToConversation - destination cascade (S3/S4/S5 conversational sources)', () => {
+  it('resolves conversations.wa_id (S3) when the contact carries no usable number', async () => {
+    const db = sendPathDb(
+      [],
+      {},
+      {
+        contact: { id: 'ct-1', phone: null },
+        conversation: { wa_id: '573155667789' },
+        inboundRows: [{ message_id: 'wamid.INBOUND' }],
+      }
+    );
+
+    await sendMessageToConversation(db, 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'Hola',
+    });
+
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: '573155667789' })
+    );
+  });
+
+  it('resolves contacts.metadata phone (S2) ahead of older sources', async () => {
+    const db = sendPathDb(
+      [],
+      {},
+      {
+        contact: {
+          id: 'ct-1',
+          phone: null,
+          metadata: { phone: '573266778890' },
+        },
+      }
+    );
+
+    await sendMessageToConversation(db, 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'Hola',
+    });
+
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: '573266778890' })
+    );
+  });
+
+  it('reports (and sends to) the last inbound from (S5) when nothing else holds a number', async () => {
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args) => {
+      logs.push(args.map(String).join(' '));
+    });
+    try {
+      adminRead.persistedPhones = [];
+      const db = sendPathDb(
+        [],
+        {},
+        {
+          contact: { id: 'ct-1', phone: null },
+          inboundRows: [{ sender_phone: '57345566778' }],
+        }
+      );
+
+      await sendMessageToConversation(db, 'acct-1', {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'Hola',
+      });
+
+      const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+      expect(sendTextMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ to: '57345566778' })
+      );
+      // S5 acts like a recovered number: the service role corrects the row.
+      expect(adminRead.persistedPhones).toContain('57345566778');
+
+      // The [INFORME_DIAGNOSTICO_DESTINATARIO] block is printed before Meta.
+      expect(logs.join('\n')).toContain('[INFORME_DIAGNOSTICO_DESTINATARIO]');
+      expect(logs.join('\n')).toContain(
+        '- DESTINATARIO FINAL RESUELTO: "57345566778"'
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('complies with strict priority: a valid contacts.phone (S1) beats a wamid stored on the conversation (S3)', async () => {
+    const db = sendPathDb(
+      [],
+      {},
+      {
+        contact: { id: 'ct-1', phone: '+573044556788' },
+        conversation: { wa_id: '573155667789' },
+      }
+    );
+
+    await sendMessageToConversation(db, 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'Hola',
+    });
+
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: '573044556788' })
+    );
   });
 });
 

@@ -108,9 +108,13 @@ export function fail(
   code: string,
   message: string,
   status: number,
-  headers?: Record<string, string>
+  headers?: Record<string, string>,
+  extra?: Record<string, unknown>
 ): NextResponse {
-  return NextResponse.json({ error: { code, message } }, { status, headers });
+  return NextResponse.json(
+    { error: { code, message, ...extra } },
+    { status, headers }
+  );
 }
 
 /**

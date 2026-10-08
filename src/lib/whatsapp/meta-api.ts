@@ -59,16 +59,24 @@ export class MetaApiError extends Error {
   readonly code: number | null
   readonly subcode: number | null
   readonly recipientInvalid: boolean
+  /** The verbatim response body Meta returned ('' when none could be read). */
+  readonly rawBody: string | null
 
   constructor(
     message: string,
-    opts: { status: number; code?: number | null; subcode?: number | null },
+    opts: {
+      status: number
+      code?: number | null
+      subcode?: number | null
+      rawBody?: string | null
+    },
   ) {
     super(message)
     this.name = 'MetaApiError'
     this.status = opts.status
     this.code = opts.code ?? null
     this.subcode = opts.subcode ?? null
+    this.rawBody = opts.rawBody ?? null
     this.recipientInvalid = MetaApiError.isRecipientComplaint(
       this.status,
       this.code,
@@ -447,7 +455,12 @@ async function throwMetaError(response: Response, fallback: string): Promise<nev
   if (typeof data.error?.error_subcode === 'number') {
     subcode = data.error.error_subcode
   }
-  throw new MetaApiError(message, { status: response.status, code, subcode })
+  throw new MetaApiError(message, {
+    status: response.status,
+    code,
+    subcode,
+    rawBody: raw,
+  })
 }
 
 // ============================================================

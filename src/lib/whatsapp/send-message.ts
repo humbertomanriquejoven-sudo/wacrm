@@ -50,10 +50,17 @@ import {
   isDialablePhone,
   isRecipientRejection,
   sendWithRecipientFallback,
-  resolveRecipient,
   latestInboundAnchorId,
   createAnchorResolver,
+  type ResolvedRecipient,
 } from '@/lib/whatsapp/recipient-resolver';
+import {
+  buildDestinationCascadeReport,
+  printDestinationCascadeReport,
+  formatDestinationCascadeReport,
+  toDiagnosticHttp,
+  HOW_TO_FIX_DESTINATION,
+} from '@/lib/whatsapp/recipient-cascade';
 import type { MessageTemplate } from '@/types';
 import {
   resolveTemplateRow,
@@ -77,11 +84,33 @@ export const VALID_MESSAGE_TYPES = [
 export class SendMessageError extends Error {
   readonly code: string;
   readonly status: number;
-  constructor(code: string, message: string, status: number) {
+  /**
+   * The waterfall `diagnostic_report` (raw value per cascade source), surfaced
+   * on the HTTP 422 when no destination could be resolved — or on any Meta
+   * rejection, so the operator sees exactly what each source held.
+   */
+  readonly diagnosticReport?: Record<string, string> | null;
+  /** Operator-facing fix instructions, carried on destination failures. */
+  readonly howToFix?: string | null;
+  /** Metas's verbatim error body (or message) when Meta rejected the send. */
+  readonly metaResponse?: string | null;
+  constructor(
+    code: string,
+    message: string,
+    status: number,
+    extra?: {
+      diagnosticReport?: Record<string, string> | null;
+      howToFix?: string | null;
+      metaResponse?: string | null;
+    }
+  ) {
     super(message);
     this.name = 'SendMessageError';
     this.code = code;
     this.status = status;
+    this.diagnosticReport = extra?.diagnosticReport ?? null;
+    this.howToFix = extra?.howToFix ?? null;
+    this.metaResponse = extra?.metaResponse ?? null;
   }
 }
 
@@ -443,13 +472,64 @@ export async function sendMessageToConversation(
       });
   }
 
-  // Escalera Úntica de resolución de destinatario — decide AT SEND TIME
-  // from the contact row: a real number wins (direct `to`); a contact we
-  // can only reach through an opaque id (BSUID / wa_id / @user) is
-  // resolved next. Moving this BEFORE the reply-anchor logic lets the two
-  // interact: quoting OUR OWN message does not authorize an opaque
-  // destination, so that case falls through to the dynamic lookup below.
-  const resolved = await resolveRecipient(contact, accountId, conversationId);
+  // CASCADA DE RESOLUCIÓN DE DESTINATARIO (waterfall pipeline). Con la
+  // service role (bypass RLS) se inspeccionan, EN ORDEN ESTRICTO, las cinco
+  // fuentes — 1. contacts.phone, 2. contacts.metadata, 3. conversations.wa_id
+  // / metadata, 4. ID del canal / BSUID numérico, 5. último mensaje entrante.
+  // Cada fuente se sanea a dígitos puros (>= 8 → VALIDO) y gana la PRIMERA
+  // válida. El INFORME_DIAGNOSTICO_DESTINATARIO se imprime SIEMPRE antes de
+  // tocar Meta Graph API.
+  const cascadeReport = await buildDestinationCascadeReport({
+    conversationId,
+    contactId: contact.id,
+    accountId,
+    contact,
+    conversation,
+  });
+  printDestinationCascadeReport(cascadeReport);
+
+  // B) Sin ningún destinatario numérico en las cinco fuentes: se CANCELA la
+  // llamada a Meta y se responde 422 estructurado con el informe + la guía de
+  // solución — sin gastar un request que Meta solo iba a rechazar o a
+  // tragarse en silencio.
+  if (!cascadeReport.finalTo) {
+    const technical =
+      `No destination could be resolved for conversation ${conversationId} / contact ${contact.id}: ` +
+      `every cascade source was missing, placeholder or non-numeric. ` +
+      `No HTTP request was sent to Meta.`;
+    console.error(
+      `[send-message] INVALID RECIPIENT for conversation ${conversationId} / contact ${contact.id}: ${technical}`,
+    );
+    await recordSendFailure(db, {
+      conversationId,
+      senderType: params.senderType ?? 'agent',
+      messageType,
+      contentText: contentText ?? null,
+      mediaUrl: mediaUrl || null,
+      errorDetail: technical,
+    });
+    throw new SendMessageError(
+      'no_delivery_destination',
+      'No fue posible determinar un destinatario válido para WhatsApp',
+      422,
+      {
+        diagnosticReport: toDiagnosticHttp(cascadeReport),
+        howToFix: HOW_TO_FIX_DESTINATION,
+      },
+    );
+  }
+
+  const resolved: ResolvedRecipient = {
+    to: cascadeReport.finalTo,
+    source:
+      cascadeReport.chosen === 'latest_inbound_from'
+        ? 'recovered'
+        : cascadeReport.chosen === 'contacts_phone' ||
+            cascadeReport.chosen === 'contacts_metadata'
+          ? 'phone'
+          : 'bsuid',
+    isPhone: isDialablePhone(cascadeReport.finalTo),
+  };
 
   // Resolve the reply target to its Meta message_id. The parent must
   // belong to this same conversation — otherwise a caller could quote
@@ -694,6 +774,10 @@ export async function sendMessageToConversation(
       contact,
       accountId,
       conversationId,
+      // The destination was chosen by the CASCADE above (which may have found
+      // a conversational source the contact row does not carry) — make it the
+      // head of the retry queue instead of re-deriving it from the row.
+      first: resolved,
       send: async (address) => {
         const variants = isDialablePhone(address)
           ? phoneVariants(sanitizePhoneForMeta(address))
@@ -734,6 +818,17 @@ export async function sendMessageToConversation(
       err instanceof Error ? err.message : 'Unknown Meta API error';
     console.error('[send-message] Meta send failed:', message);
 
+    // C) Errores de la API de Meta: se imprime la respuesta COMPLETA de Meta
+    // (verbatim) junto con el [INFORME_DIAGNOSTICO_DESTINATARIO], y la
+    // respuesta HTTP devuelve el mensaje de Meta + la guía `how_to_fix`.
+    if (err instanceof MetaApiError) {
+      console.log(formatDestinationCascadeReport(cascadeReport));
+      console.error(
+        '[send-message] Meta response body:',
+        err.rawBody ?? message,
+      );
+    }
+
     // Recipient problems are OUR data problem, not an upstream outage, and
     // must never masquerade as one. Either the contact has no address we
     // could resolve (`InvalidRecipientError`, raised before any HTTP call)
@@ -742,8 +837,8 @@ export async function sendMessageToConversation(
     // they surface as a typed 422 carrying the verbatim cause instead of a
     // generic 502 that reads like Meta is down. 502 stays reserved for what
     // it actually means: Meta answered 5xx, timed out, or the network died.
-    // A typed failure already surfaced (e.g. the @handle preventive 422)
-    // must travel untouched — re-wrapping it as a 502 would hide the cause.
+    // A typed failure already surfaced must travel untouched — re-wrapping it
+    // as a 502 would hide the cause.
     if (err instanceof SendMessageError) {
       throw err;
     }
@@ -751,26 +846,51 @@ export async function sendMessageToConversation(
       throw new SendMessageError(
         'invalid_recipient',
         `Cannot resolve a WhatsApp address for this contact: ${message}`,
-        422
+        422,
+        {
+          diagnosticReport: toDiagnosticHttp(cascadeReport),
+          howToFix: HOW_TO_FIX_DESTINATION,
+          metaResponse: message,
+        }
       );
     }
     if (err instanceof MetaApiError) {
+      const metaResponse = err.rawBody ?? message;
       if (err.recipientInvalid) {
         throw new SendMessageError(
           'invalid_recipient',
           `WhatsApp rejected the recipient address: ${message}`,
-          422
+          422,
+          {
+            diagnosticReport: toDiagnosticHttp(cascadeReport),
+            howToFix: HOW_TO_FIX_DESTINATION,
+            metaResponse,
+          }
         );
       }
       if (err.status >= 400 && err.status < 500) {
         throw new SendMessageError(
           'meta_rejected',
           `WhatsApp rejected the message: ${message}`,
-          422
+          422,
+          {
+            diagnosticReport: toDiagnosticHttp(cascadeReport),
+            howToFix: HOW_TO_FIX_DESTINATION,
+            metaResponse,
+          }
         );
       }
     }
-    throw new SendMessageError('meta_error', `Meta API error: ${message}`, 502);
+    throw new SendMessageError(
+      'meta_error',
+      `Meta API error: ${message}`,
+      502,
+      {
+        diagnosticReport: toDiagnosticHttp(cascadeReport),
+        howToFix: HOW_TO_FIX_DESTINATION,
+        metaResponse: message,
+      }
+    );
   }
 
   // Persist whichever real number worked so the next send goes straight to
