@@ -397,7 +397,7 @@ describe('deliverBroadcast Inbox mirroring', () => {
   it('mirrors a send for an E.164 recipient into that contact thread', async () => {
     const { db, log } = mirrorDb({});
 
-    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana', 'mar 10']));
+    await deliverBroadcast(db, mirrorPlan('573266778890', ['Ana', 'mar 10']));
 
     // No `direction` / `metadata` columns exist on `messages`; naming
     // either makes PostgREST reject the insert with 42703.
@@ -419,7 +419,7 @@ describe('deliverBroadcast Inbox mirroring', () => {
     // opaque id and a number differ only in the string sent to Meta.
     const { db, log } = mirrorDb({});
 
-    await deliverBroadcast(db, mirrorPlan('CO.1008477715690681', ['Ana']));
+    await deliverBroadcast(db, mirrorPlan('CO.9988776655443322', ['Ana']));
 
     // The thread is located by contact identity alone, never by the
     // address string, so no BSUID/phone special case can creep in here.
@@ -453,7 +453,7 @@ describe('deliverBroadcast Inbox mirroring', () => {
     // from the Inbox.
     const { db, log } = mirrorDb({ conversationId: null });
 
-    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana', 'mar 10']));
+    await deliverBroadcast(db, mirrorPlan('573266778890', ['Ana', 'mar 10']));
 
     // The send is still recorded as delivered...
     expect(log.recipientUpdates[0]).toMatchObject({
@@ -482,7 +482,7 @@ describe('deliverBroadcast Inbox mirroring', () => {
     // never abort the mirror.
     const { db, log } = mirrorDb({ conversationId: null });
 
-    await deliverBroadcast(db, mirrorPlan('CO.1008477715690681', ['Ana']));
+    await deliverBroadcast(db, mirrorPlan('CO.9988776655443322', ['Ana']));
 
     expect(log.conversationInserts[0]).toMatchObject({ contact_id: 'c-generic' });
     expect(log.messagesUpserts[0]).toMatchObject({
@@ -495,7 +495,7 @@ describe('deliverBroadcast Inbox mirroring', () => {
   it('reuses the existing thread instead of opening a second one', async () => {
     const { db, log } = mirrorDb({});
 
-    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana']));
+    await deliverBroadcast(db, mirrorPlan('573266778890', ['Ana']));
 
     expect(log.conversationInserts).toHaveLength(0);
     expect(log.messagesUpserts[0]).toMatchObject({ conversation_id: 'conv-1' });
@@ -506,7 +506,7 @@ describe('deliverBroadcast Inbox mirroring', () => {
     // resumed campaign re-sent the same wamid.
     const { db, log } = mirrorDb({});
 
-    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana']));
+    await deliverBroadcast(db, mirrorPlan('573266778890', ['Ana']));
 
     expect(log.messagesUpserts[0]).toMatchObject({
       conversation_id: 'conv-1',
@@ -523,7 +523,7 @@ describe('deliverBroadcast Inbox mirroring', () => {
   it('stamps the send time so the bubble sorts against inbound messages', async () => {
     const { db, log } = mirrorDb({});
 
-    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana', 'mar 10']));
+    await deliverBroadcast(db, mirrorPlan('573266778890', ['Ana', 'mar 10']));
 
     expect(log.messagesUpserts[0].created_at).toEqual(expect.any(String));
     expect(log.conversationUpdates[0]).toMatchObject({
@@ -537,7 +537,7 @@ describe('deliverBroadcast Inbox mirroring', () => {
     // would re-queue it and deliver twice.
     const { db, log } = mirrorDb({ insertError: { message: 'boom' } });
 
-    await deliverBroadcast(db, mirrorPlan('573121828949', ['Ana']));
+    await deliverBroadcast(db, mirrorPlan('573266778890', ['Ana']));
 
     expect(log.recipientUpdates[0]).toMatchObject({ status: 'sent' });
   });

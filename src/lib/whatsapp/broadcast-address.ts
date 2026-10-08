@@ -47,7 +47,7 @@ const HISTORY_SCAN_LIMIT = 200;
  * The phone-shape check runs on the WHOLE value before any digit is
  * inspected, and that ordering is the whole point: `isDialablePhone`
  * rejects anything that is not `+` / digits / spacing, so an @username
- * (`@usuario`) and a BSUID (`CO.1008477715690681`) can never be
+ * (`@usuario`) and a BSUID (`CO.9988776655443322`) can never be
  * digit-stripped into a plausible-looking number. Stripping first is what
  * turned a handle into 10 stray digits and aimed a campaign at a stranger.
  *

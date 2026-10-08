@@ -124,7 +124,7 @@ describe('flushPendingReplies', () => {
       db,
       accountId: 'acct-1',
       contactId: 'contact-1',
-      recipient: { phone: 'CO.1008477715690681', wa_user_id: '1008477715690681' },
+      recipient: { phone: 'CO.9988776655443322', wa_user_id: '9988776655443322' },
       send,
     })
 
@@ -143,7 +143,7 @@ describe('flushPendingReplies', () => {
       db,
       accountId: 'acct-1',
       contactId: 'contact-1',
-      recipient: { phone: '573122182949' },
+      recipient: { phone: '573155667789' },
       send,
     });
 
@@ -166,7 +166,7 @@ describe('flushPendingReplies', () => {
       db,
       accountId: 'acct-1',
       contactId: 'contact-1',
-      recipient: { phone: '573122182949' },
+      recipient: { phone: '573155667789' },
       send,
     });
 
@@ -187,7 +187,7 @@ describe('flushPendingReplies', () => {
       db,
       accountId: 'acct-1',
       contactId: 'contact-1',
-      recipient: { phone: '573122182949' },
+      recipient: { phone: '573155667789' },
       send,
     });
 

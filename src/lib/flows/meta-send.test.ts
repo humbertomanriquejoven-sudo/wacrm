@@ -232,7 +232,7 @@ describe('engineSendAiReply', () => {
 
   it('keeps the whole text in ONE bubble when single:true (booking confirmation)', async () => {
     const text =
-      '¡Listo, Humberto! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n' +
+      '¡Listo, Cliente! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n' +
       '\n' +
       'Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n' +
       'https://meet.google.com/abc'

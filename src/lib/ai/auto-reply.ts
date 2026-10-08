@@ -367,7 +367,7 @@ export function buildRescheduleConfirmationMessage(
   contactName?: string | null
 ): string | null {
   if (booking.confirmado !== true) return null;
-  const nombre = contactName?.trim() || 'Humberto';
+  const nombre = contactName?.trim() || 'Cliente';
   const fecha = booking.fecha ?? booking.inicio?.slice(0, 10) ?? '';
   const hora = booking.hora ?? booking.inicio?.slice(11, 16) ?? '';
   const link = booking.link || MEET_FALLBACK_LINK;
@@ -467,7 +467,7 @@ export function buildBookingConfirmationMessage(
   contactName?: string | null
 ): string | null {
   if (booking.confirmado !== true) return null;
-  const nombre = contactName?.trim() || 'Humberto';
+  const nombre = contactName?.trim() || 'Cliente';
   const fecha = booking.fecha ?? booking.inicio?.slice(0, 10) ?? '';
   const hora = booking.hora ?? booking.inicio?.slice(11, 16) ?? '';
   const link = booking.link || MEET_FALLBACK_LINK;
@@ -489,7 +489,7 @@ export function buildBookingCalendarErrorMessage(
   if (booking.confirmado !== true || booking.calendarSynced !== false) {
     return null;
   }
-  const nombre = contactName?.trim() || 'Humberto';
+  const nombre = contactName?.trim() || 'Cliente';
   const fecha = booking.fecha ?? booking.inicio?.slice(0, 10) ?? '';
   const hora = booking.hora ?? booking.inicio?.slice(11, 16) ?? '';
   const cuando = fecha && hora ? ` para el ${fecha} a las ${hora}` : '';

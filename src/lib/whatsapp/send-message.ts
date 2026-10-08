@@ -552,7 +552,7 @@ export async function sendMessageToConversation(
       // message the UI shows is the operator-facing rule; the console keeps
       // the technical detail.
       const detail =
-        `No es posible enviar un mensaje a este usuario sin un número de teléfono o un mensaje de entrada previo.`;
+        `No es posible enviar mensaje a este contacto sin un número de teléfono o un mensaje previo de entrada.`;
       const technical =
         `Recipient "${resolved.to}" (source: ${resolved.source}) has no dialable phone number and conversation ` +
         `${conversationId} has no inbound wamid to quote, so WhatsApp cannot address it — an opaque id sent ` +

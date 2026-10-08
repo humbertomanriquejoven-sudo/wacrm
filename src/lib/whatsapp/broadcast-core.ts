@@ -307,7 +307,7 @@ export async function deliverBroadcast(
 ): Promise<void> {
   for (const recipient of plan.planned) {
     // NOT `phoneVariants`: that helper assumes a bare number and, fed an
-    // opaque id, manufactures neighbours like 'CO.01008477715690681' by
+    // opaque id, manufactures neighbours like 'CO.09988776655443322' by
     // injecting trunk zeros. An id has exactly one form and must be sent
     // verbatim.
 const variants = recipientAddressVariants(recipient.phone);

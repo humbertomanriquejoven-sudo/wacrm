@@ -7,6 +7,7 @@ import { findMergeableOrphan, mergeContactInto } from '@/lib/contacts/merge';
 import { flushPendingReplies } from '@/lib/whatsapp/pending-reply';
 import { toDialable } from '@/lib/whatsapp/recipient-resolver';
 import { sendMessageToConversation } from '@/lib/whatsapp/send-message';
+import { supabaseAdmin } from '@/lib/flows/admin-client';
 
 /**
  * Record a contact's real phone number.
@@ -90,7 +91,12 @@ export async function PATCH(
       });
     }
 
-    const { error: updateErr } = await ctx.supabase
+    // The UPDATE runs with the Service Role: a dashboard user whose RLS
+    // scope happens to deny write access to this row must still be able to
+    // record the number (the whole reason this endpoint exists). Tenancy is
+    // preserved by filtering on `account_id`, so no other account's rows can
+    // be touched.
+    const { error: updateErr } = await supabaseAdmin()
       .from('contacts')
       .update({ phone, updated_at: new Date().toISOString() })
       .eq('id', contactId)

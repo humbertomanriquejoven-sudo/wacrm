@@ -171,8 +171,8 @@ describe("recipientAddressVariants", () => {
   // with "Invalid phone number format" � while the Inbox delivered to those
   // same contacts successfully.
   it("forwards a namespaced BSUID verbatim", () => {
-    expect(recipientAddressVariants("CO.1008477715690681")).toEqual([
-      "CO.1008477715690681",
+    expect(recipientAddressVariants("CO.9988776655443322")).toEqual([
+      "CO.9988776655443322",
     ]);
   });
 
@@ -193,16 +193,16 @@ describe("recipientAddressVariants", () => {
   });
 
   it("never reduces an id to its digits", () => {
-    // "CO.1008477715690681" sanitized is "1008477715690681", which is a
+    // "CO.9988776655443322" sanitized is "9988776655443322", which is a
     // DIFFERENT recipient as far as Meta is concerned.
-    expect(recipientAddressVariants("CO.1008477715690681")).not.toContain(
-      "1008477715690681",
+    expect(recipientAddressVariants("CO.9988776655443322")).not.toContain(
+      "9988776655443322",
     );
   });
 
   it("still expands a real number into its trunk-prefix variants", () => {
-    const variants = recipientAddressVariants("573121828949");
-    expect(variants).toContain("573121828949");
+    const variants = recipientAddressVariants("573266778890");
+    expect(variants).toContain("573266778890");
     expect(variants.length).toBeGreaterThan(1);
   });
 
@@ -258,7 +258,7 @@ describe("hasPublicUserHandle", () => {
 
   it("rejects a bare BSUID / numeric id", () => {
     expect(hasPublicUserHandle({ ...base, wa_user_id: "1486998326437295" })).toBe(false);
-    expect(hasPublicUserHandle({ ...base, phone: "CO.1008477715690681" })).toBe(false);
+    expect(hasPublicUserHandle({ ...base, phone: "CO.9988776655443322" })).toBe(false);
   });
 
   it("rejects an empty / placeholder contact", () => {

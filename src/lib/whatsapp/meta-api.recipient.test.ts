@@ -20,8 +20,8 @@ describe('templateRecipientField', () => {
   })
 
   it('still normalizes a real number to E.164 digits', () => {
-    expect(templateRecipientField('+57 316 707 1066')).toEqual({
-      to: '573167071066',
+    expect(templateRecipientField('+57 304 455 6788')).toEqual({
+      to: '573044556788',
     })
   })
 
@@ -40,7 +40,7 @@ describe('templateRecipientField', () => {
     // `to` wins when both are present, so mixing them is how the two
     // shapes drifted apart in the first place.
     for (const value of [
-      '573167071066',
+      '573044556788',
       'CO.1486998326437295',
       '1486998326437295',
       '@jjuanpablo22222',
@@ -71,8 +71,8 @@ describe('templateRecipientField', () => {
 
 describe('recipientAddressField', () => {
   it('routes an E.164 phone number to "to" as digits', () => {
-    expect(recipientAddressField('+57 316 707 1066')).toEqual({
-      to: '573167071066',
+    expect(recipientAddressField('+57 304 455 6788')).toEqual({
+      to: '573044556788',
     })
   })
 
@@ -113,11 +113,11 @@ describe('recipientAddressField', () => {
   })
 
   it('prefers "to" for a dialable number and "recipient" for an id, never both', () => {
-    const phone = recipientAddressField('573121828949')
-    const bsuid = recipientAddressField('CO.1008477715690681')
-    expect(phone.to).toBe('573121828949')
+    const phone = recipientAddressField('573266778890')
+    const bsuid = recipientAddressField('CO.9988776655443322')
+    expect(phone.to).toBe('573266778890')
     expect(phone.recipient).toBeUndefined()
-    expect(bsuid.recipient).toBe('CO.1008477715690681')
+    expect(bsuid.recipient).toBe('CO.9988776655443322')
     expect(bsuid.to).toBeUndefined()
   })
 })

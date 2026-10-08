@@ -416,7 +416,7 @@ export async function POST(request: Request) {
       // adopt a real number where a sibling contact has one.
       await repairBsuidPhoneContacts()
       // Normalize any stored phone that isn't digits-only (e.g. a legacy
-      // '+57 312 218 2949') so outbound `to` is always clean.
+      // '+57 315 566 7789') so outbound `to` is always clean.
       await sanitizeStoredPhones()
       // Remove orphan contacts left by pre-BSUID versions of this handler,
       // which could insert a row with no usable `phone`. Those rows are
@@ -860,7 +860,7 @@ async function processMessage(
   //
   // The BSUID case is what broke outbound delivery: we only had `phone` to
   // store an identifier, so a BSUID-only sender produced a contact whose
-  // `phone` held something like 'CO.1008477715690681' — not a number, so
+  // `phone` held something like 'CO.9988776655443322' — not a number, so
   // `sanitizePhoneForMeta` rejected it and every send failed while the
   // typing indicator still fired. Classify first, then store each value
   // in the column it actually belongs to.
@@ -901,7 +901,7 @@ async function processMessage(
   // looked like a BSUID), the id Meta actually sent in `messages[0].from`
   // was dropped on the floor: `recipient_id` stayed NULL, the row resolved
   // to its `@handle`, and Meta answered (#100) Invalid parameter for every
-  // send — the "@humbertomanriquejoven fails while @juanpablo22222 works"
+  // send — the "@alias_demo fails while @juanpablo22222 works"
   // split, decided purely by which identity fields happened to be filled.
   const metaSendId =
     [trimmedWaId, trimmedFrom, senderUserId].find(
@@ -1984,8 +1984,8 @@ async function autoMergeOrphanInto(
  * its namespace prefix stripped, or null when the value isn't one.
  *
  * Two shapes are accepted:
- *   * explicitly prefixed — 'CO.1008477715690681' / 'WAID.…';
- *   * bare but too long to be a number — '1008477715690681' (16 digits).
+ *   * explicitly prefixed — 'CO.9988776655443322' / 'WAID.…';
+ *   * bare but too long to be a number — '9988776655443322' (16 digits).
  *
  * The second case is why `isBsuidLike` exists: a real phone number never
  * reaches here, but an already-stripped BSUID does, and we must not fall
@@ -2043,8 +2043,8 @@ function classifyIdentityType(input: {
 
 /**
  * Normalize a WhatsApp handle to its display form, leading '@' included:
- * `'humberto'` → `'@humberto'`, `'@humberto'` → `'@humberto'`,
- * `'@@humberto'` → `'@humberto'`.
+ * `'usuario'` → `'@usuario'`, `'@usuario'` → `'@usuario'`,
+ * `'@@usuario'` → `'@usuario'`.
  *
  * Returns null for anything that isn't a plausible handle. This is the
  * guard that keeps a BSUID from being stored as a username: 'CO.1008…'
@@ -2068,10 +2068,10 @@ function withAtSign(raw: string | null | undefined): string | null {
  * Repair contacts whose `phone` holds a BSUID instead of a number.
  *
  * Earlier versions of this handler stored the sender's identifier in
- * `phone`, so rows like `'CO.1008477715690681'` ended up there. Those are
+ * `phone`, so rows like `'CO.9988776655443322'` ended up there. Those are
  * undeliverable (Meta rejects a 'CO.…' as `to`) and they also poison the
  * phone-suffix dedupe pre-filter, which is why such a contact never merged
- * with the real '573122182949' row for the same person.
+ * with the real '573155667789' row for the same person.
  *
  * The fix is a lookup by the identity fields we DO trust (`wa_user_id`
  * first, then `username`, then `name`) among that contact's siblings in
@@ -2095,7 +2095,7 @@ async function repairBsuidPhoneContacts(): Promise<void> {
     //   1. `phone like 'CO.%'`    — prefixed BSUID, original bug.
     //   2. `phone like 'WAID.%'` — the phone-scoped namespace.
     //   3. `phone` of 15+ bare digits — a BSUID whose prefix an earlier
-    //      handler already stripped (exactly '1008477715690681'). PostgREST
+    //      handler already stripped (exactly '9988776655443322'). PostgREST
     //      can't express a length test, so match any 15-digit run and let
     //      `isBsuidLike` filter precisely below.
     const cols =
@@ -2141,8 +2141,8 @@ async function repairBsuidPhoneContacts(): Promise<void> {
 
       // Derive the @-prefixed handle from the stored name when we can.
       // `withAtSign` rejects anything that isn't handle-shaped, so a
-      // display name like 'Humberto Manrique' is skipped rather than
-      // turned into '@Humberto Manrique'.
+      // display name like 'Nombre Demo' is skipped rather than
+      // turned into '@Nombre Demo'.
       const handle = withAtSign(row.username) ?? null
       if (handle && handle !== row.username) patch.username = handle
 
@@ -2203,7 +2203,7 @@ async function findRealNumberForIdentity(
  * Normalize every stored contact `phone` to digits-only E.164 form.
  *
  * Rows written before the webhook started normalizing can still hold
- * '+57 312 218 2949'-style values. Meta's `to` field is used with the
+ * '+57 315 566 7789'-style values. Meta's `to` field is used with the
  * stored value downstream, and a dirty number there is rejected or — worse —
  * silently misrouted. A row whose phone is a BSUID/identifier is left
  * alone: `repairBsuidPhoneContacts` owns moving those to `wa_user_id`.

@@ -134,7 +134,7 @@ export class InvalidRecipientError extends MetaApiError {
     super(
       `invalid recipient "${address}": ${
         reason ??
-        'expected a phone number, a BSUID (e.g. \'CO.1008477715690681\') ' +
+        'expected a phone number, a BSUID (e.g. \'CO.<numeric_id>\') ' +
           'or a WhatsApp username, but got an empty or unusable value. ' +
           'No HTTP request was sent.'
       }`,
@@ -152,7 +152,7 @@ export class InvalidRecipientError extends MetaApiError {
  * Pre-flight gate every send helper runs before touching the network.
  *
  * The `to` field Meta's Cloud API expects is a phone number in E.164
- * digits-only form ('573167071066'). This normalizes anything dialable
+ * digits-only form ('573044556788'). This normalizes anything dialable
  * down to that shape, and refuses — with a clear console warning — to
  * send to anything else (a BSUID, an @handle, or garbage). `isDialablePhone`
  * caps the length at 13 digits, which is what separates a real number from
@@ -344,7 +344,7 @@ export function isOpaqueMetaId(address: string): boolean {
 /**
  * Reduce any stored identifier to the bare numeric id Meta accepts in `to`.
  *
- *   '573167071066'                 -> '573167071066'  (already a number)
+ *   '573044556788'                 -> '573044556788'  (already a number)
  *   'CO.1486998326437295'          -> '1486998326437295'
  *   'WAID.987654321'               -> '987654321'
  *   '123456@lid'                   -> '123456'
@@ -682,7 +682,7 @@ export interface SendTextMessageArgs {
  * through a `@user` / `@lid` display id is a different problem from a phone
  * number:
  *
- *   1. A dialable E.164 number → `{ to: "573167071066" }`. No anchor needed:
+ *   1. A dialable E.164 number → `{ to: "573044556788" }`. No anchor needed:
  *      Meta addresses the number on its own.
  *   2. An opaque Meta id (`CO.…`, `WAID.…`, `LID.…`, a >14-digit wa_id/BSUID
  *      run, a short digit run out of `@lid`) → the digits in `to` WITH

@@ -100,8 +100,8 @@ describe("sendMediaMessage — recipient addressing (text-path parity)", () => {
   });
 
   it("puts an E.164 number in `to` as bare digits", async () => {
-    await sendMediaMessage({ ...BASE, to: "+57 316 707 1066", kind: "image" });
-    expect(captured?.to).toBe("573167071066");
+    await sendMediaMessage({ ...BASE, to: "+57 304 455 6788", kind: "image" });
+    expect(captured?.to).toBe("573044556788");
     expect(captured?.recipient).toBeUndefined();
   });
 

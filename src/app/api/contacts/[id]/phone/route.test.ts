@@ -28,6 +28,31 @@ vi.mock('@/lib/whatsapp/send-message', () => ({
   sendMessageToConversation: mocks.sendMessageToConversation,
 }));
 
+// The phone UPDATE must run with the Service Role (RLS bypass for the
+// dashboard sidebar save). This mock captures the administrative write.
+let adminContactUpdate: Record<string, unknown> | null = null;
+vi.mock('@/lib/flows/admin-client', () => ({
+  supabaseAdmin: () => ({
+    from: (table: string) => {
+      const b: Record<string, unknown> = {};
+      const chain = () => b;
+      for (const m of ['eq']) b[m] = vi.fn(chain);
+      b.update = vi.fn((payload: Record<string, unknown>) => {
+        adminContactUpdate = payload;
+        const r = b;
+        (r as { then?: unknown }).then = (
+          resolve: (v: unknown) => unknown
+        ) => resolve({ error: updateError });
+        return b;
+      });
+      b.then = (resolve: (v: unknown) => unknown) =>
+        resolve({ data: null, error: null });
+      void table;
+      return b;
+    },
+  }),
+}));
+
 import { PATCH } from './route';
 
 /**
@@ -42,7 +67,6 @@ import { PATCH } from './route';
 // `.update(...)` payload is captured so tests can assert what was saved.
 // ---------------------------------------------------------------
 let contactRow: Record<string, unknown> | null = null;
-let contactUpdate: Record<string, unknown> | null = null;
 let updateError: { message: string; code?: string } | null = null;
 
 const CONTEXT = {
@@ -60,7 +84,7 @@ function makeSupabase() {
       const chain = () => b;
       for (const m of ['select', 'eq', 'neq']) b[m] = vi.fn(chain);
       b.update = vi.fn((payload: Record<string, unknown>) => {
-        contactUpdate = payload;
+        void payload;
         const r = b;
         (r as { then?: unknown }).then = (
           resolve: (v: unknown) => unknown
@@ -90,12 +114,12 @@ beforeEach(() => {
   contactRow = {
     id: 'contact-1',
     account_id: 'acct-1',
-    phone: 'CO.1008477715690681',
+    phone: 'CO.9988776655443322',
     name: 'Ana Ruiz',
     username: null,
-    wa_user_id: '1008477715690681',
+    wa_user_id: '9988776655443322',
   };
-  contactUpdate = null;
+  adminContactUpdate = null;
   updateError = null;
 
   const supabase = makeSupabase();
@@ -120,41 +144,41 @@ beforeEach(() => {
 describe('PATCH /api/contacts/[id]/phone', () => {
   it('requires the agent role', async () => {
     mocks.requireRole.mockRejectedValue(new Error('forbidden'));
-    const res = await PATCH(request({ phone: '573122182949' }), params);
+    const res = await PATCH(request({ phone: '573155667789' }), params);
     expect(res.status).toBe(403);
   });
 
   it('rejects a missing phone', async () => {
     const res = await PATCH(request({}), params);
     expect(res.status).toBe(400);
-    expect(contactUpdate).toBeNull();
+    expect(adminContactUpdate).toBeNull();
   });
 
   it('rejects a value that is not a dialable number', async () => {
     // A BSUID is exactly what the contact already has; accepting it would
     // "save" the broken value and re-run the same failed send.
-    const res = await PATCH(request({ phone: 'CO.1008477715690681' }), params);
+    const res = await PATCH(request({ phone: 'CO.9988776655443322' }), params);
     expect(res.status).toBe(400);
-    expect(contactUpdate).toBeNull();
+    expect(adminContactUpdate).toBeNull();
   });
 
   it('normalises the number to digits on save', async () => {
-    const res = await PATCH(request({ phone: '+57 (312) 218-2949' }), params);
+    const res = await PATCH(request({ phone: '+57 (315) 566-7789' }), params);
     expect(res.status).toBe(200);
-    expect(contactUpdate).toMatchObject({ phone: '573122182949' });
+    expect(adminContactUpdate).toMatchObject({ phone: '573155667789' });
     const body = await res.json();
-    expect(body.phone).toBe('573122182949');
+    expect(body.phone).toBe('573155667789');
   });
 
   it('404s when the contact is not in the account', async () => {
     contactRow = null;
-    const res = await PATCH(request({ phone: '573122182949' }), params);
+    const res = await PATCH(request({ phone: '573155667789' }), params);
     expect(res.status).toBe(404);
   });
 
   it('reports a duplicate number as a conflict, without flushing', async () => {
     updateError = { message: 'duplicate key', code: '23505' };
-    const res = await PATCH(request({ phone: '573122182949' }), params);
+    const res = await PATCH(request({ phone: '573155667789' }), params);
     expect(res.status).toBe(409);
     // Nothing was delivered: the save failed, so the phone is unchanged
     // and sending anyway would target the old, rejected address.
@@ -162,7 +186,7 @@ describe('PATCH /api/contacts/[id]/phone', () => {
   });
 
   it('flushes the parked reply after a successful save', async () => {
-    const res = await PATCH(request({ phone: '573122182949' }), params);
+    const res = await PATCH(request({ phone: '573155667789' }), params);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -177,13 +201,13 @@ describe('PATCH /api/contacts/[id]/phone', () => {
       expect.objectContaining({
         accountId: 'acct-1',
         contactId: 'contact-1',
-        recipient: expect.objectContaining({ phone: '573122182949' }),
+        recipient: expect.objectContaining({ phone: '573155667789' }),
       })
     );
   });
 
   it('sends each parked reply through the shared send core', async () => {
-    await PATCH(request({ phone: '573122182949' }), params);
+    await PATCH(request({ phone: '573155667789' }), params);
 
     const send = mocks.flushPendingReplies.mock.calls[0][0].send as (
       conversationId: string,
@@ -206,8 +230,8 @@ describe('PATCH /api/contacts/[id]/phone', () => {
   it('still flushes when the number is unchanged, since the point is unblocking', async () => {
     // An operator re-saving the same number is a legitimate way to retry a
     // send that failed for a reason we have since fixed.
-    contactRow = { ...(contactRow as Record<string, unknown>), phone: '573122182949' };
-    const res = await PATCH(request({ phone: '+573122182949' }), params);
+    contactRow = { ...(contactRow as Record<string, unknown>), phone: '573155667789' };
+    const res = await PATCH(request({ phone: '+573155667789' }), params);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.changed).toBe(false);
@@ -218,10 +242,10 @@ describe('PATCH /api/contacts/[id]/phone', () => {
     mocks.findMergeableOrphan.mockResolvedValue({
       id: 'contact-orphan',
       account_id: 'acct-1',
-      phone: 'CO.1008477715690681',
+      phone: 'CO.9988776655443322',
       name: 'Ana Ruiz',
       username: null,
-      wa_user_id: '1008477715690681',
+      wa_user_id: '9988776655443322',
     });
     mocks.mergeContactInto.mockResolvedValue({
       merged: true,
@@ -230,7 +254,7 @@ describe('PATCH /api/contacts/[id]/phone', () => {
       fieldsAbsorbed: ['wa_user_id'],
     });
 
-    const res = await PATCH(request({ phone: '573122182949' }), params);
+    const res = await PATCH(request({ phone: '573155667789' }), params);
     expect(res.status).toBe(200);
     expect(mocks.mergeContactInto).toHaveBeenCalledWith(
       expect.anything(),
@@ -250,7 +274,7 @@ describe('PATCH /api/contacts/[id]/phone', () => {
       conversations: [],
     });
 
-    const res = await PATCH(request({ phone: '573122182949' }), params);
+    const res = await PATCH(request({ phone: '573155667789' }), params);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toMatchObject({ ok: true, pending_replies_failed: 1 });

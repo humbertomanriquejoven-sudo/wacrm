@@ -46,60 +46,60 @@ beforeEach(() => {
 
 describe('phone vs Meta identifier classification', () => {
   it('accepts real E.164 numbers', () => {
-    for (const phone of ['573122182949', '+573122182949', '1 555 123 4567']) {
+    for (const phone of ['573155667789', '+573155667789', '1 555 123 4567']) {
       expect(isDialablePhone(phone)).toBe(true)
     }
-    expect(toDialable('+57 312 218 2949')).toBe('573122182949')
+    expect(toDialable('+57 315 566 7789')).toBe('573155667789')
   })
 
   it('rejects BSUIDs even though they are all digits', () => {
     // The whole point: normalizePhone strips the prefix, so a naive
     // digits-only check would pass these as phone numbers.
-    expect(isDialablePhone('CO.1008477715690681')).toBe(false)
-    expect(isDialablePhone('1008477715690681')).toBe(false)
+    expect(isDialablePhone('CO.9988776655443322')).toBe(false)
+    expect(isDialablePhone('9988776655443322')).toBe(false)
     expect(isDialablePhone('WAID.99887766')).toBe(false)
-    expect(toDialable('CO.1008477715690681')).toBeNull()
+    expect(toDialable('CO.9988776655443322')).toBeNull()
   })
 
   it('REGLA 1: cleans @, spaces and dashes out of a stored phone', () => {
     // A `phone` column holding digits under '@'/' '/'-' punctuation is
     // still THE number for this contact and must win the ladder.
-    expect(isDialablePhone('@573167071066')).toBe(true)
-    expect(toDialable('@573167071066')).toBe('573167071066')
-    expect(toDialable('5731-6707-1066')).toBe('573167071066')
-    expect(toDialable(' 573 167 071 066 ')).toBe('573167071066')
+    expect(isDialablePhone('@573044556788')).toBe(true)
+    expect(toDialable('@573044556788')).toBe('573044556788')
+    expect(toDialable('5730-4455-6788')).toBe('573044556788')
+    expect(toDialable(' 573 044 556 788 ')).toBe('573044556788')
     // A display handle is not a number: letters disqualify.
-    expect(toDialable('@humbertomanriquejoven')).toBeNull()
+    expect(toDialable('@alias_demo')).toBeNull()
     // A '@'-decorated BSUID still trips the E.164 length ceiling.
-    expect(toDialable('@1008477715690681')).toBeNull()
+    expect(toDialable('@9988776655443322')).toBeNull()
   })
 
   it('classifies long digit strings as Meta identifiers', () => {
-    expect(isMetaIdentifier('CO.1008477715690681')).toBe(true)
-    expect(isMetaIdentifier('1008477715690681')).toBe(true)
-    expect(isMetaIdentifier('573122182949')).toBe(false)
+    expect(isMetaIdentifier('CO.9988776655443322')).toBe(true)
+    expect(isMetaIdentifier('9988776655443322')).toBe(true)
+    expect(isMetaIdentifier('573155667789')).toBe(false)
   })
 
   it('strips the namespace prefix for storage', () => {
-    expect(normalizeMetaIdentifier('CO.1008477715690681')).toBe('1008477715690681')
-    expect(normalizeMetaIdentifier('1008477715690681')).toBe('1008477715690681')
+    expect(normalizeMetaIdentifier('CO.9988776655443322')).toBe('9988776655443322')
+    expect(normalizeMetaIdentifier('9988776655443322')).toBe('9988776655443322')
     // A real number is not an identifier.
-    expect(normalizeMetaIdentifier('573122182949')).toBeNull()
+    expect(normalizeMetaIdentifier('573155667789')).toBeNull()
   })
 })
 
 describe('normalizeUsername', () => {
   it('always produces a single leading @', () => {
-    expect(normalizeUsername('humberto')).toBe('@humberto')
-    expect(normalizeUsername('@humberto')).toBe('@humberto')
-    expect(normalizeUsername('@@humberto')).toBe('@humberto')
-    expect(normalizeUsername('  humberto  ')).toBe('@humberto')
+    expect(normalizeUsername('usuario')).toBe('@usuario')
+    expect(normalizeUsername('@usuario')).toBe('@usuario')
+    expect(normalizeUsername('@@usuario')).toBe('@usuario')
+    expect(normalizeUsername('  usuario  ')).toBe('@usuario')
   })
 
   it('never produces a username from an identifier or a number', () => {
-    expect(normalizeUsername('CO.1008477715690681')).toBeNull()
-    expect(normalizeUsername('573122182949')).toBeNull()
-    expect(normalizeUsername('Humberto Manrique')).toBeNull()
+    expect(normalizeUsername('CO.9988776655443322')).toBeNull()
+    expect(normalizeUsername('573155667789')).toBeNull()
+    expect(normalizeUsername('Nombre Demo')).toBeNull()
     expect(normalizeUsername('')).toBeNull()
   })
 })
@@ -107,28 +107,28 @@ describe('normalizeUsername', () => {
 describe('identityFilterParts', () => {
   it('builds one filter per STRONG identity the payload carries', () => {
     const parts = identityFilterParts({
-      phone: '573122182949',
-      wa_user_id: '1008477715690681',
-      username: 'humbertomanrique',
+      phone: '573155667789',
+      wa_user_id: '9988776655443322',
+      username: 'alias_demo',
     })
     // Username is deliberately absent: matching on a handle could pull a
     // different phone number into this contact.
     expect(parts).toEqual([
-      'phone.eq.573122182949',
-      'wa_user_id.eq.1008477715690681',
+      'phone.eq.573155667789',
+      'wa_user_id.eq.9988776655443322',
     ])
   })
 
   it('never emits a username filter, even when only the handle is present', () => {
-    const parts = identityFilterParts({ username: 'humbertomanrique' })
+    const parts = identityFilterParts({ username: 'alias_demo' })
     expect(parts).toEqual([])
   })
 
   it('omits a BSUID found sitting in the phone column', () => {
     // The legacy shape: phone holds the BSUID. It must be matched as
     // wa_user_id, never as a phone number.
-    const parts = identityFilterParts({ phone: 'CO.1008477715690681' })
-    expect(parts).toEqual(['wa_user_id.eq.1008477715690681'])
+    const parts = identityFilterParts({ phone: 'CO.9988776655443322' })
+    expect(parts).toEqual(['wa_user_id.eq.9988776655443322'])
     expect(parts.some((p) => p.startsWith('phone.'))).toBe(false)
   })
 
@@ -169,10 +169,10 @@ describe('isRecipientRejection', () => {
 describe('findRecoverablePhone', () => {
   const ORPHAN = {
     id: 'contact-1',
-    phone: 'CO.1008477715690681',
+    phone: 'CO.9988776655443322',
     name: 'Ana Ruiz',
     username: null,
-    wa_user_id: '1008477715690681',
+    wa_user_id: '9988776655443322',
   }
 
   /**
@@ -200,10 +200,10 @@ describe('findRecoverablePhone', () => {
 
   it('returns the contact own number when it is already dialable', async () => {
     const found = await findRecoverablePhone(
-      { id: 'contact-1', phone: '573122182949' },
+      { id: 'contact-1', phone: '573155667789' },
       'acct-1',
     )
-    expect(found).toEqual({ phone: '573122182949', fromContactId: 'contact-1' })
+    expect(found).toEqual({ phone: '573155667789', fromContactId: 'contact-1' })
     // No history lookup needed.
     expect(mocks.fromAny).not.toHaveBeenCalled()
   })
@@ -219,19 +219,19 @@ describe('findRecoverablePhone', () => {
       conversations: [{ id: 'conv-1' }],
       // Newest first: a BSUID, then the real number Meta used earlier.
       messages: [
-        { sender_phone: 'CO.1008477715690681' },
-        { sender_phone: '573122182949' },
+        { sender_phone: 'CO.9988776655443322' },
+        { sender_phone: '573155667789' },
       ],
     })
 
     const found = await findRecoverablePhone(ORPHAN, 'acct-1')
-    expect(found).toEqual({ phone: '573122182949', fromContactId: null })
+    expect(found).toEqual({ phone: '573155667789', fromContactId: null })
   })
 
   it('ignores BSUIDs stored on messages, since they are what it is escaping', async () => {
     mockTables({
       conversations: [{ id: 'conv-1' }],
-      messages: [{ sender_phone: 'CO.1008477715690681' }],
+      messages: [{ sender_phone: 'CO.9988776655443322' }],
     })
 
     const found = await findRecoverablePhone(ORPHAN, 'acct-1')
@@ -239,7 +239,7 @@ describe('findRecoverablePhone', () => {
   })
 
   it('does not consult history when the contact has no conversations', async () => {
-    mockTables({ conversations: [], messages: [{ sender_phone: '573122182949' }] })
+    mockTables({ conversations: [], messages: [{ sender_phone: '573155667789' }] })
 
     const found = await findRecoverablePhone(ORPHAN, 'acct-1')
     expect(found).toBeNull()
@@ -248,18 +248,18 @@ describe('findRecoverablePhone', () => {
   it('confines the search to the given conversation', async () => {
     mockTables({
       conversations: [{ id: 'conv-9' }],
-      messages: [{ sender_phone: '573122182949' }],
+      messages: [{ sender_phone: '573155667789' }],
     })
 
     const found = await findRecoverablePhone(ORPHAN, 'acct-1', 'conv-9')
-    expect(found).toEqual({ phone: '573122182949', fromContactId: null })
+    expect(found).toEqual({ phone: '573155667789', fromContactId: null })
   })
 
   it('returns null when the given conversation does not belong to the contact', async () => {
     // `maybeSingle` resolves null, so no message rows are read.
     mockTables({
       conversations: [],
-      messages: [{ sender_phone: '573122182949' }],
+      messages: [{ sender_phone: '573155667789' }],
     })
 
     const found = await findRecoverablePhone(
@@ -305,10 +305,10 @@ describe('resolveRecipient - one ladder for all senders', () => {
 
   it('prefers a dialable number, unchanged', async () => {
     const r = await resolveRecipient(
-      { id: 'c1', phone: '+57 312 218 2949' },
+      { id: 'c1', phone: '+57 315 566 7789' },
       'acct-1',
     )
-    expect(r).toMatchObject({ to: '573122182949', source: 'phone', isPhone: true })
+    expect(r).toMatchObject({ to: '573155667789', source: 'phone', isPhone: true })
   })
 
   it('REGLA 1: a valid phone ignores username, BSUID and wa_id entirely', async () => {
@@ -317,17 +317,17 @@ describe('resolveRecipient - one ladder for all senders', () => {
     const r = await resolveRecipient(
       {
         id: 'c1',
-        phone: '573167071066',
-        username: '@humbertomanriquejoven',
-        wa_user_id: '1008477715690681',
-        wa_id: '1008477715690681',
-        recipient_id: '1008477715690681',
+        phone: '573044556788',
+        username: '@alias_demo',
+        wa_user_id: '9988776655443322',
+        wa_id: '9988776655443322',
+        recipient_id: '9988776655443322',
       },
       'acct-1',
       'conv-1',
     )
     expect(r).toEqual({
-      to: '573167071066',
+      to: '573044556788',
       source: 'phone',
       isPhone: true,
     })
@@ -373,7 +373,7 @@ describe('resolveRecipient - one ladder for all senders', () => {
     })
 
     const r = await resolveRecipient(
-      { id: 'c1', phone: 'CO.1008477715690681', wa_user_id: '1008477715690681' },
+      { id: 'c1', phone: 'CO.9988776655443322', wa_user_id: '9988776655443322' },
       'acct-1',
       'conv-1',
     )
@@ -399,32 +399,32 @@ describe('recipientAddressQueue - shared by the AI and the manual sender', () =>
     const queue = await recipientAddressQueue(
       {
         id: 'c1',
-        phone: 'CO.1008477715690681',
-        wa_user_id: '1008477715690681',
+        phone: 'CO.9988776655443322',
+        wa_user_id: '9988776655443322',
         wa_id: '5511999999999',
         recipient_id: '99887766',
         username: 'tienda',
       },
       'acct-1',
-      'CO.1008477715690681',
+      'CO.9988776655443322',
       'conv-1',
     )
 
-    expect(queue[0]).toBe('CO.1008477715690681')
+    expect(queue[0]).toBe('CO.9988776655443322')
     expect(queue).toContain('5511999999999')
-    expect(queue).toContain('1008477715690681')
+    expect(queue).toContain('9988776655443322')
     expect(queue).toContain('99887766')
     expect(queue).toContain('@tienda')
   })
 
   it('de-duplicates, so an unchanged contact yields one entry', async () => {
     const queue = await recipientAddressQueue(
-      { id: 'c1', phone: '573122182949' },
+      { id: 'c1', phone: '573155667789' },
       'acct-1',
-      '573122182949',
+      '573155667789',
       'conv-1',
     )
-    expect(queue).toEqual(['573122182949'])
+    expect(queue).toEqual(['573155667789'])
   })
 
   it('reports a number recovered from history so it can be persisted', async () => {
@@ -446,9 +446,9 @@ describe('recipientAddressQueue - shared by the AI and the manual sender', () =>
 
     const onRecovered = vi.fn()
     const queue = await recipientAddressQueue(
-      { id: 'c1', phone: 'CO.1008477715690681' },
+      { id: 'c1', phone: 'CO.9988776655443322' },
       'acct-1',
-      'CO.1008477715690681',
+      'CO.9988776655443322',
       'conv-1',
       { onRecovered },
     )
@@ -456,7 +456,7 @@ describe('recipientAddressQueue - shared by the AI and the manual sender', () =>
     // `primary` stays first; the recovered dialable number is the next thing to
     // try. (In the real flow `resolveRecipient` already prefers the recovered
     // number, so it arrives here as the primary.)
-    expect(queue[0]).toBe('CO.1008477715690681')
+    expect(queue[0]).toBe('CO.9988776655443322')
     expect(queue).toContain('573001234567')
     expect(onRecovered).toHaveBeenCalledWith('573001234567')
   })
@@ -508,8 +508,8 @@ describe('createAnchorResolver — the anchor follows the address', () => {
     const db = anchorDb([{ message_id: 'wamid.NEW' }])
     const anchorFor = createAnchorResolver(db as never, 'conv-1')
 
-    expect(await anchorFor('573167071066')).toBeUndefined()
-    expect(await anchorFor('+57 316 707 1066')).toBeUndefined()
+    expect(await anchorFor('573044556788')).toBeUndefined()
+    expect(await anchorFor('+57 304 455 6788')).toBeUndefined()
     expect(db.from).not.toHaveBeenCalled()
   })
 
@@ -517,15 +517,15 @@ describe('createAnchorResolver — the anchor follows the address', () => {
     const db = anchorDb([{ message_id: 'wamid.NEW' }])
     const anchorFor = createAnchorResolver(db as never, 'conv-1')
 
-    expect(await anchorFor('1008477715690681')).toBe('wamid.NEW')
+    expect(await anchorFor('9988776655443322')).toBe('wamid.NEW')
   })
 
   it('resolves the lookup once and reuses it for every opaque attempt', async () => {
     const db = anchorDb([{ message_id: 'wamid.NEW' }])
     const anchorFor = createAnchorResolver(db as never, 'conv-1')
 
-    await anchorFor('1008477715690681')
-    await anchorFor('@humbertomanriquejoven')
+    await anchorFor('9988776655443322')
+    await anchorFor('@alias_demo')
     expect(db.from).toHaveBeenCalledTimes(1)
   })
 
@@ -533,7 +533,7 @@ describe('createAnchorResolver — the anchor follows the address', () => {
     const db = anchorDb([{ message_id: 'wamid.NEW' }])
     const anchorFor = createAnchorResolver(db as never, 'conv-1', 'wamid.CHOSEN')
 
-    expect(await anchorFor('1008477715690681')).toBe('wamid.CHOSEN')
+    expect(await anchorFor('9988776655443322')).toBe('wamid.CHOSEN')
     expect(db.from).not.toHaveBeenCalled()
   })
 
@@ -541,6 +541,6 @@ describe('createAnchorResolver — the anchor follows the address', () => {
     const db = anchorDb([])
     const anchorFor = createAnchorResolver(db as never, 'conv-1')
 
-    expect(await anchorFor('1008477715690681')).toBeUndefined()
+    expect(await anchorFor('9988776655443322')).toBeUndefined()
   })
 })

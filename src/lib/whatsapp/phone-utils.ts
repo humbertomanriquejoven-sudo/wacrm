@@ -71,16 +71,16 @@ const E164_MAX_DIGITS = 13
  *
  * REGLA 1 (phone always wins): a stored `phone` that CONTAINS valid digits
  * is THE number for this contact even when it carries decoration — a
- * leading '@' ('@573167071066'), spaces, dashes, parentheses or dots are
+ * leading '@' ('@573044556788'), spaces, dashes, parentheses or dots are
  * all cleaned away by `normalizePhone` before the length check, exactly
  * like a '+'. Letters remain disqualifying, so a display handle
- * ('@humbertomanriquejoven') can never be mistaken for one, and a
- * '@'-decorated BSUID ('@1008477715690681') still trips the length
+ * ('@alias_demo') can never be mistaken for one, and a
+ * '@'-decorated BSUID ('@9988776655443322') still trips the length
  * ceiling below.
  *
  * The length ceiling is the load-bearing part. Meta's BSUIDs are 15–17
  * digits, and `normalizePhone` strips every non-digit, so both
- * 'CO.1008477715690681' and a bare '1008477715690681' reduce to the same
+ * 'CO.9988776655443322' and a bare '9988776655443322' reduce to the same
  * 16 digits — any "is it just digits?" test accepts them as a phone
  * number. Rejecting the namespace marker and anything past 13 digits is
  * what actually separates a number from an identifier.
@@ -379,8 +379,8 @@ export function passthroughMetaId(
  * Having it here as a tested function is what keeps the two from drifting:
  * the broadcast sender once gated on `isValidE164(sanitizePhoneForMeta(x))`
  * and so rejected every opaque id, while the Inbox delivered to the same
- * contacts fine. Worse, judging the SANITIZED value meant `CO.1008477715690681`
- * was assessed as `1008477715690681` and `@user1234567` as `1234567` — a
+ * contacts fine. Worse, judging the SANITIZED value meant `CO.9988776655443322`
+ * was assessed as `9988776655443322` and `@user1234567` as `1234567` — a
  * well-formed 7-digit number that passed the gate and would have aimed a
  * campaign at a stranger.
  *

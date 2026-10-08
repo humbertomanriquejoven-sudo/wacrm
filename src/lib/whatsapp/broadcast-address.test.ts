@@ -39,22 +39,22 @@ describe('normalizeToE164', () => {
     // not exactly 10 or 11 digits, so a correctly-stored 12-digit
     // Colombian E.164 � the format every real contact has � was thrown
     // away and the recipient was reported undeliverable.
-    expect(normalizeToE164('573121828949')).toBe('573121828949')
-    expect(normalizeToE164('+57 312 182 8949')).toBe('573121828949')
-    expect(normalizeToE164('57 312 182 8949')).toBe('573121828949')
+    expect(normalizeToE164('573266778890')).toBe('573266778890')
+    expect(normalizeToE164('+57 326 677 8890')).toBe('573266778890')
+    expect(normalizeToE164('57 326 677 8890')).toBe('573266778890')
   })
 
   it('adds the default country code to a bare 10-digit national number', () => {
-    expect(normalizeToE164('3121828949')).toBe('573121828949')
-    expect(normalizeToE164('(312) 182-8949')).toBe('573121828949')
+    expect(normalizeToE164('3266778890')).toBe('573266778890')
+    expect(normalizeToE164('(326) 677-8890')).toBe('573266778890')
   })
 
   it('does not double-prefix a number that already has a country code', () => {
     // 11 and 12 digit values carry their own country code and were
     // previously prefixed AGAIN, producing a 13-digit address pointing at
     // a different person.
-    expect(normalizeToE164('57312182894')).toBe('57312182894')
-    expect(normalizeToE164('573121828949')).toBe('573121828949')
+    expect(normalizeToE164('57345566778')).toBe('57345566778')
+    expect(normalizeToE164('573266778890')).toBe('573266778890')
   })
 
   it('refuses to build a number out of a username', () => {
@@ -63,12 +63,12 @@ describe('normalizeToE164', () => {
     expect(normalizeToE164('@usuario')).toBeNull()
     expect(normalizeToE164('usuario')).toBeNull()
     // A handle whose digits alone look like a national number.
-    expect(normalizeToE164('@usuario3121828949')).toBeNull()
+    expect(normalizeToE164('@usuario3266778890')).toBeNull()
   })
 
   it('refuses a BSUID', () => {
-    expect(normalizeToE164('CO.1008477715690681')).toBeNull()
-    expect(normalizeToE164('1008477715690681')).toBeNull()
+    expect(normalizeToE164('CO.9988776655443322')).toBeNull()
+    expect(normalizeToE164('9988776655443322')).toBeNull()
   })
 
   it('returns null for empty input', () => {
@@ -80,22 +80,22 @@ describe('normalizeToE164', () => {
 
 describe('contactPhone', () => {
   it('prefers a usable contact.phone', () => {
-    expect(contactPhone(contact({ phone: '573121828949' }))).toBe(
-      '573121828949',
+    expect(contactPhone(contact({ phone: '573266778890' }))).toBe(
+      '573266778890',
     )
   })
 
   it('falls back to wa_id when phone is unusable', () => {
     expect(
-      contactPhone(contact({ phone: null, wa_id: '573121828949' })),
-    ).toBe('573121828949')
+      contactPhone(contact({ phone: null, wa_id: '573266778890' })),
+    ).toBe('573266778890')
   })
 
   it('never treats username or wa_user_id as a phone number', () => {
     // A broadcast `to` field takes a number. A BSUID there returns HTTP
     // 200 from Meta and silently drops the message.
     expect(
-      contactPhone(contact({ username: '@usuario', wa_user_id: '1008477715690681' })),
+      contactPhone(contact({ username: '@usuario', wa_user_id: '9988776655443322' })),
     ).toBeNull()
   })
 
@@ -422,12 +422,12 @@ describe('recoverAddressesFromHistory', () => {
       fakeDb(
         log,
         [{ id: 'conv-1', contact_id: 'contact-1' }],
-        [{ conversation_id: 'conv-1', sender_phone: '573121828949' }],
+        [{ conversation_id: 'conv-1', sender_phone: '573266778890' }],
       ),
-      [contact({ username: '@usuario', wa_user_id: '1008477715690681' })],
+      [contact({ username: '@usuario', wa_user_id: '9988776655443322' })],
     )
 
-    expect(recovered.get('contact-1')).toBe('573121828949')
+    expect(recovered.get('contact-1')).toBe('573266778890')
   })
 
   it('skips conversations belonging to a different contact', async () => {
@@ -523,7 +523,7 @@ it('recovers a BSUID recorded in sender_phone', async () => {
     const log = newLog()
     const recovered = await recoverAddressesFromHistory(
       fakeDb(log, [], []),
-      [contact({ phone: '573121828949' })],
+      [contact({ phone: '573266778890' })],
     )
 
     expect(recovered.size).toBe(0)
@@ -578,10 +578,10 @@ describe('resolveBroadcastAddress', () => {
       contact({
         phone: 'unknown',
         username: '@jjuanpablo22222',
-        wa_user_id: 'CO.1008477715690681',
+        wa_user_id: 'CO.9988776655443322',
       }),
     )
-    expect(resolved).toEqual({ to: 'CO.1008477715690681', isPhone: false })
+    expect(resolved).toEqual({ to: 'CO.9988776655443322', isPhone: false })
   })
 
   it('falls back to a bare numeric Meta id', () => {
@@ -620,19 +620,19 @@ it('never uses a bare @handle as the destination', () => {
     expect(
       resolveBroadcastAddress(
         contact({ phone: 'unknown', username: '@jjuanpablo22222' }),
-        'CO.1008477715690681',
+        'CO.9988776655443322',
       ),
-    ).toEqual({ to: 'CO.1008477715690681', isPhone: false })
+    ).toEqual({ to: 'CO.9988776655443322', isPhone: false })
   })
 
   it('prefers a real number recovered over the contact row identifiers', () => {
     // A recovered dialable number is still the strongest signal.
     expect(
       resolveBroadcastAddress(
-        contact({ phone: 'unknown', wa_user_id: 'CO.1008477715690681' }),
-        '573121828949',
+        contact({ phone: 'unknown', wa_user_id: 'CO.9988776655443322' }),
+        '573266778890',
       ),
-    ).toEqual({ to: '573121828949', isPhone: true })
+    ).toEqual({ to: '573266778890', isPhone: true })
   })
 
   it('is null when neither the row nor the history yields a number (tier D)', () => {
@@ -655,9 +655,9 @@ it('never uses a bare @handle as the destination', () => {
   it('prefers a real number over an identifier on the same row', () => {
     // An opaque id must not pre-empt a number sitting further down the list.
     const resolved = resolveBroadcastAddress(
-      contact({ phone: '573121828949', wa_user_id: 'CO.1008477715690681' }),
+      contact({ phone: '573266778890', wa_user_id: 'CO.9988776655443322' }),
     )
-    expect(resolved).toEqual({ to: '573121828949', isPhone: true })
+    expect(resolved).toEqual({ to: '573266778890', isPhone: true })
   })
 
   it('prefers wa_id over the BSUID', () => {
@@ -665,7 +665,7 @@ it('never uses a bare @handle as the destination', () => {
       contact({
         phone: 'unknown',
         wa_id: '1486998326437295',
-        wa_user_id: 'CO.1008477715690681',
+        wa_user_id: 'CO.9988776655443322',
       }),
     )
     expect(resolved?.to).toBe('1486998326437295')
@@ -674,9 +674,9 @@ it('never uses a bare @handle as the destination', () => {
   it('uses a number recovered from the contact own history', () => {
     const resolved = resolveBroadcastAddress(
       contact({ phone: 'unknown', username: '@usuario' }),
-      '573121828949',
+      '573266778890',
     )
-    expect(resolved).toEqual({ to: '573121828949', isPhone: true })
+    expect(resolved).toEqual({ to: '573266778890', isPhone: true })
   })
 
   it('reports no address when the row holds nothing usable', () => {
@@ -693,19 +693,19 @@ describe('metaIdFromRawPayload', () => {
     // number, so `from_user_id` is the only real id on the message.
     expect(
       metaIdFromRawPayload({
-        message: { id: 'wamid.1', from: 'unknown', from_user_id: 'CO.1008477715690681' },
+        message: { id: 'wamid.1', from: 'unknown', from_user_id: 'CO.9988776655443322' },
         contact: { wa_id: 'unknown', profile: { name: 'Ana' } },
       }),
-    ).toBe('CO.1008477715690681')
+    ).toBe('CO.9988776655443322')
   })
 
   it('reads the contact-level BSUID when the message omits it', () => {
     expect(
       metaIdFromRawPayload({
         message: { id: 'wamid.2', from: 'unknown' },
-        contact: { wa_id: '', user_id: 'CO.1008477715690681', profile: { name: 'Ana' } },
+        contact: { wa_id: '', user_id: 'CO.9988776655443322', profile: { name: 'Ana' } },
       }),
-    ).toBe('CO.1008477715690681')
+    ).toBe('CO.9988776655443322')
   })
 
   it('reaches an id nested in a full Cloud API entry', () => {
@@ -717,7 +717,7 @@ describe('metaIdFromRawPayload', () => {
             changes: [
               {
                 value: {
-                  contacts: [{ wa_id: '', user_id: 'CO.1008477715690681' }],
+                  contacts: [{ wa_id: '', user_id: 'CO.9988776655443322' }],
                   messages: [{ from: 'unknown' }],
                 },
               },
@@ -725,7 +725,7 @@ describe('metaIdFromRawPayload', () => {
           },
         ],
       }),
-    ).toBe('CO.1008477715690681')
+    ).toBe('CO.9988776655443322')
   })
 
   it('never returns the placeholder, a display name, or a phone_number_id', () => {
@@ -856,12 +856,12 @@ describe('persistRecoveredAddress', () => {
     const ok = await persistRecoveredAddress(
       fakeDb(log, [], []),
       'contact-1',
-      '573121828949',
+      '573266778890',
     )
 
     expect(ok).toBe(true)
     expect(log.contactUpdates).toEqual([
-      { id: 'contact-1', patch: { phone: '573121828949' } },
+      { id: 'contact-1', patch: { phone: '573266778890' } },
     ])
   })
 
@@ -869,7 +869,7 @@ describe('persistRecoveredAddress', () => {
     // phone_normalized is GENERATED ALWAYS (migration 022); including it in
     // an update is rejected outright, so the write-back would always fail.
     const log = newLog()
-    await persistRecoveredAddress(fakeDb(log, [], []), 'contact-1', '573121828949')
+    await persistRecoveredAddress(fakeDb(log, [], []), 'contact-1', '573266778890')
 
     expect(Object.keys(log.contactUpdates[0].patch)).toEqual(['phone'])
   })
@@ -884,7 +884,7 @@ describe('persistRecoveredAddress', () => {
     const ok = await persistRecoveredAddress(
       fakeDb(log, [], []),
       'contact-1',
-      'CO.1008477715690681',
+      'CO.9988776655443322',
     )
 
     expect(ok).toBe(false)
@@ -901,7 +901,7 @@ describe('persistRecoveredAddress', () => {
     const ok = await persistRecoveredAddress(
       fakeDb(log, [], [], { updateError: 'duplicate key value violates unique constraint' }),
       'contact-1',
-      '573121828949',
+      '573266778890',
     )
 
     expect(ok).toBe(false)
@@ -1017,7 +1017,7 @@ describe('resolveRecipientAddresses - the pipeline shared by creation and retry'
   it('classifies destinations: numbers and opaque ids yes, handles no', () => {
     expect(isDeliverableAddress('573001234567')).toBe(true)
     expect(isDeliverableAddress('1486998326437295')).toBe(true)
-    expect(isDeliverableAddress('CO.01008477715690681')).toBe(true)
+    expect(isDeliverableAddress('CO.09988776655443322')).toBe(true)
     expect(isDeliverableAddress('@juanpablo')).toBe(false)
     expect(isDeliverableAddress('unknown')).toBe(false)
     expect(isDeliverableAddress('')).toBe(false)

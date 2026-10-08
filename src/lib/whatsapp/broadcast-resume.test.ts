@@ -262,7 +262,7 @@ describe('planBroadcastResume', () => {
           recipients: [
             identifierRecipient('r1', {
               phone: 'unknown',
-              wa_user_id: 'CO.1008477715690681',
+              wa_user_id: 'CO.9988776655443322',
             }),
           ],
         },
@@ -277,7 +277,7 @@ describe('planBroadcastResume', () => {
     expect(plan.planned).toEqual([
       {
         recipientRowId: 'r1',
-        phone: 'CO.1008477715690681',
+        phone: 'CO.9988776655443322',
         params: ['A123'],
         contactId: 'c-r1',
       },
@@ -331,7 +331,7 @@ describe('planBroadcastResume', () => {
           messages: [
             {
               conversation_id: 'cv-1',
-              sender_phone: '573121828949',
+              sender_phone: '573266778890',
               raw_meta_payload: null,
             },
           ],
@@ -349,7 +349,7 @@ describe('planBroadcastResume', () => {
     expect(plan.planned).toEqual([
       {
         recipientRowId: 'r1',
-        phone: '573121828949',
+        phone: '573266778890',
         params: ['A123'],
         contactId: 'c-r1',
       },
@@ -374,7 +374,7 @@ describe('planBroadcastResume', () => {
               conversation_id: 'cv-1',
               sender_phone: null,
               raw_meta_payload: {
-                message: { from: 'unknown', from_user_id: 'CO.1008477715690681' },
+                message: { from: 'unknown', from_user_id: 'CO.9988776655443322' },
                 contact: { wa_id: '' },
               },
             },
@@ -391,7 +391,7 @@ describe('planBroadcastResume', () => {
     // Namespaced form is kept verbatim: 	oMetaTargetId strips the 'CO.'
     // at the payload boundary, and stripping it here would lose the
     // namespace that distinguishes a BSUID from a phone number.
-    expect(plan.planned[0].phone).toBe('CO.1008477715690681');
+    expect(plan.planned[0].phone).toBe('CO.9988776655443322');
   });
 
   it('anchors each resumed template to that contact\'s own inbound wamid', async () => {
@@ -415,13 +415,13 @@ describe('planBroadcastResume', () => {
           messages: [
             {
               conversation_id: 'cv-1',
-              sender_phone: '573121828949',
+              sender_phone: '573266778890',
               raw_meta_payload: null,
               message_id: 'wamid.A1',
             },
             {
               conversation_id: 'cv-2',
-              sender_phone: '573121828948',
+              sender_phone: '573155667788',
               raw_meta_payload: null,
               message_id: 'wamid.B1',
             },
@@ -438,8 +438,8 @@ describe('planBroadcastResume', () => {
     expect(byRow.get('r1')?.contextMessageId).toBe('wamid.A1');
     expect(byRow.get('r2')?.contextMessageId).toBe('wamid.B1');
     // And the destinations stayed with their own contacts.
-    expect(byRow.get('r1')?.phone).toBe('573121828949');
-    expect(byRow.get('r2')?.phone).toBe('573121828948');
+    expect(byRow.get('r1')?.phone).toBe('573266778890');
+    expect(byRow.get('r2')?.phone).toBe('573155667788');
   });
 
   it('still fails a recipient with no deliverable address', async () => {

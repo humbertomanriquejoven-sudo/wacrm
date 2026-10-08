@@ -447,8 +447,8 @@ describe('sendMessageToConversation — template persistence (#483)', () => {
 describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', () => {
   const OPAQUE_CONTACT = {
     id: 'ct-1',
-    phone: 'CO.1008477715690681',
-    wa_user_id: '1008477715690681',
+    phone: 'CO.9988776655443322',
+    wa_user_id: '9988776655443322',
     username: null,
   };
 
@@ -481,7 +481,7 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
 
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
     expect(sendTextMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ to: '1008477715690681' })
+      expect.objectContaining({ to: '9988776655443322' })
     );
   });
 
@@ -575,26 +575,26 @@ describe('sendMessageToConversation - strict service-role contact override', () 
     );
     adminRead.contactRow = {
       id: 'ct-1',
-      phone: '@573167071066',
-      wa_user_id: '1008477715690681',
-      username: '@humbertomanriquejoven',
+      phone: '@573044556788',
+      wa_user_id: '9988776655443322',
+      username: '@alias_demo',
     };
 
     await sendMessageToConversation(db, 'acct-1', {
       conversationId: 'cv-1',
       messageType: 'text',
-      contentText: 'Hola Humberto',
+      contentText: 'Hola Cliente',
     });
 
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
     expect(sendTextMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ to: '573167071066' })
+      expect.objectContaining({ to: '573044556788' })
     );
     const call = vi.mocked(sendTextMessage).mock.calls[0][0] as {
       to: string;
       contextMessageId?: string;
     };
-    expect(call.to).not.toMatch(/@humbertomanriquejoven|1008477715690681/);
+    expect(call.to).not.toMatch(/@alias_demo|9988776655443322/);
     expect(call.contextMessageId).toBeUndefined();
   });
 
@@ -636,9 +636,9 @@ describe('sendMessageToConversation - TAREA 1: payload phone auto-persists via s
     // `phone` holds the @user. The caller still hands us the real number.
     adminRead.contactRow = {
       id: 'ct-1',
-      phone: '@humbertomanriquejoven',
-      wa_user_id: '1008477715690681',
-      username: '@humbertomanriquejoven',
+      phone: '@alias_demo',
+      wa_user_id: '9988776655443322',
+      username: '@alias_demo',
     };
     const db = sendPathDb(
       [],
@@ -649,20 +649,20 @@ describe('sendMessageToConversation - TAREA 1: payload phone auto-persists via s
     await sendMessageToConversation(db, 'acct-1', {
       conversationId: 'cv-1',
       messageType: 'text',
-      contentText: 'Hola Humberto',
-      phone: '  +57 316 707 1066 ',
+      contentText: 'Hola Cliente',
+      phone: '  +57 304 455 6788 ',
     });
 
-    expect(adminRead.persistedPhones).toContain('573167071066');
+    expect(adminRead.persistedPhones).toContain('573044556788');
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
     expect(sendTextMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ to: '573167071066' })
+      expect.objectContaining({ to: '573044556788' })
     );
     const call = vi.mocked(sendTextMessage).mock.calls[0][0] as {
       to: string;
       contextMessageId?: string;
     };
-    expect(call.to).not.toMatch(/@humbertomanriquejoven|1008477715690681/);
+    expect(call.to).not.toMatch(/@alias_demo|9988776655443322/);
     expect(call.contextMessageId).toBeUndefined();
   });
 
@@ -679,12 +679,12 @@ describe('sendMessageToConversation - TAREA 1: payload phone auto-persists via s
       conversationId: 'cv-1',
       messageType: 'text',
       contentText: 'Hola',
-      phone: '573167071066',
+      phone: '573044556788',
     });
 
     // The payload number must NOT win over the already-stored one: nothing
-    // may write '573167071066' into `contacts.phone` nor aim the payload at it.
-    expect(adminRead.persistedPhones).not.toContain('573167071066');
+    // may write '573044556788' into `contacts.phone` nor aim the payload at it.
+    expect(adminRead.persistedPhones).not.toContain('573044556788');
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
     expect(sendTextMessage).toBeCalledWith(
       expect.objectContaining({ to: '15551234567' })
@@ -708,7 +708,7 @@ describe('sendMessageToConversation - @handle/preventive 422 (no phone, no BSUID
         contact: {
           id: 'ct-1',
           phone: null,
-          username: 'humbertomanriquejoven',
+          username: 'alias_demo',
         },
       }
     );
@@ -716,7 +716,7 @@ describe('sendMessageToConversation - @handle/preventive 422 (no phone, no BSUID
     const err = await sendMessageToConversation(db, 'acct-1', {
       conversationId: 'cv-1',
       messageType: 'text',
-      contentText: 'Hola Humberto',
+      contentText: 'Hola Cliente',
     }).catch((e: Error) => e);
 
     expect(err).toBeInstanceOf(SendMessageError);
@@ -741,7 +741,7 @@ describe('sendMessageToConversation - phone rejected → escalated BSUID carries
   it('anchors the escalated opaque attempt to the newest inbound wamid', async () => {
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
     vi.mocked(sendTextMessage).mockImplementation(async (args) => {
-      if (args.to === '1008477715690681') return { messageId: 'wamid.escalated' };
+      if (args.to === '9988776655443322') return { messageId: 'wamid.escalated' };
       throw new MetaApiError('Recipient phone number not in allowed list', {
         status: 400,
         code: 131030,
@@ -755,7 +755,7 @@ describe('sendMessageToConversation - phone rejected → escalated BSUID carries
           contact: {
             id: 'ct-1',
             phone: '+15551234567',
-            wa_id: '1008477715690681',
+            wa_id: '9988776655443322',
           },
           inboundRows: [{ message_id: 'wamid.INBOUND' }],
         }),
@@ -775,7 +775,7 @@ describe('sendMessageToConversation - phone rejected → escalated BSUID carries
       expect(first.to).toBe('15551234567');
       expect(first.contextMessageId).toBeUndefined();
       // The escalated opaque id carries the thread's customer wamid.
-      const escalated = calls.find((c) => c[0].to === '1008477715690681');
+      const escalated = calls.find((c) => c[0].to === '9988776655443322');
       expect(escalated).toBeDefined();
       expect(escalated![0].contextMessageId).toBe('wamid.INBOUND');
     } finally {
@@ -794,8 +794,8 @@ describe('sendMessageToConversation - phone rejected → escalated BSUID carries
 describe('sendMessageToConversation - media recipients (same resolver as text)', () => {
   const OPAQUE_CONTACT = {
     id: 'ct-1',
-    phone: 'CO.1008477715690681',
-    wa_user_id: '1008477715690681',
+    phone: 'CO.9988776655443322',
+    wa_user_id: '9988776655443322',
     username: null,
   };
 
@@ -816,7 +816,7 @@ describe('sendMessageToConversation - media recipients (same resolver as text)',
 
     expect(sendMediaMessageMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        to: '1008477715690681',
+        to: '9988776655443322',
         kind: 'image',
         link: 'https://cdn.example.com/pic.jpg',
         caption: 'caption',

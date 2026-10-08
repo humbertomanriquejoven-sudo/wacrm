@@ -34,11 +34,11 @@ describe('cleanRecipientAddress', () => {
   })
 
   it('strips a leading @ when there is no suffix', () => {
-    expect(cleanRecipientAddress('@573167071066')).toBe('573167071066')
+    expect(cleanRecipientAddress('@573044556788')).toBe('573044556788')
   })
 
   it('leaves a namespaced BSUID prefix intact rather than fabricating a number', () => {
-    expect(cleanRecipientAddress('CO.1008477715690681')).toBe('CO.1008477715690681')
+    expect(cleanRecipientAddress('CO.9988776655443322')).toBe('CO.9988776655443322')
   })
 
   it('is empty for an empty address', () => {
@@ -48,11 +48,11 @@ describe('cleanRecipientAddress', () => {
 
 describe('toMetaTargetId', () => {
   it('leaves a plain phone number untouched', () => {
-    expect(toMetaTargetId('573167071066')).toBe('573167071066')
+    expect(toMetaTargetId('573044556788')).toBe('573044556788')
   })
 
   it('strips a CO. namespace down to the numeric id', () => {
-    expect(toMetaTargetId('CO.1008477715690681')).toBe('1008477715690681')
+    expect(toMetaTargetId('CO.9988776655443322')).toBe('9988776655443322')
   })
 
   it('strips a WAID. namespace', () => {
@@ -78,7 +78,7 @@ describe('toMetaTargetId', () => {
 
 describe('isOpaqueMetaId', () => {
   it('accepts a namespaced BSUID', () => {
-    expect(isOpaqueMetaId('CO.1008477715690681')).toBe(true)
+    expect(isOpaqueMetaId('CO.9988776655443322')).toBe(true)
   })
 
   it('accepts a LID-namespaced id', () => {
@@ -90,7 +90,7 @@ describe('isOpaqueMetaId', () => {
   })
 
   it('rejects a real phone number', () => {
-    expect(isOpaqueMetaId('573167071066')).toBe(false)
+    expect(isOpaqueMetaId('573044556788')).toBe(false)
   })
 
   it('rejects a short numeric id scraped out of a @lid display id', () => {
@@ -144,11 +144,11 @@ describe('sendTextMessage recipient shapes', () => {
     await sendTextMessage({
       phoneNumberId: 'PNID',
       accessToken: 'TOKEN',
-      to: '+57 316 707 1066',
+      to: '+57 304 455 6788',
       text: 'hola',
     })
     const body = sentBody(fetchMock)
-    expect(body.to).toBe('573167071066')
+    expect(body.to).toBe('573044556788')
     expect(body.recipient).toBeUndefined()
     expect(body.text).toEqual({ preview_url: false, body: 'hola' })
     expect(body.messaging_product).toBe('whatsapp')
@@ -160,13 +160,13 @@ describe('sendTextMessage recipient shapes', () => {
     await sendTextMessage({
       phoneNumberId: 'PNID',
       accessToken: 'TOKEN',
-      to: 'CO.1008477715690681',
+      to: 'CO.9988776655443322',
       text: 'hola',
       contextMessageId: 'wamid.HBgL_INBOUND',
     })
     const body = sentBody(fetchMock)
     // Meta rejects letters and dots in `to`; the digits are the real id.
-    expect(body.to).toBe('1008477715690681')
+    expect(body.to).toBe('9988776655443322')
     expect(body.recipient).toBeUndefined()
     // …and the reply anchor is mandatory for that id (#131009 guard).
     expect(body.context).toEqual({ message_id: 'wamid.HBgL_INBOUND' })
@@ -176,14 +176,14 @@ describe('sendTextMessage recipient shapes', () => {
     await sendTextMessage({
       phoneNumberId: 'PNID',
       accessToken: 'TOKEN',
-      to: 'CO.1008477715690681',
+      to: 'CO.9988776655443322',
       text: 'hola',
       contextMessageId: 'wamid.HBgL_INBOUND',
       recipientField: 'recipient',
     })
     const body = sentBody(fetchMock)
     // Escape hatch keeps the address intact for Meta's alternate shape.
-    expect(body.recipient).toBe('CO.1008477715690681')
+    expect(body.recipient).toBe('CO.9988776655443322')
     expect(body.to).toBeUndefined()
     expect(body.context).toEqual({ message_id: 'wamid.HBgL_INBOUND' })
   })
@@ -235,7 +235,7 @@ describe('sendTextMessage recipient shapes', () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
     await expect(
-      sendTextMessage({ phoneNumberId: 'PNID', accessToken: 'TOKEN', to: '573167071066', text: 'x' }),
+      sendTextMessage({ phoneNumberId: 'PNID', accessToken: 'TOKEN', to: '573044556788', text: 'x' }),
     ).rejects.toThrow(/Invalid parameter/)
 
     const tagged = errorSpy.mock.calls.find(

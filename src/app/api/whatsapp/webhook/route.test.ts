@@ -547,7 +547,7 @@ function bsuidInboundRequest() {
               contacts: [
                 {
                   wa_id: '',
-                  user_id: 'CO.1008477715690681',
+                  user_id: 'CO.9988776655443322',
                   profile: { name: 'Ana Ruiz', username: 'anaruiz' },
                 },
               ],
@@ -555,7 +555,7 @@ function bsuidInboundRequest() {
                 {
                   id: 'wamid.BSUID1',
                   from: '',
-                  from_user_id: 'CO.1008477715690681',
+                  from_user_id: 'CO.9988776655443322',
                   timestamp: '1700000000',
                   type: 'text',
                   text: { body: 'hola' },
@@ -699,11 +699,11 @@ describe('inbound webhook: raw_meta_payload persistence (migration 052)', () => 
       message?: { from_user_id?: string }
       contact?: { user_id?: string; wa_id?: string }
     }
-    expect(raw.message?.from_user_id).toBe('CO.1008477715690681')
-    expect(raw.contact?.user_id).toBe('CO.1008477715690681')
+    expect(raw.message?.from_user_id).toBe('CO.9988776655443322')
+    expect(raw.contact?.user_id).toBe('CO.9988776655443322')
 
     // The read side agrees with the write side.
-    expect(metaIdFromRawPayload(raw)).toBe('CO.1008477715690681')
+    expect(metaIdFromRawPayload(raw)).toBe('CO.9988776655443322')
   })
 
   it('retries without the column when migration 052 is not applied', async () => {
@@ -1486,7 +1486,7 @@ describe('inbound webhook: Meta identity columns (migration 053)', () => {
     // `wa_id`, which is where Meta's 'unknown' placeholder would otherwise
     // land.
     expect(insert).toMatchObject({
-      wa_user_id: '1008477715690681',
+      wa_user_id: '9988776655443322',
       identity_type: 'BSUID',
       phone_number_id: 'pn-1',
     })
@@ -1499,8 +1499,8 @@ describe('inbound webhook: Meta identity columns (migration 053)', () => {
     // very first broadcast attempt with no backfill pass in between. What this
     // test still forbids is the PLACEHOLDER reaching them: idx_contacts_wa_id
     // indexes any non-empty value as a real id.
-    expect(insert.wa_id).toBe('1008477715690681')
-    expect(insert.recipient_id).toBe('1008477715690681')
+    expect(insert.wa_id).toBe('9988776655443322')
+    expect(insert.recipient_id).toBe('9988776655443322')
     expect(
       JSON.stringify([
         insert.wa_id,
@@ -1670,7 +1670,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
       // No dialable number disclosed: the @handle becomes the destination,
       // `phone` is never blank, and the BSUID lives in wa_user_id.
       phone: 'unknown',
-      wa_user_id: '1008477715690681',
+      wa_user_id: '9988776655443322',
       // Username keeps the '@' so it renders as WhatsApp shows it.
       username: '@anaruiz',
     })
@@ -1680,28 +1680,28 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
   it('repairs a bare 16-digit BSUID sitting in phone', async () => {
     // The prefix-stripped shape the task calls out: `phone` holds
-    // '1008477715690681' with no 'CO.' marker at all, so a
+    // '9988776655443322' with no 'CO.' marker at all, so a
     // `like 'CO.%'`-only repair would miss it entirely.
     mockFindExistingContact.mockResolvedValue(null)
     h.state.bsuidPhoneContacts = [
       {
         id: 'contact-bare',
         account_id: 'acc-1',
-        phone: '1008477715690681',
+        phone: '9988776655443322',
         name: 'Ana Ruiz',
         username: '@anaruiz',
       },
     ]
-    h.state.siblingPhoneCandidates = [{ phone: '573122182949' }]
+    h.state.siblingPhoneCandidates = [{ phone: '573155667789' }]
 
     await runWebhook()
 
     const patch = h.state.contactUpdateCalls[0]?.patch
     expect(patch).toBeDefined()
     // Moved into wa_user_id…
-    expect(patch.wa_user_id).toBe('1008477715690681')
+    expect(patch.wa_user_id).toBe('9988776655443322')
     // …and phone restored to the real number from the sibling row.
-    expect(patch.phone).toBe('573122182949')
+    expect(patch.phone).toBe('573155667789')
   })
 
   it('adds the @ prefix to a bare handle during repair', async () => {
@@ -1710,7 +1710,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
       {
         id: 'contact-noat',
         account_id: 'acc-1',
-        phone: '1008477715690681',
+        phone: '9988776655443322',
         name: 'Ana Ruiz',
         username: 'anaruiz',
       },
@@ -1720,7 +1720,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     const patch = h.state.contactUpdateCalls[0]?.patch ?? {}
     expect(patch.username).toBe('@anaruiz')
-    expect(patch.wa_user_id).toBe('1008477715690681')
+    expect(patch.wa_user_id).toBe('9988776655443322')
   })
 
   it('leaves a legitimately long E.164 phone alone during repair', async () => {
@@ -1732,7 +1732,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
       {
         id: 'contact-real',
         account_id: 'acc-1',
-        phone: '573122182949',
+        phone: '573155667789',
         name: 'Real Person',
       },
     ]
@@ -1741,7 +1741,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     const patches = h.state.contactUpdateCalls.map((c) => c.patch)
     expect(
-      patches.some((p) => p.wa_user_id && !String(p.wa_user_id).includes('573122182949')),
+      patches.some((p) => p.wa_user_id && !String(p.wa_user_id).includes('573155667789')),
     ).toBe(false)
   })
 
@@ -1754,7 +1754,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     h.state.bsuidLookupResponse = {
       id: 'contact-real-phone',
       account_id: 'acc-1',
-      phone: '573122182949',
+      phone: '573155667789',
       name: 'Ana Ruiz',
       username: '@anaruiz',
     }
@@ -1765,7 +1765,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     expect(h.state.contactInsertCalls).toHaveLength(1)
     expect(h.state.contactInsertCalls[0]).toMatchObject({
       phone: 'unknown',
-      wa_user_id: '1008477715690681',
+      wa_user_id: '9988776655443322',
     })
     expect(
       h.state.contactUpdateCalls.filter((c) => c.patch.phone),
@@ -1844,10 +1844,10 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
       id: 'contact-existing',
       account_id: 'acc-1',
       user_id: 'user-1',
-      phone: '573122182949',
+      phone: '573155667789',
       name: 'Ana Ruiz',
       username: '@anaruiz',
-      wa_user_id: '1008477715690681',
+      wa_user_id: '9988776655443322',
     }
 
     await POST(bsuidInboundRequest())
@@ -1865,7 +1865,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
       {
         id: 'contact-broken',
         account_id: 'acc-1',
-        phone: 'CO.1008477715690681',
+        phone: 'CO.9988776655443322',
         name: 'Ana Ruiz',
         username: 'anaruiz',
       },
@@ -1875,7 +1875,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     expect(h.state.contactUpdateCalls.length).toBeGreaterThan(0)
     const patch = h.state.contactUpdateCalls[0].patch
-    expect(patch.wa_user_id).toBe('1008477715690681')
+    expect(patch.wa_user_id).toBe('9988776655443322')
     expect(patch.username).toBe('@anaruiz')
     // No sibling had a real number, so `phone` must NOT be overwritten with
     // a fabricated one — the row is left for a later inbound to repair.
@@ -1891,19 +1891,19 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
       {
         id: 'contact-broken',
         account_id: 'acc-1',
-        phone: 'CO.1008477715690681',
+        phone: 'CO.9988776655443322',
         name: 'Ana Ruiz',
         username: 'anaruiz',
       },
     ]
-    h.state.siblingPhoneCandidates = [{ phone: '573122182949' }]
+    h.state.siblingPhoneCandidates = [{ phone: '573155667789' }]
 
     await runWebhook()
 
     expect(h.state.contactUpdateCalls.length).toBeGreaterThan(0)
     expect(h.state.contactUpdateCalls[0].patch).toMatchObject({
-      phone: '573122182949',
-      wa_user_id: '1008477715690681',
+      phone: '573155667789',
+      wa_user_id: '9988776655443322',
       username: '@anaruiz',
     })
   })

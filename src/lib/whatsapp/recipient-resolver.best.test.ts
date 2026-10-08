@@ -16,13 +16,13 @@ describe('resolveBestRecipient — generic identifier priority', () => {
 
   it('prefers a dialable phone over every other identifier', async () => {
     const r = await resolveBestRecipient({
-      phone: '+57 316 707 1066',
+      phone: '+57 304 455 6788',
       wa_id: '123456789012345',
       wa_user_id: 'CO.999',
       recipient_id: '99887766',
       username: 'someone',
     })
-    expect(r.to).toBe('573167071066')
+    expect(r.to).toBe('573044556788')
     expect(r.isPhone).toBe(true)
     expect(r.source).toBe('phone')
   })
@@ -38,8 +38,8 @@ describe('resolveBestRecipient — generic identifier priority', () => {
   })
 
   it('normalizes a phone carrying + and spaces down to digits', async () => {
-    const r = await resolveBestRecipient({ phone: '+57 316 707 1066' })
-    expect(r.to).toBe('573167071066')
+    const r = await resolveBestRecipient({ phone: '+57 304 455 6788' })
+    expect(r.to).toBe('573044556788')
   })
 
   it('prefers wa_id over the BSUID', async () => {

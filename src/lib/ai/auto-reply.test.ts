@@ -929,7 +929,7 @@ describe('dispatchInboundToAiReply — anti-hallucination guard', () => {
 
     const sent = h.engineSendAiReply.mock.calls[0][0].text as string;
     expect(sent).toBe(
-      '¡Listo, Humberto! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n' +
+      '¡Listo, Cliente! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n' +
         '\n' +
         'Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n' +
         'https://meet.google.com/abc'
@@ -1285,7 +1285,7 @@ describe('buildBookingConfirmationMessage — pure function', () => {
       'cita ha sido agendada con éxito para el 2026-09-18 a las 14:00'
     );
     expect(out).toBe(
-      '¡Listo, Humberto! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n' +
+      '¡Listo, Cliente! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n' +
         '\n' +
         'Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n' +
         'https://meet.google.com/new'
@@ -1306,7 +1306,7 @@ describe('buildBookingConfirmationMessage — pure function', () => {
         null
       )
     ).toBe(
-      '¡Listo, Humberto! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n' +
+      '¡Listo, Cliente! Tu cita ha sido agendada con éxito para el 2026-09-18 a las 14:00.\n' +
         '\n' +
         'Puedes unirte a la videollamada de Google Meet directamente desde este enlace:\n' +
         'https://meet.google.com/real-link'
@@ -1342,7 +1342,7 @@ describe('buildBookingConfirmationMessage — pure function', () => {
       null
     );
     expect(out).toContain('para el 2026-09-18 a las 14:00');
-    expect(out).toContain('¡Listo, Humberto!');
+    expect(out).toContain('¡Listo, Cliente!');
   });
 });
 

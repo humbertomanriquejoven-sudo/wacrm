@@ -98,7 +98,7 @@ function makeDb(rowsByTable: Record<string, Row[]>) {
 }
 
 /** A real Meta BSUID: 16 digits, as Meta issues them. */
-const BSUID = '1008477715690681';
+const BSUID = '9988776655443322';
 
 const SURVIVOR = {
   id: 'c-real',
