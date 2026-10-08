@@ -510,12 +510,12 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
     expect(call.contextMessageId).toBeUndefined();
   });
 
-  it('refuses when the thread has no inbound wamid to quote', async () => {
-    // No anchor and no dialable number: the send would be a bare opaque id
-    // that Meta drops with (#131009) "Recipient phone number not in allowed
-    // list". Fail locally with a typed 422 (and a recorded failed bubble)
-    // instead of putting a doomed request on the wire.
-    const err = await sendMessageToConversation(
+  it('sends a strictly numeric id directly when the thread has no inbound wamid', async () => {
+    // A numeric BSUID/wa_id is a valid bare `to` for Meta: the anchor is a
+    // strict improvement when present, but its absence must not strand the
+    // send. Only a NON-numeric address (username / @handle) is refused — and
+    // that refusal happens earlier, in the preventive @/letters guard.
+    const outcome = await sendMessageToConversation(
       sendPathDb([], {}, { contact: OPAQUE_CONTACT, inboundRows: [] }),
       'acct-1',
       {
@@ -523,14 +523,15 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
         messageType: 'text',
         contentText: 'Hola',
       }
-    ).catch((e: unknown) => e);
-
-    expect(err).toBeInstanceOf(SendMessageError);
-    expect((err as SendMessageError).code).toBe('invalid_recipient');
-    expect((err as SendMessageError).status).toBe(422);
+    );
 
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
-    expect(sendTextMessage).not.toHaveBeenCalled();
+    expect(outcome).toBeDefined();
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: '9988776655443322' })
+    );
+    const call = vi.mocked(sendTextMessage).mock.calls[0][0];
+    expect(call.contextMessageId).toBeUndefined();
   });
 
   it('keeps an explicit operator reply target over the thread anchor', async () => {

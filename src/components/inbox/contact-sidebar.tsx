@@ -205,7 +205,7 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
                   <input
                     value={phoneDraft}
                     onChange={(e) => setPhoneDraft(e.target.value)}
-                    placeholder="573######"
+                    placeholder="Número de teléfono"
                     className="h-8 flex-1 rounded-md border border-border bg-background px-2 text-sm"
                   />
                   <Button
