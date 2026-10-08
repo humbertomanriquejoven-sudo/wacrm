@@ -693,6 +693,43 @@ describe('sendMessageToConversation - TAREA 1: payload phone auto-persists via s
 });
 
 // ============================================================
+// VALIDACIÓN PREVENTIVA DE `to` — Meta rechaza con (#131009) cualquier
+// destinatario que sea un @handle o contenga letras. Si la escalera solo
+// pudo resolver algo así, el core DEBE responder 422 SIN gastar la llamada
+// HTTP a Meta.
+// ============================================================
+describe('sendMessageToConversation - @handle/preventive 422 (no phone, no BSUID)', () => {
+  it('never calls Meta with an @username recipient and answers 422', async () => {
+    adminRead.persistedPhones = [];
+    const db = sendPathDb(
+      [],
+      {},
+      {
+        contact: {
+          id: 'ct-1',
+          phone: null,
+          username: 'humbertomanriquejoven',
+        },
+      }
+    );
+
+    const err = await sendMessageToConversation(db, 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'Hola Humberto',
+    }).catch((e: Error) => e);
+
+    expect(err).toBeInstanceOf(SendMessageError);
+    expect((err as SendMessageError).status).toBe(422);
+    expect((err as SendMessageError).message).toBe(
+      'El contacto no tiene un teléfono válido guardado en la base de datos. Por favor guarda el número antes de enviar.'
+    );
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================
 // REGLA 1 → REGLA 2 escalation. The phone wins the ladder (REGLA 1) and
 // goes out unanchored; Meta rejects it, so the queue walks up to the
 // BSUID. THAT escalated attempt is where (#131009) "Parameter value is

@@ -43,6 +43,7 @@ import {
   sanitizePhoneForMeta,
   phoneVariants,
   toDialable,
+  passthroughMetaId,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils';
 import {
@@ -137,6 +138,17 @@ export interface SendMessageResult {
   messageId: string;
   /** Meta's `wamid` for the delivered message. */
   whatsappMessageId: string;
+}
+
+/**
+ * True when a Meta `to` value must never reach the Graph API: an `@handle`
+ * or a letter-bearing display name — Meta answers both with (#131009)
+ * "Parameter value is not valid". Namespaced Meta ids (`CO.…`, `WAID.…`,
+ * `LID.…`) deliberately contain a prefix + dot and ARE valid destinations,
+ * so they are passed through.
+ */
+function isForbiddenMetaTo(to: string): boolean {
+  return to.startsWith('@') || (!passthroughMetaId(to) && /[a-zA-Z]/.test(to));
 }
 
 /**
@@ -496,6 +508,33 @@ export async function sendMessageToConversation(
   // refused locally with a typed 422 and a recorded failed bubble instead of
   // firing a request Meta will only drop.
   if (!contextMessageId && resolved.to && !resolved.isPhone) {
+    // VALIDACIÓN PREVENTIVA DE `to`: Meta rechaza con (#131009) cualquier
+    // destinatario que sea un @handle o que contenga letras. Si la escalera
+    // solo pudo resolver algo así NO se gasta la llamada HTTP — ni siquiera
+    // para intentar anclarlo — y se responde 422 para que el operador guarde
+    // el número. (Los BSUID/wa_id numéricos siguen siendo CAMINO B legítimo.)
+    if (isForbiddenMetaTo(resolved.to)) {
+      const technical =
+        `Recipient "${resolved.to}" (source: ${resolved.source}) starts with @ or contains letters; ` +
+        `Meta refuses such a destination with (#131009) "Parameter value is not valid". ` +
+        `No HTTP request was sent to Meta. Save a dialable phone on the contact and retry.`;
+      console.error(
+        `[send-message] INVALID RECIPIENT for conversation ${conversationId} / contact ${contact.id}: ${technical}`,
+      );
+      await recordSendFailure(db, {
+        conversationId,
+        senderType: params.senderType ?? 'agent',
+        messageType,
+        contentText: contentText ?? null,
+        mediaUrl: mediaUrl || null,
+        errorDetail: technical,
+      });
+      throw new SendMessageError(
+        'contact_no_phone',
+        'El contacto no tiene un teléfono válido guardado en la base de datos. Por favor guarda el número antes de enviar.',
+        422,
+      );
+    }
     // `messages` can be RLS-blocked for a user-scoped client, so the anchor is
     // read with the service role — the lookup must never be held hostage by RLS.
     contextMessageId =
@@ -571,6 +610,20 @@ export async function sendMessageToConversation(
   );
 
   const attempt = async (phone: string): Promise<string> => {
+    // VALIDACIÓN PREVENTIVA DE `to`: Meta rechaza con (#131009) cualquier
+    // destinatario que sea un @handle o contenga letras. Si la escalera solo
+    // pudo resolver algo así, NO se gasta la llamada HTTP — se responde 422 a
+    // la interfaz para que el operador guarde el número del contacto.
+    if (isForbiddenMetaTo(phone)) {
+      console.error(
+        `[send-message] refusing to send to invalid Meta recipient "${phone}" (contains @ or letters) — no HTTP call made`,
+      );
+      throw new SendMessageError(
+        'contact_no_phone',
+        'El contacto no tiene un teléfono válido guardado en la base de datos. Por favor guarda el número antes de enviar.',
+        422,
+      );
+    }
     const anchor = await anchorFor(phone);
     if (messageType === 'template') {
       const result = await sendTemplateMessage({
@@ -703,6 +756,11 @@ export async function sendMessageToConversation(
     // they surface as a typed 422 carrying the verbatim cause instead of a
     // generic 502 that reads like Meta is down. 502 stays reserved for what
     // it actually means: Meta answered 5xx, timed out, or the network died.
+    // A typed failure already surfaced (e.g. the @handle preventive 422)
+    // must travel untouched — re-wrapping it as a 502 would hide the cause.
+    if (err instanceof SendMessageError) {
+      throw err;
+    }
     if (err instanceof InvalidRecipientError) {
       throw new SendMessageError(
         'invalid_recipient',
