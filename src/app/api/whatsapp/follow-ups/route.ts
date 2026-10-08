@@ -17,7 +17,6 @@ import {
   type FollowUpType,
 } from '@/lib/whatsapp/follow-up-worker'
 import { sendMessageToConversation, SendMessageError } from '@/lib/whatsapp/send-message'
-import { getRecipientAddress } from '@/lib/whatsapp/meta-api'
 
 type Ctx = Awaited<ReturnType<typeof getCurrentAccount>>
 
@@ -98,7 +97,7 @@ async function resolveConversation(
       id: String(row.id),
       contact_id: String(row.contact_id),
       follow_up_enabled: (row.follow_up_enabled as boolean | null) ?? null,
-      response_wait_enabled: (row as any).response_wait_enabled !== false,
+      response_wait_enabled: (row as Record<string, unknown>).response_wait_enabled !== false,
     },
   }
 }
@@ -165,7 +164,7 @@ export async function GET(request: Request) {
       .order('updated_at', { ascending: false })
       .limit(1)
       .maybeSingle()
-    let waitLast: any = null
+    let waitLast: Record<string, unknown> | null = null
     if (lastRes.error && isMissingColumnError(lastRes.error.message)) {
       const legacy = await supabase
         .from('response_wait_timers')
@@ -175,12 +174,12 @@ export async function GET(request: Request) {
         .order('updated_at', { ascending: false })
         .limit(1)
         .maybeSingle()
-      if (!legacy.error && legacy.data) waitLast = legacy.data
+      if (!legacy.error && legacy.data) waitLast = legacy.data as Record<string, unknown>
     } else if (!lastRes.error && lastRes.data) {
-      waitLast = lastRes.data
+      waitLast = lastRes.data as Record<string, unknown>
     }
 
-    let waitDerived: any = null
+    let waitDerived: { expires_at: string; delay_minutes: number } | null = null
     if (!waitTimer && owned.conv.response_wait_enabled) {
       const lastMsgRes = await supabase
         .from('messages')
@@ -189,13 +188,13 @@ export async function GET(request: Request) {
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle()
-      const msg = !lastMsgRes.error ? lastMsgRes.data : null
+      const msg = !lastMsgRes.error ? (lastMsgRes.data as Record<string, unknown> | null) : null
       const anchor =
         msg?.created_at && (msg.sender_type === 'agent' || msg.sender_type === 'bot')
-          ? Date.parse(msg.created_at as string)
+          ? Date.parse(String(msg.created_at))
           : NaN
       if (Number.isFinite(anchor)) {
-        const lastMinutes = waitLast?.delay_minutes
+        const lastMinutes = waitLast?.delay_minutes as number | undefined
         const delayMinutes =
           typeof lastMinutes === 'number' && lastMinutes > 0 && lastMinutes <= 10080
             ? Math.floor(lastMinutes)
@@ -217,7 +216,7 @@ export async function GET(request: Request) {
       .eq('account_id', accountId)
       .maybeSingle()
     if (!cfgRes.error && cfgRes.data) {
-      globalEnabled = (cfgRes.data as any).follow_up_enabled !== false
+      globalEnabled = (cfgRes.data as Record<string, unknown>).follow_up_enabled !== false
     }
 
     return NextResponse.json({
@@ -268,12 +267,12 @@ export async function POST(request: Request) {
     }
 
     const conversationId =
-      typeof body.conversation_id === 'string'
-        ? body.conversation_id
-        : typeof body.conversationId === 'string'
-          ? body.conversationId
+      typeof (body as Record<string, unknown>).conversation_id === 'string'
+        ? ((body as Record<string, unknown>).conversation_id as string)
+        : typeof (body as Record<string, unknown>).conversationId === 'string'
+          ? ((body as Record<string, unknown>).conversationId as string)
           : ''
-    const action = typeof body.action === 'string' ? body.action : ''
+    const action = typeof (body as Record<string, unknown>).action === 'string' ? ((body as Record<string, unknown>).action as string) : ''
     if (!conversationId) {
       return NextResponse.json(
         { success: false, error: 'Falta conversation_id' },
@@ -299,7 +298,7 @@ export async function POST(request: Request) {
     }
 
     if (action === 'reschedule') {
-      const delayMinutes = Math.max(1, Math.min(10080, Number(body.delay_minutes) || 10))
+      const delayMinutes = Math.max(1, Math.min(10080, Number((body as Record<string, unknown>).delay_minutes) || 10))
       const grab = await supabaseAdmin()
         .from('follow_ups')
         .select('id, conversation_id, type, status, execute_at')
@@ -308,7 +307,7 @@ export async function POST(request: Request) {
         .order('execute_at', { ascending: true })
         .limit(1)
         .maybeSingle()
-      if (!grab.data?.id) {
+      if (!(grab.data as Record<string, unknown> | null)?.id) {
         return NextResponse.json(
           { error: 'No pending follow-up to reschedule' },
           { status: 404 },
@@ -318,7 +317,7 @@ export async function POST(request: Request) {
       const updated = await supabaseAdmin()
         .from('follow_ups')
         .update({ execute_at: executeAt })
-        .eq('id', grab.data.id)
+        .eq('id', (grab.data as Record<string, unknown>).id)
         .eq('status', 'pending')
         .select('id, conversation_id, type, status, execute_at')
         .single()
@@ -326,14 +325,14 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: updated.error.message }, { status: 500 })
       }
       console.log(
-        `[follow-up] ${userId} rescheduled ${updated.data?.id} for conversation ${conversationId} by ${delayMinutes} minutes.`,
+        `[follow-up] ${userId} rescheduled ${(updated.data as Record<string, unknown> | null)?.id} for conversation ${conversationId} by ${delayMinutes} minutes.`,
       )
       return NextResponse.json({ success: true, follow_up: updated.data })
     }
 
     if (action === 'schedule') {
-      const delayMinutes = Math.max(1, Math.min(10080, Number(body.delay_minutes) || 10))
-      const type = (body.type as FollowUpType) || 'follow_up'
+      const delayMinutes = Math.max(1, Math.min(10080, Number((body as Record<string, unknown>).delay_minutes) || 10))
+      const type = ((body as Record<string, unknown>).type as FollowUpType) || 'follow_up'
       const id = await scheduleManualFollowUp(supabaseAdmin(), {
         conversationId,
         contactId: owned.conv.contact_id,
@@ -345,7 +344,7 @@ export async function POST(request: Request) {
     }
 
     if (action === 'set_enabled') {
-      const enabled = body.enabled === true || body.enabled === 'true'
+      const enabled = (body as Record<string, unknown>).enabled === true || (body as Record<string, unknown>).enabled === 'true'
       await supabaseAdmin()
         .from('conversations')
         .update({ follow_up_enabled: enabled })
@@ -362,7 +361,7 @@ export async function POST(request: Request) {
     }
 
     if (action === 'wait_enabled') {
-      const enabled = body.enabled === true || body.enabled === 'true'
+      const enabled = (body as Record<string, unknown>).enabled === true || (body as Record<string, unknown>).enabled === 'true'
       await supabaseAdmin()
         .from('conversations')
         .update({ response_wait_enabled: enabled })
@@ -377,7 +376,7 @@ export async function POST(request: Request) {
     if (action === 'wait_schedule' || action === 'wait_reset' || action === 'reset') {
       const delayMinutes = Math.max(
         1,
-        Math.min(10080, Number(body.delay_minutes) || ARM_DEFAULT_MINUTES),
+        Math.min(10080, Number((body as Record<string, unknown>).delay_minutes) || ARM_DEFAULT_MINUTES),
       )
       if (action !== 'wait_schedule') {
         await cancelResponseWaitTimers(supabaseAdmin(), conversationId, 'manual')
@@ -423,12 +422,6 @@ export async function POST(request: Request) {
       return NextResponse.json({ success: true })
     }
 
-    const rawMinutes = Number(body.delay_minutes)
-    const customMinutes =
-      Number.isFinite(rawMinutes) && rawMinutes > 0
-        ? Math.min(10080, Math.max(1, Math.floor(rawMinutes)))
-        : null
-
     if (action === 'process_now') {
       const admin = supabaseAdmin()
       let forceText: string = GENERIC_REMINDER
@@ -464,29 +457,26 @@ export async function POST(request: Request) {
           .maybeSingle()
         if (convRes.error) throw convRes.error
         if (!convRes.data) throw new Error('Conversation not found')
-        const conv = convRes.data
 
         const contactRes = await admin
           .from('contacts')
           .select(
             'id, phone, wa_id, wa_user_id, recipient_id, username, name, profile_name, display_name',
           )
-          .eq('id', conv.contact_id)
+          .eq('id', (convRes.data as Record<string, unknown>).contact_id)
           .maybeSingle()
         if (contactRes.error) throw contactRes.error
         if (contactRes.data) {
-          const target = getRecipientAddress(contactRes.data as any)
-          await (sendMessageToConversation as any)({ supabase: admin, accountId, conversationId, text: forceText, contact: contactRes.data as any, autoArm: false })
+          await (sendMessageToConversation as unknown as (arg: unknown) => Promise<unknown>)({
+            supabase: admin,
+            accountId,
+            conversationId,
+            text: forceText,
+            contact: contactRes.data as unknown,
+            autoArm: false,
+          })
           forcedSent = true
         }
-
-
-
-
-
-
-
-
       } catch (err) {
         if (err instanceof SendMessageError) {
           console.error('[TIMER FORCE-SEND ERROR]', err.code, err.message)
@@ -503,12 +493,12 @@ export async function POST(request: Request) {
       }
 
       try {
-        await (runDueFollowUps as any)(accountId, supabaseAdmin())
+        await (runDueFollowUps as unknown as (a: string, s: unknown) => Promise<void>)(accountId, admin)
       } catch (err) {
         console.error('[process_now runDueFollowUps]', err)
       }
       try {
-        await (runDueResponseWaitTimers as any)(accountId, supabaseAdmin())
+        await (runDueResponseWaitTimers as unknown as (a: string, s: unknown) => Promise<void>)(accountId, admin)
       } catch (err) {
         console.error('[process_now runDueResponseWaitTimers]', err)
       }
@@ -521,11 +511,11 @@ export async function POST(request: Request) {
     }
 
     if (action === 'set_type') {
-      const id = body.id
+      const id = (body as Record<string, unknown>).id
       if (!id || typeof id !== 'string') {
         return NextResponse.json({ error: 'id required' }, { status: 400 })
       }
-      const type = (body.type as FollowUpType) || 'follow_up'
+      const type = ((body as Record<string, unknown>).type as FollowUpType) || 'follow_up'
       await supabaseAdmin()
         .from('follow_ups')
         .update({ type })

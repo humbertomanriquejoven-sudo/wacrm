@@ -452,7 +452,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     } catch (err) {
       console.error("[TRIGGER 00:00 ERROR]:", err);
     }
-  }, [conversationId, t]);
+  }, [conversationId]);
 
   // CLIENT-TRIGGERED DISPATCH: every 1-second clock tick, an ACTIVE timer
   // whose server-derived remainder has reached 00:00 asks the backend to
@@ -491,7 +491,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       );
       void fireProcessNow();
     }
-  }, [status, serverSkew, followNowTs, waitNowTs, fireProcessNow]);
+  }, [status, serverSkew, followNowTs, waitNowTs, fireProcessNow, conversationId]);
 
   // ---- Timer 1 (seguimiento automático) -----------------------------
   const scheduleFollowUp = useCallback(async () => {
@@ -634,7 +634,7 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
     } finally {
       setBusyWait(null);
     }
-  }, [waitMinutes, post, refresh, t]);
+  }, [waitMinutes, post, refresh, t, conversationId]);
 
   // The shell NEVER leaves the DOM — no `return null` while loading, so the
   // banner stays fixed in the layout. Isolation across chats: only render a
