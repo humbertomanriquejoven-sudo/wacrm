@@ -407,6 +407,9 @@ async function throwMetaError(response: Response, fallback: string): Promise<nev
     `[Meta API] HTTP ${response.status} — ${fallback}`,
     raw || '(empty response body)',
   )
+  // Producción (Easypanel): el cuerpo de la respuesta que Meta devolvió con
+  // error, verbatim, bajo una etiqueta estable que se puede filtrar.
+  console.error('[META_ERROR_RESPONSE]', raw || '(empty response body)')
 
   let data: MetaErrorResponse = {}
   if (raw) {
@@ -624,6 +627,33 @@ export async function getSubscribedApps(
 // Sending
 // ============================================================
 
+/**
+ * POST a WhatsApp message payload to `/{phone_number_id}/messages`.
+ *
+ * Production diagnostics (Easypanel): the EXACT JSON that leaves the process
+ * is printed immediately before the fetch under a stable tag, and every
+ * non-OK Meta response body is logged (echoed by `throwMetaError` under
+ * `META_ERROR_RESPONSE`). Both make a delivery failure diagnosable from the
+ * deployment logs alone — including a recepient rejection that produced a
+ * 200-but-dropped message (no response body to log) vs. a literal 4xx with a
+ * body to read.
+ */
+async function postMessagesPayload(
+  url: string,
+  accessToken: string,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  console.log('[META_PAYLOAD_ENVIADO]', JSON.stringify(body, null, 2))
+  return fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify(body),
+  })
+}
+
 export interface SendTextMessageArgs {
   phoneNumberId: string
   accessToken: string
@@ -811,14 +841,7 @@ export async function sendTextMessage(
   if (contextMessageId) {
     body.context = { message_id: contextMessageId }
   }
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${accessToken}`,
-    },
-    body: JSON.stringify(body),
-  })
+  const response = await postMessagesPayload(url, accessToken, body)
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
@@ -916,14 +939,7 @@ export async function sendMediaMessage(
   }
   if (contextMessageId) body.context = { message_id: contextMessageId }
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${accessToken}`,
-    },
-    body: JSON.stringify(body),
-  })
+  const response = await postMessagesPayload(url, accessToken, body)
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
@@ -1036,14 +1052,7 @@ export async function sendTemplateMessage(
     body.context = { message_id: contextMessageId }
   }
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${accessToken}`,
-    },
-    body: JSON.stringify(body),
-  })
+  const response = await postMessagesPayload(url, accessToken, body)
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
@@ -1346,20 +1355,14 @@ export async function sendReactionMessage(
   const { phoneNumberId, accessToken, to, targetMessageId, emoji } = args
   const recipient = assertDialableRecipient(to)
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${accessToken}`,
-    },
-    body: JSON.stringify({
-      messaging_product: 'whatsapp',
-      recipient_type: 'individual',
-      ...recipientFields(recipient),
-      type: 'reaction',
-      reaction: { message_id: targetMessageId, emoji },
-    }),
-  })
+  const body: Record<string, unknown> = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    ...recipientFields(recipient),
+    type: 'reaction',
+    reaction: { message_id: targetMessageId, emoji },
+  }
+  const response = await postMessagesPayload(url, accessToken, body)
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
@@ -1484,14 +1487,7 @@ export async function sendInteractiveButtons(
   if (contextMessageId) body.context = { message_id: contextMessageId }
 
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${accessToken}`,
-    },
-    body: JSON.stringify(body),
-  })
+  const response = await postMessagesPayload(url, accessToken, body)
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
@@ -1618,14 +1614,7 @@ export async function sendInteractiveList(
   if (contextMessageId) body.context = { message_id: contextMessageId }
 
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${accessToken}`,
-    },
-    body: JSON.stringify(body),
-  })
+  const response = await postMessagesPayload(url, accessToken, body)
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }

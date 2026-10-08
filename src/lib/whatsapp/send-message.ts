@@ -311,13 +311,53 @@ export async function sendMessageToConversation(
     throw new SendMessageError('not_found', 'Conversation not found', 404);
   }
 
-  const contact = conversation.contact;
+  let contact = conversation.contact;
   if (!contact) {
     throw new SendMessageError(
       'bad_request',
       'Contact not found for this conversation',
       400
     );
+  }
+
+  // STRICT RECIPIENT OVERRIDE. The address that reaches Meta must come from
+  // THIS contact row, never from anything the caller claimed. The embed above
+  // is read under the caller's RLS (column policies can trim `phone`, and a
+  // contacts join can come back partial), so the full row is re-read with the
+  // service role key: RLS cannot hide `phone` / `wa_id` / `wa_user_id` /
+  // `username` here. The embed survives as a fallback only for a runtime where
+  // the admin client is unconfigured. The read is defensive: an override
+  // failure must never take the send down.
+  let adminContact: Record<string, unknown> | null = null;
+  try {
+    const { data, error } = await supabaseAdmin()
+      .from('contacts')
+      .select('*')
+      .eq('id', contact.id)
+      .single();
+    if (!error && data) {
+      adminContact = data as unknown as Record<string, unknown>;
+      console.log(
+        `[send-message] strict contact override: contact ${contact.id} re-read via service role → phone="${data.phone ?? ''}", wa_id="${data.wa_id ?? ''}", wa_user_id="${data.wa_user_id ?? ''}", username="${data.username ?? ''}"`
+      );
+    } else if (error) {
+      console.warn(
+        '[send-message] service-role contact override unavailable for',
+        contact.id,
+        '- falling back to the RLS-scoped embed:',
+        error.message
+      );
+    }
+  } catch (err) {
+    console.warn(
+      '[send-message] service-role contact override unavailable for',
+      contact.id,
+      '- falling back to the RLS-scoped embed:',
+      err instanceof Error ? err.message : err
+    );
+  }
+  if (adminContact) {
+    contact = adminContact as typeof contact;
   }
 
   // WhatsApp config, account-scoped.
@@ -562,6 +602,10 @@ export async function sendMessageToConversation(
   // and retries a different identifier when Meta rejects the first. Real
   // numbers additionally get their trunk-prefix variants (the sandbox's
   // #131030 quirk); an opaque id has exactly one form.
+  console.log(
+    `[send-message] sending to conversation ${conversationId}: ladder → to="${resolved.to}" (source=${resolved.source}, isPhone=${resolved.isPhone}); ` +
+      `context=${contextMessageId ?? 'none (direct number)'}`
+  );
   let waMessageId = '';
   let workingPhone = contact.phone ?? '';
   try {

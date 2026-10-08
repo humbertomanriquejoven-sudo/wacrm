@@ -201,7 +201,10 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
   isLegacyFormat: () => false,
 }));
 
-const adminRead = vi.hoisted(() => ({ inboundRows: [] as unknown[] }));
+const adminRead = vi.hoisted(() => ({
+  inboundRows: [] as unknown[],
+  contactRow: null as Record<string, unknown> | null,
+}));
 
 vi.mock('@/lib/flows/admin-client', () => ({
   supabaseAdmin: () => ({
@@ -215,6 +218,17 @@ vi.mock('@/lib/flows/admin-client', () => ({
           not: () => builder,
           order: () => builder,
           limit: async () => ({ data: adminRead.inboundRows, error: null }),
+        };
+        return builder;
+      }
+      if (table === 'contacts') {
+        // The strict recipient override re-reads the full contact row with the
+        // service role; `adminRead.contactRow` can differ from the RLS-scoped
+        // `conversation.contact` embed to simulate RLS hiding a phone.
+        const builder: Record<string, unknown> = {
+          select: () => builder,
+          eq: () => builder,
+          single: async () => ({ data: adminRead.contactRow, error: null }),
         };
         return builder;
       }
@@ -264,6 +278,12 @@ function sendPathDb(
   // `inboundRows` below keeps the user-scoped fake's own `limit` honest.
   const inboundRows = opts?.inboundRows ?? [];
   adminRead.inboundRows = inboundRows;
+  // Mirror the contact into the service-role read; a test may then override
+  // this with a row that RLS WOULD have hidden (see the strict-override test).
+  adminRead.contactRow = (opts?.contact ?? {
+    id: 'ct-1',
+    phone: '+15551234567',
+  }) as Record<string, unknown>;
 
   return {
     from(table: string) {
@@ -523,6 +543,71 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
     // The bubble the operator actually clicked wins over the newest inbound.
     expect(sendTextMessage).toHaveBeenCalledWith(
       expect.objectContaining({ contextMessageId: 'wamid.CHOSEN' })
+    );
+  });
+});
+
+// ============================================================
+// STRICT RECIPIENT OVERRIDE. Whatever the caller claims (a BSUID, an
+// @user) or whatever an RLS-scoped read returns (a contact row whose
+// `phone` is trimmed away), the send core re-reads the full contacts row
+// with the service role and forces the destination from the DB.
+// ============================================================
+describe('sendMessageToConversation - strict service-role contact override', () => {
+  it('sends DIRECTLY to the service-role phone even when the RLS embed hides it', async () => {
+    // The embed (RLS-scoped) exposes a phone-less contact; the service-role
+    // read carries the decorated real number. The override must clean it and
+    // aim the payload at the bare digits — never at a BSUID or @user.
+    const db = sendPathDb(
+      [],
+      {},
+      { contact: { id: 'ct-1', phone: null } }
+    );
+    adminRead.contactRow = {
+      id: 'ct-1',
+      phone: '@573167071066',
+      wa_user_id: '1008477715690681',
+      username: '@humbertomanriquejoven',
+    };
+
+    await sendMessageToConversation(db, 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'Hola Humberto',
+    });
+
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: '573167071066' })
+    );
+    const call = vi.mocked(sendTextMessage).mock.calls[0][0] as {
+      to: string;
+      contextMessageId?: string;
+    };
+    expect(call.to).not.toMatch(/@humbertomanriquejoven|1008477715690681/);
+    expect(call.contextMessageId).toBeUndefined();
+  });
+
+  it('falls back to the embed when the service-role read is unavailable', async () => {
+    // A service-role client that cannot serve `contacts` (unconfigured at
+    // runtime, tests, partial mocks) must degrade to the RLS embed instead of
+    // crashing the send.
+    const db = sendPathDb(
+      [],
+      {},
+      { contact: { id: 'ct-1', phone: '+15551234567' } }
+    );
+    adminRead.contactRow = null;
+
+    await sendMessageToConversation(db, 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'Hola',
+    });
+
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: '15551234567' })
     );
   });
 });
