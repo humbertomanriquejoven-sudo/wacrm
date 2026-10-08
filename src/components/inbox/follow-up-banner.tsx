@@ -42,6 +42,26 @@ async function parseFollowUpsResponse(res: Response): Promise<SafeFollowUpsBody>
   }
 }
 
+// Multi-field error extraction: the backend may answer with `error`,
+// `message`, `details` or `err` — ANY of them is shown, so the toast never
+// falls back to a generic "Fallo desconocido". A string body wins directly
+// (a proxy page while it IS the message), and the HTTP status is the last
+// resort.
+function extractError(
+  data: Record<string, unknown> | null | undefined | string,
+  status: number,
+): string {
+  if (typeof data === "string" && data.trim()) return data;
+  const d = (data ?? {}) as Record<string, unknown>;
+  return (
+    (d.error as string) ||
+    (d.message as string) ||
+    (d.details as string) ||
+    (d.err as string) ||
+    `Error HTTP ${status}`
+  );
+}
+
 // ------------------------------------------------------------------
 // Per-conversation timer banner — TWO fully independent, persistent
 // timers per chat, each with its OWN ON/OFF switch:
@@ -361,9 +381,10 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
         // body is the proxy's "service down" page — never render it as
         // content, always log what actually came back and toast the detail.
         if (!res.ok || !parsed.ok || data.success === false) {
+          console.log("[FOLLOW-UP RAW RESPONSE]:", res.status, data);
           console.error("[FOLLOW-UP DETAILED ERROR]:", data);
           toast.error(
-            `Error de seguimiento: ${(data.error as string) || "Fallo desconocido"}`,
+            `Error de seguimiento: ${extractError(data, res.status)}`,
           );
           return null;
         }
@@ -381,6 +402,15 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
   // into a toast). The route is session-authorized (no cron token), so a
   // non-200 here is a real backend failure worth logging with `res.text()`.
   const fireProcessNow = useCallback(async () => {
+    // 00:00 VALIDATION — never POST an empty/invalid id: a missing banner id
+    // is a mount/state bug, not something the server can fix. Fail visibly.
+    if (typeof conversationId !== "string" || !conversationId.trim()) {
+      console.error("[FOLLOW-UP TRIGGER] Missing conversation_id — aborting 00:00 dispatch", {
+        conversationId,
+      });
+      toast.error("Error: ID de conversación no encontrado en el banner");
+      return;
+    }
     try {
       const res = await fetch("/api/whatsapp/follow-ups", {
         method: "POST",
@@ -399,10 +429,11 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
         error?: string;
       };
       if (!res.ok || !parsed.ok || json.success === false) {
+        console.log("[FOLLOW-UP RAW RESPONSE]:", res.status, json);
         console.error("[TRIGGER 00:00 ERROR]:", res.status, parsed.text || "");
         console.error("[FOLLOW-UP DETAILED ERROR]:", json);
         toast.error(
-          `Error de seguimiento: ${json.error || "Fallo desconocido"}`,
+          `Error de seguimiento: ${extractError(json, res.status)}`,
         );
         return;
       }

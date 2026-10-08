@@ -305,18 +305,41 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
-    const { supabase, accountId, userId } = await requireRole('agent')
+    // Session/role verification — on failure answer an explicit JSON 401
+    // instead of an opaque 500 / HTML proxy page.
+    let session: Awaited<ReturnType<typeof requireRole>> | null = null
+    try {
+      session = await requireRole('agent')
+    } catch (err) {
+      console.error('[FOLLOW-UP AUTH ERROR]:', err)
+    }
+    if (!session) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: 'Sesión no válida o sin permisos (401/403)',
+        },
+        { status: 401 },
+      )
+    }
+    const { supabase, accountId, userId } = session
 
     const body = await request.json().catch(() => null)
     if (!body || typeof body !== 'object') {
       return NextResponse.json({ error: 'Invalid request body' }, { status: 400 })
     }
+    // Flexible id extraction: accept camelCase too (some clients POST
+    // `conversationId`); never crash on a missing/empty value.
     const conversationId =
-      typeof body.conversation_id === 'string' ? body.conversation_id : ''
+      typeof body.conversation_id === 'string'
+        ? body.conversation_id
+        : typeof body.conversationId === 'string'
+          ? body.conversationId
+          : ''
     const action = typeof body.action === 'string' ? body.action : ''
     if (!conversationId) {
       return NextResponse.json(
-        { error: 'conversation_id is required' },
+        { success: false, error: 'Falta el parámetro conversation_id' },
         { status: 400 },
       )
     }
