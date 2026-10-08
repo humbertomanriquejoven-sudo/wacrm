@@ -165,6 +165,36 @@ async function prepareRecipient(
   return { to: recipient.to, sanitized, isPhone: recipient.isPhone }
 }
 
+/**
+ * Resolve the #131009 anchor for one send — the shared rule every sender
+ * in this file obeys.
+ *
+ * A dialable number is addressed directly and needs no anchor. An opaque id
+ * (BSUID / wa_id / @lid / @user) is accepted by Meta only as a reply
+ * quoting one of the customer's own messages, so when the caller didn't
+ * bring a `contextMessageId` the thread's newest inbound wamid is looked up
+ * dynamically in `messages`. No anchor + opaque destination = no
+ * addressable recipient: refuse locally, BEFORE any HTTP request, instead
+ * of firing one Meta drops with "Recipient phone number not in allowed
+ * list" (#131009).
+ */
+async function resolveAnchorOrRefuse(
+  db: ReturnType<typeof supabaseAdmin>,
+  opts: { conversationId: string; isPhone: boolean; target: string },
+): Promise<string | undefined> {
+  if (opts.isPhone) return undefined
+  const anchorMessageId =
+    (await latestInboundAnchorId(db, opts.conversationId)) ?? undefined
+  if (!anchorMessageId) {
+    throw new Error(
+      `cannot send to the opaque id "${opts.target}" for conversation ${opts.conversationId}: ` +
+        `the thread has no inbound wamid to quote, so WhatsApp cannot address it (#131009 guard) — ` +
+        `no HTTP request was sent`,
+    )
+  }
+  return anchorMessageId
+}
+
 export async function engineSendText(
   args: SendTextEngineArgs,
 ): Promise<{ whatsapp_message_id: string }> {
@@ -192,18 +222,11 @@ export async function engineSendText(
   // the thread's newest customer wamid now; with no anchor there is no way to
   // address this contact, so fail before any HTTP request instead of letting
   // Meta drop the message. Dialable numbers are untouched: no anchor needed.
-  let anchorMessageId: string | undefined
-  if (!isPhone) {
-    anchorMessageId =
-      (await latestInboundAnchorId(db, args.conversationId)) ?? undefined
-    if (!anchorMessageId) {
-      throw new Error(
-        `cannot send to the opaque id "${target}" for conversation ${args.conversationId}: ` +
-          `the thread has no inbound wamid to quote, so WhatsApp cannot address it (#131009 guard) — ` +
-          `no HTTP request was sent`,
-      )
-    }
-  }
+  const anchorMessageId = await resolveAnchorOrRefuse(db, {
+    conversationId: args.conversationId,
+    isPhone,
+    target,
+  })
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
@@ -247,6 +270,10 @@ export async function engineSendText(
           accessToken,
           to: v,
           text: args.text,
+          // Quote the customer's own message. Without this the anchor
+          // resolved above is pointless: an opaque destination reaches Meta
+          // ONLY inside `context` (#131009).
+          contextMessageId: anchorMessageId,
         })
         waMessageId = r.messageId
         workingPhone = v
@@ -554,11 +581,19 @@ export async function engineSendMedia(
   if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-  const { to: target, sanitized } = await prepareRecipient(
+  const { to: target, sanitized, isPhone } = await prepareRecipient(
     contact,
     args.accountId,
     args.conversationId,
   )
+
+  // #131009 anchor — same rule as the text sender: an opaque id is
+  // deliverable only as a reply to the customer's own message.
+  const anchorMessageId = await resolveAnchorOrRefuse(db, {
+    conversationId: args.conversationId,
+    isPhone,
+    target,
+  })
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
@@ -580,6 +615,7 @@ export async function engineSendMedia(
       link: args.link,
       caption: args.caption,
       filename: args.filename,
+      contextMessageId: anchorMessageId,
     })
     return r.messageId
   }
@@ -724,11 +760,20 @@ async function sendInteractiveViaMeta(
   if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-const { to: target, sanitized } = await prepareRecipient(
+const { to: target, sanitized, isPhone } = await prepareRecipient(
     contact,
     input.accountId,
     input.conversationId,
   )
+
+  // #131009 anchor — same rule as the text sender: an opaque id is
+  // deliverable only as a reply to the customer's own message. This also
+  // covers the automations engine, whose interactive sends delegate here.
+  const anchorMessageId = await resolveAnchorOrRefuse(db, {
+    conversationId: input.conversationId,
+    isPhone,
+    target,
+  })
 
   const { data: config, error: configErr } = await db
     .from('whatsapp_config')
@@ -751,6 +796,7 @@ const { to: target, sanitized } = await prepareRecipient(
         buttons: input.buttons,
         headerText: input.headerText,
         footerText: input.footerText,
+        contextMessageId: anchorMessageId,
       })
       return r.messageId
     }
@@ -763,6 +809,7 @@ const { to: target, sanitized } = await prepareRecipient(
       sections: input.sections,
       headerText: input.headerText,
       footerText: input.footerText,
+      contextMessageId: anchorMessageId,
     })
     return r.messageId
   }

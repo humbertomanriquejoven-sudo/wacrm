@@ -352,6 +352,14 @@ export async function sendMessageToConversation(
       });
   }
 
+  // Escalera Úntica de resolución de destinatario — decide AT SEND TIME
+  // from the contact row: a real number wins (direct `to`); a contact we
+  // can only reach through an opaque id (BSUID / wa_id / @user) is
+  // resolved next. Moving this BEFORE the reply-anchor logic lets the two
+  // interact: quoting OUR OWN message does not authorize an opaque
+  // destination, so that case falls through to the dynamic lookup below.
+  const resolved = await resolveRecipient(contact, accountId, conversationId);
+
   // Resolve the reply target to its Meta message_id. The parent must
   // belong to this same conversation — otherwise a caller could quote
   // messages they can't see by guessing UUIDs.
@@ -359,7 +367,7 @@ export async function sendMessageToConversation(
   if (replyToMessageId) {
     const { data: parent, error: parentError } = await db
       .from('messages')
-      .select('message_id, conversation_id')
+      .select('message_id, conversation_id, sender_type')
       .eq('id', replyToMessageId)
       .eq('conversation_id', conversationId)
       .maybeSingle();
@@ -371,17 +379,26 @@ export async function sendMessageToConversation(
         400
       );
     }
+    const parentIsOurs =
+      parent.sender_type === 'agent' || parent.sender_type === 'bot';
+    const destinationIsOpaque = Boolean(resolved.to) && !resolved.isPhone;
     if (!parent.message_id) {
       console.warn(
         '[send-message] reply target has no Meta message_id; sending without context'
+      );
+    } else if (parentIsOurs && destinationIsOpaque) {
+      // WhatsApp only accepts an opaque id as a reply QUOTING ONE OF THE
+      // CUSTOMER'S OWN messages — quoting our agent/bot bubble leaves Meta
+      // with nothing that authorizes the destination (#131009). Fall
+      // through to the thread's newest customer wamid below.
+      console.warn(
+        `[send-message] reply target ${parent.message_id} is our own message; an opaque destination needs the customer's wamid — anchoring to the thread's newest inbound instead`
       );
     } else {
       contextMessageId = parent.message_id;
     }
   }
 
-  // The parity fix.
-  //
   // A contact we can only identify by an opaque id — a `@user` display id, a
   // BSUID, a `WAID.`/`LID.` id — CANNOT be addressed as a cold destination in
   // Meta's `to`: sent bare it has been observed to come back as (#131009)
@@ -399,39 +416,36 @@ export async function sendMessageToConversation(
   // to quote there is no way to address this contact at all, so the send is
   // refused locally with a typed 422 and a recorded failed bubble instead of
   // firing a request Meta will only drop.
-  if (!contextMessageId) {
-    const resolved = await resolveRecipient(contact, accountId, conversationId);
-    if (resolved.to && !resolved.isPhone) {
-      contextMessageId =
-        (await latestInboundAnchorId(db, conversationId)) ?? undefined;
-      if (contextMessageId) {
-        console.log(
-          `[send-message] contact ${contact.id} is addressed by an opaque id (${resolved.source}); ` +
-            `anchoring the send to inbound message ${contextMessageId} so WhatsApp accepts it`
-        );
-      } else {
-        // No anchor and no dialable number: an opaque id sent bare comes back
-        // as (#131009) "Recipient phone number not in allowed list". Fail
-        // HERE, loudly and locally, instead of putting a request on the wire
-        // that bounces or — worse — lands as a 200 that never delivered.
-        const detail =
-          `Recipient "${resolved.to}" (source: ${resolved.source}) has no dialable phone number and conversation ` +
-          `${conversationId} has no inbound wamid to quote, so WhatsApp cannot address it — an opaque id sent ` +
-          `without a reply anchor is refused by Meta with (#131009). ` +
-          `No HTTP request was sent to Meta.`;
-        console.error(
-          `[send-message] INVALID RECIPIENT for conversation ${conversationId} / contact ${contact.id}: ${detail}`,
-        );
-        await recordSendFailure(db, {
-          conversationId,
-          senderType: params.senderType ?? 'agent',
-          messageType,
-          contentText: contentText ?? null,
-          mediaUrl: mediaUrl || null,
-          errorDetail: detail,
-        });
-        throw new SendMessageError('invalid_recipient', detail, 422);
-      }
+  if (!contextMessageId && resolved.to && !resolved.isPhone) {
+    contextMessageId =
+      (await latestInboundAnchorId(db, conversationId)) ?? undefined;
+    if (contextMessageId) {
+      console.log(
+        `[send-message] contact ${contact.id} is addressed by an opaque id (${resolved.source}); ` +
+          `anchoring the send to inbound message ${contextMessageId} so WhatsApp accepts it`
+      );
+    } else {
+      // No anchor and no dialable number: an opaque id sent bare comes back
+      // as (#131009) "Recipient phone number not in allowed list". Fail
+      // HERE, loudly and locally, instead of putting a request on the wire
+      // that bounces or — worse — lands as a 200 that never delivered.
+      const detail =
+        `Recipient "${resolved.to}" (source: ${resolved.source}) has no dialable phone number and conversation ` +
+        `${conversationId} has no inbound wamid to quote, so WhatsApp cannot address it — an opaque id sent ` +
+        `without a reply anchor is refused by Meta with (#131009). ` +
+        `No HTTP request was sent to Meta.`;
+      console.error(
+        `[send-message] INVALID RECIPIENT for conversation ${conversationId} / contact ${contact.id}: ${detail}`,
+      );
+      await recordSendFailure(db, {
+        conversationId,
+        senderType: params.senderType ?? 'agent',
+        messageType,
+        contentText: contentText ?? null,
+        mediaUrl: mediaUrl || null,
+        errorDetail: detail,
+      });
+      throw new SendMessageError('invalid_recipient', detail, 422);
     }
   }
 
