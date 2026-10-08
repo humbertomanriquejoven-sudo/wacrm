@@ -350,7 +350,20 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       });
       if (!res.ok) {
         const body = await res.text();
-        console.error("Error enviando seguimiento:", body || `HTTP ${res.status}`);
+        console.error("[TRIGGER 00:00 ERROR]:", res.status, body || "");
+        // Surface the server's own message on the banner (a toast) so the
+        // failure is visible in the interface, not only the console.
+        toast.error(
+          body
+            ? (() => {
+                try {
+                  return (JSON.parse(body) as { error?: string }).error;
+                } catch {
+                  return body;
+                }
+              })() ?? t("updateError")
+            : `${t("updateError")} (HTTP ${res.status})`,
+        );
         return;
       }
       const json = (await res.json().catch(() => ({}))) as {
@@ -359,7 +372,10 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
         sent?: { follow_ups?: number; response_wait?: number };
       };
       if (json.success === false) {
-        console.error("Error enviando seguimiento:", JSON.stringify(json));
+        console.error("[TRIGGER 00:00 ERROR]:", JSON.stringify(json));
+        toast.error(
+          (json as { error?: string }).error ?? t("updateError"),
+        );
         return;
       }
       if (json.message_id) {
@@ -375,9 +391,9 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
         );
       }
     } catch (err) {
-      console.error("Error enviando seguimiento:", err);
+      console.error("[TRIGGER 00:00 ERROR]:", err);
     }
-  }, [conversationId]);
+  }, [conversationId, t]);
 
   // CLIENT-TRIGGERED DISPATCH: every 1-second clock tick, an ACTIVE timer
   // whose server-derived remainder has reached 00:00 asks the backend to
@@ -516,6 +532,11 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
       const json = await post("wait_reset", { delay_minutes: value });
       if (json) {
         if (json.scheduled === false) {
+          console.error(
+            "[RESET BUTTON ERROR]: could not reset the timer for conversation",
+            conversationId,
+            JSON.stringify(json),
+          );
           setWaitError((json.error as string) ?? t("waitFailed"));
           toast.error((json.error as string) ?? t("waitFailed"));
         } else {

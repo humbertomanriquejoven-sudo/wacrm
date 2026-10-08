@@ -15,7 +15,7 @@ import {
   buildFollowUpMessage,
   type FollowUpType,
 } from '@/lib/whatsapp/follow-up-worker'
-import { sendMessageToConversation } from '@/lib/whatsapp/send-message'
+import { sendMessageToConversation, SendMessageError } from '@/lib/whatsapp/send-message'
 
 /**
  * CRM-facing follow-ups API — the UI companion to the runner.
@@ -466,11 +466,35 @@ export async function POST(request: Request) {
               )
             } catch (err) {
               // Meta rejected it or the send core could not resolve a
-              // destination — recorded EXPLICITLY (console.error) so the
-              // failure is traceable server-side and in the frontend log.
+              // destination — the exact API answer is captured and printed
+              // EXPLICITLY (including a 24h-window restriction like Meta
+              // error 131047 / 400), and the backend answers with the real
+              // status + error object instead of hiding it behind a 200.
+              const detail =
+                err instanceof SendMessageError
+                  ? {
+                      message: err.message,
+                      code: err.code,
+                      meta_status: err.status,
+                    }
+                  : {
+                      message: err instanceof Error ? err.message : String(err),
+                      code: 'unknown',
+                      meta_status: 500,
+                    }
               console.error(
-                `[TIMER FORCE-SEND] forced contextual send failed for conversation ${conversationId}:`,
-                err instanceof Error ? err.message : err,
+                '[META REJECTION AT 00:00]:',
+                JSON.stringify({ ...detail, conversation_id: conversationId }),
+              )
+              return NextResponse.json(
+                {
+                  success: false,
+                  error: detail.message,
+                  code: detail.code,
+                  meta_status: detail.meta_status,
+                  conversation_id: conversationId,
+                },
+                { status: detail.meta_status >= 400 ? detail.meta_status : 502 },
               )
             }
           }

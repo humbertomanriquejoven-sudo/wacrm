@@ -1284,6 +1284,19 @@ export async function runDueFollowUps(
           `[follow-up] could not send the follow-up for conversation ${conversationId} (destination resolved via getRecipientAddress: ${destination ?? 'none'}):`,
           err instanceof Error ? err.message : err,
         )
+        const metaErr =
+          err &&
+          typeof err === 'object' &&
+          'status' in (err as object) &&
+          'code' in (err as object)
+            ? (err as { status?: number; code?: string; message?: string })
+            : null
+        if (metaErr?.status && metaErr.code) {
+          console.error(
+            `[META REJECTION AT 00:00]: status ${metaErr.status}, code ${metaErr.code} —`,
+            metaErr.message ?? '',
+          )
+        }
         const { error: noRespErr } = await client
           .from('follow_ups')
           .update({ status: 'no_response' })
@@ -1691,6 +1704,19 @@ export async function runDueResponseWaitTimers(
           `[response-wait] could not send the follow-up for conversation ${conversationId} (destination resolved via getRecipientAddress: ${destination ?? 'none'}):`,
           err instanceof Error ? err.message : err,
         )
+        const metaErr =
+          err &&
+          typeof err === 'object' &&
+          'status' in (err as object) &&
+          'code' in (err as object)
+            ? (err as { status?: number; code?: string; message?: string })
+            : null
+        if (metaErr?.status && metaErr.code) {
+          console.error(
+            `[META REJECTION AT 00:00]: status ${metaErr.status}, code ${metaErr.code} —`,
+            metaErr.message ?? '',
+          )
+        }
         const { error: noRespErr } = await client
           .from('response_wait_timers')
           .update({ status: 'no_response' })
