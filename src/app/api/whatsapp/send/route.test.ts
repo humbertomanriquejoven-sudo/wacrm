@@ -401,7 +401,9 @@ describe('POST /api/whatsapp/send — media recipient + failure mapping', () => 
 
     expect(status).toBe(422)
     expect(json.code).toBe('invalid_recipient')
-    expect(json.error).toMatch(/no destination is available/)
+    // The definitive delivery-error string; the cause rides in meta_response.
+    expect(json.error).toBe('Error de entrega de mensaje')
+    expect(json.meta_response).toMatch(/no destination is available/)
     // Nothing was delivered, so nothing may be recorded as sent.
     expect(messageInserts).toHaveLength(0)
   })
@@ -416,7 +418,8 @@ describe('POST /api/whatsapp/send — media recipient + failure mapping', () => 
 
     expect(status).toBe(422)
     expect(json.code).toBe('meta_rejected')
-    expect(json.error).toMatch(/Invalid file/)
+    expect(json.error).toBe('Error de entrega de mensaje')
+    expect(json.meta_response).toMatch(/Invalid file/)
   })
 
   it('still 502s when Meta itself fails upstream', async () => {

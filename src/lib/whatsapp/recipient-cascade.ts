@@ -33,7 +33,7 @@ import { isPlaceholderValue } from '@/lib/whatsapp/phone-utils'
  * core and the HTTP layers all quote the exact same copy.
  */
 export const HOW_TO_FIX_DESTINATION =
-  "INSTRUCCIONES DE SOLUCIÓN: 1. Dirígete a la columna derecha del CRM (Panel lateral del contacto). 2. En el campo 'Número de teléfono', ingresa el número celular con código de país (ejemplo: 573001234567). 3. Presiona 'Guardar'. Si el usuario escribe un nuevo mensaje, el sistema capturará su número automáticamente."
+  'CÓMO SOLUCIONARLO: 1. Escribe el número telefónico del cliente con código de país en el panel derecho (ej. 573001234567). 2. Presiona Guardar. Si el cliente escribe un nuevo mensaje, el sistema vinculará su canal automáticamente.'
 
 export type CascadeSourceKey =
   | 'contacts_phone'
@@ -58,17 +58,17 @@ export interface DestinationCascadeReport {
   /** The first source's digit run, or null when no source was valid. */
   finalTo: string | null
   chosen: CascadeSourceKey | null
+  /** Raw contact phone as stored in the DB ('' when absent). */
+  phoneDb: string
+  /** Raw conversation-level id (wa_id / channel_id) — '' when absent. */
+  bsuid: string
+  /** True when the conversation-level id yields a VALID numeric run. */
+  bsuidValid: boolean
+  /** Newest inbound wamid in this conversation, or null when there is none. */
+  latestInboundWamid: string | null
 }
 
 const SEPARATOR = '='.repeat(50)
-
-export const SOURCE_LABELS: Record<CascadeSourceKey, string> = {
-  contacts_phone: 'Fuente 1 (contacts.phone)',
-  contacts_metadata: 'Fuente 2 (contacts.metadata)',
-  conversations_wa_id: 'Fuente 3 (conversations.wa_id)',
-  channel_bsuid: 'Fuente 4 (conversation.channel_id / bsuid)',
-  latest_inbound_from: 'Fuente 5 (latest_inbound_from)',
-}
 
 /**
  * Sanitize a source value per the REGLA DE SANITIZACIÓN: keep ONLY numeric
@@ -91,8 +91,13 @@ export function sanitizeCascadeSource(raw: unknown): CascadeSourceStatus {
 /** The flat `diagnostic_report` object carried on the HTTP 422 (and logs). */
 export function toDiagnosticHttp(
   report: DestinationCascadeReport,
-): Record<CascadeSourceKey, string> {
+): Record<string, string> {
   return {
+    // Definitive CRM-facing keys (Task 3B): the UI reads these three.
+    phone_db: report.phoneDb,
+    bsuid: report.bsuid,
+    selected_target: report.finalTo ?? '',
+    // Granular per-source detail, kept for deeper debugging.
     contacts_phone: report.sources.contacts_phone.raw ?? '',
     contacts_metadata: report.sources.contacts_metadata.raw ?? '',
     conversations_wa_id: report.sources.conversations_wa_id.raw ?? '',
@@ -105,19 +110,15 @@ export function toDiagnosticHttp(
 export function formatDestinationCascadeReport(
   report: DestinationCascadeReport,
 ): string {
-  const line = (key: CascadeSourceKey) =>
-    `- ${SOURCE_LABELS[key]}: "${report.sources[key].raw}" -> [${report.sources[key].status}]`
   return [
     SEPARATOR,
     '[INFORME_DIAGNOSTICO_DESTINATARIO]',
     `- Conversation ID: ${report.conversationId ?? ''}`,
     `- Contact ID: ${report.contactId ?? ''}`,
-    line('contacts_phone'),
-    line('contacts_metadata'),
-    line('conversations_wa_id'),
-    line('channel_bsuid'),
-    line('latest_inbound_from'),
-    `- DESTINATARIO FINAL RESUELTO: "${report.finalTo ?? 'NINGUNO'}"`,
+    `- Contact Phone (DB): "${report.phoneDb}" -> [${report.sources.contacts_phone.status}]`,
+    `- Conversation BSUID/WA_ID: "${report.bsuid}" -> [${report.bsuidValid ? 'VALIDO' : 'INVALIDO'}]`,
+    `- Last Inbound WAMID: "${report.latestInboundWamid ?? 'NINGUNO'}"`,
+    `- DESTINATARIO FINAL SELECCIONADO: "${report.finalTo ?? 'NINGUNO'}"`,
     SEPARATOR,
   ].join('\n')
 }
@@ -205,26 +206,35 @@ export async function buildDestinationCascadeReport(
       contact?.recipient_id
   )
 
-  // Fuente 5 — último mensaje entrante: sender_id / raw_payload ->> from.
+  // Fuente 5 — último mensaje entrante: sender_id / raw_payload ->> from,
+  // y su wamid (para anclar el envío a un BSUID cuando se necesita).
   // Leída siempre con la service role: un cliente con RLS (user-scoped) jamás
   // debe secuestrar la resolución del destinatario.
   let latestInboundFrom: CascadeSourceStatus = sanitizeCascadeSource(null)
+  let latestInboundWamid: string | null = null
   if (conversationId) {
     try {
       const { data, error } = await db
         .from('messages')
-        .select('sender_phone, raw_meta_payload')
+        .select('sender_phone, raw_meta_payload, message_id')
         .eq('conversation_id', conversationId)
         .eq('sender_type', 'customer')
         .order('created_at', { ascending: false })
         .limit(1)
       const row = (data ?? [])[0] as
-        | { sender_phone?: string | null; raw_meta_payload?: unknown }
+        | {
+            sender_phone?: string | null
+            raw_meta_payload?: unknown
+            message_id?: string | null
+          }
         | undefined
       if (!error && row) {
         latestInboundFrom = sanitizeCascadeSource(
           row.sender_phone ?? metaIdFromRawPayload(row.raw_meta_payload)
         )
+        if (typeof row.message_id === 'string' && row.message_id) {
+          latestInboundWamid = row.message_id
+        }
       }
     } catch {
       // best-effort por diseño: sin huella no se inventa destino.
@@ -251,11 +261,26 @@ export async function buildDestinationCascadeReport(
     }
   }
 
+  // The conversation-level id the log/HTTP report presents as "BSUID/WA_ID":
+  // the wamid stored on the conversation (S3) when available, else the channel
+  // id (S4). Marked VALIDO when either of those sources is.
+  const bsuid =
+    sources.conversations_wa_id.raw !== ''
+      ? sources.conversations_wa_id.raw
+      : sources.channel_bsuid.raw
+  const bsuidValid =
+    sources.conversations_wa_id.status === 'VALIDO' ||
+    sources.channel_bsuid.status === 'VALIDO'
+
   return {
     conversationId: conversationId ?? null,
     contactId: contactId ?? null,
     sources,
     finalTo,
     chosen,
+    phoneDb: sources.contacts_phone.raw ?? '',
+    bsuid,
+    bsuidValid,
+    latestInboundWamid,
   }
 }

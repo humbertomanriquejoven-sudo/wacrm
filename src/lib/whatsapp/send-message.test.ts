@@ -747,12 +747,13 @@ describe('sendMessageToConversation - destination cascade 422 (no phone, no BSUI
     const sendError = err as SendMessageError;
     expect(sendError.status).toBe(422);
     expect(sendError.code).toBe('no_delivery_destination');
-    expect(sendError.message).toBe(
-      'No fue posible determinar un destinatario válido para WhatsApp'
-    );
-    // Every cascade source must be reported empty — including the metadata
-    // and the conversation-level columns that the legacy resolver never looked at.
+    // The definitive delivery-error string the CRM UI displays cleanly.
+    expect(sendError.message).toBe('Error de entrega de mensaje');
+    // The CRM-facing keys (Task 3B) plus the granular per-source detail.
     expect(sendError.diagnosticReport).toEqual({
+      phone_db: '',
+      bsuid: '',
+      selected_target: '',
       contacts_phone: '',
       contacts_metadata: '',
       conversations_wa_id: '',
@@ -851,7 +852,12 @@ describe('sendMessageToConversation - destination cascade (S3/S4/S5 conversation
       // The [INFORME_DIAGNOSTICO_DESTINATARIO] block is printed before Meta.
       expect(logs.join('\n')).toContain('[INFORME_DIAGNOSTICO_DESTINATARIO]');
       expect(logs.join('\n')).toContain(
-        '- DESTINATARIO FINAL RESUELTO: "57345566778"'
+        '- DESTINATARIO FINAL SELECCIONADO: "57345566778"'
+      );
+      // The conversation now carries no numeric id, so the BSUID/WA_ID line
+      // reports INVALIDO while the phone-driven destination is still sent.
+      expect(logs.join('\n')).toContain(
+        '- Conversation BSUID/WA_ID: "" -> [INVALIDO]'
       );
     } finally {
       spy.mockRestore();
@@ -1038,7 +1044,9 @@ describe('sendMessageToConversation - Meta failure mapping', () => {
     expect(err).toBeInstanceOf(SendMessageError);
     expect(err.status).toBe(422);
     expect(err.code).toBe('invalid_recipient');
-    expect(err.message).toMatch(/no destination is available/);
+    // The definitive delivery-error string; the cause rides in meta_response.
+    expect(err.message).toBe('Error de entrega de mensaje');
+    expect(err.metaResponse).toMatch(/no destination is available/);
   });
 
   it("maps Meta's recipient rejection to 422 invalid_recipient", async () => {
@@ -1050,7 +1058,8 @@ describe('sendMessageToConversation - Meta failure mapping', () => {
     );
     expect(err.status).toBe(422);
     expect(err.code).toBe('invalid_recipient');
-    expect(err.message).toMatch(/not in allowed list/);
+    expect(err.message).toBe('Error de entrega de mensaje');
+    expect(err.metaResponse).toMatch(/not in allowed list/);
   });
 
   it('maps any other Meta 4xx to 422 with the verbatim cause', async () => {
@@ -1062,7 +1071,8 @@ describe('sendMessageToConversation - Meta failure mapping', () => {
     );
     expect(err.status).toBe(422);
     expect(err.code).toBe('meta_rejected');
-    expect(err.message).toMatch(/Invalid file/);
+    expect(err.message).toBe('Error de entrega de mensaje');
+    expect(err.metaResponse).toMatch(/Invalid file/);
   });
 
   it('keeps 502 for a genuine Meta outage (5xx / network)', async () => {
@@ -1071,7 +1081,8 @@ describe('sendMessageToConversation - Meta failure mapping', () => {
     );
     expect(err.status).toBe(502);
     expect(err.code).toBe('meta_error');
-    expect(err.message).toMatch(/Service unavailable/);
+    expect(err.message).toBe('Error de entrega de mensaje');
+    expect(err.metaResponse).toMatch(/Service unavailable/);
   });
 });
 

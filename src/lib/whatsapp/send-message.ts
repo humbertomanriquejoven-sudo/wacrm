@@ -510,7 +510,7 @@ export async function sendMessageToConversation(
     });
     throw new SendMessageError(
       'no_delivery_destination',
-      'No fue posible determinar un destinatario válido para WhatsApp',
+      'Error de entrega de mensaje',
       422,
       {
         diagnosticReport: toDiagnosticHttp(cascadeReport),
@@ -843,23 +843,18 @@ export async function sendMessageToConversation(
       throw err;
     }
     if (err instanceof InvalidRecipientError) {
-      throw new SendMessageError(
-        'invalid_recipient',
-        `Cannot resolve a WhatsApp address for this contact: ${message}`,
-        422,
-        {
-          diagnosticReport: toDiagnosticHttp(cascadeReport),
-          howToFix: HOW_TO_FIX_DESTINATION,
-          metaResponse: message,
-        }
-      );
+      throw new SendMessageError('invalid_recipient', 'Error de entrega de mensaje', 422, {
+        diagnosticReport: toDiagnosticHttp(cascadeReport),
+        howToFix: HOW_TO_FIX_DESTINATION,
+        metaResponse: message,
+      });
     }
     if (err instanceof MetaApiError) {
       const metaResponse = err.rawBody ?? message;
       if (err.recipientInvalid) {
         throw new SendMessageError(
           'invalid_recipient',
-          `WhatsApp rejected the recipient address: ${message}`,
+          'Error de entrega de mensaje',
           422,
           {
             diagnosticReport: toDiagnosticHttp(cascadeReport),
@@ -871,7 +866,7 @@ export async function sendMessageToConversation(
       if (err.status >= 400 && err.status < 500) {
         throw new SendMessageError(
           'meta_rejected',
-          `WhatsApp rejected the message: ${message}`,
+          'Error de entrega de mensaje',
           422,
           {
             diagnosticReport: toDiagnosticHttp(cascadeReport),
@@ -881,16 +876,11 @@ export async function sendMessageToConversation(
         );
       }
     }
-    throw new SendMessageError(
-      'meta_error',
-      `Meta API error: ${message}`,
-      502,
-      {
-        diagnosticReport: toDiagnosticHttp(cascadeReport),
-        howToFix: HOW_TO_FIX_DESTINATION,
-        metaResponse: message,
-      }
-    );
+    throw new SendMessageError('meta_error', 'Error de entrega de mensaje', 502, {
+      diagnosticReport: toDiagnosticHttp(cascadeReport),
+      howToFix: HOW_TO_FIX_DESTINATION,
+      metaResponse: message,
+    });
   }
 
   // Persist whichever real number worked so the next send goes straight to
