@@ -1238,6 +1238,28 @@ export async function runDueFollowUps(
         `[TIMER CENTRAL SEND] Calling central send function (sendMessageToConversation) for conversation ${conversationId}...`,
       )
 
+      // NULL-SAFETY GUARD (anti-crash at dispatch): the send core must never
+      // receive a missing id/account or an empty payload — that is the last
+      // defensible checkpoint before the Meta call. Any hole here closes the
+      // row as `no_response` (a terminal state) instead of throwing an opaque
+      // error that could escape as a 500.
+      if (!conversationId || !accountId || !text) {
+        console.error(
+          `[TIMER SEND GUARD] missing required send input — closing ${id} as no_response (conversationId=${conversationId}, accountId=${accountId}, text=${(text ?? '').length} chars).`,
+        )
+        const { error: guardErr } = await client
+          .from('follow_ups')
+          .update({ status: 'no_response' })
+          .eq('id', id)
+          .eq('status', 'processing')
+        if (guardErr) {
+          console.error(`[follow-up] could not mark ${id} as no_response:`, guardErr.message)
+        } else {
+          result.noResponse++
+        }
+        continue
+      }
+
       // Send through the SAME core the inbox uses for a manual message
       // (`sendMessageToConversation`), so the OFFICIAL Meta API is hit and a
       // follow-up to a phone-less contact still reaches them. It resolves the
@@ -1666,6 +1688,26 @@ export async function runDueResponseWaitTimers(
       console.log(
         `[TIMER CENTRAL SEND] Calling central send function (sendMessageToConversation) for conversation ${conversationId}...`,
       )
+
+      // NULL-SAFETY GUARD (anti-crash at dispatch): same checkpoint as the
+      // follow-up runner — a missing id/account or empty payload closes the
+      // row as `no_response` instead of letting the sent core throw.
+      if (!conversationId || !accountId || !text) {
+        console.error(
+          `[TIMER SEND GUARD] missing required send input — closing ${id} as no_response (conversationId=${conversationId}, accountId=${accountId}, text=${(text ?? '').length} chars).`,
+        )
+        const { error: guardErr } = await client
+          .from('response_wait_timers')
+          .update({ status: 'no_response' })
+          .eq('id', id)
+          .eq('status', 'processing')
+        if (guardErr) {
+          console.error(`[response-wait] could not mark ${id} as no_response:`, guardErr.message)
+        } else {
+          result.noResponse++
+        }
+        continue
+      }
 
       try {
         const sendResult = await sendMessageToConversation(client, accountId, {

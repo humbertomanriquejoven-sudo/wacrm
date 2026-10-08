@@ -283,7 +283,22 @@ export async function GET(request: Request) {
       server_now: new Date().toISOString(),
     })
   } catch (err) {
-    return toErrorResponse(err)
+    // NEVER let an unhandled exception escape this handler: log the full
+    // stack server-side and ALWAYS answer with a JSON body (a Next route
+    // throwing would otherwise let the platform serve its HTML proxy page
+    // — the exact "/service is not reachable" error seen behind Easypanel).
+    // Known client errors (401/403 auth, 400 validation) keep their status;
+    // everything else becomes a hard 500 carrying the real message so the
+    // browser's DevTools can read it.
+    console.error('[CRITICAL FOLLOW-UP CRASH]:', err)
+    const looked = err as { status?: unknown } | null
+    if (looked && typeof looked.status === 'number' && looked.status >= 400 && looked.status < 500) {
+      return toErrorResponse(err)
+    }
+    return NextResponse.json(
+      { success: false, error: err instanceof Error ? err.message : String(err) },
+      { status: 500 },
+    )
   }
 }
 
@@ -777,6 +792,16 @@ export async function POST(request: Request) {
     )
     return NextResponse.json({ success: true, follow_up: updated })
   } catch (err) {
-    return toErrorResponse(err)
+    // Same anti-crash guarantee as GET: log the full stack and answer with
+    // a JSON body — never the platform's HTML proxy page.
+    console.error('[CRITICAL FOLLOW-UP CRASH]:', err)
+    const looked = err as { status?: unknown } | null
+    if (looked && typeof looked.status === 'number' && looked.status >= 400 && looked.status < 500) {
+      return toErrorResponse(err)
+    }
+    return NextResponse.json(
+      { success: false, error: err instanceof Error ? err.message : String(err) },
+      { status: 500 },
+    )
   }
 }

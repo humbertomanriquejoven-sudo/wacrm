@@ -9,6 +9,42 @@ import { Switch } from "@/components/ui/switch";
 import type { FollowUp, ResponseWaitTimer } from "@/types";
 
 // ------------------------------------------------------------------
+// Safe response parsing for `/api/whatsapp/follow-ups`. When the backend is
+// down (or a proxy like Easypanel answers instead), the response body is an
+// HTML error page — `res.json()` would throw. We always read the raw text,
+// verify the `Content-Type`, and surface the HTML separately instead of
+// letting it render or bubble up as an uncaught parse error.
+const SERVER_ERROR_COPY = "Error en el servidor al enviar seguimiento";
+
+type SafeFollowUpsBody = { ok: boolean; json: Record<string, unknown>; text: string };
+
+async function parseFollowUpsResponse(res: Response): Promise<SafeFollowUpsBody> {
+  const text = await res.text();
+  const ct = res.headers.get("content-type") ?? "";
+  const isJson = ct.includes("application/json") || res.status === 204;
+  if (!isJson) {
+    console.error(
+      "[HTML PROXY ERROR DETECTED]:",
+      text || `HTTP ${res.status} with a non-JSON body`,
+    );
+    return { ok: false, json: {}, text };
+  }
+  try {
+    return {
+      ok: true,
+      json: ((JSON.parse(text) as Record<string, unknown>) ?? {}) as Record<string, unknown>,
+      text,
+    };
+  } catch {
+    console.error(
+      "[HTML PROXY ERROR DETECTED]:",
+      text || "Empty or invalid JSON body",
+    );
+    return { ok: false, json: {}, text };
+  }
+}
+
+// ------------------------------------------------------------------
 // Per-conversation timer banner — TWO fully independent, persistent
 // timers per chat, each with its OWN ON/OFF switch:
 //
@@ -229,7 +265,9 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
         { cache: "no-store" },
       );
       if (!res.ok) return null;
-      const j = (await res.json()) as FollowUpStatus;
+      const parsed = await parseFollowUpsResponse(res);
+      if (!parsed.ok) return null;
+      const j = parsed.json as unknown as FollowUpStatus;
       if (mounted.current) {
         // Re-anchor the countdowns to the SERVER clock (see `server_now`).
         const serverTs =
@@ -319,12 +357,15 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
             ...extra,
           }),
         });
-        const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-        if (!res.ok) {
-          toast.error((json?.error as string) ?? t("updateError"));
+        const parsed = await parseFollowUpsResponse(res);
+        if (!res.ok || !parsed.ok) {
+          // A JSON error reveals the server's own message; an HTML/non-JSON
+          // body is the proxy's "service down" page — never render it, just
+          // toast the clean copy.
+          toast.error((parsed.json?.error as string) ?? SERVER_ERROR_COPY);
           return null;
         }
-        return json;
+        return parsed.json;
       } catch {
         toast.error(t("networkError"));
         return null;
@@ -348,25 +389,13 @@ export function FollowUpBanner({ conversationId }: { conversationId: string }) {
         }),
         cache: "no-store",
       });
-      if (!res.ok) {
-        const body = await res.text();
-        console.error("[TRIGGER 00:00 ERROR]:", res.status, body || "");
-        // Surface the server's own message on the banner (a toast) so the
-        // failure is visible in the interface, not only the console.
-        toast.error(
-          body
-            ? (() => {
-                try {
-                  return (JSON.parse(body) as { error?: string }).error;
-                } catch {
-                  return body;
-                }
-              })() ?? t("updateError")
-            : `${t("updateError")} (HTTP ${res.status})`,
-        );
+      const parsed = await parseFollowUpsResponse(res);
+      if (!res.ok || !parsed.ok) {
+        console.error("[TRIGGER 00:00 ERROR]:", res.status, parsed.text || "");
+        toast.error((parsed.json?.error as string) ?? SERVER_ERROR_COPY);
         return;
       }
-      const json = (await res.json().catch(() => ({}))) as {
+      const json = parsed.json as {
         success?: boolean;
         message_id?: string | null;
         sent?: { follow_ups?: number; response_wait?: number };
