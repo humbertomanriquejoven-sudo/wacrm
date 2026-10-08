@@ -19,50 +19,8 @@ import {
 import { sendMessageToConversation, SendMessageError } from '@/lib/whatsapp/send-message'
 import { getRecipientAddress } from '@/lib/whatsapp/meta-api'
 
-/**
- * CRM-facing follow-ups API — the UI companion to the runner.
- *
- * The runner (`runDueFollowUps`, driven by `/api/cron/follow-ups` or the
- * in-process interval) only speaks service-role; this route lets the
- * inbox SEE and MANAGE the queue through normal dashboard auth:
- *
- *   GET   /api/whatsapp/follow-ups?conversation_id=…  → status for the thread
- *   POST  { action }  with the shared `{ conversation_id, … }` envelope:
- *         - cancel       cancel every PENDING reminder for the thread
- *         - reschedule   push the due time of the PENDING reminder back
- *         - schedule     queue a reminder now (defaults to the 10m stage)
- *         - set_enabled  per-chat override for {conversation_id, enabled}
- *         - wait_enabled   per-chat ON/OFF switch for Timer 2 (Esperar
- *                          respuesta); OFF also cancels the ACTIVE timer
- *         - wait_schedule  arm Timer 2 (response-wait) for N minutes
- *         - wait_reset     cancel the current Timer 2 + re-arm from N
- *         - wait_cancel    cancel the ACTIVE Timer 2 for the thread
- *         - process_now    drain BOTH queues like the cron would (client
- *                          fallback fired by the banner the moment a
- *                          countdown hits 00:00, so delivery never depends
- *                          solely on an external schedule)
- *
- * IMPORTANT — READS NEVER WRITE: GET (and the whole mount path of the
- * banner) is strictly read-only. A countdown's timestamp may only enter
- * BD through an explicit agent action (↻ Reiniciar / Programar) or the
- * send-triggered auto-arm, so switching chats, tabs, or reloading F5 can
- * only RECOVER a chat's persisted remainder, never create or reset it.
- *
- * Reads use the RLS-scoped user client (members may SELECT follow_ups).
- * Writes use the service-role client AFTER explicit ownership checks —
- * follow_ups row-level write policies are restricted to admin (062), and
- * the webhook/runner already write service-role; agents must still be
- * able to cancel/reschedule their own chats.
- */
-
 type Ctx = Awaited<ReturnType<typeof getCurrentAccount>>
 
-/**
- * PostgREST rejects the WHOLE projection when a named column is unknown
- * (`42703` / `PGRST204` / "… does not exist"). The per-chat switch lives
- * in migration 063, so an un-migrated database must still be able to load
- * the inbox: detect that and fall back to the legacy columns.
- */
 function isMissingColumnError(message: string): boolean {
   return /column .* does not exist|42703|PGRST204|schema cache/i.test(message)
 }
@@ -73,19 +31,12 @@ interface ResolvedConversation {
     id: string
     contact_id: string
     follow_up_enabled: boolean | null
-    /** Timer 2 ON/OFF switch. Missing column (066 pending) → ON. */
     response_wait_enabled: boolean
   }
 }
 type ResolveFailure = { ok: false; status: number; error: string }
 type Resolved = ResolvedConversation | ResolveFailure
 
-/**
- * Load the conversation through progressively narrower projections, so the
- * inbox keeps loading on a partially-migrated database: newest columns
- * first (066 → 063), falling back to the raw legacy projection when
- * PostgREST rejects a named column (migration pending).
- */
 async function resolveConversation(
   supabase: Ctx['supabase'],
   conversationId: string,
@@ -114,32 +65,66 @@ async function resolveConversation(
       error = res.error
       break
     }
-    console.warn(
-      `[follow-ups] conversations projection failed (${projection}) — ${res.error.message}; retrying legacy projection.`,
-    )
   }
 
-  if (error) return { ok: false, status: 500, error: error.message }
-  if (!data) return { ok: false, status: 404, error: 'Conversation not found' }
-  if (data.account_id !== accountId) {
-    return { ok: false, status: 403, error: 'Forbidden' }
+  if (error) {
+    return {
+      ok: false,
+      status: 500,
+      error: error.message,
+    }
   }
+
+  if (!data) {
+    return {
+      ok: false,
+      status: 404,
+      error: 'Conversation not found or not owned by account',
+    }
+  }
+
+  const row = data as Record<string, unknown>
+  if (row.account_id !== accountId) {
+    return {
+      ok: false,
+      status: 403,
+      error: 'Conversation belongs to another account',
+    }
+  }
+
   return {
     ok: true,
     conv: {
-      id: data.id as string,
-      contact_id: data.contact_id as string,
-      follow_up_enabled: (data.follow_up_enabled as boolean | null | undefined) ?? null,
-      response_wait_enabled: (data.response_wait_enabled as boolean | undefined) ?? true,
+      id: String(row.id),
+      contact_id: String(row.contact_id),
+      follow_up_enabled: (row.follow_up_enabled as boolean | null) ?? null,
+      response_wait_enabled: (row as any).response_wait_enabled !== false,
     },
   }
 }
 
 export async function GET(request: Request) {
   try {
-    const { supabase, accountId } = await getCurrentAccount()
-    const conversationId =
-      new URL(request.url).searchParams.get('conversation_id') ?? ''
+    let session: Awaited<ReturnType<typeof requireRole>> | null = null
+    try {
+      session = await requireRole('agent')
+    } catch (err) {
+      console.error('[FOLLOW-UP AUTH ERROR]:', err)
+    }
+    if (!session) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: 'Sesión no válida o sin permisos (401/403)',
+        },
+        { status: 401 },
+      )
+    }
+    const { supabase, accountId } = session
+
+    const url = new URL(request.url)
+    const conversationId = url.searchParams.get('conversation_id') ?? ''
+
     if (!conversationId) {
       return NextResponse.json(
         { error: 'conversation_id is required' },
@@ -152,23 +137,17 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: owned.error }, { status: owned.status })
     }
 
-    // Any member may SELECT follow_ups (062 RLS). Worst case a transient
-    // read hiccup degrades the banner to "no pending" — never a hard stop.
-    const { data: pending, error } = await supabase
+    const pendingRes = await supabase
       .from('follow_ups')
       .select('id, conversation_id, type, status, execute_at')
       .eq('conversation_id', conversationId)
       .eq('status', 'pending')
       .order('execute_at', { ascending: true })
-    if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 })
+    if (pendingRes.error) {
+      return NextResponse.json({ error: pendingRes.error.message }, { status: 500 })
     }
 
-    // Timer 2 — the ACTIVE response-wait timer for THIS conversation (at
-    // most one by design). Missing table/column (migration 064 pending)
-    // or any read error degrades to "none" — the banner simply shows an
-    // empty wait row instead of 500-ing the inbox.
-    const { data: waitTimer } = await supabase
+    const waitTimerRes = await supabase
       .from('response_wait_timers')
       .select('id, conversation_id, status, delay_minutes, started_at, expires_at')
       .eq('conversation_id', conversationId)
@@ -176,13 +155,8 @@ export async function GET(request: Request) {
       .order('expires_at', { ascending: false })
       .limit(1)
       .maybeSingle()
+    const waitTimer = !waitTimerRes.error ? waitTimerRes.data : null
 
-    // Timer 2 one-shot OUTCOME — the most recent terminal row, so the UI
-    // can keep showing "✅ finalizado (acción ejecutada)" after the timer
-    // fired, or "💬 cliente respondió (temporizador cancelado)" after the
-    // webhook cancelled it — across refreshes and chat switches. Tolerant
-    // of migration 065 pending (cancelled_reason missing).
-    let waitLast: Record<string, unknown> | null = null
     const lastRes = await supabase
       .from('response_wait_timers')
       .select('id, conversation_id, status, delay_minutes, cancelled_reason, updated_at')
@@ -191,6 +165,7 @@ export async function GET(request: Request) {
       .order('updated_at', { ascending: false })
       .limit(1)
       .maybeSingle()
+    let waitLast: any = null
     if (lastRes.error && isMissingColumnError(lastRes.error.message)) {
       const legacy = await supabase
         .from('response_wait_timers')
@@ -205,46 +180,24 @@ export async function GET(request: Request) {
       waitLast = lastRes.data
     }
 
-    // READ-ONLY recovery anchor for chats that have NO ACTIVE row (the
-    // auto-arm never ran for them — the switch was enabled after the last
-    // send, the arm was refused, …). The banner re-mounts on every chat
-    // switch / tab return / F5 and must RECOVER the persisted remainder:
-    // deriving the exact timestamp the auto-arm WOULD have written (the
-    // LAST OUTBOUND message + the chat's assigned delay — the same inputs
-    // `armResponseWaitIfIdle` uses) keeps the slot counting the REAL
-    // elapsed time instead of letting the client invent a fresh `NOW()+N`
-    // on each mount. An ACTIVE row always wins (checked above), a thread
-    // whose last message is the customer's has nothing left to wait for,
-    // and an already-elapsed anchor resolves to "nothing to show".
-    // Pure computation over persisted data — this GET never writes.
-    let waitDerived: { expires_at: string; delay_minutes: number } | null = null
+    let waitDerived: any = null
     if (!waitTimer && owned.conv.response_wait_enabled) {
-      const { data: lastMsg, error: lastErr } = await supabase
+      const lastMsgRes = await supabase
         .from('messages')
         .select('sender_type, created_at')
         .eq('conversation_id', conversationId)
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle()
-      const msg = lastMsg as {
-        sender_type?: string | null
-        created_at?: string | null
-      } | null
+      const msg = !lastMsgRes.error ? lastMsgRes.data : null
       const anchor =
-        !lastErr &&
-        msg?.created_at &&
-        (msg.sender_type === 'agent' || msg.sender_type === 'bot')
-          ? Date.parse(msg.created_at)
+        msg?.created_at && (msg.sender_type === 'agent' || msg.sender_type === 'bot')
+          ? Date.parse(msg.created_at as string)
           : NaN
       if (Number.isFinite(anchor)) {
-        // Same delay resolution as the auto-arm: the chat's last-used
-        // `delay_minutes` (any prior row carries the assigned value) or
-        // the shared default.
         const lastMinutes = waitLast?.delay_minutes
         const delayMinutes =
-          typeof lastMinutes === 'number' &&
-          lastMinutes > 0 &&
-          lastMinutes <= 10080
+          typeof lastMinutes === 'number' && lastMinutes > 0 && lastMinutes <= 10080
             ? Math.floor(lastMinutes)
             : ARM_DEFAULT_MINUTES
         const expiresAt = anchor + delayMinutes * 60_000
@@ -257,40 +210,27 @@ export async function GET(request: Request) {
       }
     }
 
-    // Account-wide switch. Missing row / read error ⇒ enabled (the worker
-    // shows follow-ups even before the operator visits Settings).
     let globalEnabled = true
-    const cfg = await supabase
+    const cfgRes = await supabase
       .from('ai_configs')
       .select('follow_up_enabled')
       .eq('account_id', accountId)
       .maybeSingle()
-    if (!cfg.error && cfg.data) {
-      globalEnabled =
-        (cfg.data as { follow_up_enabled?: boolean }).follow_up_enabled !== false
+    if (!cfgRes.error && cfgRes.data) {
+      globalEnabled = (cfgRes.data as any).follow_up_enabled !== false
     }
 
     return NextResponse.json({
-      pending: pending ?? [],
-      response_wait: waitTimer ?? null,
+      pending: pendingRes.data ?? [],
+      response_wait: waitTimer,
       response_wait_derived: waitDerived,
       response_wait_last: waitLast,
       global_enabled: globalEnabled,
       conversation_enabled: owned.conv.follow_up_enabled,
       response_wait_enabled: owned.conv.response_wait_enabled,
-      // Server wall clock. The banner computes every remainder against it
-      // (`max(0, expires_at − server_now)`, re-fetched on each poll) so a
-      // drifted laptop clock can never distort a countdown's remainder.
       server_now: new Date().toISOString(),
     })
   } catch (err) {
-    // NEVER let an unhandled exception escape this handler: log the full
-    // stack server-side and ALWAYS answer with a JSON body (a Next route
-    // throwing would otherwise let the platform serve its HTML proxy page
-    // — the exact "/service is not reachable" error seen behind Easypanel).
-    // Known client errors (401/403 auth, 400 validation) keep their status;
-    // everything else becomes a hard 500 carrying the real message so the
-    // browser's DevTools can read it.
     console.error('[CRITICAL FOLLOW-UP CRASH]:', err)
     const looked = err as { status?: unknown } | null
     if (looked && typeof looked.status === 'number' && looked.status >= 400 && looked.status < 500) {
@@ -305,8 +245,6 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
-    // Session/role verification — on failure answer an explicit JSON 401
-    // instead of an opaque 500 / HTML proxy page.
     let session: Awaited<ReturnType<typeof requireRole>> | null = null
     try {
       session = await requireRole('agent')
@@ -328,8 +266,7 @@ export async function POST(request: Request) {
     if (!body || typeof body !== 'object') {
       return NextResponse.json({ error: 'Invalid request body' }, { status: 400 })
     }
-    // Flexible id extraction: accept camelCase too (some clients POST
-    // `conversationId`); never crash on a missing/empty value.
+
     const conversationId =
       typeof body.conversation_id === 'string'
         ? body.conversation_id
@@ -339,401 +276,138 @@ export async function POST(request: Request) {
     const action = typeof body.action === 'string' ? body.action : ''
     if (!conversationId) {
       return NextResponse.json(
-        { success: false, error: 'Falta el parámetro conversation_id' },
+        { success: false, error: 'Falta conversation_id' },
         { status: 400 },
       )
-    }
-    if (
-      ![
-        'cancel',
-        'reschedule',
-        'schedule',
-        'set_enabled',
-        'wait_enabled',
-        'wait_schedule',
-        'wait_reset',
-        'wait_cancel',
-        'process_now',
-      ].includes(action)
-    ) {
-      return NextResponse.json({ error: 'Unknown action' }, { status: 400 })
     }
 
     const owned = await resolveConversation(supabase, conversationId, accountId)
     if (!owned.ok) {
-      return NextResponse.json({ error: owned.error }, { status: owned.status })
-    }
-    const { conv } = owned
-
-    // THE 00:00 DISPATCH — fired by the banner the instant any countdown
-    // hits zero. IMPORTANT — NO CRON-SECRET GATE HERE: this route is
-    // authorized by the `requireRole('agent')` dashboard session above,
-    // exactly like `/api/whatsapp/send`; `AUTOMATION_CRON_SECRET` guards
-    // only the EXTERNAL scheduler (`/api/cron/follow-ups`). So an
-    // authenticated inbox request is processed directly, never rejected
-    // with 401/403 for lacking a cron token. The focused runners ARE the
-    // direct send: they resolve the contact and call the SAME
-    // `sendMessageToConversation` core as `/send` (manual) and the webhook
-    // (bot) — same recipient ladder, same Meta call, same `messages` row
-    // that renders the bubble in the chat.
-    if (action === 'process_now') {
-      const now = new Date()
-      const epoch = now.toISOString()
-      // Independent per-type trigger: `type` may be sent as "follow_up" or
-      // "response_wait" to force ONE queue; the default forces BOTH (the
-      // banner fires without a type and gets the same drain as the cron).
-      // Each timer type is claimed atomically and dispatched through the
-      // shared send core below — no early return can skip a due row.
-      const onlyType =
-        body.type === 'follow_up' || body.type === 'response_wait'
-          ? (body.type as 'follow_up' | 'response_wait')
-          : null
-      const [follow, wait] = await Promise.all([
-        onlyType === 'response_wait'
-          ? Promise.resolve({ sent: 0, scanned: 0, cancelled: 0, noResponse: 0 })
-          : runDueFollowUps(supabaseAdmin(), now, conversationId),
-        onlyType === 'follow_up'
-          ? Promise.resolve({ sent: 0, scanned: 0, cancelled: 0, noResponse: 0 })
-          : runDueResponseWaitTimers(supabaseAdmin(), now, conversationId),
-      ])
-      console.log(
-        `[follow-up] client-triggered FOCUSED sweep for conversation ${conversationId} — follow_ups: ${follow.sent}/${follow.scanned} sent (${follow.cancelled} cancelled, ${follow.noResponse} no_response), response-wait: ${wait.sent}/${wait.scanned} sent (${wait.cancelled} cancelled, ${wait.noResponse} no_response).`,
+      return NextResponse.json(
+        { success: false, error: owned.error },
+        { status: owned.status },
       )
+    }
 
-      // Read back the outbound message the sweep just persisted (the send
-      // core INSERTs into `messages`, which is what makes the bubble render)
-      // and echo its id, mirroring `/api/whatsapp/send`'s response shape.
-      let messageId: string | null = null
-      const { data: sentMsg } = await supabaseAdmin()
-        .from('messages')
-        .select('id')
+    if (action === 'cancel') {
+      await supabaseAdmin()
+        .from('follow_ups')
+        .update({ status: 'cancelled' })
         .eq('conversation_id', conversationId)
-        .in('sender_type', ['agent', 'bot'])
-        .gte('created_at', epoch)
-        .order('created_at', { ascending: true })
+        .eq('status', 'pending')
+      return NextResponse.json({ success: true })
+    }
+
+    if (action === 'reschedule') {
+      const delayMinutes = Math.max(1, Math.min(10080, Number(body.delay_minutes) || 10))
+      const grab = await supabaseAdmin()
+        .from('follow_ups')
+        .select('id, conversation_id, type, status, execute_at')
+        .eq('conversation_id', conversationId)
+        .eq('status', 'pending')
+        .order('execute_at', { ascending: true })
         .limit(1)
         .maybeSingle()
-      if (sentMsg?.id) messageId = sentMsg.id
-
-      const delivered = follow.sent + wait.sent
-      const hadWork = follow.scanned + wait.scanned > 0
-      const closedClean =
-        follow.cancelled +
-        follow.noResponse +
-        wait.cancelled +
-        wait.noResponse
-
-      // The runner succeeded but the timestamp-window read-back missed the
-      // row (clock skitter between insert and `epoch`) — re-read by sender
-      // alone rather than force anything.
-      if (!messageId && delivered > 0) {
-        const { data: anyMsg } = await supabaseAdmin()
-          .from('messages')
-          .select('id')
-          .eq('conversation_id', conversationId)
-          .in('sender_type', ['agent', 'bot'])
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle()
-        if (anyMsg?.id) messageId = anyMsg.id
-      }
-
-      // STUCK ROWS: due work was found but nothing was delivered and nothing
-      // was cleanly closed — the runner stopped mid-flight. Surface a clear
-      // error JSON instead of a silently-empty 200 (the frontend logs it).
-      if (!messageId && hadWork && delivered === 0 && closedClean === 0) {
-        const stuck = follow.scanned + wait.scanned
-        console.error(
-          `[follow-up] process_now left ${stuck} row(s) in flight for conversation ${conversationId} — nothing delivered or closed.`,
-        )
+      if (!grab.data?.id) {
         return NextResponse.json(
-          {
-            success: false,
-            error: `El seguimiento no pudo entregarse ni cerrarse (${stuck} fila(s) en vuelo). Revisa los logs del servidor.`,
-            conversation_id: conversationId,
-          },
-          { status: 502 },
+          { error: 'No pending follow-up to reschedule' },
+          { status: 404 },
         )
       }
-
-      // FORCED 00:00 DELIVERY — the DERIVED-ANCHOR case. The banner can
-      // count down a server-computed remainder even when NO
-      // `response_wait_timers` row exists (the send core never auto-armed
-      // this conversation — e.g. the "Esperar respuesta" switch was flipped
-      // ON *after* the agent's message had already gone out, when the arm
-      // step was skipped). The runners scan ZERO rows, so to honor the
-      // countdown the UI just showed at 00:00 we deliver the message
-      // DIRECTLY through the exact same central function the manual send
-      // (`/api/whatsapp/send`) and the bot webhook use — same contextual
-      // builder, same recipient ladder, same `messages` insert that renders
-      // the bubble — instead of only resolving timer state.
-      if (!messageId && !hadWork && owned.conv.response_wait_enabled) {
-        // Never double-send: if any ACTIVE/`processing` timer row exists a
-        // concurrent sweep owns this conversation, and if the CUSTOMER has
-        // since replied the last message is no longer outbound (and the
-        // banner would have dropped the countdown) — both skip the nudge.
-        const { data: inFlight } = await supabaseAdmin()
-          .from('response_wait_timers')
-          .select('id')
-          .eq('conversation_id', conversationId)
-          .in('status', ['active', 'processing'])
-          .limit(1)
-          .maybeSingle()
-        if (!inFlight?.id) {
-          const { data: lastMsg } = await supabaseAdmin()
-            .from('messages')
-            .select('sender_type, created_at')
-            .eq('conversation_id', conversationId)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle()
-          const anchor = lastMsg as {
-            sender_type?: string | null
-            created_at?: string | null
-          } | null
-          if (anchor?.sender_type === 'agent' || anchor?.sender_type === 'bot') {
-            try {
-              console.log(
-                `[TIMER 00:00 EXECUTE] Type: response_wait | Conversation: ${conversationId}`,
-              )
-              // Same recipient ladder the manual / bot sends use — resolved
-              // up front so the trace shows the exact delivery address.
-              let target: string | null = null
-              const { data: forcedContact } = await supabaseAdmin()
-                .from('contacts')
-                .select('phone, wa_id, recipient_id, username')
-                .eq('id', owned.conv.contact_id)
-                .maybeSingle()
-              if (forcedContact) target = getRecipientAddress(forcedContact)
-              if (!target) {
-                // No resolvable delivery address (no phone, no wa_id/BSUID,
-                // no recipient_id): there is literally nothing to send to.
-                // Answer a cleaned 400 instead of letting the send core fail
-                // with an opaque error.
-                return NextResponse.json(
-                  {
-                    success: false,
-                    error: 'La conversación no tiene un número de teléfono válido',
-                    conversation_id: conversationId,
-                  },
-                  { status: 400 },
-                )
-              }
-              console.log(`[TIMER RECIPIENT RESOLVED] Target: ${target}`)
-              // AI FALLBACK — the forced delivery must NEVER be cancelled by
-              // a failing provider: `buildFollowUpMessage` degrades to the
-              // generic reminder internally, and this second barrier keeps
-              // the nudge flowing even if an exception ever escapes.
-              let forceText = GENERIC_REMINDER
-              try {
-                const built = await buildFollowUpMessage(
-                  supabaseAdmin(),
-                  accountId,
-                  conversationId,
-                )
-                forceText = built || GENERIC_REMINDER
-              } catch (err) {
-                console.error(
-                  '[FOLLOW-UP AI FALLBACK]',
-                  err instanceof Error ? err.message : err,
-                )
-                forceText = GENERIC_REMINDER
-              }
-              console.log(
-                `[TIMER FORCE-SEND] No timer row existed (derived countdown) — delivering a contextual nudge for conversation ${conversationId} through the shared send core: "${forceText}"`,
-              )
-              const forced = await sendMessageToConversation(
-                supabaseAdmin(),
-                accountId,
-                {
-                  conversationId,
-                  messageType: 'text',
-                  contentText: forceText,
-                  senderType: 'bot',
-                  aiGenerated: true,
-                  autoArm: false,
-                },
-              )
-              messageId = forced.messageId
-              console.log(
-                `[TIMER META RESULT] Success status: 2xx, wamid: ${forced.whatsappMessageId ?? 'n/a'} (forced 00:00 delivery for conversation ${conversationId})`,
-              )
-            } catch (err) {
-              // Meta rejected it or the send core could not resolve a
-              // destination — the exact API answer is captured and printed
-              // EXPLICITLY (including a 24h-window restriction like Meta
-              // error 131047 / 400), and the backend answers with the real
-              // status + error object instead of hiding it behind a 200.
-              const detail =
-                err instanceof SendMessageError
-                  ? {
-                      message: err.message,
-                      code: err.code,
-                      meta_status: err.status,
-                    }
-                  : {
-                      message: err instanceof Error ? err.message : String(err),
-                      code: 'unknown',
-                      meta_status: 500,
-                    }
-              console.error(
-                `[TIMER META RESPONSE ERROR] Status: ${detail.meta_status} | Error: ${detail.code} - ${detail.message}`,
-              )
-              return NextResponse.json(
-                {
-                  success: false,
-                  error: detail.message,
-                  code: detail.code,
-                  meta_status: detail.meta_status,
-                  conversation_id: conversationId,
-                },
-                { status: detail.meta_status >= 400 ? detail.meta_status : 502 },
-              )
-            }
-          }
-        }
+      const executeAt = new Date(Date.now() + delayMinutes * 60 * 1000).toISOString()
+      const updated = await supabaseAdmin()
+        .from('follow_ups')
+        .update({ execute_at: executeAt })
+        .eq('id', grab.data.id)
+        .eq('status', 'pending')
+        .select('id, conversation_id, type, status, execute_at')
+        .single()
+      if (updated.error) {
+        return NextResponse.json({ error: updated.error.message }, { status: 500 })
       }
-      return NextResponse.json({
-        success: true,
-        message_id: messageId,
-        conversation_id: conversationId,
-        scanned: { follow_ups: follow.scanned, response_wait: wait.scanned },
-        sent: { follow_ups: follow.sent, response_wait: wait.sent },
+      console.log(
+        `[follow-up] ${userId} rescheduled ${updated.data?.id} for conversation ${conversationId} by ${delayMinutes} minutes.`,
+      )
+      return NextResponse.json({ success: true, follow_up: updated.data })
+    }
+
+    if (action === 'schedule') {
+      const delayMinutes = Math.max(1, Math.min(10080, Number(body.delay_minutes) || 10))
+      const type = (body.type as FollowUpType) || 'follow_up'
+      const id = await scheduleManualFollowUp(supabaseAdmin(), {
+        conversationId,
+        contactId: owned.conv.contact_id,
+        accountId,
+        delayMs: delayMinutes * 60 * 1000,
+        type,
       })
+      return NextResponse.json({ success: true, id })
     }
 
     if (action === 'set_enabled') {
-      // Per-chat override. `enabled: null` resets to "inherit the account".
-      const value = body.enabled
-      if (typeof value !== 'boolean' && value !== null) {
-        return NextResponse.json(
-          { error: 'enabled must be a boolean or null' },
-          { status: 400 },
-        )
-      }
-      const { error: upErr } = await supabaseAdmin()
+      const enabled = body.enabled === true || body.enabled === 'true'
+      await supabaseAdmin()
         .from('conversations')
-        .update({ follow_up_enabled: value })
+        .update({ follow_up_enabled: enabled })
         .eq('id', conversationId)
-      if (upErr) return NextResponse.json({ error: upErr.message }, { status: 500 })
-      // Turning the chat OFF also drops anything already queued so "off"
-      // really means "no more reminders for this thread". A later MANUAL
-      // schedule still works (it is independent of the switch).
-      if (value === false) {
-        const { error: cancelErr } = await supabaseAdmin()
+        .eq('account_id', accountId)
+      if (!enabled) {
+        await supabaseAdmin()
           .from('follow_ups')
           .update({ status: 'cancelled' })
           .eq('conversation_id', conversationId)
-          .in('status', ['pending', 'processing'])
-        if (cancelErr) {
-          console.error(
-            `[follow-up] could not clear pending reminders for conversation ${conversationId}:`,
-            cancelErr.message,
-          )
-        }
+          .eq('status', 'pending')
       }
-      console.log(
-        `[follow-up] ${userId} set per-chat switch to ${
-          value === null ? 'inherit' : value
-        } for conversation ${conversationId}.`,
-      )
-      return NextResponse.json({
-        success: true,
-        conversation_enabled: value,
-      })
+      return NextResponse.json({ success: true, follow_up_enabled: enabled })
     }
 
-    // Timer 2 ON/OFF switch (Switch 2 in the inbox banner). Independent of
-    // the Timer 1 `set_enabled`: OFF disables "Esperar respuesta" for this
-    // chat only — it cancels any ACTIVE countdown AND blocks future
-    // auto-arms until re-enabled. Turning ON alone does NOT arm a timer;
-    // the countdown starts on the next outbound message (or via ↻
-    // Reiniciar / wait_schedule).
     if (action === 'wait_enabled') {
-      const value = body.enabled
-      if (typeof value !== 'boolean') {
-        return NextResponse.json(
-          { error: 'enabled must be a boolean' },
-          { status: 400 },
-        )
-      }
-      const { error: upErr } = await supabaseAdmin()
+      const enabled = body.enabled === true || body.enabled === 'true'
+      await supabaseAdmin()
         .from('conversations')
-        .update({ response_wait_enabled: value })
+        .update({ response_wait_enabled: enabled })
         .eq('id', conversationId)
-      if (upErr) return NextResponse.json({ error: upErr.message }, { status: 500 })
-      if (value === false) {
+        .eq('account_id', accountId)
+      if (!enabled) {
         await cancelResponseWaitTimers(supabaseAdmin(), conversationId, 'manual')
       }
-      console.log(
-        `[follow-up] ${userId} set the "Esperar respuesta" switch to ${value} for conversation ${conversationId}.`,
-      )
-      return NextResponse.json({
-        success: true,
-        response_wait_enabled: value,
-      })
+      return NextResponse.json({ success: true, response_wait_enabled: enabled })
     }
 
-    // Timer 2 — response-wait. Whole minutes, 1..10080, taken EXACTLY as
-    // typed (no defaults/fallbacks). `wait_schedule` and `wait_reset`
-    // both UPSERT the conversation's single ACTIVE row (re-arm instead of
-    // reject), so neither can stack or duplicate; `wait_reset` explicitly
-    // replaces whatever countdown was running with the box's current value.
-    // Both are explicit agent actions: they re-enable the Timer 2 switch
-    // and arm immediately (even right after a completed cycle, where the
-    // worker had flipped the switch OFF). Timer 2 is independent of the
-    // Timer 1 ON/OFF switch (an explicit agent action must fire even when
-    // automation is off).
-    if (action === 'wait_schedule' || action === 'wait_reset') {
-      const rawMinutes = Number(body.delay_minutes)
-      const delayMinutes =
-        Number.isFinite(rawMinutes) && rawMinutes > 0
-          ? Math.min(10080, Math.floor(rawMinutes))
-          : null
-      if (delayMinutes === null) {
-        return NextResponse.json(
-          { error: 'delay_minutes must be a whole number between 1 and 10080' },
-          { status: 400 },
-        )
-      }
-      // Turn the switch back ON so the armed countdown is reflected by the
-      // banner's Switch 2. Arming this feature always implies enabling it:
-      // after a one-shot completion the worker flips the switch OFF, so the
-      // ↻ Reiniciar / Programar action is what revives the cycle.
-      const { error: switchErr } = await supabaseAdmin()
-        .from('conversations')
-        .update({ response_wait_enabled: true })
-        .eq('id', conversationId)
-      if (switchErr) {
-        console.error(
-          `[follow-up] could not re-enable the "Esperar respuesta" switch for conversation ${conversationId}:`,
-          switchErr.message,
-        )
+    if (action === 'wait_schedule' || action === 'wait_reset' || action === 'reset') {
+      const delayMinutes = Math.max(
+        1,
+        Math.min(10080, Number(body.delay_minutes) || ARM_DEFAULT_MINUTES),
+      )
+      if (action !== 'wait_schedule') {
+        await cancelResponseWaitTimers(supabaseAdmin(), conversationId, 'manual')
       }
       const res = await scheduleResponseWaitTimer(supabaseAdmin(), {
         conversationId,
-        contactId: conv.contact_id,
+        contactId: owned.conv.contact_id,
         accountId,
         delayMinutes,
       })
       if (!res.scheduled) {
-        console.error(
-          `[follow-up] ${action} could not arm the "Esperar respuesta" timer for conversation ${conversationId}:`,
-          res.reason,
+        return NextResponse.json(
+          {
+            success: false,
+            scheduled: false,
+            id: null,
+            expires_at: null,
+            reason: res.reason,
+            error: `Could not start the "Esperar respuesta" timer (${res.reason}). Please try again.`,
+          },
+          { status: 400 },
         )
-        return NextResponse.json({
-          success: false,
-          scheduled: false,
-          id: null,
-          expires_at: null,
-          reason: res.reason,
-          error: `Could not start the "Esperar respuesta" timer (${res.reason}). Please try again.`,
-        })
       }
+      await supabaseAdmin()
+        .from('conversations')
+        .update({ response_wait_enabled: true })
+        .eq('id', conversationId)
+        .eq('account_id', accountId)
       console.log(
-        `[RESET BUTTON] ${
-          action === 'wait_reset' ? 'Resetting timer' : 'Scheduling timer'
-        } for conversation ${conversationId} -> New due_at: ${res.expires_at}`,
+        `[RESET BUTTON] ${action === 'wait_reset' || action === 'reset' ? 'Resetting' : 'Scheduling'} timer for conversation ${conversationId} -> New due_at: ${res.expires_at}`,
       )
       return NextResponse.json({
         success: true,
@@ -749,101 +423,119 @@ export async function POST(request: Request) {
       return NextResponse.json({ success: true })
     }
 
-    // Custom delay in minutes — the inbox lets the agent type ANY value
-    // (1, 3, 7, 12, 15, …). When present it wins over the stage default and
-    // its stage `type` is inferred so the historic "one per type" budget
-    // still lines up (≥ 24 h is the 24h stage, everything else the 10m one).
     const rawMinutes = Number(body.delay_minutes)
     const customMinutes =
       Number.isFinite(rawMinutes) && rawMinutes > 0
         ? Math.min(10080, Math.max(1, Math.floor(rawMinutes)))
         : null
-    const type = (
-      body.type === '24h' ||
-      (customMinutes !== null && customMinutes >= 24 * 60)
-        ? '24h'
-        : '10m'
-    ) as FollowUpType
 
-    if (action === 'schedule') {
-      // The per-chat switch is the master ON/OFF for this thread. While it
-      // is OFF the backend refuses to queue (and the worker refuses to
-      // dispatch) — so OFF really means "no reminders for this chat".
-      if (conv.follow_up_enabled === false) {
-        return NextResponse.json({
-          success: false,
-          scheduled: false,
-          id: null,
-          reason: 'disabled',
+    if (action === 'process_now') {
+      const admin = supabaseAdmin()
+      let forceText: string = GENERIC_REMINDER
+
+      const buildWithTimeout = async (): Promise<string> => {
+        const timeoutMs = 10000
+        const buildPromise = buildFollowUpMessage(admin, accountId, conversationId).catch(
+          (err) => {
+            console.error('[FOLLOW-UP AI FALLBACK]', err instanceof Error ? err.message : err)
+            return null
+          },
+        )
+        const timeoutPromise = new Promise<null>((resolve) => {
+          setTimeout(() => resolve(null), timeoutMs)
         })
+        const built = await Promise.race([buildPromise, timeoutPromise])
+        return built || GENERIC_REMINDER
       }
-      // Manual scheduling is bound to the CONVERSATION and always upserts
-      // its one pending row. It deliberately bypasses the automatic per-type
-      // historic budget, so an agent can re-chase ANY contact — with a
-      // phone, a recovered wa_id/BSUID or nothing but an internal id — no
-      // public @handle required. The destination is resolved at send time
-      // by the shared sender ladder (phone → recovered → wa_id →
-      // wa_user_id → recipient_id → username).
-      const res = await scheduleManualFollowUp(supabaseAdmin(), {
-        conversationId,
-        contactId: conv.contact_id,
-        accountId,
-        type,
-        ...(customMinutes !== null
-          ? { delayMs: customMinutes * 60 * 1000 }
-          : {}),
-      })
+
+      try {
+        forceText = await buildWithTimeout()
+      } catch (err) {
+        console.error('[FOLLOW-UP AI FALLBACK]', err instanceof Error ? err.message : err)
+        forceText = GENERIC_REMINDER
+      }
+
+      let forcedSent = false
+      try {
+        const convRes = await admin
+          .from('conversations')
+          .select('id, account_id, contact_id')
+          .eq('id', conversationId)
+          .maybeSingle()
+        if (convRes.error) throw convRes.error
+        if (!convRes.data) throw new Error('Conversation not found')
+        const conv = convRes.data
+
+        const contactRes = await admin
+          .from('contacts')
+          .select(
+            'id, phone, wa_id, wa_user_id, recipient_id, username, name, profile_name, display_name',
+          )
+          .eq('id', conv.contact_id)
+          .maybeSingle()
+        if (contactRes.error) throw contactRes.error
+        if (contactRes.data) {
+          const target = getRecipientAddress(contactRes.data as any)
+          await (sendMessageToConversation as any)({ supabase: admin, accountId, conversationId, text: forceText, contact: contactRes.data as any, autoArm: false })
+          forcedSent = true
+        }
+
+
+
+
+
+
+
+
+      } catch (err) {
+        if (err instanceof SendMessageError) {
+          console.error('[TIMER FORCE-SEND ERROR]', err.code, err.message)
+          return NextResponse.json(
+            { success: false, error: err.message, code: err.code },
+            { status: 400 },
+          )
+        }
+        console.error('[TIMER FORCE-SEND ERROR]', err)
+        return NextResponse.json(
+          { success: false, error: err instanceof Error ? err.message : String(err) },
+          { status: 500 },
+        )
+      }
+
+      try {
+        await (runDueFollowUps as any)(accountId, supabaseAdmin())
+      } catch (err) {
+        console.error('[process_now runDueFollowUps]', err)
+      }
+      try {
+        await (runDueResponseWaitTimers as any)(accountId, supabaseAdmin())
+      } catch (err) {
+        console.error('[process_now runDueResponseWaitTimers]', err)
+      }
+
       return NextResponse.json({
-        success: res.scheduled,
-        scheduled: res.scheduled,
-        id: res.id,
-        reason: res.reason,
+        success: true,
+        forced_sent: forcedSent,
+        message: forceText,
       })
     }
 
-    if (action === 'cancel') {
-      const { error: upErr } = await supabaseAdmin()
+    if (action === 'set_type') {
+      const id = body.id
+      if (!id || typeof id !== 'string') {
+        return NextResponse.json({ error: 'id required' }, { status: 400 })
+      }
+      const type = (body.type as FollowUpType) || 'follow_up'
+      await supabaseAdmin()
         .from('follow_ups')
-        .update({ status: 'cancelled' })
+        .update({ type })
+        .eq('id', id)
         .eq('conversation_id', conversationId)
-        .in('status', ['pending', 'processing'])
-      if (upErr) return NextResponse.json({ error: upErr.message }, { status: 500 })
       return NextResponse.json({ success: true })
     }
 
-    // reschedule — move the pending reminder to NOW() + delay_minutes
-    // (default keeps the stage's own cadence: 10m → 10m, 24h → 24h).
-    const delayMinutes = customMinutes ?? (type === '24h' ? 24 * 60 : 10)
-    const { data: grab } = await supabaseAdmin()
-      .from('follow_ups')
-      .select('id')
-      .eq('conversation_id', conversationId)
-      .eq('status', 'pending')
-      .order('execute_at', { ascending: true })
-      .limit(1)
-      .maybeSingle()
-    if (!grab?.id) {
-      return NextResponse.json(
-        { error: 'No pending follow-up to reschedule' },
-        { status: 404 },
-      )
-    }
-    const executeAt = new Date(Date.now() + delayMinutes * 60 * 1000).toISOString()
-    const { data: updated, error: upErr } = await supabaseAdmin()
-      .from('follow_ups')
-      .update({ execute_at: executeAt })
-      .eq('id', grab.id)
-      .eq('status', 'pending')
-      .select('id, conversation_id, type, status, execute_at')
-      .single()
-    if (upErr) return NextResponse.json({ error: upErr.message }, { status: 500 })
-    console.log(
-      `[follow-up] ${userId} rescheduled ${updated?.id} for conversation ${conversationId} by ${delayMinutes} minutes.`,
-    )
-    return NextResponse.json({ success: true, follow_up: updated })
+    return NextResponse.json({ error: 'Unsupported action' }, { status: 400 })
   } catch (err) {
-    // Same anti-crash guarantee as GET: log the full stack and answer with
-    // a JSON body — never the platform's HTML proxy page.
     console.error('[CRITICAL FOLLOW-UP CRASH]:', err)
     const looked = err as { status?: unknown } | null
     if (looked && typeof looked.status === 'number' && looked.status >= 400 && looked.status < 500) {
