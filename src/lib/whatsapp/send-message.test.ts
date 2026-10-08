@@ -201,14 +201,30 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
   isLegacyFormat: () => false,
 }));
 
+const adminRead = vi.hoisted(() => ({ inboundRows: [] as unknown[] }));
+
 vi.mock('@/lib/flows/admin-client', () => ({
-  // Only used for the best-effort "pause active flow run" write.
   supabaseAdmin: () => ({
-    from: () => ({
-      update: () => ({
-        eq: () => ({ eq: () => ({ eq: async () => ({ error: null }) }) }),
-      }),
-    }),
+    from: (table: string) => {
+      if (table === 'messages') {
+        // The service-role client serves the inbound-anchor lookups so the
+        // send path is never blocked by RLS on `messages`.
+        const builder: Record<string, unknown> = {
+          select: () => builder,
+          eq: () => builder,
+          not: () => builder,
+          order: () => builder,
+          limit: async () => ({ data: adminRead.inboundRows, error: null }),
+        };
+        return builder;
+      }
+      // Best-effort "pause active flow run" write.
+      return {
+        update: () => ({
+          eq: () => ({ eq: () => ({ eq: async () => ({ error: null }) }) }),
+        }),
+      };
+    },
   }),
 }));
 
@@ -244,7 +260,10 @@ function sendPathDb(
   };
   // Inbound rows returned by the anchor lookup. `latestInboundAnchorId` reads
   // the newest customer wamid so a send to an opaque-id contact can be quoted.
+  // The lookup runs with the service-role client (`adminRead`); the sibling
+  // `inboundRows` below keeps the user-scoped fake's own `limit` honest.
   const inboundRows = opts?.inboundRows ?? [];
+  adminRead.inboundRows = inboundRows;
 
   return {
     from(table: string) {

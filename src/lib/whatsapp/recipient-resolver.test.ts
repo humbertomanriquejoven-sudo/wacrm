@@ -311,6 +311,28 @@ describe('resolveRecipient - one ladder for all senders', () => {
     expect(r).toMatchObject({ to: '573122182949', source: 'phone', isPhone: true })
   })
 
+  it('REGLA 1: a valid phone ignores username, BSUID and wa_id entirely', async () => {
+    // Every opaque field is set and dialable-looking; the digits in the phone
+    // column still win untouched. BSUID / wa_id / @user must not surface.
+    const r = await resolveRecipient(
+      {
+        id: 'c1',
+        phone: '573167071066',
+        username: '@humbertomanriquejoven',
+        wa_user_id: '1008477715690681',
+        wa_id: '1008477715690681',
+        recipient_id: '1008477715690681',
+      },
+      'acct-1',
+      'conv-1',
+    )
+    expect(r).toEqual({
+      to: '573167071066',
+      source: 'phone',
+      isPhone: true,
+    })
+  })
+
   it('falls back to wa_id when no number exists anywhere', async () => {
     const r = await resolveRecipient(
       { id: 'c1', phone: null, wa_id: '5511999999999' },

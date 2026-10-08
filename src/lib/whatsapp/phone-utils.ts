@@ -62,8 +62,8 @@ export function isValidE164(phone: string): boolean {
 
 /** Meta's namespace prefix on a BSUID. */
 const BSUID_PREFIX_RE = /^(CO|WAID)\./i
-/** E.164 in practice: 7–13 digits. Above 13 a value cannot be a number. */
-const E164_MIN_DIGITS = 7
+/** E.164 in practice: 8–13 digits. Above 13 a value cannot be a number. */
+const E164_MIN_DIGITS = 8
 const E164_MAX_DIGITS = 13
 
 /**

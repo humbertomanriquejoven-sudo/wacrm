@@ -418,8 +418,10 @@ export async function sendMessageToConversation(
   // refused locally with a typed 422 and a recorded failed bubble instead of
   // firing a request Meta will only drop.
   if (!contextMessageId && resolved.to && !resolved.isPhone) {
+    // `messages` can be RLS-blocked for a user-scoped client, so the anchor is
+    // read with the service role — the lookup must never be held hostage by RLS.
     contextMessageId =
-      (await latestInboundAnchorId(db, conversationId)) ?? undefined;
+      (await latestInboundAnchorId(supabaseAdmin(), conversationId)) ?? undefined;
     if (contextMessageId) {
       console.log(
         `[send-message] contact ${contact.id} is addressed by an opaque id (${resolved.source}); ` +
@@ -480,7 +482,11 @@ export async function sendMessageToConversation(
   // that escalated attempt needs the thread's customer wamid or Meta
   // answers (#131009) "Parameter value is not valid". Lazily resolved and
   // memoized, so an all-phone send never queries `messages`.
-  const anchorFor = createAnchorResolver(db, conversationId, contextMessageId);
+  const anchorFor = createAnchorResolver(
+    supabaseAdmin(),
+    conversationId,
+    contextMessageId
+  );
 
   const attempt = async (phone: string): Promise<string> => {
     const anchor = await anchorFor(phone);

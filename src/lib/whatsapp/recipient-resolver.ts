@@ -368,28 +368,43 @@ export async function latestInboundAnchorId(
 ): Promise<string | null> {
   if (!conversationId) return null
 
-  const { data, error } = await db
-    .from('messages')
-    .select('message_id')
-    .eq('conversation_id', conversationId)
-    .eq('sender_type', 'customer')
-    .not('message_id', 'is', null)
-    .order('created_at', { ascending: false })
-    .limit(1)
+  // The anchor lookup must never take the send down. Callers should hand a
+  // service-role client (`supabaseAdmin()`), but even a broken or
+  // RLS-blocked client is handled here: whatever fails, we degrade to null
+  // and the caller addresses the contact directly or refuses locally.
+  let row: { message_id?: string | null } | undefined
+  try {
+    const { data, error } = await db
+      .from('messages')
+      .select('message_id')
+      .eq('conversation_id', conversationId)
+      .eq('sender_type', 'customer')
+      .not('message_id', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(1)
 
-  if (error) {
-    // Best-effort: an anchor we cannot read must not fail the send. The caller
-    // falls back to addressing the contact directly.
+    if (error) {
+      // Best-effort: an anchor we cannot read must not fail the send. The caller
+      // falls back to addressing the contact directly.
+      console.warn(
+        '[recipient-resolver] could not read an inbound anchor for conversation',
+        conversationId,
+        '-',
+        error.message,
+      )
+      return null
+    }
+    row = (data ?? [])[0] as { message_id?: string | null } | undefined
+  } catch (err) {
     console.warn(
-      '[recipient-resolver] could not read an inbound anchor for conversation',
+      '[recipient-resolver] inbound anchor lookup for conversation',
       conversationId,
-      '-',
-      error.message,
+      'failed:',
+      err instanceof Error ? err.message : err,
     )
     return null
   }
 
-  const row = (data ?? [])[0] as { message_id?: string | null } | undefined
   return row?.message_id ?? null
 }
 
