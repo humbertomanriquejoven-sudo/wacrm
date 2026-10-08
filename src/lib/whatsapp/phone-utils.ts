@@ -3,6 +3,14 @@
  * Meta requires digits only — no + prefix, no spaces, no dashes.
  * e.g. "+370 63949836" → "37063949836"
  */
+export function cleanPhoneNumber(rawPhone: string): string | null {
+  const v = (rawPhone ?? '').trim().toLowerCase()
+  if (!v || v === 'unknown') return null
+  const digits = v.replace(/\D/g, '')
+  if (!digits) return null
+  return digits
+}
+
 export function sanitizePhoneForMeta(phone: string): string {
   if (!phone) return ''
   return phone.replace(/\D/g, '')
