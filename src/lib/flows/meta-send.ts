@@ -26,6 +26,7 @@ import {
   isDialablePhone,
   recipientAddressQueue,
   latestInboundAnchorId,
+  createAnchorResolver,
 } from '@/lib/whatsapp/recipient-resolver'
 import type { RecipientCandidate } from '@/lib/whatsapp/recipient-resolver'
 
@@ -260,6 +261,11 @@ export async function engineSendText(
     target,
     args.conversationId,
   )
+  // The anchor FOLLOWS the address: fixed for an opaque-first send above,
+  // looked up lazily when the queue ESCALATES from a rejected phone to an
+  // opaque id — that mid-walk switch is exactly where a cold (#131009)
+  // used to bite. Memoized, so an all-phone send never queries `messages`.
+  const anchorFor = createAnchorResolver(db, args.conversationId, anchorMessageId)
 
   for (const address of addressQueue) {
     workingPhone = address
@@ -273,7 +279,7 @@ export async function engineSendText(
           // Quote the customer's own message. Without this the anchor
           // resolved above is pointless: an opaque destination reaches Meta
           // ONLY inside `context` (#131009).
-          contextMessageId: anchorMessageId,
+          contextMessageId: await anchorFor(v),
         })
         waMessageId = r.messageId
         workingPhone = v
@@ -428,6 +434,10 @@ export async function engineSendAiReply(
     target,
     args.conversationId,
   )
+  // `fixed` = the message being answered (or the opaque-first anchor).
+  // A phone-first reply that Meta rejects escalates to an opaque id
+  // mid-walk — the resolver then anchors THAT attempt lazily.
+  const anchorFor = createAnchorResolver(db, args.conversationId, anchorMessageId)
 
   for (let i = 0; i < fragments.length; i++) {
     // Keep composing state alive between bubbles. The webhook already
@@ -458,9 +468,11 @@ export async function engineSendAiReply(
         // (`@user` / `@lid` / BSUID) this is not optional: Meta accepts such
         // a destination only as a context-anchored reply on their wamid, and
         // a bare send comes back as (#131009) "Recipient phone number not in
-        // allowed list". `anchorMessageId` prefers the message being answered
-        // and falls back to the thread's newest customer wamid.
-        contextMessageId: anchorMessageId,
+        // allowed list". Prefers the message being answered, falls back to
+        // the thread's newest customer wamid — and is resolved PER ATTEMPT so
+        // a queue that escalates from a rejected phone to an opaque id still
+        // carries the anchor.
+        contextMessageId: await anchorFor(phone),
       })
       return r.messageId
     }
@@ -606,6 +618,8 @@ export async function engineSendMedia(
 
   const accessToken = decrypt(config.access_token)
 
+  const anchorFor = createAnchorResolver(db, args.conversationId, anchorMessageId)
+
   const attempt = async (phone: string): Promise<string> => {
     const r = await sendMediaMessage({
       phoneNumberId: config.phone_number_id,
@@ -615,7 +629,9 @@ export async function engineSendMedia(
       link: args.link,
       caption: args.caption,
       filename: args.filename,
-      contextMessageId: anchorMessageId,
+      // Per-attempt: fixed for an opaque-first send, lazily anchored when
+      // the queue escalates from a rejected phone to an opaque id.
+      contextMessageId: await anchorFor(phone),
     })
     return r.messageId
   }
@@ -786,6 +802,8 @@ const { to: target, sanitized, isPhone } = await prepareRecipient(
 
   const accessToken = decrypt(config.access_token)
 
+  const anchorFor = createAnchorResolver(db, input.conversationId, anchorMessageId)
+
   const attempt = async (phone: string): Promise<string> => {
     if (input.kind === 'buttons') {
       const r = await sendInteractiveButtons({
@@ -796,7 +814,9 @@ const { to: target, sanitized, isPhone } = await prepareRecipient(
         buttons: input.buttons,
         headerText: input.headerText,
         footerText: input.footerText,
-        contextMessageId: anchorMessageId,
+        // Per-attempt: fixed for an opaque-first send, lazily anchored when
+        // the queue escalates from a rejected phone to an opaque id.
+        contextMessageId: await anchorFor(phone),
       })
       return r.messageId
     }
@@ -809,7 +829,7 @@ const { to: target, sanitized, isPhone } = await prepareRecipient(
       sections: input.sections,
       headerText: input.headerText,
       footerText: input.footerText,
-      contextMessageId: anchorMessageId,
+      contextMessageId: await anchorFor(phone),
     })
     return r.messageId
   }

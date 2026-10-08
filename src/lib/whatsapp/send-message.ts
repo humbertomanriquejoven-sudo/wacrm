@@ -50,6 +50,7 @@ import {
   sendWithRecipientFallback,
   resolveRecipient,
   latestInboundAnchorId,
+  createAnchorResolver,
 } from '@/lib/whatsapp/recipient-resolver';
 import type { MessageTemplate } from '@/types';
 import {
@@ -473,7 +474,16 @@ export async function sendMessageToConversation(
     sendLanguage = resolved.language;
   }
 
+  // The anchor FOLLOWS the address. The reply quote / opaque-first anchor
+  // resolved above is fixed, but a phone-first send that Meta rejects
+  // escalates to an opaque id inside `sendWithRecipientFallback` — and
+  // that escalated attempt needs the thread's customer wamid or Meta
+  // answers (#131009) "Parameter value is not valid". Lazily resolved and
+  // memoized, so an all-phone send never queries `messages`.
+  const anchorFor = createAnchorResolver(db, conversationId, contextMessageId);
+
   const attempt = async (phone: string): Promise<string> => {
+    const anchor = await anchorFor(phone);
     if (messageType === 'template') {
       const result = await sendTemplateMessage({
         phoneNumberId: config.phone_number_id,
@@ -484,7 +494,7 @@ export async function sendMessageToConversation(
         template: templateRow ?? undefined,
         messageParams: templateMessageParams ?? undefined,
         params: templateParams || [],
-        contextMessageId,
+        contextMessageId: anchor,
       });
       return result.messageId;
     }
@@ -497,7 +507,7 @@ export async function sendMessageToConversation(
         link: mediaUrl!,
         caption: contentText || undefined,
         filename: filename || undefined,
-        contextMessageId,
+        contextMessageId: anchor,
       });
       return result.messageId;
     }
@@ -512,7 +522,7 @@ export async function sendMessageToConversation(
           headerText: p.header || undefined,
           footerText: p.footer || undefined,
           buttons: p.buttons,
-          contextMessageId,
+          contextMessageId: anchor,
         });
         return result.messageId;
       }
@@ -525,7 +535,7 @@ export async function sendMessageToConversation(
         headerText: p.header || undefined,
         footerText: p.footer || undefined,
         sections: p.sections,
-        contextMessageId,
+        contextMessageId: anchor,
       });
       return result.messageId;
     }
@@ -534,7 +544,7 @@ export async function sendMessageToConversation(
       accessToken,
       to: phone,
       text: contentText!,
-      contextMessageId,
+      contextMessageId: anchor,
     });
     return result.messageId;
   };

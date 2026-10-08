@@ -69,6 +69,15 @@ const E164_MAX_DIGITS = 13
 /**
  * True when `value` is a real, dialable E.164 phone number.
  *
+ * REGLA 1 (phone always wins): a stored `phone` that CONTAINS valid digits
+ * is THE number for this contact even when it carries decoration — a
+ * leading '@' ('@573167071066'), spaces, dashes, parentheses or dots are
+ * all cleaned away by `normalizePhone` before the length check, exactly
+ * like a '+'. Letters remain disqualifying, so a display handle
+ * ('@humbertomanriquejoven') can never be mistaken for one, and a
+ * '@'-decorated BSUID ('@1008477715690681') still trips the length
+ * ceiling below.
+ *
  * The length ceiling is the load-bearing part. Meta's BSUIDs are 15–17
  * digits, and `normalizePhone` strips every non-digit, so both
  * 'CO.1008477715690681' and a bare '1008477715690681' reduce to the same
@@ -81,7 +90,7 @@ export function isDialablePhone(value: string | null | undefined): boolean {
   const trimmed = value.trim()
   if (!trimmed) return false
   if (BSUID_PREFIX_RE.test(trimmed)) return false
-  if (!/^\+?[\d\s().-]+$/.test(trimmed)) return false
+  if (!/^\+?[@\d\s().-]+$/.test(trimmed)) return false
   const digits = normalizePhone(trimmed).length
   return digits >= E164_MIN_DIGITS && digits <= E164_MAX_DIGITS
 }

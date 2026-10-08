@@ -1,4 +1,5 @@
 import {
+  isDialablePhone,
   normalizeMetaIdentifier,
   normalizeUsername,
   passthroughMetaId,
@@ -390,6 +391,41 @@ export async function latestInboundAnchorId(
 
   const row = (data ?? [])[0] as { message_id?: string | null } | undefined
   return row?.message_id ?? null
+}
+
+/**
+ * Per-attempt `context.message_id` resolution for senders that walk
+ * `recipientAddressQueue`.
+ *
+ * WHY per-attempt and not one anchor resolved up front: the queue can
+ * CHANGE identity mid-walk. REGLA 1 puts a dialable `phone` first (no
+ * anchor needed), and only after Meta rejects that number does the queue
+ * escalate to an opaque id — `wa_id` / BSUID / `@handle`. THAT is the
+ * escalation where #131009 bites: the opaque id sent cold, because the
+ * phone-first resolution decided no anchor would ever be needed. So the
+ * anchor FOLLOWS the address actually being attempted: a dialable number
+ * gets none, an opaque id gets the thread's newest customer wamid,
+ * looked up lazily on first use and memoized for the rest of the send
+ * (an all-phone send never touches `messages`).
+ *
+ * `fixed` — an explicit reply quote, or the anchor already resolved for
+ * an opaque-first send — always wins: it is the message this send is
+ * answering.
+ */
+export function createAnchorResolver(
+  db: Pick<SupabaseClient, 'from'>,
+  conversationId: string | null | undefined,
+  fixed?: string | null,
+): (address: string) => Promise<string | undefined> {
+  let cached: string | null | undefined
+  return async (address: string): Promise<string | undefined> => {
+    if (fixed) return fixed
+    if (isDialablePhone(address)) return undefined
+    if (cached === undefined) {
+      cached = await latestInboundAnchorId(db, conversationId)
+    }
+    return cached ?? undefined
+  }
 }
 
 /**

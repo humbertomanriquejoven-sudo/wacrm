@@ -11,6 +11,7 @@ import {
   resolveRecipient,
   recipientAddressQueue,
   latestInboundAnchorId,
+  createAnchorResolver,
 } from '@/lib/whatsapp/recipient-resolver'
 import { MetaApiError } from '@/lib/whatsapp/meta-api'
 
@@ -58,6 +59,19 @@ describe('phone vs Meta identifier classification', () => {
     expect(isDialablePhone('1008477715690681')).toBe(false)
     expect(isDialablePhone('WAID.99887766')).toBe(false)
     expect(toDialable('CO.1008477715690681')).toBeNull()
+  })
+
+  it('REGLA 1: cleans @, spaces and dashes out of a stored phone', () => {
+    // A `phone` column holding digits under '@'/' '/'-' punctuation is
+    // still THE number for this contact and must win the ladder.
+    expect(isDialablePhone('@573167071066')).toBe(true)
+    expect(toDialable('@573167071066')).toBe('573167071066')
+    expect(toDialable('5731-6707-1066')).toBe('573167071066')
+    expect(toDialable(' 573 167 071 066 ')).toBe('573167071066')
+    // A display handle is not a number: letters disqualify.
+    expect(toDialable('@humbertomanriquejoven')).toBeNull()
+    // A '@'-decorated BSUID still trips the E.164 length ceiling.
+    expect(toDialable('@1008477715690681')).toBeNull()
   })
 
   it('classifies long digit strings as Meta identifiers', () => {
@@ -456,5 +470,55 @@ describe('latestInboundAnchorId', () => {
     const eqCalls = builder.eq.mock.calls.map((c) => [c[0], c[1]])
     expect(eqCalls).toContainEqual(['conversation_id', 'conv-9'])
     expect(eqCalls).toContainEqual(['sender_type', 'customer'])
+  })
+})
+
+describe('createAnchorResolver — the anchor follows the address', () => {
+  function anchorDb(rows: unknown[]) {
+    const b: Record<string, unknown> = {}
+    const chain = () => b
+    for (const m of ['select', 'eq', 'not', 'order']) b[m] = vi.fn(chain)
+    b.limit = vi.fn(() => Promise.resolve({ data: rows, error: null }))
+    return { from: vi.fn(() => b) }
+  }
+
+  it('gives a dialable number no anchor and never queries messages', async () => {
+    const db = anchorDb([{ message_id: 'wamid.NEW' }])
+    const anchorFor = createAnchorResolver(db as never, 'conv-1')
+
+    expect(await anchorFor('573167071066')).toBeUndefined()
+    expect(await anchorFor('+57 316 707 1066')).toBeUndefined()
+    expect(db.from).not.toHaveBeenCalled()
+  })
+
+  it('anchors an opaque id to the thread newest inbound wamid', async () => {
+    const db = anchorDb([{ message_id: 'wamid.NEW' }])
+    const anchorFor = createAnchorResolver(db as never, 'conv-1')
+
+    expect(await anchorFor('1008477715690681')).toBe('wamid.NEW')
+  })
+
+  it('resolves the lookup once and reuses it for every opaque attempt', async () => {
+    const db = anchorDb([{ message_id: 'wamid.NEW' }])
+    const anchorFor = createAnchorResolver(db as never, 'conv-1')
+
+    await anchorFor('1008477715690681')
+    await anchorFor('@humbertomanriquejoven')
+    expect(db.from).toHaveBeenCalledTimes(1)
+  })
+
+  it('prefers a fixed anchor (reply quote / opaque-first) over the lookup', async () => {
+    const db = anchorDb([{ message_id: 'wamid.NEW' }])
+    const anchorFor = createAnchorResolver(db as never, 'conv-1', 'wamid.CHOSEN')
+
+    expect(await anchorFor('1008477715690681')).toBe('wamid.CHOSEN')
+    expect(db.from).not.toHaveBeenCalled()
+  })
+
+  it('returns undefined for an opaque id when the thread has no inbound', async () => {
+    const db = anchorDb([])
+    const anchorFor = createAnchorResolver(db as never, 'conv-1')
+
+    expect(await anchorFor('1008477715690681')).toBeUndefined()
   })
 })

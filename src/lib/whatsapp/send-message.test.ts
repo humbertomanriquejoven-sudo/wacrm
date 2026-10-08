@@ -509,6 +509,63 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
 });
 
 // ============================================================
+// REGLA 1 → REGLA 2 escalation. The phone wins the ladder (REGLA 1) and
+// goes out unanchored; Meta rejects it, so the queue walks up to the
+// BSUID. THAT escalated attempt is where (#131009) "Parameter value is
+// not valid" used to bite: the phone-first resolution had decided no
+// anchor was ever needed, so the opaque id went out cold. The anchor now
+// follows the address.
+// ============================================================
+describe('sendMessageToConversation - phone rejected → escalated BSUID carries the anchor', () => {
+  it('anchors the escalated opaque attempt to the newest inbound wamid', async () => {
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    vi.mocked(sendTextMessage).mockImplementation(async (args) => {
+      if (args.to === '1008477715690681') return { messageId: 'wamid.escalated' };
+      throw new MetaApiError('Recipient phone number not in allowed list', {
+        status: 400,
+        code: 131030,
+      });
+    });
+
+    try {
+      const captured: CapturedWrites = {};
+      const result = await sendMessageToConversation(
+        sendPathDb([], captured, {
+          contact: {
+            id: 'ct-1',
+            phone: '+15551234567',
+            wa_id: '1008477715690681',
+          },
+          inboundRows: [{ message_id: 'wamid.INBOUND' }],
+        }),
+        'acct-1',
+        {
+          conversationId: 'cv-1',
+          messageType: 'text',
+          contentText: 'Hola',
+        }
+      );
+
+      expect(result.whatsappMessageId).toBe('wamid.escalated');
+
+      const calls = vi.mocked(sendTextMessage).mock.calls;
+      // REGLA 1: the real number goes first, completely untouched — no anchor.
+      const first = calls[0][0];
+      expect(first.to).toBe('15551234567');
+      expect(first.contextMessageId).toBeUndefined();
+      // The escalated opaque id carries the thread's customer wamid.
+      const escalated = calls.find((c) => c[0].to === '1008477715690681');
+      expect(escalated).toBeDefined();
+      expect(escalated![0].contextMessageId).toBe('wamid.INBOUND');
+    } finally {
+      vi.mocked(sendTextMessage).mockImplementation(async () => ({
+        messageId: 'wamid.text',
+      }));
+    }
+  });
+});
+
+// ============================================================
 // MEDIA parity — attachments run through the same resolver and the
 // same inbound-wamid anchor as text, so an image to a `@user` contact
 // is addressed identically to a message the operator types by hand.
