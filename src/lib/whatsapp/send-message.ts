@@ -471,14 +471,18 @@ export async function sendMessageToConversation(
       // No anchor and no dialable number: an opaque id sent bare comes back
       // as (#131009) "Recipient phone number not in allowed list". Fail
       // HERE, loudly and locally, instead of putting a request on the wire
-      // that bounces or — worse — lands as a 200 that never delivered.
+      // that bounces or — worse — lands as a 200 that never delivered. The
+      // message the UI shows is the operator-facing rule; the console keeps
+      // the technical detail.
       const detail =
+        `No es posible enviar mensaje a este usuario de Meta sin un mensaje previo de entrada o un teléfono registrado.`;
+      const technical =
         `Recipient "${resolved.to}" (source: ${resolved.source}) has no dialable phone number and conversation ` +
         `${conversationId} has no inbound wamid to quote, so WhatsApp cannot address it — an opaque id sent ` +
         `without a reply anchor is refused by Meta with (#131009). ` +
         `No HTTP request was sent to Meta.`;
       console.error(
-        `[send-message] INVALID RECIPIENT for conversation ${conversationId} / contact ${contact.id}: ${detail}`,
+        `[send-message] INVALID RECIPIENT for conversation ${conversationId} / contact ${contact.id}: ${technical}`,
       );
       await recordSendFailure(db, {
         conversationId,
@@ -486,7 +490,7 @@ export async function sendMessageToConversation(
         messageType,
         contentText: contentText ?? null,
         mediaUrl: mediaUrl || null,
-        errorDetail: detail,
+        errorDetail: technical,
       });
       throw new SendMessageError('invalid_recipient', detail, 422);
     }
@@ -640,7 +644,12 @@ export async function sendMessageToConversation(
         throw lastError ?? new Error('Meta rejected every address variant');
       },
       onRecovered: async (phone) => {
-        await db.from('contacts').update({ phone }).eq('id', contact.id);
+        // Persist the recovered number through the service role so an
+        // RLS-scoped caller can never be the thing that loses it.
+        await supabaseAdmin()
+          .from('contacts')
+          .update({ phone })
+          .eq('id', contact.id);
       },
     });
   } catch (err) {
@@ -684,7 +693,8 @@ export async function sendMessageToConversation(
 
   // Persist whichever real number worked so the next send goes straight to
   // it. Only ever a number — a working BSUID/handle must never overwrite
-  // the phone column.
+  // the phone column. Written with the service role: RLS must never block
+  // the correction that makes the contact sendable.
   if (
     workingPhone &&
     workingPhone !== contact.phone &&
@@ -693,7 +703,7 @@ export async function sendMessageToConversation(
     console.log(
       `[send-message] Auto-corrected contact phone: ${contact.phone} → ${workingPhone}`
     );
-    await db
+    await supabaseAdmin()
       .from('contacts')
       .update({ phone: workingPhone })
       .eq('id', contact.id);

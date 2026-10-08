@@ -224,13 +224,17 @@ vi.mock('@/lib/flows/admin-client', () => ({
       if (table === 'contacts') {
         // The strict recipient override re-reads the full contact row with the
         // service role; `adminRead.contactRow` can differ from the RLS-scoped
-        // `conversation.contact` embed to simulate RLS hiding a phone.
-        const builder: Record<string, unknown> = {
-          select: () => builder,
-          eq: () => builder,
+        // `conversation.contact` embed to simulate RLS hiding a phone. The
+        // same client also persists recovered / auto-corrected numbers.
+        const read = () => ({
+          select: vi.fn(() => read()),
+          eq: vi.fn(() => read()),
           single: async () => ({ data: adminRead.contactRow, error: null }),
-        };
-        return builder;
+          update: () => ({
+            eq: async () => ({ error: null }),
+          }),
+        });
+        return read();
       }
       // Best-effort "pause active flow run" write.
       return {

@@ -409,7 +409,7 @@ async function throwMetaError(response: Response, fallback: string): Promise<nev
   )
   // Producción (Easypanel): el cuerpo de la respuesta que Meta devolvió con
   // error, verbatim, bajo una etiqueta estable que se puede filtrar.
-  console.error('[META_ERROR_RESPONSE]', raw || '(empty response body)')
+  console.error('[META_API_ERROR]', raw || '(empty response body)')
 
   let data: MetaErrorResponse = {}
   if (raw) {
@@ -633,7 +633,7 @@ export async function getSubscribedApps(
  * Production diagnostics (Easypanel): the EXACT JSON that leaves the process
  * is printed immediately before the fetch under a stable tag, and every
  * non-OK Meta response body is logged (echoed by `throwMetaError` under
- * `META_ERROR_RESPONSE`). Both make a delivery failure diagnosable from the
+ * `META_API_ERROR`). Both make a delivery failure diagnosable from the
  * deployment logs alone — including a recepient rejection that produced a
  * 200-but-dropped message (no response body to log) vs. a literal 4xx with a
  * body to read.
@@ -643,7 +643,7 @@ async function postMessagesPayload(
   accessToken: string,
   body: Record<string, unknown>,
 ): Promise<Response> {
-  console.log('[META_PAYLOAD_ENVIADO]', JSON.stringify(body, null, 2))
+  console.log('[META_PAYLOAD_OUTBOUND]', JSON.stringify(body, null, 2))
   return fetch(url, {
     method: 'POST',
     headers: {
