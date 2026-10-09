@@ -53,6 +53,8 @@ const contactFields = [
   { value: 'name', labelKey: 'name' },
   { value: 'phone', labelKey: 'phone' },
   { value: 'email', labelKey: 'email' },
+  { value: 'recipient_address', labelKey: 'recipientAddress' },
+  { value: 'recipient_type', labelKey: 'recipientType' },
 ];
 
 const SAMPLE_CONTACT: Contact = {
@@ -62,7 +64,10 @@ const SAMPLE_CONTACT: Contact = {
   name: 'John Doe',
   phone: '+1234567890',
   email: 'john@example.com',
-  company: 'Acme Corp',
+  wa_id: '1234567890',
+  bsuid: 'CO.1234567890',
+  recipient_address: '1234567890',
+  recipient_type: 'phone' as 'phone',
   created_at: new Date().toISOString(),
   updated_at: new Date().toISOString(),
 };

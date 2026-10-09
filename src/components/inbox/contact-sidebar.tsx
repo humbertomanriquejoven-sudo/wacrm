@@ -134,7 +134,7 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
     contact.name ||
     (contact.phone && contact.phone !== "unknown"
       ? contact.phone
-      : contact.username || contact.wa_user_id || "unknown");
+      : contact.bsuid || contact.recipient_address || contact.username || "unknown");
   const initials = displayName.charAt(0).toUpperCase();
 
   return (
@@ -144,13 +144,11 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
           {/* Contact Info */}
           <div className="flex flex-col items-center text-center">
             <div className="flex h-16 w-16 items-center justify-center rounded-full bg-muted text-lg font-semibold text-foreground">
-              {contact.avatar_url ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  src={contact.avatar_url}
-                  alt={displayName}
-                  className="h-16 w-16 rounded-full object-cover"
-                />
+              {contact.recipient_address ? (
+                // Simple avatar using the first 2 chars of recipient_address
+                <span className="rounded-full bg-primary text-primary-foreground text-xs font-semibold">
+                  {contact.recipient_address?.charAt(0)?.charAt(0).toUpperCase() || 'U'}
+                </span>
               ) : (
                 initials
               )}

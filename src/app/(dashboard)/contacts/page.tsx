@@ -617,10 +617,10 @@ export default function ContactsPage() {
                     {contact.wa_id || <span className="text-muted-foreground">-</span>}
                   </TableCell>
                   <TableCell className="text-muted-foreground">
-                    {contact.wa_user_id || <span className="text-muted-foreground">-</span>}
+                    {contact.bsuid || <span className="text-muted-foreground">-</span>}
                   </TableCell>
                   <TableCell className="text-muted-foreground text-sm">
-                    {contact.direccion_entrega || <span className="text-muted-foreground">-</span>}
+                    {contact.recipient_address || <span className="text-muted-foreground">-</span>}
                   </TableCell>
                   <TableCell className="text-muted-foreground hidden md:table-cell text-sm">
                     {contact.email || <span className="text-muted-foreground">-</span>}

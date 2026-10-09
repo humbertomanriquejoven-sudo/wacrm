@@ -1,0 +1,32 @@
+﻿src/components/broadcasts/step3-personalize.tsx(58,7): error TS2739: Type '{ id: string; user_id: string; account_id: string; name: string; phone: string; email: string; company: string; created_at: string; updated_at: string; }' is missing the following properties from type 'Contact': recipient_address, recipient_type
+src/components/broadcasts/step3-personalize.tsx(214,13): error TS2322: Type 'string | null | undefined' is not assignable to type 'string | undefined'.
+  Type 'null' is not assignable to type 'string | undefined'.
+src/components/inbox/contact-sidebar.tsx(137,37): error TS2551: Property 'wa_user_id' does not exist on type 'Contact'. Did you mean 'user_id'?
+src/components/inbox/contact-sidebar.tsx(147,24): error TS2339: Property 'avatar_url' does not exist on type 'Contact'.
+src/components/inbox/contact-sidebar.tsx(150,32): error TS2339: Property 'avatar_url' does not exist on type 'Contact'.
+src/components/inbox/contact-sidebar.tsx(176,51): error TS2551: Property 'wa_user_id' does not exist on type 'Contact'. Did you mean 'user_id'?
+src/components/inbox/contact-sidebar.tsx(194,75): error TS2551: Property 'wa_user_id' does not exist on type 'Contact'. Did you mean 'user_id'?
+src/components/inbox/contact-sidebar.tsx(196,63): error TS2551: Property 'wa_user_id' does not exist on type 'Contact'. Did you mean 'user_id'?
+src/components/inbox/conversation-list.tsx(463,19): error TS2339: Property 'avatar_url' does not exist on type 'Contact'.
+src/components/inbox/conversation-list.tsx(466,26): error TS2339: Property 'avatar_url' does not exist on type 'Contact'.
+src/components/inbox/message-thread.tsx(924,37): error TS2551: Property 'wa_user_id' does not exist on type 'Contact'. Did you mean 'user_id'?
+src/components/inbox/message-thread.tsx(969,47): error TS2551: Property 'wa_user_id' does not exist on type 'Contact'. Did you mean 'user_id'?
+src/hooks/use-broadcast-sending.ts(172,9): error TS2322: Type 'string | null | undefined' is not assignable to type 'string | undefined'.
+  Type 'null' is not assignable to type 'string | undefined'.
+src/lib/inbox/conversations.test.ts(19,5): error TS2322: Type '{ id: string; user_id: string; account_id: string; phone: string | null; phone_normalized?: string | undefined; name?: string | undefined; username?: string | null | undefined; wa_id?: string | ... 1 more ... | undefined; ... 10 more ...; company?: string | ... 1 more ... | undefined; } | undefined' is not assignable to type 'Contact | undefined'.
+  Type '{ id: string; user_id: string; account_id: string; phone: string | null; phone_normalized?: string | undefined; name?: string | undefined; username?: string | null | undefined; wa_id?: string | null | undefined; bsuid?: string | null | undefined; ... 9 more ...; company?: string | null | undefined; }' is not assignable to type 'Contact'.
+    Types of property 'recipient_address' are incompatible.
+      Type 'string | undefined' is not assignable to type 'string'.
+        Type 'undefined' is not assignable to type 'string'.
+src/lib/inbox/conversations.test.ts(123,46): error TS2345: Argument of type '{ id: string; user_id: string; contact_id: string; status: "open"; unread_count: number; created_at: string; updated_at: string; contact: { id: string; user_id: string; account_id: string; phone: string; created_at: string; updated_at: string; contact_tags: ({ ...; } | { ...; })[]; }; }' is not assignable to parameter of type 'RawConversation'.
+  Type '{ id: string; user_id: string; contact_id: string; status: "open"; unread_count: number; created_at: string; updated_at: string; contact: { id: string; user_id: string; account_id: string; phone: string; created_at: string; updated_at: string; contact_tags: ({ ...; } | { ...; })[]; }; }' is not assignable to type '{ contact?: RawContact | null | undefined; }'.
+    Types of property 'contact' are incompatible.
+      Type '{ id: string; user_id: string; account_id: string; phone: string; created_at: string; updated_at: string; contact_tags: ({ tags: { id: string; user_id: string; name: string; color: string; created_at: string; }; } | { ...; })[]; }' is not assignable to type 'RawContact'.
+        Type '{ id: string; user_id: string; account_id: string; phone: string; created_at: string; updated_at: string; contact_tags: ({ tags: { id: string; user_id: string; name: string; color: string; created_at: string; }; } | { ...; })[]; }' is missing the following properties from type 'Contact': recipient_address, recipient_type
+src/lib/whatsapp/broadcast-address.test.ts(98,52): error TS2561: Object literal may only specify known properties, but 'wa_user_id' does not exist in type 'Partial<Contact>'. Did you mean to write 'user_id'?
+src/lib/whatsapp/broadcast-address.test.ts(427,40): error TS2561: Object literal may only specify known properties, but 'wa_user_id' does not exist in type 'Partial<Contact>'. Did you mean to write 'user_id'?
+src/lib/whatsapp/broadcast-address.test.ts(581,9): error TS2561: Object literal may only specify known properties, but 'wa_user_id' does not exist in type 'Partial<Contact>'. Did you mean to write 'user_id'?
+src/lib/whatsapp/broadcast-address.test.ts(632,37): error TS2561: Object literal may only specify known properties, but 'wa_user_id' does not exist in type 'Partial<Contact>'. Did you mean to write 'user_id'?
+src/lib/whatsapp/broadcast-address.test.ts(651,41): error TS2561: Object literal may only specify known properties, but 'wa_user_id' does not exist in type 'Partial<Contact>'. Did you mean to write 'user_id'?
+src/lib/whatsapp/broadcast-address.test.ts(658,40): error TS2561: Object literal may only specify known properties, but 'wa_user_id' does not exist in type 'Partial<Contact>'. Did you mean to write 'user_id'?
+src/lib/whatsapp/broadcast-address.test.ts(668,9): error TS2561: Object literal may only specify known properties, but 'wa_user_id' does not exist in type 'Partial<Contact>'. Did you mean to write 'user_id'?

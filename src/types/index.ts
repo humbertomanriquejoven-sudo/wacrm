@@ -105,33 +105,29 @@ export interface Contact {
    *  and unique per account. Read-only. */
   phone_normalized?: string;
   name?: string;
-  email?: string;
-  company?: string;
-  avatar_url?: string;
-  /** Facebook/WhatsApp profile username (migration 048). Lets us match and
-   *  address a sender whose phone number Meta never disclosed. */
+  /** Username recibido en el webhook (ej. @usuario) */
   username?: string | null;
-  /** Business-scoped user id Meta sends for unregistered numbers
-   *  (migration 048). Survives a merge onto a contact that has a real
-   *  phone, so later messages from that number resolve to this row. */
-  wa_user_id?: string | null;
-  /** Native WhatsApp ID from Meta Cloud API webhook (migration 053). */
+  /** WhatsApp ID nativo de Meta Cloud API webhook (migración 053). */
   wa_id?: string | null;
-  /** WhatsApp Business API phone_number_id from Meta webhook (migration 053). */
-  phone_number_id?: string | null;
-  /** Direccion de entrega desde webhook Meta (migration reciente). */
-  direccion_entrega?: string | null;
+  /** BSUID (Business Scoped User ID) confirmado en el campo correspondiente del webhook. */
+  bsuid?: string | null;
+  /** Identificador seleccionado para enviar el mensaje: wa_id si se envía por teléfono, o bsuid si el endpoint lo admite. */
+  recipient_address: string;
+  /** Tipo de identificador seleccionado: 'phone' si recipient_address es wa_id, o 'bsuid' si es bsuid. */
+  recipient_type: 'phone' | 'bsuid';
+  email?: string;
+  /** Arreglo de etiquetas asociadas al contacto. */
+  tags?: Tag[];
+  created_at: string;
+  updated_at: string;
   /** Technical category of the primary identifier (migration 053). */
   identity_type?: 'PHONE_E164' | 'BSUID' | 'USERNAME' | 'LID' | null;
   /** Display name shown in the WhatsApp profile (migration 053). */
   display_name?: string | null;
   /** Recipient ID from Meta (migration 053, alternative identifier). */
   recipient_id?: string | null;
-  created_at: string;
-  updated_at: string;
-  /** Hydrated by queries that embed `contact_tags(tags(*))` (e.g. the
-   *  Inbox conversation list, for tag filtering). Absent otherwise. */
-  tags?: Tag[];
+  /** Company name associated with the contact (optional, for backward compatibility). */
+  company?: string | null;
 }
 
 export interface Tag {
