@@ -10,8 +10,8 @@
  */
 
 import {
+  isBsuid,
   isDialablePhone,
-  isNamespacedMetaId,
   isOpaqueWaId,
   isPlaceholderValue,
   isValidE164,
@@ -216,13 +216,16 @@ export class InvalidRecipientError extends MetaApiError {
 /**
  * Pre-flight gate every send helper runs before touching the network.
  *
- * Everything Meta can RECEIVE a message in `to` is returned normalized:
+ * Everything Meta can RECEIVE a message for is returned normalized:
  *   CASO A — a real E.164 number ('573044556788') → digits-only `to`.
  *   CASO B — a numeric opaque wa_id ('1486998326437295'), the canonical id a
  *            privacy-shielded sender's inbound `from` carries → digits in `to`
  *            (the caller MUST attach `context.message_id`).
- * Everything else is REFUSED (CASO C): a namespaced BSUID (`CO.…`/`WAID.…`/
- * `LID.…`) and an `@handle` are identity markers, never a destination.
+ *   CASO C — a namespaced BSUID / user id (`CO.…`/`WAID.…`/`LID.…`) → the
+ *            value is returned INTACT (prefix preserved) so the payload
+ *            builder routes it to Meta's `recipient` field and omits `to`.
+ * An `@handle` and a letter-only value are identity/display data and are
+ * REFUSED: Meta answers (#100) Invalid parameter.
  */
 function assertDialableRecipient(address: string): string {
   const value = (address ?? '').trim()
@@ -258,15 +261,11 @@ function assertDialableRecipient(address: string): string {
     console.warn('[send] blocked: "@"-only recipient, no HTTP request made.')
     throw new InvalidRecipientError(value)
   }
-  // CASO C — a namespaced BSUID (`CO.…`/`WAID.…`/`LID.…`) is an IDENTITY
-  // marker (stored column: `wa_user_id`), never a `to` destination: sent
-  // there Meta answers (#131009) and silently drops. Refuse loudly.
-  if (isNamespacedMetaId(bare)) {
-    console.warn(
-      `[send] blocked: "${bare}" is a namespaced BSUID / handle (CASO C) and is NEVER a deliverable destination. No HTTP request was made to Meta.`,
-    )
-    throw new InvalidRecipientError(value, RECIPIENT_IDENTITY_REFUSED)
-  }
+  // CASO C — a namespaced BSUID (`CO.…`/`WAID.…`/`LID.…`) is a real,
+  // deliverable destination, but NOT in `to`: per the official Cloud API a
+  // BSUID travels in `recipient` (and `to` is omitted). Keep the prefix and
+  // the value byte-for-byte; the field builder routes it.
+  if (isBsuid(bare)) return bare
   if (isDialablePhone(bare)) {
     const digits = normalizePhone(bare)
     if (isValidE164(digits)) return digits
@@ -279,10 +278,10 @@ function assertDialableRecipient(address: string): string {
 }
 
 /**
- * The address field(s) for one recipient. Always Meta's `to`, because under
- * CASO A/B/C a deliverable destination is a phone number OR a numeric opaque
- * wa_id — both live in `to` — and anything else (a namespaced BSUID, an
- * `@handle`) is refused before reaching the wire.
+ * The address field(s) for one recipient, routed by the value's shape:
+ * a dialable phone or a numeric opaque wa_id → `{ to }`; a namespaced BSUID /
+ * user id → `{ recipient }` (with `to` omitted); an `@handle` →
+ * `InvalidRecipientError`.
  */
 function recipientFields(address: string): Record<string, string> {
   const bare = address.startsWith('@') ? address.slice(1).trim() : address
@@ -290,21 +289,21 @@ function recipientFields(address: string): Record<string, string> {
 }
 
 /**
- * The address field Meta expects for one recipient (CASO A/B/C):
+ * The address field Meta expects for one recipient:
  *
  *   A. a dialable E.164 number → stripped to digits, sent as `to`;
  *   B. a numeric opaque wa_id (`messages[0].from` for a privacy-shielded
  *      sender; also a short digit run out of an `@lid` id) → sent as `to`;
- *   C. anything else — a namespaced BSUID (`CO.…`/`WAID.…`/`LID.…`) or an
- *      `@handle` — is an IDENTITY marker and is REFUSED, never a destination.
+ *   C. a namespaced BSUID / user id (`CO.…`/`WAID.…`/`LID.…`) → sent as
+ *      `recipient` (the official Cloud API field), with `to` omitted.
  */
 export function recipientAddressField(destination: string): Record<string, string> {
   return canonicalToField(destination)
 }
 
 /**
- * The address field for a send that travels in Meta's `to`: TEMPLATE,
- * MEDIA, interactive, reaction and text messages.
+ * The address field for a send: TEMPLATE, MEDIA, interactive, reaction and
+ * text messages all share ONE canonical routing.
  *
  * CASO A — a real E.164 number travels in `to` (the numeric id with any
  * formatting removed, which is what `toMetaTargetId` produces).
@@ -315,17 +314,11 @@ export function recipientAddressField(destination: string): Record<string, strin
  * one of the owner's own messages (the `context.message_id` anchor) — callers
  * resolve it from the thread; sent cold Meta answers (#131009) and drops.
  *
- * CASO C — a namespaced BSUID (`US.…`/`CO.…`/`WAID.…`/`LID.…`) or an
- * `@handle` is an IDENTITY marker, not a destination. Sending a BSUID in
- * `to` makes Meta answer (#131009) "the phone number format is incorrect"
- * and silently drop; a handle is answered (#100) Invalid parameter whether
- * or not a `context` quote is present. Both are REFUSED with a typed
- * `InvalidRecipientError` (ESCENARIO C) so no doomed request leaves the box.
- *
- * There is deliberately NO `recipient` routing anymore: the 24h-window
- * destinations all travel in `to` with a `context.message_id` anchor, per
- * the CASO A/B/C engine. `assertDeliverableDestination` keeps a final guard
- * so no letter-only value reaches the wire.
+ * CASO C — a namespaced BSUID / user id (`CO.…`/`WAID.…`/`LID.…`) travels in
+ * Meta's `recipient` field, with `recipient_type: "individual"` and `to`
+ * OMITTED. Meta's `to` parameter is EXCLUSIVE to E.164 phone numbers: a BSUID
+ * in `to` returns (#131009) "Parameter value is not valid". An `@handle` is
+ * display data and is REFUSED with a typed `InvalidRecipientError`.
  *
  * Returns `{ to: '' }` for an empty address and for the placeholder
  * `contacts.phone` is NOT NULL forces the webhook to write ('unknown') —
@@ -337,14 +330,9 @@ export function canonicalToField(destination: string): Record<string, string> {
   const bare = cleanRecipientAddress(destination);
   if (!bare) return { to: '' };
   if (isPlaceholderValue(bare)) return { to: '' };
-  // CASO C — a namespaced BSUID (`CO.…`/`WAID.…`/`LID.…`) or an `@handle`
-  // (letters surviving normalization) is an IDENTITY marker. It is never a
-  // deliverable destination: Meta answers (#131009) for a BSUID in `to` and
-  // (#100) for a handle, dropping the message. Refuse locally so the caller
-  // surfaces a typed 422 instead of a doomed probe.
-  if (isNamespacedMetaId(bare)) {
-    throw new InvalidRecipientError(bare, RECIPIENT_IDENTITY_REFUSED);
-  }
+  // CASO C — a namespaced BSUID / user id goes in `recipient`, NEVER `to`.
+  // The fields are mutually exclusive: `to` is omitted entirely.
+  if (isBsuid(bare)) return { recipient: bare };
   if (!isDialablePhone(bare) && !isOpaqueWaId(bare)) {
     // Letter-only handes / garbage: `toMetaTargetId` would reduce
     // `jjuanpablo22222` to `22222` — a number invented from a display name,
@@ -360,9 +348,9 @@ export function canonicalToField(destination: string): Record<string, string> {
 
 /**
  * Template-flavoured name for {@link canonicalToField}, kept for existing
- * callers and tests. Templates and media share one canonical `to` shape:
+ * callers and tests. Templates and media share one canonical routing:
  * CASO A (E.164) and CASO B (numeric wa_id) travel in `to`, and CASO C
- * (BSUID / handle) is refused everywhere.
+ * (BSUID) travels in `recipient`; a handle is refused everywhere.
  */
 export function templateRecipientField(destination: string): Record<string, string> {
   return canonicalToField(destination);
@@ -375,9 +363,9 @@ export function templateRecipientField(destination: string): Record<string, stri
  * reply that QUOTES one of the owner's own messages — the caller must attach
  * a `context.message_id` anchor.
  *
- * A namespaced BSUID (`CO.…`/`WAID.…`/`LID.…`) and an `@handle` are NOT
- * opaque destinations: they are identity markers (CASO C) and are refused
- * by `canonicalToField` / `assertDialableRecipient` at send time.
+ * A namespaced BSUID (`CO.…`/`WAID.…`/`LID.…`) is NOT an opaque wa_id: it is
+ * a separate destination shape (CASO C) that travels in Meta's `recipient`
+ * field. An `@handle` is display data and is refused.
  */
 export function isOpaqueMetaId(address: string): boolean {
   return isOpaqueWaId(address)
@@ -436,28 +424,10 @@ const USERNAME_HANDLE_REFUSED =
   'Meta.';
 
 /**
- * CASO C copy — a namespaced BSUID is an IDENTITY marker, never a `to`
- * destination. Stored in the `wa_user_id` / `bsuid` column by the webhook,
- * never in `phone` or `wa_id`; sending it in `to` is the (#131009)
- * production silent-drop this engine exists to prevent.
- */
-const RECIPIENT_IDENTITY_REFUSED =
-  'un BSUID (CO./WAID./LID.) o un handle NUNCA es un destinatario válido: ' +
-  'WhatsApp no entrega mensajes a identificadores de usuario sin un número ' +
-  'E.164 (CASO C). Guarda el BSUID en wa_user_id y el handle en username; ' +
-  'envía solo al teléfono E.164 (CASO A) o al wa_id/recipient_id numérico ' +
-  '(CASO B, con contexto). No se envió ninguna petición HTTP a Meta.'
-
-/**
- * Final guard (ESCENARIO C) — refuses any destination that is not a
- * deliverable identifier BEFORE it can reach Meta. The only two shapes
- * Cloud API can ever address are a numeric id (`^\d+$` in `to`) and a
- * namespaced id with a numeric payload (`CO.1008…`, `WAID.…`, `LID.…` —
- * kept for legacy `recipient` callers). Anything else — an `@handle` whose
- * letters survive normalization, a letter-only run (`acme.store`,
- * `tienda`) — is display data, not an address: Meta answers (#100) Invalid
- * parameter. Refusing here keeps the doomed request off the wire and lets
- * every caller surface a typed 422.
+ * Final guard — refuses a display value (an `@handle`, a letter-only run like
+ * `acme.store` / `tienda`) that is not an address at all. The deliverable
+ * shapes are a numeric id (in `to`) and a namespaced BSUID / user id with a
+ * numeric payload (in `recipient`); both are admitted here.
  */
 function assertDeliverableDestination(fieldValue: string): void {
   const value = (fieldValue ?? '').trim()
@@ -756,8 +726,8 @@ export interface SendTextMessageArgs {
    * CASO A/B/C engine. `recipientField: 'recipient'` exists only as an
    * explicit legacy RETRY: if Meta rejects the `to` form, a caller may
    * re-send with the id intact in `recipient` rather than lose the message.
-   * Identity markers (BSUID / handle) are refused by the guards before
-   * either field is built.
+   * A namespaced BSUID is routed to `recipient` automatically; a handle is
+   * refused before either field is built.
    */
   recipientField?: 'to' | 'recipient'
 }
@@ -766,9 +736,7 @@ export interface SendTextMessageArgs {
  * Send a free-form WhatsApp text message.
  * Only works inside the 24-hour customer service window.
  *
- * Two destination classes decide the payload, because a contact reached
- * through a `@user` / `@lid` display id is a different problem from a phone
- * number:
+ * Three destination classes decide the payload:
  *
  *   1. A dialable E.164 number → `{ to: "573044556788" }`. No anchor needed:
  *      Meta addresses the number on its own (CASO A).
@@ -782,15 +750,17 @@ export interface SendTextMessageArgs {
  *      the conversation's newest customer wamid (`latestInboundAnchorId`),
  *      and an opaque destination that arrives WITHOUT an anchor is refused
  *      here, before any HTTP request.
+ *   3. A namespaced BSUID / user id (`CO.…`/`WAID.…`/`LID.…`) → Meta's
+ *      `recipient` field, with `recipient_type: "individual"` and `to`
+ *      OMITTED. `to` is EXCLUSIVE to E.164 numbers: a BSUID there returns
+ *      (#131009). No `context` anchor is required for the `recipient` form.
  *
- * Refused locally: an EMPTY address, the `unknown` placeholder, any non-
- * dialable destination without a `contextMessageId` (the #131009 guard), a
- * NAMESPACED BSUID (`CO.…`/`WAID.…`/`LID.…`) and ANY `@handle` — CASO C.
- * Bisuids are identity markers stored in `wa_user_id`, never destinations;
- * a bare `@username` can never be rescued by quoting (Meta answers (#100)
- * Invalid parameter for a handle in `to` whether or not `context` is
- * present), so both are refused here before any HTTP request, and the
- * senders surface a typed 422 in place of a doomed probe.
+ * Refused locally: an EMPTY address, the `unknown` placeholder, a numeric
+ * opaque destination without a `contextMessageId` (the #131009 guard), and
+ * ANY `@handle`. A bare `@username` can never be rescued by quoting (Meta
+ * answers (#100) Invalid parameter for a handle whether or not `context` is
+ * present), so it is refused here before any HTTP request and the senders
+ * surface a typed 422 in place of a doomed probe.
  */
 export async function sendTextMessage(
   args: SendTextMessageArgs
@@ -851,21 +821,15 @@ export async function sendTextMessage(
     )
   }
 
-  // #131009 guard (CASO A/B/C): an IDENTITY marker (namespaced BSUID or
-  // handle) is refused outright — a handle is answered (#100) whether or not
-  // a `context` quote is attached, and a BSUID in `to` is silently dropped.
-  // A genuine numeric opaque wa_id (CASO B) is deliverable ONLY as a reply
-  // that QUOTES one of the owner's own messages, so without a
-  // `contextMessageId` anchor it is refused here too, before any HTTP
-  // request. Callers resolve the anchor from the thread
-  // (`latestInboundAnchorId` / `findInboundWamid`).
-  if (isNamespacedMetaId(address)) {
-    console.error(
-      `[send] CASO C (#131009 guard): destination "${address}" is a namespaced BSUID / handle — IDENTITY data, NEVER a deliverable destination — no HTTP request was sent. Store BSUIDs in wa_user_id; send to the numeric wa_id (CASO B, with context) or a phone (CASO A).`,
-    )
-    throw new InvalidRecipientError(address, RECIPIENT_IDENTITY_REFUSED)
-  }
-  if (!contextMessageId && !isDialablePhone(address)) {
+  // #131009 guard (CASO A/B/C): a numeric opaque wa_id (CASO B) is
+  // deliverable ONLY as a reply that QUOTES one of the owner's own messages,
+  // so without a `contextMessageId` anchor it is refused here, before any
+  // HTTP request. Callers resolve the anchor from the thread
+  // (`latestInboundAnchorId` / `findInboundWamid`). A namespaced BSUID
+  // (CASO C) travels in `recipient` and needs NO anchor; a phone (CASO A)
+  // needs none either. A bare `@handle` is refused later by
+  // `canonicalToField`.
+  if (!contextMessageId && !isDialablePhone(address) && !isBsuid(address)) {
     console.error(
       `[send] MISSING CONTEXT (#131009 guard): opaque destination "${address}" without a contextMessageId anchor — no HTTP request was sent. CASO B requires quoting one of the customer's own messages; anchor via this conversation's newest inbound wamid.`,
     )
@@ -877,12 +841,12 @@ export async function sendTextMessage(
     )
   }
 
-  // Destination field (CASO A/B/C): a deliverable address is ALWAYS an
-  // E.164 phone (CASO A) or a numeric opaque wa_id (CASO B) and travels in
-  // `to`. `canonicalToField` refuses a namespaced BSUID / `@handle` (CASO C)
-  // with a typed error, so no identity marker can reach Meta. The
-  // `recipientField` override is kept only as an explicit legacy retry hatch
-  // (meta-send) — the guards above already refused anything undeliverable.
+  // Destination field, routed by shape: a phone (CASO A) or numeric opaque
+  // wa_id (CASO B) travels in `to`; a namespaced BSUID (CASO C) travels in
+  // `recipient` with `to` omitted. `canonicalToField` refuses an `@handle`.
+  // The `recipientField` override is kept only as an explicit legacy retry
+  // hatch (automations) — the guards above already refused anything
+  // undeliverable.
   const addressField: Record<string, string> =
     args.recipientField === 'recipient'
       ? // Explicit override: send the address in `recipient` instead of `to`.

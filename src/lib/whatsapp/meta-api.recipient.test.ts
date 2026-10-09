@@ -15,16 +15,20 @@ import {
 //      (#131009) and dropped; a handle with (#100).
 
 describe('templateRecipientField', () => {
-  it('REFUSES a namespaced BSUID — identity data, never a destination (CASO C)', () => {
-    expect(() => templateRecipientField('CO.1486998326437295')).toThrow(
-      InvalidRecipientError
-    )
-    expect(() => templateRecipientField('WAID.987654321')).toThrow(
-      InvalidRecipientError
-    )
-    expect(() => templateRecipientField('LID.99887766')).toThrow(
-      InvalidRecipientError
-    )
+  it('routes a namespaced BSUID to "recipient" (CASO C)', () => {
+    expect(templateRecipientField('CO.1486998326437295')).toEqual({
+      recipient: 'CO.1486998326437295',
+    })
+    expect(templateRecipientField('WAID.987654321')).toEqual({
+      recipient: 'WAID.987654321',
+    })
+    expect(templateRecipientField('LID.99887766')).toEqual({
+      recipient: 'LID.99887766',
+    })
+    // CASO C: `to` must be OMITTED entirely when recipient is used
+    const field = templateRecipientField('CO.1486998326437295')
+    expect(field.to).toBeUndefined()
+    expect(Boolean(field.to) && Boolean(field.recipient)).toBe(false)
   })
 
   it('routes a long numeric opaque wa_id to "to" (CASO B)', () => {
@@ -89,10 +93,11 @@ describe('recipientAddressField', () => {
     })
   })
 
-  it('REFUSES a "CO."-prefixed BSUID (CASO C)', () => {
-    expect(() => recipientAddressField('CO.1486998326437295')).toThrow(
-      InvalidRecipientError
-    )
+  it('routes a namespaced BSUID to "recipient" (CASO C), omitting "to"', () => {
+    const field = recipientAddressField('CO.1486998326437295')
+    expect(field.recipient).toBe('CO.1486998326437295')
+    expect(field.to).toBeUndefined()
+    // Rule: never put "CO." in the `to` field when recipient is used
   })
 
   it('treats a long bare numeric id as an opaque wa_id and sends it in "to"', () => {
@@ -101,13 +106,13 @@ describe('recipientAddressField', () => {
     })
   })
 
-  it('REFUSES every namespaced BSUID (CASO C)', () => {
-    expect(() => recipientAddressField('WAID.987654321')).toThrow(
-      InvalidRecipientError
-    )
-    expect(() => recipientAddressField('LID.99887766')).toThrow(
-      InvalidRecipientError
-    )
+  it('routes every namespaced BSUID to "recipient" (CASO C)', () => {
+    expect(recipientAddressField('WAID.987654321')).toEqual({
+      recipient: 'WAID.987654321',
+    })
+    expect(recipientAddressField('LID.99887766')).toEqual({
+      recipient: 'LID.99887766',
+    })
   })
 
   it('NEVER sends an @handle — ESCENARIO C refuses it locally', () => {

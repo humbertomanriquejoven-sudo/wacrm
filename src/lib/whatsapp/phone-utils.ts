@@ -198,6 +198,31 @@ export function isNamespacedMetaId(value: string | null | undefined): boolean {
 }
 
 /**
+ * True when `value` is a NAMESPACED BSUID / user id — the shape Meta reads
+ * from the `recipient` field (`CO.1486998326437295`, `WAID.987654321`,
+ * `LID.99887766`).
+ *
+ * A BSUID is NOT a phone number and is NEVER sent in `to`: Meta answers
+ * (#131009) "Parameter value is not valid" and silently drops the message.
+ * Per the official Cloud API, a BSUID travels in `recipient` with
+ * `recipient_type: "individual"`, and `to` MUST be omitted. This predicate
+ * is the single classifier the payload builder and the recipient resolver
+ * share, so a value is judged the same way at resolve and at send time.
+ *
+ * Shape: a namespace of letters, a dot, then a payload that contains at
+ * least one digit. A bare handle (`jjuanpablo22222`), a display handle
+ * (`acme.store`, no digit) and a numeric opaque wa_id are deliberately NOT
+ * BSUIDs.
+ */
+export function isBsuid(value: string | null | undefined): boolean {
+  if (!value) return false
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  if (isPlaceholderValue(trimmed)) return false
+  return /^[A-Za-z]+\.[\w.-]*\d[\w.-]*$/.test(trimmed)
+}
+
+/**
  * True when `value` is a deliverable-by-quote opaque wa_id: an all-digit run
  * (optional `+`) that is NOT a dialable E.164 number — the canonical id a
  * privacy-shielded sender's `messages[0].from` carries.

@@ -143,7 +143,7 @@ async function prepareRecipient(
   contact: RecipientCandidate,
   accountId: string,
   conversationId?: string | null,
-): Promise<{ to: string; sanitized: string; isPhone: boolean }> {
+): Promise<{ to: string; sanitized: string; isPhone: boolean; isBsuid: boolean }> {
   const recipient = await resolveRecipient(contact, accountId, conversationId)
   if (!recipient.to) throw new Error('contact not found for this account')
 
@@ -163,27 +163,33 @@ async function prepareRecipient(
     throw new Error(`contact phone invalid: ${recipient.to}`)
   }
 
-  return { to: recipient.to, sanitized, isPhone: recipient.isPhone }
+  return {
+    to: recipient.to,
+    sanitized,
+    isPhone: recipient.isPhone,
+    isBsuid: Boolean(recipient.isBsuid),
+  }
 }
 
 /**
  * Resolve the #131009 anchor for one send — the shared rule every sender
  * in this file obeys.
  *
- * A dialable number is addressed directly and needs no anchor. An opaque id
- * (BSUID / wa_id / @lid / @user) is accepted by Meta only as a reply
- * quoting one of the customer's own messages, so when the caller didn't
- * bring a `contextMessageId` the thread's newest inbound wamid is looked up
- * dynamically in `messages`. No anchor + opaque destination = no
- * addressable recipient: refuse locally, BEFORE any HTTP request, instead
- * of firing one Meta drops with "Recipient phone number not in allowed
- * list" (#131009).
+ * A dialable number is addressed directly and needs no anchor. A namespaced
+ * BSUID (CASO C) travels in Meta's `recipient` field and needs no anchor
+ * either. An opaque NUMERIC id (wa_id / @lid / @user) is accepted by Meta only
+ * as a reply quoting one of the customer's own messages, so when the caller
+ * didn't bring a `contextMessageId` the thread's newest inbound wamid is
+ * looked up dynamically in `messages`. No anchor + opaque destination = no
+ * addressable recipient: refuse locally, BEFORE any HTTP request, instead of
+ * firing one Meta drops with "Recipient phone number not in allowed list"
+ * (#131009).
  */
 async function resolveAnchorOrRefuse(
   db: ReturnType<typeof supabaseAdmin>,
-  opts: { conversationId: string; isPhone: boolean; target: string },
+  opts: { conversationId: string; isPhone: boolean; isBsuid?: boolean; target: string },
 ): Promise<string | undefined> {
-  if (opts.isPhone) return undefined
+  if (opts.isPhone || opts.isBsuid) return undefined
   const anchorMessageId =
     (await latestInboundAnchorId(db, opts.conversationId)) ?? undefined
   if (!anchorMessageId) {
@@ -211,7 +217,7 @@ export async function engineSendText(
   if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-  const { to: target, sanitized, isPhone } = await prepareRecipient(
+  const { to: target, sanitized, isPhone, isBsuid } = await prepareRecipient(
     contact,
     args.accountId,
     args.conversationId,
@@ -222,10 +228,11 @@ export async function engineSendText(
   // as "Recipient phone number not in allowed list" and is dropped. Resolve
   // the thread's newest customer wamid now; with no anchor there is no way to
   // address this contact, so fail before any HTTP request instead of letting
-  // Meta drop the message. Dialable numbers are untouched: no anchor needed.
+  // Meta drop the message. Dialable numbers and BSUIDs are untouched.
   const anchorMessageId = await resolveAnchorOrRefuse(db, {
     conversationId: args.conversationId,
     isPhone,
+    isBsuid,
     target,
   })
 
@@ -377,7 +384,7 @@ export async function engineSendAiReply(
   if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-  const { to: target, sanitized, isPhone } = await prepareRecipient(
+  const { to: target, sanitized, isPhone, isBsuid } = await prepareRecipient(
     contact,
     args.accountId,
     args.conversationId,
@@ -388,13 +395,13 @@ export async function engineSendAiReply(
   // is the natural anchor; without one, fall back to the thread's newest
   // customer wamid. No anchor + opaque destination = no addressable
   // recipient: refuse before the first fragment rather than fire a request
-  // Meta drops. Dialable numbers need no anchor and stay untouched.
+  // Meta drops. Dialable numbers and BSUIDs need no anchor.
   let anchorMessageId = args.composeMessageId
-  if (!isPhone && !anchorMessageId) {
+  if (!isPhone && !isBsuid && !anchorMessageId) {
     anchorMessageId =
       (await latestInboundAnchorId(db, args.conversationId)) ?? undefined
   }
-  if (!isPhone && !anchorMessageId) {
+  if (!isPhone && !isBsuid && !anchorMessageId) {
     throw new Error(
       `cannot reply to the opaque id "${target}" for conversation ${args.conversationId}: ` +
         `the thread has no inbound wamid to quote, so WhatsApp cannot address it (#131009 guard) — ` +
@@ -593,7 +600,7 @@ export async function engineSendMedia(
   if (contactErr || !contact) {
     throw new Error('contact not found for this account')
   }
-  const { to: target, sanitized, isPhone } = await prepareRecipient(
+  const { to: target, sanitized, isPhone, isBsuid } = await prepareRecipient(
     contact,
     args.accountId,
     args.conversationId,
@@ -604,6 +611,7 @@ export async function engineSendMedia(
   const anchorMessageId = await resolveAnchorOrRefuse(db, {
     conversationId: args.conversationId,
     isPhone,
+    isBsuid,
     target,
   })
 

@@ -1,4 +1,5 @@
 import {
+  isBsuid,
   isDialablePhone,
   isOpaqueWaId,
   normalizeMetaIdentifier,
@@ -15,6 +16,7 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 // way at resolve time and at send time. Re-exported here because this
 // module is the historical import site for callers and tests.
 export {
+  isBsuid,
   isDialablePhone,
   toDialable,
   isMetaIdentifier,
@@ -66,11 +68,21 @@ export type RecipientSource =
   | 'username'
 
 export interface ResolvedRecipient {
-  /** Value to place in Meta's `to`. Empty when nothing was resolvable. */
+  /**
+   * The address Meta should receive. For a phone (CASO A) or a numeric opaque
+   * wa_id (CASO B) this travels in `to`; for a namespaced BSUID (CASO C) it
+   * travels in `recipient` (see `isBsuid`). Empty when nothing was resolvable.
+   */
   to: string
   source: RecipientSource
   /** True when `to` is a dialable E.164 number rather than an opaque id. */
   isPhone: boolean
+  /**
+   * True when `to` is a namespaced BSUID / user id (`CO.…`/`WAID.…`/`LID.…`).
+   * The sender must place it in Meta's `recipient` field and omit `to`; no
+   * `context.message_id` anchor is required for this shape.
+   */
+  isBsuid?: boolean
   /**
    * Set when `to` came from a DIFFERENT row than the contact we started
    * from. Callers persist this back so the stale value stops recurring.
@@ -97,26 +109,29 @@ export function identityFilterParts(contact: RecipientCandidate): string[] {
 }
 
 /**
- * CASO A/B: turn one stored value into the destination Meta should receive,
- * or null when the value is NOT addressable.
+ * Turn one stored value into the destination Meta should receive, or null
+ * when the value is NOT addressable.
  *
  * `cleanRecipientAddress` strips a trailing `@user`/`@lid` routing suffix. A
  * value that is still a dialable E.164 number is CASO A (`isPhone: true`); a
- * bare numeric id that is NOT a number is CASO B (`isPhone: false`, always
- * sent with a `context.message_id` anchor). A NAMESPACED value
- * (`CO.…`/`WAID.…`/`LID.…`), an `@handle` and any non-numeric value are
- * identity markers (CASO C) and yield null.
+ * namespaced BSUID / user id is CASO C (`isBsuid: true`, travels in Meta's
+ * `recipient`); a bare numeric id that is NOT a number is CASO B
+ * (`isPhone: false`, always sent with a `context.message_id` anchor). An
+ * `@handle` and any other non-numeric value yield null.
  */
 function deliverableDestination(
   value: string | null | undefined,
-): { to: string; isPhone: boolean } | null {
+): { to: string; isPhone: boolean; isBsuid: boolean } | null {
   if (!value) return null
   const cleaned = cleanRecipientAddress(value)
   if (!cleaned) return null
   const dialable = toDialable(cleaned)
-  if (dialable) return { to: dialable, isPhone: true }
+  if (dialable) return { to: dialable, isPhone: true, isBsuid: false }
+  // CASO C — a namespaced BSUID / user id keeps its prefix and travels in
+  // Meta's `recipient` field (never `to`).
+  if (isBsuid(cleaned)) return { to: cleaned, isPhone: false, isBsuid: true }
   if (!isOpaqueWaId(cleaned)) return null
-  return { to: cleaned.replace(/\D/g, ''), isPhone: false }
+  return { to: cleaned.replace(/\D/g, ''), isPhone: false, isBsuid: false }
 }
 
 /**
@@ -332,7 +347,7 @@ export async function findRecoverableIdentifier(
 }
 
 /**
- * Resolve the value Meta should receive in `to`, for any contact.
+ * Resolve the value Meta should receive, for any contact.
  *
  * Resolution order — everything comes from THIS contact (and its own
  * thread), never from another contact (CASO A/B/C):
@@ -343,15 +358,16 @@ export async function findRecoverableIdentifier(
  *   3. `wa_id` — the numeric opaque id Meta used as the inbound `from`, i.e.
  *      the address that demonstrably reached us (CASO B, always anchored to a
  *      `context.message_id` by the senders).
+ *   4. `wa_user_id` — the BSUID / user id Meta disclosed in place of a number
+ *      (CASO C). It travels in Meta's `recipient` field and needs no anchor.
  *   5. `recipient_id` — the alternative numeric Meta identifier (CASO B).
- *   5b. A numeric id recovered from THIS contact's own inbound message
+ *   5b. An id recovered from THIS contact's own inbound message
  *      (`sender_phone` / `raw_meta_payload`) or its conversation row — the
  *      trace a privacy-shielded sender leaves without ever touching a column.
+ *      A namespaced recovered id is a BSUID (CASO C) and is surfaced as such.
  *
- * NEVER surfaced: `wa_user_id` (the BSUID) and `username` (a public handle).
- * Both are identity markers (CASO C): a BSUID is stored in its own column
- * and a handle is display data, and sending either in `to` is answered by
- * Meta with (#131009) / (#100) and silently dropped.
+ * NEVER surfaced: `username` (a public handle) — display data, refused by Meta
+ * on the send endpoint.
  *
  * Nothing here is specific to a WABA, a number or an identifier: every
  * branch is decided by the data present at call time.
@@ -370,8 +386,9 @@ export async function resolveRecipient(
   if (own) {
     return {
       to: own.to,
-      source: own.isPhone ? 'phone' : 'wa_id',
+      source: own.isBsuid ? 'bsuid' : own.isPhone ? 'phone' : 'wa_id',
       isPhone: own.isPhone,
+      isBsuid: own.isBsuid,
     }
   }
 
@@ -391,33 +408,43 @@ export async function resolveRecipient(
 
   // 3. `wa_id` — what Meta itself addressed us with on the inbound message.
   //    A dialable value is a real number (CASO A); a numeric-only value is
-  //    the opaque wa_id (CASO B). A namespaced BSUID planted in `wa_id` by
-  //    older code is rejected here: it is identity data, not a destination.
+  //    the opaque wa_id (CASO B); a namespaced value is a BSUID (CASO C).
   const waId = deliverableDestination(contact.wa_id)
   if (waId) {
     return {
       to: waId.to,
-      source: waId.isPhone ? 'phone' : 'wa_id',
+      source: waId.isBsuid ? 'bsuid' : waId.isPhone ? 'phone' : 'wa_id',
       isPhone: waId.isPhone,
+      isBsuid: waId.isBsuid,
     }
   }
 
-  // 4. (removed) the BSUID (`wa_user_id`) is NEVER a `to` destination — CASO C.
+  // 4. `wa_user_id` — the BSUID / user id Meta disclosed when the sender had
+  //    no number. It travels in Meta's `recipient` field (CASO C).
+  const bsuid = deliverableDestination(contact.wa_user_id)
+  if (bsuid) {
+    return {
+      to: bsuid.to,
+      source: 'bsuid',
+      isPhone: false,
+      isBsuid: true,
+    }
+  }
 
   // 5. `recipient_id` — the alternative numeric Meta identifier.
   const recipientId = deliverableDestination(contact.recipient_id)
   if (recipientId) {
     return {
       to: recipientId.to,
-      source: recipientId.isPhone ? 'phone' : 'wa_id',
+      source: recipientId.isBsuid ? 'bsuid' : recipientId.isPhone ? 'phone' : 'wa_id',
       isPhone: recipientId.isPhone,
+      isBsuid: recipientId.isBsuid,
     }
   }
 
   // 5b. The id Meta left on this contact's OWN inbound message — the only
   //     trace a privacy-redacted sender leaves when it never made it onto
-  //     the contact row. Numeric-only: a namespaced recovered id would be an
-  //     identity marker and is rejected by `deliverableDestination`.
+  //     the contact row. A namespaced recovered id is surfaced as a BSUID.
   const recoveredId = await findRecoverableIdentifier(
     contact,
     accountId,
@@ -427,8 +454,9 @@ export async function resolveRecipient(
   if (recoveredWaId) {
     return {
       to: recoveredWaId.to,
-      source: recoveredWaId.isPhone ? 'phone' : 'wa_id',
+      source: recoveredWaId.isBsuid ? 'bsuid' : recoveredWaId.isPhone ? 'phone' : 'wa_id',
       isPhone: recoveredWaId.isPhone,
+      isBsuid: recoveredWaId.isBsuid,
     }
   }
 
@@ -449,11 +477,10 @@ export async function resolveRecipient(
  * gate made the AI retry useless for the contacts least likely to be
  * reachable. One canonical list, both paths.
  *
- * Under CASO A/B/C only two address shapes are ever queued: a dialable
- * E.164 number (CASO A) or a numeric opaque wa_id (CASO B, always sent with
- * a `context.message_id` anchor). A namespaced BSUID and a `username` are
- * identity markers (CASO C) and are NOT queued: sending either in `to` is
- * denied by Meta and silently dropped.
+ * Under CASO A/B/C three address shapes are ever queued: a dialable E.164
+ * number (CASO A), a numeric opaque wa_id (CASO B, always sent with a
+ * `context.message_id` anchor), and a namespaced BSUID (CASO C, sent in Meta's
+ * `recipient` field). A `username` is display data and is NOT queued.
  *
  * `primary` comes first and is de-duplicated, so an unchanged contact yields a
  * single-entry queue and behaves exactly as before.
@@ -503,9 +530,9 @@ export async function recipientAddressQueue(
     }
   }
 
-  // A numeric opaque id recovered from this contact's own inbound payload —
-  // the privacy-redacted sender, where no number exists anywhere. A
-  // namespaced recovered id is identity data and is rejected (CASO C).
+  // An id recovered from this contact's own inbound payload — the
+  // privacy-redacted sender, where no number exists anywhere. A namespaced id
+  // is a BSUID (CASO C) and is surfaced in `recipient`.
   const recoveredId = await findRecoverableIdentifier(
     contact,
     accountId,
@@ -515,6 +542,7 @@ export async function recipientAddressQueue(
 
   push(deliverableDestination(contact.phone)?.to)
   push(deliverableDestination(contact.wa_id)?.to)
+  push(deliverableDestination(contact.wa_user_id)?.to)
   push(deliverableDestination(contact.recipient_id)?.to)
 
   return queue
@@ -614,7 +642,7 @@ export function createAnchorResolver(
   let cached: string | null | undefined
   return async (address: string): Promise<string | undefined> => {
     if (fixed) return fixed
-    if (isDialablePhone(address)) return undefined
+    if (isDialablePhone(address) || isBsuid(address)) return undefined
     if (cached === undefined) {
       cached = await latestInboundAnchorId(db, conversationId)
     }
@@ -674,9 +702,9 @@ export async function sendWithRecipientFallback<T>(args: {
   if (!head.to) {
     throw new InvalidRecipientError(
       '',
-      'the contact has no dialable number or numeric wa_id/recipient_id to ' +
-        'address the message to (CASO A/B). A BSUID or a username is identity ' +
-        'data, never a destination (CASO C). No HTTP request was sent.',
+      'the contact has no dialable number, numeric wa_id/recipient_id, or ' +
+        'BSUID to address the message to (CASO A/B/C). A username is display ' +
+        'data, never a destination. No HTTP request was sent.',
     )
   }
 
@@ -724,12 +752,14 @@ export async function sendWithRecipientFallback<T>(args: {
  *      normalized away by `toDialable`).
  *   2. `wa_id` — the numeric opaque id Meta used as the inbound `from`. This
  *      is the field that carries a privacy-shielded sender's underlying id.
- *   3. `recipient_id` — the alternative numeric Meta identifier.
- *   4. (optional deeper pass) a real number recovered from this contact's
+ *   3. `wa_user_id` — the BSUID / user id Meta disclosed in place of a number
+ *      (CASO C). It travels in Meta's `recipient` field.
+ *   4. `recipient_id` — the alternative numeric Meta identifier.
+ *   5. (optional deeper pass) a real number recovered from this contact's
  *      own conversation history.
  *
- * NEVER surfaced: `wa_user_id` (the BSUID) and `username` (a public handle)
- * — both are identity markers (CASO C), never a `to` destination.
+ * NEVER surfaced: `username` (a public handle) — display data Meta refuses on
+ * the send endpoint.
  *
  * When `accountId` is supplied it also consults `resolveRecipient`, which can
  * recover a real number from this contact's own conversation history — a
@@ -753,8 +783,9 @@ export async function resolveBestRecipient(
   if (phone) {
     return {
       to: phone.to,
-      source: phone.isPhone ? 'phone' : 'wa_id',
+      source: phone.isBsuid ? 'bsuid' : phone.isPhone ? 'phone' : 'wa_id',
       isPhone: phone.isPhone,
+      isBsuid: phone.isBsuid,
     }
   }
 
@@ -766,20 +797,32 @@ export async function resolveBestRecipient(
   if (waId) {
     return {
       to: waId.to,
-      source: waId.isPhone ? 'phone' : 'wa_id',
+      source: waId.isBsuid ? 'bsuid' : waId.isPhone ? 'phone' : 'wa_id',
       isPhone: waId.isPhone,
+      isBsuid: waId.isBsuid,
     }
   }
 
-  // 3. (removed) the BSUID (`wa_user_id`) is NEVER a destination — CASO C.
+  // 3. wa_user_id — the BSUID / user id Meta disclosed when the sender had no
+  //    number. It travels in Meta's `recipient` field (CASO C).
+  const bsuid = deliverableDestination(contact.wa_user_id)
+  if (bsuid) {
+    return {
+      to: bsuid.to,
+      source: 'bsuid',
+      isPhone: false,
+      isBsuid: true,
+    }
+  }
 
   // 4. recipient_id — the alternative numeric Meta identifier.
   const recipientId = deliverableDestination(contact.recipient_id)
   if (recipientId) {
     return {
       to: recipientId.to,
-      source: recipientId.isPhone ? 'phone' : 'wa_id',
+      source: recipientId.isBsuid ? 'bsuid' : recipientId.isPhone ? 'phone' : 'wa_id',
       isPhone: recipientId.isPhone,
+      isBsuid: recipientId.isBsuid,
     }
   }
 

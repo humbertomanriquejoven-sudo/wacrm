@@ -18,6 +18,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import {
+  isBsuid,
   isDialablePhone,
   passthroughMetaId,
   recipientAddressVariants,
@@ -569,20 +570,20 @@ export async function persistRecoveredAddress(
 }
 
 /**
- * Is this string something Meta will accept as a `to`?
+ * Is this string something Meta will accept as a recipient?
  *
- * The single deliverability gate. An E.164 number qualifies; so does a
- * numeric opaque wa_id (the CASO B privacy-shielded id — the caller is
- * responsible for the `context.message_id` anchor). A namespaced BSUID
- * (`CO.*`) and a bare `@handle` do NOT: identity markers are never
- * destinations (CASO C), and Meta rejects handles on the send endpoint,
- * so admitting one here is how a broadcast ends up marked `sent` for a
- * message that was never sent.
+ * The single deliverability gate. An E.164 number qualifies (travels in
+ * `to`); so does a numeric opaque wa_id (the CASO B privacy-shielded id — the
+ * caller is responsible for the `context.message_id` anchor); and so does a
+ * namespaced BSUID (`CO.*` — CASO C, which travels in Meta's `recipient`
+ * field). A bare `@handle` does NOT: Meta rejects handles on the send
+ * endpoint, so admitting one here is how a broadcast ends up marked `sent`
+ * for a message that was never sent.
  */
 export function isDeliverableAddress(to: string): boolean {
   return (
     recipientAddressVariants(to).length > 0 &&
-    (isDialablePhone(to) || isOpaqueMetaId(to))
+    (isDialablePhone(to) || isOpaqueMetaId(to) || isBsuid(to))
   );
 }
 

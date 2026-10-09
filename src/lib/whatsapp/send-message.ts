@@ -525,9 +525,9 @@ export async function sendMessageToConversation(
   // contact row does not carry. When it lands NOTHING, the SHARED ladder
   // (`resolveRecipient`) — the exact resolver the follow-up timers and the
   // broadcast path use — gets the final word under CASO A/B/C: a real E.164
-  // number (CASO A) or a numeric opaque wa_id the contact row does not carry
-  // (CASO B). A namespaced BSUID or a `@username` is NEVER a destination
-  // (CASO C) and keeps the structured 422.
+  // number (CASO A), a numeric opaque wa_id the contact row does not carry
+  // (CASO B), or a namespaced BSUID (CASO C, sent in Meta's `recipient`
+  // field). A `@username` is NEVER a destination and keeps the structured 422.
   let resolved: ResolvedRecipient;
   const cascadeTo = cascadeReport.finalTo;
   if (cascadeTo && isDialablePhone(cascadeTo)) {
@@ -548,10 +548,13 @@ export async function sendMessageToConversation(
     // an opaque id needs a `context.message_id` anchor (CASO B). So before
     // accepting the opaque id, ask the SHARED ladder: it can recover a number
     // Meta already used on this contact's OWN inbound thread
-    // (`messages.sender_phone`). Prefer that number; fall back to the
-    // cascade's opaque id, then to the ladder's numeric id.
+    // (`messages.sender_phone`). Prefer that number; then a namespaced BSUID
+    // (CASO C, which the digit-only cascade would have mangled), then the
+    // cascade's opaque id, then the ladder's numeric id.
     const ladder = await resolveRecipient(contact, accountId, conversationId);
     if (isDialablePhone(ladder.to)) {
+      resolved = ladder;
+    } else if (ladder.isBsuid) {
       resolved = ladder;
     } else if (cascadeTo) {
       resolved = {
@@ -569,7 +572,7 @@ export async function sendMessageToConversation(
       const technical =
         `No destination could be resolved for conversation ${conversationId} / contact ${contact.id}: ` +
         `every cascade source was missing, placeholder or non-numeric, and the shared ` +
-        `recipient ladder found no deliverable number or numeric wa_id (CASO A/B). ` +
+        `recipient ladder found no deliverable number, numeric wa_id or BSUID (CASO A/B/C). ` +
         `No HTTP request was sent to Meta.`;
       console.error(
         `[send-message] INVALID RECIPIENT for conversation ${conversationId} / contact ${contact.id}: ${technical}`,
@@ -609,7 +612,7 @@ export async function sendMessageToConversation(
     Number.isFinite(latestInboundAtMs) &&
     Date.now() - latestInboundAtMs < REDACTED_BSUID_WINDOW_MS;
   const needsWindow =
-    Boolean(resolved.to) && !resolved.isPhone && messageType !== 'template';
+    Boolean(resolved.to) && !resolved.isPhone && !resolved.isBsuid && messageType !== 'template';
   if (needsWindow && !windowOpen) {
     const technical =
       `Opaque-id contact ${contact.id} (to="${resolved.to}", source=${resolved.source}) ` +
@@ -661,7 +664,7 @@ export async function sendMessageToConversation(
     }
     const parentIsOurs =
       parent.sender_type === 'agent' || parent.sender_type === 'bot';
-    const destinationIsOpaque = Boolean(resolved.to) && !resolved.isPhone;
+    const destinationIsOpaque = Boolean(resolved.to) && !resolved.isPhone && !resolved.isBsuid;
     if (!parent.message_id) {
       console.warn(
         '[send-message] reply target has no Meta message_id; sending without context'
@@ -701,6 +704,7 @@ export async function sendMessageToConversation(
     !contextMessageId &&
     resolved.to &&
     !resolved.isPhone &&
+    !resolved.isBsuid &&
     messageType !== 'template'
   ) {
     // `messages` can be RLS-blocked for a user-scoped client, so the anchor is

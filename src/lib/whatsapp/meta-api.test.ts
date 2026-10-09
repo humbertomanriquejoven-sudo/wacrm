@@ -4,6 +4,7 @@ import {
   sendInteractiveButtons,
   sendInteractiveList,
   sendTypingIndicator,
+  canonicalToField,
 } from "./meta-api";
 
 // All assertions in this file run BEFORE the network call. We stub fetch
@@ -361,6 +362,36 @@ describe("sendTypingIndicator", () => {
     expect(errorSpy).toHaveBeenCalledWith(
       expect.stringContaining("HTTP 400"),
       rawBody,
-    );
+);
+});
+
+describe("recipient routing matrix", () => {
+  it('CASO A: E.164 phone number travels in "to" field', async () => {
+    expect(canonicalToField('+573044556788')).toEqual({
+      to: '573044556788',
+    });
   });
+
+  it('CASO B: numeric opaque wa_id travels in "to" field', async () => {
+    expect(canonicalToField('1486998326437295')).toEqual({
+      to: '1486998326437295',
+    })
+  });
+
+  it('CASO C: namespaced BSUID travels in "recipient" field', async () => {
+    const field = canonicalToField('CO.1486998326437295')
+    expect(field.recipient).toBe('CO.1486998326437295')
+    expect(field.to).toBeUndefined()
+  });
+
+  it('CASO A takes priority over BSUID', async () => {
+    expect(canonicalToField('573044556788')).toEqual({
+      to: '573044556788',
+    })
+  })
+
+  it('placeholder returns empty "to"', async () => {
+    expect(canonicalToField('unknown')).toEqual({ to: '' })
+  })
+})
 });
