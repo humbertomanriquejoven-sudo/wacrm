@@ -544,6 +544,8 @@ export default function ContactsPage() {
               <TableHead className="text-muted-foreground">{t('tableColumns.name')}</TableHead>
               <TableHead className="text-muted-foreground">{t('tableColumns.phone')}</TableHead>
               <TableHead className="text-muted-foreground">{t('tableColumns.username')}</TableHead>
+              <TableHead className="text-purple-400">{t('tableColumns.waId')}</TableHead>
+              <TableHead className="text-purple-400">{t('tableColumns.waUser')}</TableHead>
               <TableHead className="text-muted-foreground hidden md:table-cell">{t('tableColumns.email')}</TableHead>
               <TableHead className="text-muted-foreground hidden lg:table-cell">{t('tableColumns.company')}</TableHead>
               <TableHead className="text-muted-foreground hidden md:table-cell">{t('tableColumns.tags')}</TableHead>
@@ -609,6 +611,12 @@ export default function ContactsPage() {
                   </TableCell>
                   <TableCell className="text-muted-foreground text-sm">
                     {contact.username || <span className="text-muted-foreground">-</span>}
+                  </TableCell>
+                  <TableCell className="text-purple-400">
+                    {contact.wa_id || <span className="text-muted-foreground">-</span>}
+                  </TableCell>
+                  <TableCell className="text-purple-400">
+                    {contact.wa_user_id || <span className="text-muted-foreground">-</span>}
                   </TableCell>
                   <TableCell className="text-muted-foreground hidden md:table-cell text-sm">
                     {contact.email || <span className="text-muted-foreground">-</span>}
