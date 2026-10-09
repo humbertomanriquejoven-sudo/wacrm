@@ -807,7 +807,6 @@ export async function sendMessageToConversation(
     // The Meta API helpers (sendTextMessage, sendMediaMessage, etc.) already
     // handle this via canonicalToField, which routes isBsuid → recipient and
     // dialable/opaque wa_id → to. We just need to pass the right address.
-    const recipientField = resolved.isBsuid ? 'recipient' : 'to'; // deprecated: use resolved.isBsuid directly
     if (messageType === 'template') {
       const result = await sendTemplateMessage({
         phoneNumberId: senderPhoneNumberId,
