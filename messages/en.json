@@ -486,7 +486,8 @@
         "email": "Email",
         "company": "Company",
         "tags": "Tags",
-        "createdAt": "Created"
+        "createdAt": "Created",
+        "direccionEntrega": "Dirección de entrega"
       },
       "loading": "Loading contacts...",
       "noContactsMatch": "No contacts match your filters.",

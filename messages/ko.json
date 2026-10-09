@@ -486,7 +486,8 @@
         "email": "이메일",
         "company": "회사",
         "tags": "태그",
-        "createdAt": "생성일"
+        "createdAt": "생성일",
+        "direccionEntrega": "Dirección de entrega"
       },
       "loading": "연락처를 불러오는 중...",
       "noContactsMatch": "필터와 일치하는 연락처가 없습니다.",
