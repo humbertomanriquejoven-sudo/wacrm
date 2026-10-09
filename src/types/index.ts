@@ -119,6 +119,8 @@ export interface Contact {
   wa_id?: string | null;
   /** WhatsApp Business API phone_number_id from Meta webhook (migration 053). */
   phone_number_id?: string | null;
+  /** Direccion de entrega desde webhook Meta (migration reciente). */
+  direccion_entrega?: string | null;
   /** Technical category of the primary identifier (migration 053). */
   identity_type?: 'PHONE_E164' | 'BSUID' | 'USERNAME' | 'LID' | null;
   /** Display name shown in the WhatsApp profile (migration 053). */
