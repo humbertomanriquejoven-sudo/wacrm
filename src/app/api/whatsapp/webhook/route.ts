@@ -75,11 +75,123 @@ let rawMetaPayloadColumn: boolean | null = null
  */
 export function __resetRawMetaPayloadColumnForTests() {
   rawMetaPayloadColumn = null
+  missingInsertColumns.clear()
 }
 
 /** PostgREST reports an unknown column as 42703 / PGRST204, or in prose. */
 function isMissingColumnError(message: string): boolean {
   return /column .* does not exist|42703|PGRST204|schema cache/i.test(message)
+}
+
+/**
+ * Columns that are NOT part of the guaranteed base schema.
+ *
+ * On a database whose optional migrations are not applied — or one that was
+ * cleaned and rebuilt — PostgREST rejects the WHOLE insert when any named
+ * column is absent ("Could not find the 'x' column ... in the schema cache").
+ * For the inbound pipeline that is fatal: no contact -> no conversation -> no
+ * message row -> an empty Inbox. The base columns (`account_id`, `user_id`,
+ * `phone`, `name` / `contact_id`, ...) are never dropped; only these
+ * identity/resolution extras are, so the write always converges on a row the
+ * base schema accepts.
+ */
+const OPTIONAL_CONTACT_COLUMNS = [
+  'username',
+  'wa_id',
+  'wa_user_id',
+  'recipient_id',
+  'identity_type',
+  'phone_number_id',
+  'display_name',
+] as const
+
+const OPTIONAL_CONVERSATION_COLUMNS = ['phone_number_id'] as const
+
+/**
+ * Memory of columns PostgREST already reported missing, per table. A table
+ * missing several optional columns then costs one extra round trip per column
+ * on the FIRST inbound only — not on every message.
+ */
+const missingInsertColumns = new Map<string, Set<string>>()
+
+/** The column name a missing-column error points at, or null if unrelated. */
+function missingColumnName(error: unknown): string | null {
+  if (!error || typeof error !== 'object') return null
+  const code = String((error as { code?: unknown }).code ?? '')
+  const message = String((error as { message?: unknown }).message ?? '')
+  const isMissing =
+    code === 'PGRST204' ||
+    code === '42703' ||
+    /column .* does not exist|schema cache/i.test(message)
+  if (!isMissing) return null
+  const match =
+    message.match(/'([^']+)'\s+column/i) ??
+    message.match(/column "([^"]+)"/i) ??
+    message.match(/'([^']+)'/)
+  return match?.[1] ?? null
+}
+
+/**
+ * Insert a contact / conversation row, dropping any optional column the
+ * deployed schema lacks instead of failing the whole write.
+ *
+ * Only a missing-column error triggers a retry: a unique violation (race), an
+ * RLS denial or a network fault is returned as-is so the caller can react — a
+ * blanket retry would mask a real failure behind a second identical attempt.
+ */
+async function insertTolerant(
+  table: 'contacts' | 'conversations',
+  row: Record<string, unknown>,
+  optionalColumns: readonly string[],
+): Promise<{
+  // The Supabase client here is untyped, so the row comes back as `any`
+  // exactly as the previous inline `.insert().select().single()` did.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  data: any
+  error: { message: string; code?: string } | null
+}> {
+  const known = missingInsertColumns.get(table)
+  const payload: Record<string, unknown> = { ...row }
+  if (known) for (const column of known) delete payload[column]
+
+  const optional = new Set(optionalColumns)
+  // Bounded: at most one retry per optional column.
+  for (let attempt = 0; attempt <= optional.size; attempt++) {
+    const { data, error } = await supabaseAdmin()
+      .from(table)
+      .insert(payload)
+      .select()
+      .single()
+
+    if (!error) return { data, error: null }
+
+    const column = missingColumnName(error)
+    if (!column || !(column in payload) || !optional.has(column)) {
+      return {
+        data: null,
+        error: {
+          message: String((error as { message?: unknown }).message ?? ''),
+          code: (error as { code?: string }).code,
+        },
+      }
+    }
+
+    const set = missingInsertColumns.get(table) ?? new Set<string>()
+    set.add(column)
+    missingInsertColumns.set(table, set)
+    console.error(
+      `[webhook] ${table}.${column} is missing — retrying the insert without ` +
+        'it. Apply the pending migration to restore this metadata.',
+    )
+    delete payload[column]
+  }
+
+  return {
+    data: null,
+    error: {
+      message: `insert into ${table} exhausted its optional-column fallbacks`,
+    },
+  }
 }
 
 /**
@@ -2761,40 +2873,41 @@ async function findOrCreateContact(
   // because `phone` must stay a clean E.164 number for outbound sends.
   const phoneForRow = phone
 
-  const { data: newContact, error: createError } = await supabaseAdmin()
-    .from('contacts')
-    .insert({
+  const { data: newContact, error: createError } = await insertTolerant(
+    'contacts',
+    {
       account_id: accountId,
       user_id: configOwnerUserId,
       phone: phoneForRow,
       name: name || username || phoneForRow || waUserId || 'unknown',
       username: username ?? undefined,
       wa_user_id: waUserId ?? undefined,
-// Hydrate the numerical-identity columns from the CANONICAL wa_id
-    // (Meta's `contacts[0].wa_id` / `messages[0].from`), never from the BSUID.
-    //
-    // A BSUID is identity data, not a destination (rule 2 / CASO C): it is
-    // stored only in `wa_user_id`. Writing it into `wa_id`/`recipient_id`
-    // is exactly what made senders resolve to an id Meta silently drops
-    // (#131009) once `phone` holds 'unknown'.
-    //
-    // `recipient_id` was never written on insert at all, at any version;
-    // both columns now carry the SAME canonical Meta id so no resolver
-    // tier is left empty.
-    recipient_id: metaIdentity?.wa_id ?? undefined,
-    // OUTSIDE the metaIdentity spread on purpose: filled whenever a real
-    // canonical wa_id exists; a hidden-number sender with no disclosed id
-    // keeps these two NULL and relies on `wa_user_id` for identity only.
-    wa_id: metaIdentity?.wa_id ?? undefined,
+      // Hydrate the numerical-identity columns from the CANONICAL wa_id
+      // (Meta's `contacts[0].wa_id` / `messages[0].from`), never from the
+      // BSUID.
+      //
+      // A BSUID is identity data, not a destination (rule 2 / CASO C): it is
+      // stored only in `wa_user_id`. Writing it into `wa_id`/`recipient_id`
+      // is exactly what made senders resolve to an id Meta silently drops
+      // (#131009) once `phone` holds 'unknown'.
+      //
+      // `recipient_id` was never written on insert at all, at any version;
+      // both columns now carry the SAME canonical Meta id so no resolver
+      // tier is left empty.
+      recipient_id: metaIdentity?.wa_id ?? undefined,
+      // Filled whenever a real canonical wa_id exists; a hidden-number sender
+      // with no disclosed id keeps these two NULL and relies on `wa_user_id`
+      // for identity only.
+      wa_id: metaIdentity?.wa_id ?? undefined,
       identity_type:
         metaIdentity?.identity_type ?? (waUserId ? 'BSUID' : undefined),
       ...(metaIdentity && {
         phone_number_id: metaIdentity.phone_number_id,
         display_name: metaIdentity.display_name,
       }),
-    })
-    .select()
-    .single()
+    },
+    OPTIONAL_CONTACT_COLUMNS,
+  )
 
   if (createError) {
     // Lost a race: a concurrent inbound delivery (or another path)
@@ -2868,17 +2981,20 @@ async function findOrCreateConversation(
   }
 
   // Create new conversation. Same tenancy + audit split as
-  // findOrCreateContact above.
-  const { data: newConv, error: createError } = await supabaseAdmin()
-    .from('conversations')
-    .insert({
+  // findOrCreateContact above. Only base columns are required; the optional
+  // `phone_number_id` (migration 071) is dropped automatically if the
+  // deployed schema has not applied it, so a freshly-cleaned database can
+  // still open the thread and receive the message.
+  const { data: newConv, error: createError } = await insertTolerant(
+    'conversations',
+    {
       account_id: accountId,
       user_id: configOwnerUserId,
       contact_id: contactId,
       phone_number_id: (phoneNumberId ?? '').trim() || undefined,
-    })
-    .select()
-    .single()
+    },
+    OPTIONAL_CONVERSATION_COLUMNS,
+  )
 
   if (createError) {
     // Lost a race: a concurrent inbound delivery created the

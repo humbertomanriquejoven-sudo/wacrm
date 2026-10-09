@@ -16,7 +16,25 @@ const h = vi.hoisted(() => ({
     priorCustomerMsgCount: 0,
     /** Row `lookupInternalIdByMetaId` resolves for a `context.id`. */
     replyContextParent: null as { id: string } | null,
-    conversation: { id: 'conv-1', unread_count: 0, account_id: 'acc-1' },
+    conversation: { id: 'conv-1', unread_count: 0, account_id: 'acc-1' } as
+      | Record<string, unknown>
+      | null,
+    /** Rows inserted via conversations.insert (clean-creation path). */
+    conversationInsertCalls: [] as Record<string, unknown>[],
+    /** Row returned by conversations.insert().select().single(). */
+    conversationInsertResponse: null as Record<string, unknown> | null,
+    /**
+     * Simulate a production schema missing this contact column: the first
+     * insert attempt carrying it fails with a PostgREST missing-column error,
+     * the retry (without it) succeeds.
+     */
+    contactsRejectColumn: null as string | null,
+    /**
+     * Simulate a production schema missing this conversation column.
+     */
+    conversationsRejectColumn: null as string | null,
+    /** Error the conversation metadata RPC resolves with, if any. */
+    rpcError: null as { code?: string; message: string } | null,
     upsertCalls: [] as { row: Record<string, unknown>; options: unknown }[],
     /** Simulate a database without migration 052. */
     missingRawPayloadColumn: false as boolean,
@@ -115,8 +133,41 @@ vi.mock('@supabase/supabase-js', () => ({
                 }),
             }),
           }
-        case 'conversations':
+        case 'conversations': {
           // findOrCreateConversation: select().eq().eq().order().limit()
+          const conversationInsert = (row: Record<string, unknown>) => {
+            // Snapshot: the tolerant insert mutates its payload when it drops
+            // a rejected column, so storing the reference would erase the
+            // column we need to assert on.
+            h.state.conversationInsertCalls.push({ ...row })
+            const rejected = h.state.conversationsRejectColumn
+            const shouldReject = rejected != null && rejected in row
+            return {
+              select: () => ({
+                single: () =>
+                  Promise.resolve(
+                    shouldReject
+                      ? {
+                          data: null,
+                          error: {
+                            code: 'PGRST204',
+                            message:
+                              `Could not find the '${rejected}' column of ` +
+                              `'conversations' in the schema cache`,
+                          },
+                        }
+                      : {
+                          data:
+                            h.state.conversationInsertResponse ?? {
+                              id: 'conv-new',
+                              ...row,
+                            },
+                          error: null,
+                        },
+                  ),
+              }),
+            }
+          }
           return {
             select: () => ({
               eq: () => ({
@@ -124,13 +175,16 @@ vi.mock('@supabase/supabase-js', () => ({
                   order: () => ({
                     limit: () =>
                       Promise.resolve({
-                        data: [h.state.conversation],
+                        data: h.state.conversation
+                          ? [h.state.conversation]
+                          : [],
                         error: null,
                       }),
                   }),
                 }),
               }),
             }),
+            insert: conversationInsert,
             // Post-transcription last_message_text refresh.
             update: (patch: Record<string, unknown>) => ({
               eq: (_col: string, value: unknown) => {
@@ -139,6 +193,7 @@ vi.mock('@supabase/supabase-js', () => ({
               },
             }),
           }
+        }
         case 'broadcast_recipients':
           // Two shapes land here:
           //  - flagBroadcastReplyIfAny: select().eq().eq().in().order().limit()
@@ -283,17 +338,33 @@ vi.mock('@supabase/supabase-js', () => ({
               }),
             }),
             insert: (row: Record<string, unknown>) => {
-              h.state.contactInsertCalls.push(row)
+              // Snapshot: the tolerant insert mutates its payload when it
+              // drops a rejected column (see the conversations case).
+              h.state.contactInsertCalls.push({ ...row })
+              const rejected = h.state.contactsRejectColumn
+              const shouldReject = rejected != null && rejected in row
               return {
                 select: () => ({
                   single: () =>
-                    Promise.resolve({
-                      data: h.state.contactsInsertResponse?.data ?? {
-                        id: 'inserted-1',
-                        ...row,
-                      },
-                      error: null,
-                    }),
+                    Promise.resolve(
+                      shouldReject
+                        ? {
+                            data: null,
+                            error: {
+                              code: 'PGRST204',
+                              message:
+                                `Could not find the '${rejected}' column of ` +
+                                `'contacts' in the schema cache`,
+                            },
+                          }
+                        : {
+                            data: h.state.contactsInsertResponse?.data ?? {
+                              id: 'inserted-1',
+                              ...row,
+                            },
+                            error: null,
+                          },
+                    ),
                 }),
               }
             },
@@ -421,7 +492,7 @@ vi.mock('@supabase/supabase-js', () => ({
     },
     rpc: (name: string, args: Record<string, unknown>) => {
       h.state.rpcCalls.push({ name, args })
-      return Promise.resolve({ data: null, error: null })
+      return Promise.resolve({ data: null, error: h.state.rpcError })
     },
     // Service-role Storage, used by the inbound-media mirror (#466).
     storage: {
@@ -575,8 +646,12 @@ function bsuidInboundRequest() {
 
 async function runWebhook(message?: Record<string, unknown>) {
   const res = await POST(inboundRequest(message))
-  // Drain the after() callback exactly as the runtime would.
-  for (const cb of h.state.afterCallbacks) await cb()
+  // Drain the after() callback exactly as the runtime would. Snapshot and
+  // clear first: the webhook registers a fresh callback per POST, so a second
+  // runWebhook() in the same test must not re-run the previous run's callback.
+  const callbacks = [...h.state.afterCallbacks]
+  h.state.afterCallbacks = []
+  for (const cb of callbacks) await cb()
   return res
 }
 
@@ -611,6 +686,11 @@ beforeEach(() => {
   h.state.priorCustomerMsgCount = 0
   h.state.replyContextParent = null
   h.state.conversation = { id: 'conv-1', unread_count: 0, account_id: 'acc-1' }
+  h.state.conversationInsertCalls = []
+  h.state.conversationInsertResponse = null
+  h.state.contactsRejectColumn = null
+  h.state.conversationsRejectColumn = null
+  h.state.rpcError = null
   h.state.upsertCalls = []
   h.state.missingRawPayloadColumn = false
   __resetRawMetaPayloadColumnForTests()
@@ -855,6 +935,130 @@ describe('inbound webhook: identity persistence (migration 072)', () => {
     expect(h.state.rpcCalls[0].args).toMatchObject({
       p_last_inbound_wamid: 'wamid.IMG_PERSIST',
     })
+  })
+})
+
+// ============================================================
+// Database clean — contacts and conversations deleted.
+//
+// The user wiped contacts/conversations. The next inbound must recreate both
+// from scratch and still persist the message; an optional column the deployed
+// schema lacks must never turn into a dropped message.
+// ============================================================
+describe('inbound webhook: clean creation after a wiped database', () => {
+  it('creates a contact and a conversation from scratch and stores the message', async () => {
+    // No contact row and no conversation row exist.
+    mockFindExistingContact.mockResolvedValue(null)
+    h.state.conversation = null
+
+    await runWebhook()
+
+    // Contact created with the base identity columns.
+    expect(h.state.contactInsertCalls).toHaveLength(1)
+    expect(h.state.contactInsertCalls[0]).toMatchObject({
+      account_id: 'acc-1',
+      user_id: 'user-1',
+      phone: '15551230000',
+      name: 'Ada',
+    })
+
+    // Conversation created, tied to that contact.
+    expect(h.state.conversationInsertCalls).toHaveLength(1)
+    expect(h.state.conversationInsertCalls[0]).toMatchObject({
+      account_id: 'acc-1',
+      user_id: 'user-1',
+      contact_id: 'inserted-1',
+    })
+
+    // The message still lands — the Inbox is not empty.
+    expect(h.state.upsertCalls).toHaveLength(1)
+    expect(h.state.upsertCalls[0].row).toMatchObject({
+      conversation_id: 'conv-new',
+      sender_type: 'customer',
+    })
+    // And the downstream pipeline runs on it.
+    expect(h.state.rpcCalls.length).toBeGreaterThan(0)
+    expect(h.dispatchInboundToAiReply).toHaveBeenCalled()
+  })
+
+  it('retries the conversation insert without phone_number_id when the column is missing', async () => {
+    mockFindExistingContact.mockResolvedValue(null)
+    h.state.conversation = null
+    // Production schema predates migration 071.
+    h.state.conversationsRejectColumn = 'phone_number_id'
+
+    await runWebhook()
+
+    // Two attempts: with the column, then without it.
+    expect(h.state.conversationInsertCalls).toHaveLength(2)
+    expect(h.state.conversationInsertCalls[0]).toHaveProperty(
+      'phone_number_id',
+      'pn-1',
+    )
+    expect(h.state.conversationInsertCalls[1]).not.toHaveProperty(
+      'phone_number_id',
+    )
+    // The thread still opened and the message was saved.
+    expect(h.state.conversationInsertCalls[1]).toMatchObject({
+      account_id: 'acc-1',
+      contact_id: 'inserted-1',
+    })
+    expect(h.state.upsertCalls).toHaveLength(1)
+  })
+
+  it('retries the contact insert without an optional identity column when it is missing', async () => {
+    mockFindExistingContact.mockResolvedValue(null)
+    h.state.conversation = null
+    // Production schema predates migration 053.
+    h.state.contactsRejectColumn = 'wa_id'
+
+    await runWebhook()
+
+    expect(h.state.contactInsertCalls).toHaveLength(2)
+    expect(h.state.contactInsertCalls[0]).toHaveProperty('wa_id')
+    expect(h.state.contactInsertCalls[1]).not.toHaveProperty('wa_id')
+    // Base columns survive the retry and the contact is still created.
+    expect(h.state.contactInsertCalls[1]).toMatchObject({
+      account_id: 'acc-1',
+      phone: '15551230000',
+    })
+    // Conversation + message still persisted.
+    expect(h.state.conversationInsertCalls).toHaveLength(1)
+    expect(h.state.upsertCalls).toHaveLength(1)
+  })
+
+  it('remembers a missing column so later messages do not retry it', async () => {
+    mockFindExistingContact.mockResolvedValue(null)
+    h.state.conversation = null
+    h.state.contactsRejectColumn = 'wa_id'
+
+    await runWebhook()
+    const firstAttempts = h.state.contactInsertCalls.length
+
+    // A second inbound: the column is already known-missing, so the very
+    // first attempt omits it (no wasted round trip).
+    h.state.contactInsertCalls = []
+    h.state.conversation = { id: 'conv-1', unread_count: 0, account_id: 'acc-1' }
+    await runWebhook()
+
+    expect(h.state.contactInsertCalls).toHaveLength(1)
+    expect(h.state.contactInsertCalls[0]).not.toHaveProperty('wa_id')
+    expect(firstAttempts).toBe(2)
+  })
+
+  it('stores the message even when the conversation metadata update fails', async () => {
+    h.state.rpcError = {
+      code: '42883',
+      message: 'function bump_conversation_on_inbound does not exist',
+    }
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    await runWebhook()
+
+    // The metadata RPC failing is logged, not fatal: the message row exists.
+    expect(h.state.upsertCalls).toHaveLength(1)
+    expect(h.state.rpcCalls.length).toBeGreaterThan(0)
+    errorSpy.mockRestore()
   })
 })
 
