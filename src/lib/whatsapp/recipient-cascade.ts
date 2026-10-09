@@ -82,10 +82,22 @@ const SEPARATOR = '='.repeat(50)
  * 8+ digits is VALIDO, anything else is INVALIDO. A placeholder tale
  * ('unknown', 'null', 'n/a') is treated as absent.
  */
+export function extractNumericBsuid(value: unknown): string | null {
+  if (value == null) return null
+  let s = String(value).trim()
+  if (!s) return null
+  s = s.replace(/@(?:user|lid|c\.us)\b/gi, '').trim()
+  if (s && s[0] === '@') s = s.slice(1)
+  const d = s.replace(/\D/g, '')
+  if (d.length >= 8 && /^\d+$/.test(d)) return d
+  return null
+}
+
 export function sanitizeCascadeSource(raw: unknown): CascadeSourceStatus {
   const valueForReport = raw == null ? '' : String(raw)
   const trimmed = String(raw ?? '').trim()
-  const digits = trimmed.replace(/\D/g, '')
+  const extracted = extractNumericBsuid(trimmed) || extractNumericBsuid(raw)
+  const digits = extracted ?? trimmed.replace(/\D/g, '')
   const valid = digits.length >= 8 && !isPlaceholderValue(trimmed)
   return {
     raw: valueForReport,
@@ -206,12 +218,31 @@ export async function buildDestinationCascadeReport(
 
   // Fuente 4 — ID del canal / BSUID numérico guardado en la conversación:
   // conversation.channel_id, o el BSUID del contacto vinculado a la conversación.
-  const channelBsuid = sanitizeCascadeSource(
-    convo?.channel_id ??
-      contact?.wa_id ??
-      contact?.wa_user_id ??
-      contact?.recipient_id
-  )
+  const contactMetaDeep =
+    contact?.metadata && typeof contact.metadata === 'object'
+      ? (contact.metadata as Record<string, unknown>)
+      : null
+  const deepBsuidCandidates: unknown[] = [
+    convo?.channel_id,
+    contact?.wa_id,
+    contact?.wa_user_id,
+    contact?.recipient_id,
+    contactMetaDeep?.bsuid,
+    contactMetaDeep?.channel_id,
+    contactMetaDeep?.wa_id,
+  ]
+  const deepNumeric = deepBsuidCandidates
+    .map((v) => extractNumericBsuid(v))
+    .find((v): v is string => Boolean(v))
+
+  const channelBsuid = deepNumeric
+    ? { raw: String(deepBsuidCandidates.find((v) => extractNumericBsuid(v) === deepNumeric) ?? deepNumeric), status: 'VALIDO' as const, digits: deepNumeric }
+    : sanitizeCascadeSource(
+        convo?.channel_id ??
+          contact?.wa_id ??
+          contact?.wa_user_id ??
+          contact?.recipient_id
+      )
 
   // Fuente 5 — último mensaje entrante: sender_id / raw_payload ->> from,
   // y su wamid (para anclar el envío a un BSUID cuando se necesita).
@@ -238,9 +269,14 @@ export async function buildDestinationCascadeReport(
           }
         | undefined
       if (!error && row) {
-        latestInboundFrom = sanitizeCascadeSource(
-          row.sender_phone ?? metaIdFromRawPayload(row.raw_meta_payload)
-        )
+        const fromRawPayload = metaIdFromRawPayload(row.raw_meta_payload)
+        const fromCandidate = row.sender_phone ?? fromRawPayload
+        latestInboundFrom = sanitizeCascadeSource(fromCandidate)
+        // also try to extract numeric from full payload if available
+        const fromPayloadNumeric = extractNumericBsuid(fromRawPayload)
+        if (fromPayloadNumeric && latestInboundFrom.status !== 'VALIDO') {
+          latestInboundFrom = { raw: String(fromRawPayload ?? ''), status: 'VALIDO', digits: fromPayloadNumeric }
+        }
         if (typeof row.message_id === 'string' && row.message_id) {
           latestInboundWamid = row.message_id
         }
