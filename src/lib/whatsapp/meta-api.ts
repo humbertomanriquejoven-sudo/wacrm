@@ -19,6 +19,61 @@ import {
 const META_API_VERSION = 'v26.0'
 const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`
 
+/**
+ * Our business number (the SENDER), resolved to a value safe to put in a Graph
+ * URL. Never returns the empty string or the `'unknown'` placeholder.
+ *
+ * `whatsapp_config.phone_number_id` is the first choice. When a row is missing
+ * it — or holds the literal `'unknown'` that older webhook writes produced —
+ * the process env is the mandatory fallback (`WHATSAPP_PHONE_NUMBER_ID`, then
+ * `META_PHONE_NUMBER_ID`), so a background timer / worker / server that did
+ * not load the DB row can still address the number it was launched with.
+ */
+export function resolveMetaPhoneNumberId(
+  value: string | null | undefined,
+): string {
+  const candidates = [
+    value,
+    process.env.WHATSAPP_PHONE_NUMBER_ID,
+    process.env.META_PHONE_NUMBER_ID,
+  ]
+  for (const candidate of candidates) {
+    const id = (candidate ?? '').trim()
+    if (id && !isPlaceholderValue(id)) return id
+  }
+  return ''
+}
+
+/**
+ * Resolve the sender `phone_number_id` or refuse to build the URL.
+ *
+ * A Graph request to `/{unknown}/messages` can never be delivered and Meta
+ * answers with an opaque error, so this throws a typed error BEFORE any HTTP
+ * call. This is the single choke point that guarantees NO request is ever sent
+ * to a path containing `/unknown/`.
+ */
+export function requireMetaPhoneNumberId(
+  value: string | null | undefined,
+): string {
+  const id = resolveMetaPhoneNumberId(value)
+  if (!id) {
+    console.error(
+      '[send] MISSING CREDENTIAL: phone_number_id resolved to ""/"unknown" and neither WHATSAPP_PHONE_NUMBER_ID nor META_PHONE_NUMBER_ID is set. Refusing to POST to /unknown/messages — no HTTP request was sent.',
+    )
+    throw new InvalidRecipientError(
+      '',
+      'phone_number_id is missing or "unknown", and no fallback env ' +
+        '(WHATSAPP_PHONE_NUMBER_ID / META_PHONE_NUMBER_ID) is set. No HTTP request was sent.',
+    )
+  }
+  return id
+}
+
+/** Graph URL for a message send, with the sender id guaranteed valid. */
+function messagesUrl(phoneNumberId: string | null | undefined): string {
+  return `${META_API_BASE}/${requireMetaPhoneNumberId(phoneNumberId)}/messages`
+}
+
 export interface MetaSendResult {
   messageId: string
 }
@@ -769,15 +824,10 @@ export async function sendTextMessage(
   // network 4xx from Meta (or worse, a latently misconfigured env that
   // "looks" healthy): name the exact variable and refuse loudly BEFORE any
   // HTTP request, so a background timer cannot silently never deliver.
-  if (!phoneNumberId || !phoneNumberId.trim()) {
-    console.error(
-      '[send] MISSING CREDENTIAL: META_PHONE_NUMBER_ID (or the account phone row) resolved to an empty value — no HTTP request was sent. Check the env of the process running this task (cron / worker / Next server).',
-    )
-    throw new InvalidRecipientError(
-      '',
-      'phoneNumberId resolved to an empty value (META_PHONE_NUMBER_ID is missing in this process). No HTTP request was sent.',
-    )
-  }
+  //
+  // `requireMetaPhoneNumberId` also applies the env fallback and refuses the
+  // `'unknown'` placeholder, so the request can never target /unknown/messages.
+  requireMetaPhoneNumberId(phoneNumberId)
   if (!accessToken || !accessToken.trim()) {
     console.error(
       '[send] MISSING CREDENTIAL: META_ACCESS_TOKEN (or WHATSAPP_TOKEN) resolved to an empty value — no HTTP request was sent. Check the env of the process running this task (cron / worker / Next server).',
@@ -877,7 +927,7 @@ export async function sendTextMessage(
   }
   assertDeliverableDestination(targetId)
 
-  const url = `${META_API_BASE}/${phoneNumberId}/messages`
+  const url = messagesUrl(phoneNumberId)
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
@@ -977,7 +1027,7 @@ export async function sendMediaMessage(
     )
   }
 
-  const url = `${META_API_BASE}/${phoneNumberId}/messages`
+  const url = messagesUrl(phoneNumberId)
 
   // Audio accepts neither caption nor filename per Meta's spec — adding
   // either yields a 400. image/video/document accept a caption; only
@@ -1067,7 +1117,7 @@ export async function sendTemplateMessage(
     contextMessageId,
   } = args
   const recipient = assertDialableRecipient(to)
-  const url = `${META_API_BASE}/${phoneNumberId}/messages`
+  const url = messagesUrl(phoneNumberId)
 
   const templatePayload: Record<string, unknown> = {
     name: templateName,
@@ -1368,7 +1418,7 @@ export async function sendTypingIndicator(
   args: SendTypingIndicatorArgs,
 ): Promise<void> {
   const { phoneNumberId, accessToken, messageId } = args
-  const url = `https://graph.facebook.com/${TYPING_INDICATOR_API_VERSION}/${phoneNumberId}/messages`
+  const url = `https://graph.facebook.com/${TYPING_INDICATOR_API_VERSION}/${requireMetaPhoneNumberId(phoneNumberId)}/messages`
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -1410,7 +1460,7 @@ export async function sendReactionMessage(
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, targetMessageId, emoji } = args
   const recipient = assertDialableRecipient(to)
-  const url = `${META_API_BASE}/${phoneNumberId}/messages`
+  const url = messagesUrl(phoneNumberId)
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
@@ -1542,7 +1592,7 @@ export async function sendInteractiveButtons(
   }
   if (contextMessageId) body.context = { message_id: contextMessageId }
 
-  const url = `${META_API_BASE}/${phoneNumberId}/messages`
+  const url = messagesUrl(phoneNumberId)
   const response = await postMessagesPayload(url, accessToken, body)
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`)
@@ -1669,7 +1719,7 @@ export async function sendInteractiveList(
   }
   if (contextMessageId) body.context = { message_id: contextMessageId }
 
-  const url = `${META_API_BASE}/${phoneNumberId}/messages`
+  const url = messagesUrl(phoneNumberId)
   const response = await postMessagesPayload(url, accessToken, body)
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`)

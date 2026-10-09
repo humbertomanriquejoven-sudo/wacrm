@@ -868,9 +868,10 @@ async function processMessage(
 
   // Pick the real, dialable number Meta gave us — `messages[].from`,
   // `contacts[0].wa_id`, or `contacts[0].profile.phone`, whichever is the
-  // first one that is genuinely phone-shaped. When only a BSUID is
-  // disclosed, that numeric id is used — `phone` never stays blank and
-  // never holds a '@' handle.
+  // first one that is genuinely phone-shaped. When Meta discloses NO number
+  // (only a BSUID / `@handle`), `phone` is set to the literal 'unknown'
+  // placeholder: `phone` must stay a clean E.164 column and NEVER absorb a
+  // BSUID or an `@handle`. The opaque id is kept in `wa_user_id` instead.
   const trimmedFrom = (message.from ?? '').trim()
   const trimmedWaId = (contact.wa_id ?? '').trim()
   const trimmedProfilePhone = (

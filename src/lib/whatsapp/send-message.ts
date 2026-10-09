@@ -45,6 +45,7 @@ import {
   phoneVariants,
   toDialable,
   isRecipientNotAllowedError,
+  isPlaceholderValue,
 } from '@/lib/whatsapp/phone-utils';
 import {
   isDialablePhone,
@@ -469,6 +470,21 @@ export async function sendMessageToConversation(
 
   const accessToken = decrypt(config.access_token);
 
+  // Sender phone_number_id. Preference: the account config, then the number
+  // the webhook recorded on THIS contact (migration 053), then — enforced
+  // inside meta-api's `messagesUrl` — the process env (WHATSAPP_PHONE_NUMBER_ID
+  // / META_PHONE_NUMBER_ID). The `'unknown'` placeholder is never accepted and
+  // the send is refused before any HTTP call, so a POST to
+  // `/{unknown}/messages` is impossible.
+  const senderPhoneNumberId =
+    [
+      config.phone_number_id,
+      (contact as { phone_number_id?: string | null }).phone_number_id,
+    ]
+      .map((value) => (typeof value === 'string' ? value.trim() : ''))
+      .find((value) => value && !isPlaceholderValue(value)) ??
+    config.phone_number_id;
+
   // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
   if (isLegacyFormat(config.access_token)) {
     void db
@@ -748,7 +764,7 @@ export async function sendMessageToConversation(
     const anchor = await anchorFor(phone);
     if (messageType === 'template') {
       const result = await sendTemplateMessage({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: senderPhoneNumberId,
         accessToken,
         to: phone,
         templateName: templateName!,
@@ -762,7 +778,7 @@ export async function sendMessageToConversation(
     }
     if (isMediaKind) {
       const result = await sendMediaMessage({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: senderPhoneNumberId,
         accessToken,
         to: phone,
         kind: messageType as MediaKind,
@@ -777,7 +793,7 @@ export async function sendMessageToConversation(
       const p = interactivePayload!;
       if (p.kind === 'buttons') {
         const result = await sendInteractiveButtons({
-          phoneNumberId: config.phone_number_id,
+          phoneNumberId: senderPhoneNumberId,
           accessToken,
           to: phone,
           bodyText: p.body,
@@ -789,7 +805,7 @@ export async function sendMessageToConversation(
         return result.messageId;
       }
       const result = await sendInteractiveList({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: senderPhoneNumberId,
         accessToken,
         to: phone,
         bodyText: p.body,
