@@ -75,6 +75,17 @@ export const VALID_MESSAGE_TYPES = [
   ...MEDIA_KINDS,
 ] as const;
 
+/** How long after the customer's last inbound a BSUID-only reply may ride. */
+export const REDACTED_BSUID_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h
+
+/**
+ * Operator-facing fix for a BSUID-only contact whose 24h customer-service
+ * window has closed. Exposed so the send core, the HTTP layers and the UI
+ * all quote the exact same copy.
+ */
+export const HOW_TO_FIX_BSUID_WINDOW =
+  'CÓMO SOLUCIONARLO: 1. Pídele al cliente que envíe un nuevo mensaje por WhatsApp (así se reabre la ventana de 24 h y podrás responderle por BSUID). 2. Si el contacto tiene un teléfono, escríbelo con código de país en el panel derecho y presiona Guardar para poder responder fuera de la ventana con una plantilla.';
+
 /**
  * Typed failure with a machine `code` and a suggested HTTP `status`.
  * Callers map it to their own response shape (`toErrorResponse` for
@@ -93,6 +104,12 @@ export class SendMessageError extends Error {
   readonly howToFix?: string | null;
   /** Metas's verbatim error body (or message) when Meta rejected the send. */
   readonly metaResponse?: string | null;
+  /**
+   * True only for `bsuid_window_closed`: the contact is addressed by a
+   * privacy-redacted id and the 24h customer-service window expired. Lets a
+   * caller surface the exact "Ventana de 24h cerrada" warning on its own.
+   */
+  readonly windowClosed?: boolean;
   constructor(
     code: string,
     message: string,
@@ -101,6 +118,7 @@ export class SendMessageError extends Error {
       diagnosticReport?: Record<string, string> | null;
       howToFix?: string | null;
       metaResponse?: string | null;
+      windowClosed?: boolean;
     }
   ) {
     super(message);
@@ -110,6 +128,7 @@ export class SendMessageError extends Error {
     this.diagnosticReport = extra?.diagnosticReport ?? null;
     this.howToFix = extra?.howToFix ?? null;
     this.metaResponse = extra?.metaResponse ?? null;
+    this.windowClosed = extra?.windowClosed ?? false;
   }
 }
 
@@ -519,6 +538,52 @@ export async function sendMessageToConversation(
     isPhone: isDialablePhone(cascadeReport.finalTo),
   };
 
+  // VENTANA DE 24 HORAS (BSUID / leads redactados por privacidad de Meta).
+  // Un contacto sin teléfono real solo puede recibir mensajes de texto/libre
+  // citando SU propio mensaje entrante — y eso exige que haya escrito en las
+  // últimas 24h. `latest_inbound_at` no es una columna: se deriva del
+  // `created_at` del mensaje entrante más reciente (Fuente 5 de la cascada).
+  // Si la ventana cerró, se BLOQUEA el envío libre antes de tocar Meta con el
+  // aviso exacto en `error` + `how_to_fix`; las PLANTILLAS siguen permitidas
+  // (Meta las acepta fuera de la ventana) y un teléfono dialable ni entra aquí.
+  const latestInboundAtMs = cascadeReport.latestInboundAt
+    ? new Date(cascadeReport.latestInboundAt).getTime()
+    : Number.NaN;
+  const windowOpen =
+    Number.isFinite(latestInboundAtMs) &&
+    Date.now() - latestInboundAtMs < REDACTED_BSUID_WINDOW_MS;
+  const needsWindow =
+    Boolean(resolved.to) && !resolved.isPhone && messageType !== 'template';
+  if (needsWindow && !windowOpen) {
+    const technical =
+      `BSUID-only contact ${contact.id} (to="${resolved.to}", source=${resolved.source}) ` +
+      `has no inbound customer message within the last 24h ` +
+      `(latest_inbound_at=${cascadeReport.latestInboundAt ?? 'none'}) — the ` +
+      `customer-service window is closed. Templates are still allowed. ` +
+      `No HTTP request was sent to Meta.`;
+    console.error(
+      `[send-message] BSUID WINDOW CLOSED for conversation ${conversationId}: ${technical}`,
+    );
+    await recordSendFailure(db, {
+      conversationId,
+      senderType: params.senderType ?? 'agent',
+      messageType,
+      contentText: contentText ?? null,
+      mediaUrl: mediaUrl || null,
+      errorDetail: technical,
+    });
+    throw new SendMessageError(
+      'bsuid_window_closed',
+      'Ventana de 24h cerrada. El usuario debe enviar un nuevo mensaje para habilitar la respuesta por BSUID.',
+      422,
+      {
+        diagnosticReport: toDiagnosticHttp(cascadeReport),
+        howToFix: HOW_TO_FIX_BSUID_WINDOW,
+        windowClosed: true,
+      },
+    );
+  }
+
   // Resolve the reply target to its Meta message_id. The parent must
   // belong to this same conversation — otherwise a caller could quote
   // messages they can't see by guessing UUIDs.
@@ -571,11 +636,13 @@ export async function sendMessageToConversation(
   // in this thread — exactly what `engineSendAiReply` does with the inbound it
   // was answering. Only for opaque addresses: a contact with a dialable number
   // is addressed directly and is left completely untouched, so the ordinary
-  // case is byte-identical to before. A NUMERIC BSUID / wa_id is still sent
-  // even when the thread has no inbound wamid to quote — the anchor improves
-  // the send when present, but its absence is no longer fatal. Nothing is
-  // refused here: any other address simply anchors to the inbound wamid, or
-  // Meta rejects it and the mapping returns the structured 422.
+  // case is byte-identical to before. A NUMERIC BSUID / wa_id inside the 24h
+  // window is still sent even when the thread has no inbound wamid to quote —
+  // the anchor improves the send when present, but its absence is no longer
+  // fatal. Nothing is refused here: any other address simply anchors to the
+  // inbound wamid, or Meta rejects it and the mapping returns the structured
+  // 422. (Outside the window the BSUID gate above already refused free-form
+  // sends, so this block only runs while the window is open.)
   if (!contextMessageId && resolved.to && !resolved.isPhone) {
     // Meta rechaza un `@handle`/letras con (#131009), pero la escalera ya solo
     // emite destinos numéricos; cualquier no-numérico que llegue aquí se ancla

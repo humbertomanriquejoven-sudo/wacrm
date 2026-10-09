@@ -66,6 +66,12 @@ export interface DestinationCascadeReport {
   bsuidValid: boolean
   /** Newest inbound wamid in this conversation, or null when there is none. */
   latestInboundWamid: string | null
+  /**
+   * `created_at` of the newest inbound customer message (ISO string), or null
+   * when the conversation has no inbound yet. Drives the 24h customer-service
+   * window for privacy-redacted (BSUID / @user) contacts.
+   */
+  latestInboundAt: string | null
 }
 
 const SEPARATOR = '='.repeat(50)
@@ -118,6 +124,7 @@ export function formatDestinationCascadeReport(
     `- Contact Phone (DB): "${report.phoneDb}" -> [${report.sources.contacts_phone.status}]`,
     `- Conversation BSUID/WA_ID: "${report.bsuid}" -> [${report.bsuidValid ? 'VALIDO' : 'INVALIDO'}]`,
     `- Last Inbound WAMID: "${report.latestInboundWamid ?? 'NINGUNO'}"`,
+    `- Last Inbound At: "${report.latestInboundAt ?? 'NINGUNO'}"`,
     `- DESTINATARIO FINAL SELECCIONADO: "${report.finalTo ?? 'NINGUNO'}"`,
     SEPARATOR,
   ].join('\n')
@@ -212,11 +219,12 @@ export async function buildDestinationCascadeReport(
   // debe secuestrar la resolución del destinatario.
   let latestInboundFrom: CascadeSourceStatus = sanitizeCascadeSource(null)
   let latestInboundWamid: string | null = null
+  let latestInboundAt: string | null = null
   if (conversationId) {
     try {
       const { data, error } = await db
         .from('messages')
-        .select('sender_phone, raw_meta_payload, message_id')
+        .select('sender_phone, raw_meta_payload, message_id, created_at')
         .eq('conversation_id', conversationId)
         .eq('sender_type', 'customer')
         .order('created_at', { ascending: false })
@@ -226,6 +234,7 @@ export async function buildDestinationCascadeReport(
             sender_phone?: string | null
             raw_meta_payload?: unknown
             message_id?: string | null
+            created_at?: string | null
           }
         | undefined
       if (!error && row) {
@@ -234,6 +243,9 @@ export async function buildDestinationCascadeReport(
         )
         if (typeof row.message_id === 'string' && row.message_id) {
           latestInboundWamid = row.message_id
+        }
+        if (typeof row.created_at === 'string' && row.created_at) {
+          latestInboundAt = row.created_at
         }
       }
     } catch {
@@ -282,5 +294,6 @@ export async function buildDestinationCascadeReport(
     bsuid,
     bsuidValid,
     latestInboundWamid,
+    latestInboundAt,
   }
 }

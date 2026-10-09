@@ -430,4 +430,51 @@ describe('POST /api/whatsapp/send — media recipient + failure mapping', () => 
     expect(status).toBe(502)
     expect(json.code).toBe('meta_error')
   })
+
+  it('422s with window_closed when a BSUID-only lead is out of the 24h window', async () => {
+    // A privacy-redacted lead (no real phone, just a wa_user_id / BSUID)
+    // can only be answered inside the 24h window after their last inbound.
+    // With the thread's newest inbound older than 24h (here: none), free-form
+    // sends must 422 with the exact warning + `window_closed: true`.
+    const BSUID_CONTACT = {
+      id: 'contact-1',
+      account_id: 'acct-1',
+      phone: 'CO.9988776655443322',
+      wa_user_id: '9988776655443322',
+      username: null,
+    }
+    existingConversation = {
+      id: 'conv-existing',
+      account_id: 'acct-1',
+      contact_id: 'contact-1',
+      contact: BSUID_CONTACT,
+    }
+    contactRow = BSUID_CONTACT
+
+    const res = await POST(
+      new Request('http://localhost/api/whatsapp/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          conversation_id: 'conv-existing',
+          message_type: 'text',
+          content_text: 'Hola',
+        }),
+      }),
+    )
+    const json = (await res.json()) as Record<string, unknown>
+
+    expect(res.status).toBe(422)
+    expect(json.code).toBe('bsuid_window_closed')
+    expect(json.window_closed).toBe(true)
+    expect(json.error).toBe(
+      'Ventana de 24h cerrada. El usuario debe enviar un nuevo mensaje para habilitar la respuesta por BSUID.'
+    )
+    expect(json.how_to_fix).toBeTruthy()
+    expect(json.diagnostic_report).toBeTruthy()
+    // No Meta request was made; the refusal is recorded as a failed bubble.
+    expect(sendTemplateMessage).not.toHaveBeenCalled()
+    expect(messageInserts).toHaveLength(1)
+    expect(messageInserts[0]).toMatchObject({ status: 'failed' })
+  })
 })

@@ -149,6 +149,7 @@ export async function POST(request: Request) {
           : {}),
         ...(err.howToFix ? { how_to_fix: err.howToFix } : {}),
         ...(err.metaResponse ? { meta_response: err.metaResponse } : {}),
+        ...(err.windowClosed ? { window_closed: true } : {}),
       });
     }
     return toApiErrorResponse(err);

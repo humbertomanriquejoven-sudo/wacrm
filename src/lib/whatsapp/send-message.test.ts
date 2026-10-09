@@ -305,7 +305,14 @@ function sendPathDb(
   // The lookup runs with the service-role client (`adminRead`); the sibling
   // `inboundRows` below keeps the user-scoped fake's own `limit` honest.
   const inboundRows = opts?.inboundRows ?? [];
-  adminRead.inboundRows = inboundRows;
+  // The 24h customer-service window is measured from the newest inbound
+  // `created_at`. A test that omits it still exercises an OPEN window, so the
+  // existing BSUID/anchor coverage is unaffected; a test that wants the
+  // window closed passes an explicit `created_at` 24h+ in the past.
+  adminRead.inboundRows = inboundRows.map((row) => ({
+    created_at: new Date().toISOString(),
+    ...(row as Record<string, unknown>),
+  }));
   // Mirror the contact into the service-role read; a test may then override
   // this with a row that RLS WOULD have hidden (see the strict-override test).
   adminRead.contactRow = (opts?.contact ?? {
@@ -534,13 +541,67 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
     expect(call.contextMessageId).toBeUndefined();
   });
 
-  it('sends a strictly numeric id directly when the thread has no inbound wamid', async () => {
-    // A numeric BSUID/wa_id is a valid bare `to` for Meta: the anchor is a
-    // strict improvement when present, but its absence must not strand the
-    // send. Only a NON-numeric address (username / @handle) is refused — and
-    // that refusal happens earlier, in the preventive @/letters guard.
-    const outcome = await sendMessageToConversation(
+  it('refuses a free-form BSUID send when the 24h window is closed (no inbound at all)', async () => {
+    // A privacy-redacted lead with NO inbound ever has no 24h window: the
+    // reply would have nothing to quote, so Meta would drop it. The gate
+    // answers 422 `bsuid_window_closed` BEFORE any HTTP request, with the
+    // exact warning the UI must display.
+    const err = await sendMessageToConversation(
       sendPathDb([], {}, { contact: OPAQUE_CONTACT, inboundRows: [] }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'Hola',
+      }
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(SendMessageError);
+    const sendError = err as SendMessageError;
+    expect(sendError.status).toBe(422);
+    expect(sendError.code).toBe('bsuid_window_closed');
+    expect(sendError.message).toBe(
+      'Ventana de 24h cerrada. El usuario debe enviar un nuevo mensaje para habilitar la respuesta por BSUID.'
+    );
+    expect(sendError.windowClosed).toBe(true);
+    expect(sendError.howToFix).toBeTruthy();
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).not.toHaveBeenCalled();
+  });
+
+  it('refuses a free-form BSUID send when the newest inbound is older than 24h', async () => {
+    const twentyFiveHoursAgo = new Date(
+      Date.now() - 25 * 60 * 60 * 1000
+    ).toISOString();
+    const err = await sendMessageToConversation(
+      sendPathDb([], {}, {
+        contact: OPAQUE_CONTACT,
+        inboundRows: [
+          { message_id: 'wamid.STALE', created_at: twentyFiveHoursAgo },
+        ],
+      }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'Hola',
+      }
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(SendMessageError);
+    expect((err as SendMessageError).code).toBe('bsuid_window_closed');
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).not.toHaveBeenCalled();
+  });
+
+  it('sends a BSUID free-form message while the window stays open', async () => {
+    // A lead who wrote within the last 24h can be answered even with no
+    // inbound wamid to quote: the numeric BSUID goes cold in `to`.
+    const outcome = await sendMessageToConversation(
+      sendPathDb([], {}, {
+        contact: OPAQUE_CONTACT,
+        inboundRows: [{ message_id: 'wamid.INBOUND' }],
+      }),
       'acct-1',
       {
         conversationId: 'cv-1',
@@ -552,7 +613,51 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
     expect(outcome).toBeDefined();
     expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: '9988776655443322',
+        contextMessageId: 'wamid.INBOUND',
+      })
+    );
+  });
+
+  it('lets a template reach a BSUID contact even with the window closed', async () => {
+    // Templates are Meta's out-of-window channel: they must not be hostage
+    // to the 24h window like free-form text/media/interactive are.
+    await sendMessageToConversation(
+      sendPathDb([], {}, { contact: OPAQUE_CONTACT, inboundRows: [] }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'template',
+        templateName: 'order_update',
+        templateParams: ['A123', 'Friday'],
+      }
+    );
+
+    expect(sendTemplateMessage).toHaveBeenCalledWith(
       expect.objectContaining({ to: '9988776655443322' })
+    );
+  });
+
+  it('leaves a dialable phone untouched by the window gate even with no inbound', async () => {
+    // The gate is strictly for BSUID / privacy-redacted ids: a real number
+    // is addressed cold regardless of the 24h window.
+    await sendMessageToConversation(
+      sendPathDb([], {}, {
+        contact: { id: 'ct-1', phone: '+15551234567' },
+        inboundRows: [],
+      }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'Hola',
+      }
+    );
+
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: '15551234567' })
     );
     const call = vi.mocked(sendTextMessage).mock.calls[0][0];
     expect(call.contextMessageId).toBeUndefined();
