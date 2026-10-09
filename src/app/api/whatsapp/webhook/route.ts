@@ -1290,11 +1290,18 @@ async function processMessage(
   // both reads see the same value and write the same increment, losing one
   // (issue #369). The RPC increments in a single UPDATE and refreshes the
   // last-message summary in the same statement.
+  // `p_last_inbound_wamid` stamps `conversations.last_inbound_wamid`
+  // atomically alongside the unread bump (migration 072). That wamid is the
+  // CASO B anchor: `recipient-resolver` hands it back to Meta as
+  // `context.message_id` when the only deliverable destination is an opaque
+  // wa_id. `last_inbound_at` is stamped server-side inside the same UPDATE,
+  // so concurrent inbound deliveries cannot lose the anchor.
   const { error: convError } = await supabaseAdmin().rpc(
     'bump_conversation_on_inbound',
     {
       p_conversation_id: conversation.id,
       p_last_message_text: contentText || `[${message.type}]`,
+      p_last_inbound_wamid: message.id ?? null,
     }
   )
 

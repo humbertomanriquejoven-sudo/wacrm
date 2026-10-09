@@ -784,6 +784,81 @@ describe('inbound webhook: atomic unread bump (#369)', () => {
 })
 
 // ============================================================
+// Directiva de persistencia — Test 1.
+//
+// Every identifier lands in its OWN column, and the conversation carries the
+// CASO B anchor (`last_inbound_wamid`) plus the inbound timestamp.
+// ============================================================
+describe('inbound webhook: identity persistence (migration 072)', () => {
+  it('stamps last_inbound_at + last_inbound_wamid atomically with the bump', async () => {
+    await runWebhook()
+
+    // The wamid is what `resolveRecipient` later sends as `context.message_id`
+    // for an opaque CASO B destination; it must be recorded on the inbound.
+    expect(h.state.rpcCalls).toContainEqual({
+      name: 'bump_conversation_on_inbound',
+      args: {
+        p_conversation_id: 'conv-1',
+        p_last_message_text: 'hello',
+        p_last_inbound_wamid: 'wamid.TEST1',
+      },
+    })
+  })
+
+  it('stores wa_id, phone and phone_number_id in independent columns', async () => {
+    mockFindExistingContact.mockResolvedValue(null)
+
+    await runWebhook()
+
+    const insert = h.state.contactInsertCalls[0]
+    expect(insert).toMatchObject({
+      // CASO A: the disclosed number is a dialable destination.
+      phone: '15551230000',
+      // Meta's canonical numeric wa_id, on its own column.
+      wa_id: '15551230000',
+      // The business line that received the message.
+      phone_number_id: 'pn-1',
+      identity_type: 'PHONE_E164',
+    })
+    // No BSUID was sent, so its column stays empty rather than borrowing a
+    // value from `phone` / `wa_id`.
+    expect(insert.wa_user_id).toBeUndefined()
+  })
+
+  it('keeps a BSUID out of phone/wa_id and inside wa_user_id only', async () => {
+    h.state.existingContactResult = null
+    mockFindExistingContact.mockResolvedValue(null)
+
+    await POST(bsuidInboundRequest())
+    for (const cb of h.state.afterCallbacks) await cb()
+
+    const insert = h.state.contactInsertCalls[0]
+    // CASO C: the opaque BSUID is identity data, never a destination.
+    expect(insert.wa_user_id).toBe('9988776655443322')
+    expect(insert.identity_type).toBe('BSUID')
+    expect(insert.phone_number_id).toBe('pn-1')
+    // It must not be promoted into any address column.
+    expect(insert.wa_id ?? null).toBeNull()
+    expect(insert.recipient_id ?? null).toBeNull()
+    expect(insert.phone).toBe('unknown')
+  })
+
+  it('records the inbound wamid on the conversation for every message type', async () => {
+    await runWebhook({
+      id: 'wamid.IMG_PERSIST',
+      from: '15551230000',
+      timestamp: '1700000000',
+      type: 'image',
+      image: { id: 'img-1', mime_type: 'image/jpeg' },
+    })
+
+    expect(h.state.rpcCalls[0].args).toMatchObject({
+      p_last_inbound_wamid: 'wamid.IMG_PERSIST',
+    })
+  })
+})
+
+// ============================================================
 // Campaign status <-> Inbox status.
 //
 // A broadcast mirror writes the same Meta wamid into two places —
