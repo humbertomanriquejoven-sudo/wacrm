@@ -168,8 +168,8 @@ export function resolveVariables(
       const fieldMap: Record<string, string | undefined> = {
         name: contact.name,
         phone: contact.phone ?? '',
-        email: contact.email,
-        company: contact.company,
+        email: contact.email ?? undefined,
+        company: contact.company ?? undefined,
       };
       return fieldMap[v.value] ?? '';
     }

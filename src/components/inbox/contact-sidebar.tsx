@@ -171,7 +171,7 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
                 <span className="flex-1 text-left">
                   {contact.phone && contact.phone !== "unknown"
                     ? contact.phone
-                    : contact.username || contact.wa_user_id || contact.phone}
+                    : contact.bsuid || contact.recipient_address || contact.phone}
                 </span>
                 {copied ? (
                   <Check className="h-3 w-3 text-primary" />
@@ -189,9 +189,9 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
               {/* When no real phone is on file, surface the BSUID so the
                   operator can still tell who they're talking to — replies
                   go out through the `recipient` parameter of the Meta API. */}
-              {(!contact.phone || contact.phone === "unknown") && contact.wa_user_id && (
+              {(!contact.phone || contact.phone === "unknown") && (contact.bsuid || contact.recipient_address) && (
                 <div className="flex items-center gap-2 px-3 py-1 text-xs text-muted-foreground font-mono">
-                  <span className="flex-1 text-left">{contact.wa_user_id}</span>
+                  <span className="flex-1 text-left">{contact.bsuid || contact.recipient_address}</span>
                 </div>
               )}
 

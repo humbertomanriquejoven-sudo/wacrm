@@ -459,16 +459,14 @@ function ConversationItem({
       )}
     >
       {/* Avatar */}
-      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-medium text-foreground">
-        {contact?.avatar_url ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={contact.avatar_url}
-            alt={displayName}
-            className="h-10 w-10 rounded-full object-cover"
-          />
+<div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-medium text-foreground">
+        {contact?.recipient_address ? (
+          // Simple avatar using first char of recipient_address
+          <span className="rounded-full bg-primary text-primary-foreground text-xs font-semibold">
+            {contact.recipient_address?.charAt(0)?.toUpperCase() || 'U'}
+          </span>
         ) : (
-          initials
+          <span className="text-muted-foreground text-xs">Sin avatar</span>
         )}
       </div>
 

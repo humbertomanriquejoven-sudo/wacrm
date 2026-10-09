@@ -215,8 +215,8 @@ export function Step3Personalize({
           const fieldMap: Record<string, string | undefined> = {
             name: contact.name,
             phone: contact.phone ?? '',
-            email: contact.email,
-            company: contact.company,
+            email: contact.email ?? undefined,
+            company: contact.company ?? undefined,
           };
           replacement = fieldMap[mapping.value] ?? placeholder;
         } else if (mapping.type === 'custom_field' && mapping.value) {
