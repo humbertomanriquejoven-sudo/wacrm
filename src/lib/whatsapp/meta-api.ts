@@ -715,7 +715,8 @@ async function postMessagesPayload(
 export interface SendTextMessageArgs {
   phoneNumberId: string
   accessToken: string
-  to: string
+  to?: string
+  recipient?: string
   text: string
   /** Meta's message_id of the message being replied to. Adds a `context` field
    *  so WhatsApp renders the new message as a reply with a quote preview. */
@@ -786,7 +787,7 @@ export async function sendTextMessage(
     )
   }
 
-  const recipient = cleanRecipientAddress(to)
+  const recipient = cleanRecipientAddress(to ?? '')
   const address = recipient || (to ?? '').trim()
   if (!address) {
     // The ONE case that is still refused locally: there is no address at all
@@ -918,7 +919,8 @@ export type MediaKind = 'image' | 'video' | 'document' | 'audio'
 export interface SendMediaMessageArgs {
   phoneNumberId: string
   accessToken: string
-  to: string
+  to?: string
+  recipient?: string
   kind: MediaKind
   /** Public URL Meta fetches at send time. */
   link: string
@@ -966,7 +968,7 @@ export async function sendMediaMessage(
   // layer answers 422 instead of letting an unresolvable contact surface
   // as a generic 502. `canonicalToField` already refuses a namespaced
   // BSUID / handle (CASO C); `{ to: '' }` covers the empty/placeholder case.
-  const addressField = canonicalToField(to)
+  const addressField = canonicalToField(to ?? '')
   if (!addressField.to && !addressField.recipient) {
     console.warn(
       '[send] blocked: media recipient could not be resolved, no HTTP request was made to Meta.',
@@ -1014,7 +1016,8 @@ import {
 export interface SendTemplateMessageArgs {
   phoneNumberId: string
   accessToken: string
-  to: string
+  to?: string
+  recipient?: string
   templateName: string
   language?: string
   /**
@@ -1066,8 +1069,8 @@ export async function sendTemplateMessage(
     template,
     messageParams,
     contextMessageId,
-  } = args
-  const recipient = assertDialableRecipient(to)
+} = args
+  const recipient = assertDialableRecipient(to ?? '')
   const url = messagesUrl(phoneNumberId)
 
   const templatePayload: Record<string, unknown> = {
@@ -1467,7 +1470,8 @@ export interface InteractiveButton {
 export interface SendInteractiveButtonsArgs {
   phoneNumberId: string
   accessToken: string
-  to: string
+  to?: string
+  recipient?: string
   /** The body text — what the customer reads above the buttons. */
   bodyText: string
   /** Optional plain-text header (≤ 60 chars). */
@@ -1495,7 +1499,7 @@ export async function sendInteractiveButtons(
     phoneNumberId, accessToken, to,
     bodyText, headerText, footerText, buttons, contextMessageId,
   } = args
-  const recipient = assertDialableRecipient(to)
+  const recipient = assertDialableRecipient(to ?? '')
   validateInteractiveBody(bodyText)
   validateInteractiveHeaderFooter(headerText, footerText)
   if (buttons.length < 1 || buttons.length > INTERACTIVE_LIMITS.maxButtons) {
@@ -1571,7 +1575,8 @@ export interface InteractiveListSection {
 export interface SendInteractiveListArgs {
   phoneNumberId: string
   accessToken: string
-  to: string
+  to?: string
+  recipient?: string
   bodyText: string
   /** Label of the tap-to-expand button on the message bubble. */
   buttonLabel: string
@@ -1598,7 +1603,7 @@ export async function sendInteractiveList(
     phoneNumberId, accessToken, to,
     bodyText, buttonLabel, headerText, footerText, sections, contextMessageId,
   } = args
-  const recipient = assertDialableRecipient(to)
+  const recipient = assertDialableRecipient(to ?? '')
   validateInteractiveBody(bodyText)
   validateInteractiveHeaderFooter(headerText, footerText)
   if (!buttonLabel) throw new Error('Interactive list requires a buttonLabel.')
