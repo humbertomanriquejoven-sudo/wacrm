@@ -2672,6 +2672,20 @@ async function findOrCreateContact(
       updates.phone = phone
     }
 
+    // If this payload disclosed no number (rawPhone came back as the
+    // 'unknown' placeholder) but the row already carries a genuine E.164 in
+    // `wa_id` / `recipient_id` — a normal sender whose number was recorded in
+    // the identity column by an older version — promote it into `phone`. A
+    // real number makes the outbound `to` valid; leaving it in the id column
+    // is what forced a BSUID into `to` and produced Meta's (#131009) "phone
+    // number format is incorrect".
+    if (!updates.phone && !storedIsDialable) {
+      const storedIdPhone = [existingContact.wa_id, existingContact.recipient_id]
+        .map((value: unknown) => (typeof value === 'string' ? value : ''))
+        .find((value) => isPhoneLike(value))
+      if (storedIdPhone) updates.phone = normalizePhone(storedIdPhone)
+    }
+
     if (name && !existingContact.name) updates.name = name
     // Only when the row has none: a handle typed by a human in the CRM is
     // authoritative and must not be replaced by a later payload.

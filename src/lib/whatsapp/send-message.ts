@@ -512,9 +512,10 @@ export async function sendMessageToConversation(
   // timers would deliver it. A bare `@handle` is still not a deliverable
   // destination (ESCENARIO C) and keeps the structured 422.
   let resolved: ResolvedRecipient;
-  if (cascadeReport.finalTo) {
+  const cascadeTo = cascadeReport.finalTo;
+  if (cascadeTo && isDialablePhone(cascadeTo)) {
     resolved = {
-      to: cascadeReport.finalTo,
+      to: cascadeTo,
       source:
         cascadeReport.chosen === 'latest_inbound_from'
           ? 'recovered'
@@ -522,14 +523,25 @@ export async function sendMessageToConversation(
               cascadeReport.chosen === 'contacts_metadata'
             ? 'phone'
             : 'bsuid',
-      isPhone: isDialablePhone(cascadeReport.finalTo),
+      isPhone: true,
     };
   } else {
+    // The cascade landed an OPAQUE id (or nothing). A real number is always
+    // the better destination — Meta accepts it directly in `to`, while an
+    // opaque id has to travel in `recipient`. So before accepting the opaque
+    // id, ask the SHARED ladder: it can recover a number Meta already used on
+    // this contact's OWN inbound thread (`messages.sender_phone`). Prefer that
+    // number; fall back to the cascade's opaque id, then to the ladder's id.
     const ladder = await resolveRecipient(contact, accountId, conversationId);
-    if (
-      ladder.to &&
-      (isDialablePhone(ladder.to) || isOpaqueMetaId(ladder.to))
-    ) {
+    if (isDialablePhone(ladder.to)) {
+      resolved = ladder;
+    } else if (cascadeTo) {
+      resolved = {
+        to: cascadeTo,
+        source: cascadeReport.chosen === 'latest_inbound_from' ? 'recovered' : 'bsuid',
+        isPhone: false,
+      };
+    } else if (ladder.to && isOpaqueMetaId(ladder.to)) {
       resolved = ladder;
     } else {
       // B) Sin ningún destinatario entregable en NINGUNA fuente: se CANCELA la

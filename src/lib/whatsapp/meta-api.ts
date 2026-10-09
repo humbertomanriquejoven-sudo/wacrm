@@ -283,10 +283,11 @@ export function recipientAddressField(destination: string): Record<string, strin
  * `recipient` while the text path for the very same contact used `to`, so
  * a `@user` contact could receive texts but every image failed.)
  *
- * A number and an opaque Meta id therefore share one canonical form: `to`,
- * carrying the numeric id with any namespace removed
- * (`CO.1486998326437295` → `1486998326437295`), which is what
- * `toMetaTargetId` produces.
+ * A real number travels in `to` (the numeric id with any namespace removed,
+ * which is what `toMetaTargetId` produces). An OPAQUE Meta id — a namespaced
+ * BSUID (`US.…`/`CO.…`/`WAID.…`) or a bare run too long to be E.164 — travels
+ * in `recipient` instead: Meta reads it there, and a BSUID placed in `to` is
+ * answered with (#131009) "the phone number format is incorrect" and dropped.
  *
  * A bare handle is REFUSED (ESCENARIO C). Historically it was forwarded as
  * held (never run through `toMetaTargetId`, which returns only digits and
@@ -305,14 +306,19 @@ export function canonicalToField(destination: string): Record<string, string> {
   const bare = cleanRecipientAddress(destination);
   if (!bare) return { to: '' };
   if (isPlaceholderValue(bare)) return { to: '' };
-  // A real number in any formatting, or an opaque Meta id (namespaced with a
-  // numeric payload, or a pure digit run). Both go through the Inbox's
-  // canonical form — which never leaves letters in `to`.
-  if (
-    isDialablePhone(bare) ||
-    /^[A-Za-z]+\.[\w.-]*\d[\w.-]*$/.test(bare) ||
-    /^\+?\d+$/.test(bare)
-  ) {
+  // An OPAQUE Meta id (a namespaced BSUID such as `US.…`/`CO.…`/`WAID.…`, or
+  // a bare run too long to be E.164) is NOT a phone number: Meta reads it from
+  // its own `recipient` field. Sending it in `to` makes Meta answer (#131009)
+  // "Parameter value is not valid — el formato del número de teléfono es
+  // incorrecto" and drop the message. That is the production failure this
+  // routing fixes. `recipientAddressField` keeps a namespaced id INTACT and
+  // never mangles it through the phone sanitizers; a bare `@handle` still
+  // raises ESCENARIO C there, so no letter-only value is ever sent.
+  if (isOpaqueMetaId(bare)) {
+    return recipientAddressField(bare);
+  }
+  // A real number in any formatting, or a short digit run, travels in `to`.
+  if (isDialablePhone(bare) || /^\+?\d+$/.test(bare)) {
     const to = toMetaTargetId(bare);
     assertDeliverableDestination(to);
     return { to };
@@ -818,33 +824,35 @@ export async function sendTextMessage(
     )
   }
 
-  // #131009 guard: an opaque id (BSUID / wa_id / `@lid` run) is not a cold
-  // destination — Meta accepts it only as a REPLY to a message that person
-  // wrote, and has been observed to answer a bare send with (#131009)
-  // "Recipient phone number not in allowed list" while dropping the message.
-  // Without an anchor there is nothing to quote, so the send is refused
-  // here, before any HTTP request, instead of pretending an attempt was
-  // made. Callers resolve the anchor from the thread (`latestInboundAnchorId`
-  // / `findInboundWamid`) and are expected to fail with their own typed
-  // error first; this is the choke point that keeps a doomed request off
-  // the wire for any caller that misses it.
-  if (!contextMessageId && !isDialablePhone(address)) {
+  // #131009 guard: a short id (`@lid` digit run) or anything else that is
+  // neither a dialable number nor a real opaque Meta id has no addressable
+  // field — but a genuine opaque id (namespaced BSUID or a >14-digit id) is
+  // delivered through Meta's `recipient` field and needs NO anchor. So the
+  // anchor is only required for the ambiguous leftovers; the guard keeps those
+  // off the wire instead of pretending an attempt was made. Callers resolve
+  // the anchor from the thread (`latestInboundAnchorId` / `findInboundWamid`).
+  if (
+    !contextMessageId &&
+    !isDialablePhone(address) &&
+    !isOpaqueMetaId(address)
+  ) {
     console.error(
-      `[send] MISSING CONTEXT (#131009 guard): destination "${address}" is not a dialable phone number and no contextMessageId was supplied — no HTTP request was sent. Anchor the send to this conversation's newest customer wamid.`,
+      `[send] MISSING CONTEXT (#131009 guard): destination "${address}" is not a dialable phone number nor a deliverable opaque Meta id and no contextMessageId was supplied — no HTTP request was sent. Anchor the send to this conversation's newest customer wamid.`,
     )
     throw new InvalidRecipientError(
       address,
-      'destination is an opaque Meta id (BSUID / wa_id / @lid) and no ' +
-        'inbound wamid was supplied to quote: WhatsApp only accepts such a ' +
-        'contact as a reply to one of their own messages (#131009). ' +
+      'destination is not a dialable number nor a deliverable opaque Meta ' +
+        'id and no inbound wamid was supplied to quote (#131009). ' +
         'No HTTP request was sent.',
     )
   }
 
-  // Primary shape, per Meta's documented payload: the destination always
-  // travels in `to`, carrying the numeric id with any namespace and `@`
-  // removed (`CO.1486998326437295` -> `1486998326437295`) — exactly what
-  // `canonicalToField` produces.
+  // Destination field, per Meta's documented payload: a real phone number
+  // travels in `to`; an opaque Meta id (a namespaced BSUID `US.…`/`CO.…`/
+  // `WAID.…`, or a bare id too long to be E.164) travels in `recipient`,
+  // which is what `canonicalToField` now routes. Sending an opaque id in `to`
+  // makes Meta answer (#131009) "the phone number format is incorrect" and
+  // drop the message.
   //
   // ESCENARIO C: a handle is NEVER sent. `canonicalToField` refuses it (an
   // `@username` survives normalization as letters, and toMetaTargetId would
@@ -854,15 +862,14 @@ export async function sendTextMessage(
   // reaches the wire.
   const addressField: Record<string, string> =
     args.recipientField === 'recipient'
-      ? // Escape hatch for the alternate Meta shape (an unstripped id in
-        // `recipient`). Used as a RETRY when Meta rejects the `to` form.
+      ? // Explicit override: always send the address in `recipient`.
         { recipient: address }
       : canonicalToField(address)
-  const targetId = addressField.to || address
+  const targetId = addressField.to || addressField.recipient || address
   if (!targetId) {
     // `canonicalToField` yields `{ to: '' }` only for an empty address or the
     // `unknown` placeholder — both refused above, so this is the guard that
-    // keeps an empty `to` off the wire.
+    // keeps an empty destination off the wire.
     throw new InvalidRecipientError(
       address,
       'no destination is available for this contact after normalization. No HTTP request was sent.',
@@ -874,18 +881,15 @@ export async function sendTextMessage(
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    // `addressField` carries the destination; `context` is what makes Meta
-    // accept an OPAQUE one. An E.164 number needs no anchor. A BSUID / wa_id /
-    // `@lid` id sent bare has been observed to come back as (#131009)
-    // "Recipient phone number not in allowed list", so every caller anchors
-    // it to the contact's own inbound wamid — and the guard above refuses an
-    // opaque destination that arrives without one, keeping the doomed
-    // request off the wire.
+    // `addressField` carries the destination: an E.164 number in `to`, or an
+    // opaque Meta id in `recipient`. A `context` quote is still attached when
+    // one is available (it improves deliverability for a redacted sender), but
+    // an opaque id no longer REQUIRES it — `recipient` is the field Meta reads
+    // for a BSUID.
     //
-    // What quoting still does NOT do is make a bare `@handle` addressable:
-    // Meta answers (#100) Invalid parameter for a handle in `to` whether or
-    // not `context` is present. Resolvers are responsible for never
-    // producing one.
+    // A bare `@handle` is still not addressable: Meta answers (#100) Invalid
+    // parameter for a handle in `to` whether or not `context` is present.
+    // Resolvers are responsible for never producing one.
     ...addressField,
     type: 'text',
     text: { preview_url: false, body: text },
@@ -962,7 +966,7 @@ export async function sendMediaMessage(
   // layer answers 422 instead of letting an unresolvable contact surface
   // as a generic 502.
   const addressField = canonicalToField(to)
-  if (!addressField.to) {
+  if (!addressField.to && !addressField.recipient) {
     console.warn(
       '[send] blocked: media recipient could not be resolved, no HTTP request was made to Meta.',
     )

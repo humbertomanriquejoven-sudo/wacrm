@@ -156,7 +156,7 @@ describe('sendTextMessage recipient shapes', () => {
     expect(body.context).toBeUndefined()
   })
 
-  it('sends a namespaced BSUID as a bare numeric id in "to" (letters stripped)', async () => {
+  it('routes a namespaced BSUID through "recipient", keeping the namespace', async () => {
     await sendTextMessage({
       phoneNumberId: 'PNID',
       accessToken: 'TOKEN',
@@ -165,11 +165,28 @@ describe('sendTextMessage recipient shapes', () => {
       contextMessageId: 'wamid.HBgL_INBOUND',
     })
     const body = sentBody(fetchMock)
-    // Meta rejects letters and dots in `to`; the digits are the real id.
-    expect(body.to).toBe('9988776655443322')
-    expect(body.recipient).toBeUndefined()
-    // …and the reply anchor is mandatory for that id (#131009 guard).
+    // Meta reads an opaque BSUID from `recipient`; in `to` it is rejected
+    // with (#131009) "the phone number format is incorrect".
+    expect(body.recipient).toBe('CO.9988776655443322')
+    expect(body.to).toBeUndefined()
+    // The reply anchor is still attached when available.
     expect(body.context).toEqual({ message_id: 'wamid.HBgL_INBOUND' })
+  })
+
+  it('routes a bare long numeric id through "recipient" without requiring an anchor', async () => {
+    // The production failure: phone="unknown", the only identity is Meta's
+    // numeric id, and it was sent in `to` → (#131009) "el formato del número
+    // de teléfono es incorrecto". A real opaque id goes in `recipient` and
+    // needs no inbound wamid to quote.
+    await sendTextMessage({
+      phoneNumberId: 'PNID',
+      accessToken: 'TOKEN',
+      to: '1008477715690681',
+      text: 'hola',
+    })
+    const body = sentBody(fetchMock)
+    expect(body.recipient).toBe('1008477715690681')
+    expect(body.to).toBeUndefined()
   })
 
   it('supports the alternate "recipient" field as an explicit retry', async () => {

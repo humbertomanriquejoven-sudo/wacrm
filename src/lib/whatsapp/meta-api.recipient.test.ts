@@ -7,33 +7,35 @@ import {
 } from '@/lib/whatsapp/meta-api'
 
 describe('templateRecipientField', () => {
-  // A template addresses an opaque id through `to`, like the Inbox's
-  // sendTextMessage. Using `recipient` here is what produced
-  // "(#100) Invalid parameter".
-  it('puts an opaque BSUID in "to" with the namespace stripped', () => {
+  // An opaque Meta id travels in `recipient`, NOT `to`: a BSUID placed in `to`
+  // is answered by Meta with (#131009) "el formato del número de teléfono es
+  // incorrecto" and the message is dropped (verified in production). The
+  // namespaced form is kept INTACT — `recipient` is where Meta reads a BSUID.
+  it('routes an opaque BSUID to "recipient", keeping the namespace', () => {
     expect(templateRecipientField('CO.1486998326437295')).toEqual({
-      to: '1486998326437295',
+      recipient: 'CO.1486998326437295',
     })
-    expect(templateRecipientField('WAID.987654321')).toEqual({ to: '987654321' })
+    expect(templateRecipientField('WAID.987654321')).toEqual({
+      recipient: 'WAID.987654321',
+    })
   })
 
-  it('puts a long numeric id in "to" unchanged', () => {
+  it('routes a long numeric id to "recipient"', () => {
     expect(templateRecipientField('1486998326437295')).toEqual({
-      to: '1486998326437295',
+      recipient: '1486998326437295',
     })
   })
 
-  it('still normalizes a real number to E.164 digits', () => {
+  it('still normalizes a real number to E.164 digits in "to"', () => {
     expect(templateRecipientField('+57 304 455 6788')).toEqual({
       to: '573044556788',
     })
   })
 
   it('NEVER sends a handle — ESCENARIO C refuses it locally', () => {
-    // A bare `@username` is display data, not an address: WhatsApp answers
-    // (#100) Invalid parameter in `to` whether or not the send quotes the
-    // customer's own message. Both spellings (with and without the leading
-    // '@') must be refused before any HTTP request.
+    // A bare `@username` is display data, not an address. Both spellings
+    // (with and without the leading '@') must be refused before any HTTP
+    // request.
     expect(() => templateRecipientField('@jjuanpablo22222')).toThrow(
       InvalidRecipientError
     )
@@ -45,16 +47,18 @@ describe('templateRecipientField', () => {
     )
   })
 
-  it('never emits a "recipient" key', () => {
-    // `to` wins when both are present, so mixing them is how the two
-    // shapes drifted apart in the first place.
+  it('never emits BOTH "to" and "recipient" at once', () => {
+    // `to` wins when both are present, so they are mutually exclusive.
     for (const value of [
       '573044556788',
       'CO.1486998326437295',
       '1486998326437295',
+      '1486998326437295@lid',
+      '22222',
     ]) {
-      expect(templateRecipientField(value).recipient).toBeUndefined()
-      expect(templateRecipientField(value).to).toBeTruthy()
+      const field = templateRecipientField(value)
+      expect(Boolean(field.to) && Boolean(field.recipient)).toBe(false)
+      expect(field.to || field.recipient).toBeTruthy()
     }
   })
 
@@ -68,12 +72,17 @@ describe('templateRecipientField', () => {
     }
   })
 
-  it('reduces a BSUID to its digits whatever namespace it carries', () => {
-    // The exact forms `resolveBroadcastAddress` can return, and the shape
-    // Meta requires in `to`.
-    expect(templateRecipientField('CO.1486098326437295').to).toBe('1486098326437295')
-    expect(templateRecipientField('1486098326437295').to).toBe('1486098326437295')
-    expect(templateRecipientField('1486098326437295@lid').to).toBe('1486098326437295')
+  it('routes every BSUID shape to "recipient" whatever namespace it carries', () => {
+    // The exact forms `resolveBroadcastAddress` can return.
+    expect(templateRecipientField('CO.1486098326437295')).toEqual({
+      recipient: 'CO.1486098326437295',
+    })
+    expect(templateRecipientField('1486098326437295')).toEqual({
+      recipient: '1486098326437295',
+    })
+    expect(templateRecipientField('1486098326437295@lid')).toEqual({
+      recipient: '1486098326437295',
+    })
   })
 })
 
