@@ -99,6 +99,7 @@ export interface ContactInput {
   name?: string | null;
   email?: string | null;
   company?: string | null;
+  direccion_entrega?: string | null;
 }
 
 /**

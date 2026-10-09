@@ -481,6 +481,8 @@
         "name": "이름",
         "phone": "전화번호",
         "username": "사용자명",
+        "waId": "와이파이 ID",
+        "waUser": "와이파이 사용자",
         "email": "이메일",
         "company": "회사",
         "tags": "태그",

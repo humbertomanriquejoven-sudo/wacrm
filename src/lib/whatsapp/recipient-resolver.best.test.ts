@@ -51,13 +51,37 @@ describe('resolveBestRecipient — generic identifier priority', () => {
     expect(r.to).toBe('123456789012345')
   })
 
-  it('REFUSES a BSUID when there is no wa_id (CASO C)', async () => {
+it('delivers a BSUID even when there is no wa_id (CASO C)', async () => {
     const r = await resolveBestRecipient({
       phone: 'unknown',
       wa_user_id: 'CO.999',
     })
-    expect(r.to).toBe('')
-    expect(r.source).toBe('wa_id')
+    // El BSUID viaja en el campo `recipient` (campo `to` vacío es vǣlido
+    // cuando el routing usa `recipient`). Se confirma que el identificador
+    // se entrega y no se rechaza.
+    expect(r.to).toBe('CO.999')
+    expect(r.isBsuid).toBe(true)
+    expect(r.source).toBe('bsuid')
+  })
+
+it('preserves full BSUID CO.1486998326437295 without truncation', async () => {
+    const r = await resolveBestRecipient({
+      phone: 'unknown',
+      wa_user_id: 'CO.1486998326437295',
+    })
+    expect(r.to).toBe('CO.1486998326437295')
+    expect(r.isBsuid).toBe(true)
+    expect(r.source).toBe('bsuid')
+  })
+
+  it('preserves full BSUID CO.1008477715690681 without truncation', async () => {
+    const r = await resolveBestRecipient({
+      phone: 'unknown',
+      wa_user_id: 'CO.1008477715690681',
+    })
+    expect(r.to).toBe('CO.1008477715690681')
+    expect(r.isBsuid).toBe(true)
+    expect(r.source).toBe('bsuid')
   })
 
   it('uses recipient_id when neither phone, wa_id nor BSUID is present', async () => {

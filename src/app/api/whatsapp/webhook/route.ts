@@ -1070,7 +1070,7 @@ async function processMessage(
         : senderUsername
           ? 'username'
           : 'unknown',
-    wa_user_id: senderUserId ? `${senderUserId.slice(0, 4)}…` : null,
+    wa_user_id: senderUserId ? senderUserId : null,
     username: senderUsername,
   })
 
