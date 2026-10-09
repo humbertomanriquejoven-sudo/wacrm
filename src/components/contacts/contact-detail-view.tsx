@@ -73,6 +73,9 @@ export function ContactDetailView({
   const [editPhone, setEditPhone] = useState('');
   const [editEmail, setEditEmail] = useState('');
   const [editCompany, setEditCompany] = useState('');
+  const [editWaId, setEditWaId] = useState('');
+  const [editWaUser, setEditWaUser] = useState('');
+  const [editDireccionEntrega, setEditDireccionEntrega] = useState('');
   const [savingDetails, setSavingDetails] = useState(false);
 
   // Tags tab
@@ -112,6 +115,9 @@ export function ContactDetailView({
       setEditPhone(data.phone);
       setEditEmail(data.email ?? '');
       setEditCompany(data.company ?? '');
+      setEditWaId(data.wa_id ?? '');
+      setEditWaUser(data.wa_user_id ?? '');
+      setEditDireccionEntrega(data.direccion_entrega ?? '');
     }
     setLoading(false);
   }, [contactId, supabase]);
@@ -232,6 +238,9 @@ export function ContactDetailView({
         name: editName.trim() || null,
         email: editEmail.trim() || null,
         company: editCompany.trim() || null,
+        wa_id: editWaId.trim() || null,
+        wa_user_id: editWaUser.trim() || null,
+        direccion_entrega: editDireccionEntrega.trim() || null,
         updated_at: new Date().toISOString(),
       })
       .eq('id', contactId);
@@ -541,6 +550,30 @@ export function ContactDetailView({
                     <Input
                       value={editCompany}
                       onChange={(e) => setEditCompany(e.target.value)}
+                      className="bg-muted border-border text-foreground h-8 text-sm"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-muted-foreground text-xs">WA ID</Label>
+                    <Input
+                      value={editWaId}
+                      onChange={(e) => setEditWaId(e.target.value)}
+                      className="bg-muted border-border text-foreground h-8 text-sm"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-muted-foreground text-xs">WA User ID</Label>
+                    <Input
+                      value={editWaUser}
+                      onChange={(e) => setEditWaUser(e.target.value)}
+                      className="bg-muted border-border text-foreground h-8 text-sm"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-muted-foreground text-xs">Direccion de entrega</Label>
+                    <Input
+                      value={editDireccionEntrega}
+                      onChange={(e) => setEditDireccionEntrega(e.target.value)}
                       className="bg-muted border-border text-foreground h-8 text-sm"
                     />
                   </div>
