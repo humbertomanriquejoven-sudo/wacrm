@@ -802,7 +802,10 @@ export async function sendMessageToConversation(
   );
 
   const attempt = async (phone: string): Promise<string> => {
-    const anchor = await anchorFor(phone);
+    // Evaluar direccionEntrega del contacto para determinar campo de destinatario
+    const deliveryAddress = contact.direccion_entrega || ''
+    const isBsuid = deliveryAddress && !isDialablePhone(deliveryAddress) && !isOpaqueWaId(deliveryAddress)
+    const anchor = await anchorFor(phone)
     // Determine the recipient field shape: BSUID goes in `recipient`, phone/wa_id go in `to`.
     // The Meta API helpers (sendTextMessage, sendMediaMessage, etc.) already
     // handle this via canonicalToField, which routes isBsuid → recipient and
@@ -811,7 +814,7 @@ export async function sendMessageToConversation(
       const result = await sendTemplateMessage({
         phoneNumberId: senderPhoneNumberId,
         accessToken,
-        ...(resolved.isBsuid ? { recipient: phone } : { to: phone }),
+        ...(isBsuid ? { recipient: deliveryAddress } : { to: deliveryAddress }),
         templateName: templateName!,
         language: sendLanguage,
         template: templateRow ?? undefined,

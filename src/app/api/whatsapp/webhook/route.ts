@@ -2700,6 +2700,7 @@ async function findOrCreateContact(
     phone_number_id?: string
     identity_type?: 'PHONE_E164' | 'BSUID' | 'USERNAME' | 'LID'
     display_name?: string
+    wa_user_id?: string
   }
 ): Promise<ContactOutcome | null> {
   const db = supabaseAdmin()
@@ -2820,7 +2821,26 @@ async function findOrCreateContact(
     // in `phone` and we're about to write a real number there.
     if (waUserId && !existingContact.wa_user_id) updates.wa_user_id = waUserId
 
-    // Meta Cloud API v26.0 identity columns (migration 053)
+    // LÓGICA DE DIRECCIÓN DE ENTREGA (direccionEntrega)
+    // Reglas de negocio:
+    // 1. Si el contacto tiene wa_id válido, asignarlo a direccionEntrega
+    // 2. Si no tiene wa_id pero tiene BSUID (wa_user_id), guardar BSUID completo
+    // 3. Si tiene ambos, priorizar wa_id en direccionEntrega
+    // 4. NUNCA usar username como dirección de entrega
+    const hasWaId = !!(existingContact.wa_id && existingContact.wa_id.trim())
+    const incomingWaId = metaIdentity?.wa_id ?? null
+    const incomingWaUserId = metaIdentity?.wa_user_id ?? null
+
+    // Priorizar wa_id entrante si existe y el actual no tiene wa_id, o si el actual tiene solo wa_user_id
+    if (incomingWaId && incomingWaId.trim() && (!hasWaId || !existingContact.wa_user_id)) {
+      updates.direccionEntrega = incomingWaId
+    }
+    // Si no hay wa_id, usar BSUID entrante (guardar tal cual, sin modificar ni recortar)
+    else if (incomingWaUserId && incomingWaUserId.trim() && !hasWaId) {
+      updates.direccionEntrega = incomingWaUserId
+    }
+
+    // ...resto del código
     if (metaIdentity?.phone_number_id && !existingContact.phone_number_id) updates.phone_number_id = metaIdentity.phone_number_id
     if (metaIdentity?.identity_type && !existingContact.identity_type) updates.identity_type = metaIdentity.identity_type
     if (metaIdentity?.display_name && !existingContact.display_name) updates.display_name = metaIdentity.display_name
