@@ -73,6 +73,14 @@ vi.mock('./admin-client', () => ({
 vi.mock('@/lib/whatsapp/meta-api', () => ({
   sendTextMessage: vi.fn(),
   sendTypingIndicator: vi.fn(),
+  // `recipient-resolver` pulls this helper from `meta-api`; keep it faithful.
+  cleanRecipientAddress: (address: string) =>
+    (address ?? '')
+      .trim()
+      .replace(/@(lid|user|c.us)\b/gi, '')
+      .trim()
+      .replace(/^@/, '')
+      .trim(),
 }))
 
 vi.mock('@/lib/whatsapp/encryption', () => ({

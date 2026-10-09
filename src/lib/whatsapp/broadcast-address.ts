@@ -571,10 +571,13 @@ export async function persistRecoveredAddress(
 /**
  * Is this string something Meta will accept as a `to`?
  *
- * The single deliverability gate. An E.164 number qualifies; so does an opaque
- * id (a BSUID, or a namespaced id such as `CO.*`). A bare `@handle` does NOT:
- * Meta rejects handles on the send endpoint, so admitting one here is how a
- * broadcast ends up marked `sent` for a message that was never sent.
+ * The single deliverability gate. An E.164 number qualifies; so does a
+ * numeric opaque wa_id (the CASO B privacy-shielded id — the caller is
+ * responsible for the `context.message_id` anchor). A namespaced BSUID
+ * (`CO.*`) and a bare `@handle` do NOT: identity markers are never
+ * destinations (CASO C), and Meta rejects handles on the send endpoint,
+ * so admitting one here is how a broadcast ends up marked `sent` for a
+ * message that was never sent.
  */
 export function isDeliverableAddress(to: string): boolean {
   return (

@@ -181,30 +181,63 @@ export function normalizeMetaIdentifier(value: string | null | undefined): strin
   return isMetaIdentifier(trimmed) ? trimmed : null
 }
 
+/**
+ * True when `value` is a NAMESPACED Meta BSUID (`CO.…`, `WAID.…`, `LID.…`)
+ * or a public handle (`@…`). These are IDENTITY markers, NEVER a sendable
+ * destination (CASO C): a BSUID belongs in the `wa_user_id` / `bsuid`
+ * column and a handle in `username`, and `resolveRecipient` must never
+ * surface either of them in `to` or `recipient`.
+ */
+export function isNamespacedMetaId(value: string | null | undefined): boolean {
+  if (!value) return false
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  if (trimmed.startsWith('@')) return true
+  if (BSUID_PREFIX_RE.test(trimmed)) return true
+  return /^[A-Za-z]+\.[\w.-]+$/.test(trimmed)
+}
+
+/**
+ * True when `value` is a deliverable-by-quote opaque wa_id: an all-digit run
+ * (optional `+`) that is NOT a dialable E.164 number — the canonical id a
+ * privacy-shielded sender's `messages[0].from` carries.
+ *
+ * CASO B in the recipient engine: such an id is legitimately placed in
+ * `to`, but ONLY as a 24h-window reply that QUOTES one of the owner's own
+ * messages — the caller must attach a `context.message_id` anchor. Sent
+ * cold it has been observed to come back as (#131009) and drop.
+ */
+export function isOpaqueWaId(value: string | null | undefined): boolean {
+  if (!value) return false
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  if (isNamespacedMetaId(trimmed)) return false
+  if (isDialablePhone(trimmed)) return false
+  return /^\+?\d+$/.test(trimmed)
+}
+
 /** The address field(s) Meta's Messages API expects for one recipient. */
 export interface MetaRecipientFields {
-  /** A phone number goes here. Omitted when the address is a BSUID/handle. */
+  /** A phone number or a numeric opaque wa_id goes here. */
   to?: string
-  /** A BSUID (or parent BSUID) goes here. Omitted for phone numbers. */
+  /** A BSUID/handle would go here — but those are REFUSED (CASO C), so this
+   *  is now reserved for legacy callers; deliverable addresses always use `to`. */
   recipient?: string
 }
 
 /**
  * Route an outbound address to the field Meta actually reads.
  *
- * A dialable number keeps going in `to` exactly as before. Anything else —
- * a BSUID, or a public @handle as a last resort — is opaque to Meta's
- * number rules and must travel in `recipient`, with `recipient_type`
- * already set to "individual" by the caller.
- *
- * Both fields are supported by the API, but when both are present `to`
- * wins. So the two are mutually exclusive here: sending a BSUID in `to`
- * is the silent-drop bug this exists to prevent.
+ * A dialable number keeps going in `to` exactly as before (CASO A), and a
+ * numeric opaque wa_id also travels in `to` (CASO B). Only a namespaced
+ * BSUID or an `@handle` — identity markers that are NEVER a destination
+ * (CASO C) — would land in `recipient`; the send path refuses those before
+ * this helper is ever reached.
  */
 export function metaRecipientFields(address: string): MetaRecipientFields {
   const value = (address ?? '').trim()
   if (!value) return { to: '' }
-  if (isDialablePhone(value)) return { to: value }
+  if (isDialablePhone(value) || isOpaqueWaId(value)) return { to: value }
   return { recipient: value }
 }
 

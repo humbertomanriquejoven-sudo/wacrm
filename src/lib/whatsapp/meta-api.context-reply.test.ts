@@ -77,12 +77,12 @@ describe('toMetaTargetId', () => {
 })
 
 describe('isOpaqueMetaId', () => {
-  it('accepts a namespaced BSUID', () => {
-    expect(isOpaqueMetaId('CO.9988776655443322')).toBe(true)
+  it('REFUSES a namespaced BSUID — identity data, not a deliverable opaque wa_id', () => {
+    expect(isOpaqueMetaId('CO.9988776655443322')).toBe(false)
   })
 
-  it('accepts a LID-namespaced id', () => {
-    expect(isOpaqueMetaId('LID.99887766')).toBe(true)
+  it('REFUSES a LID-namespaced id', () => {
+    expect(isOpaqueMetaId('LID.99887766')).toBe(false)
   })
 
   it('accepts a bare digit run too long to be a phone number', () => {
@@ -93,8 +93,8 @@ describe('isOpaqueMetaId', () => {
     expect(isOpaqueMetaId('573044556788')).toBe(false)
   })
 
-  it('rejects a short numeric id scraped out of a @lid display id', () => {
-    expect(isOpaqueMetaId('123456')).toBe(false)
+  it('accepts a short numeric id scraped out of an @lid display id', () => {
+    expect(isOpaqueMetaId('123456')).toBe(true)
   })
 
   it('rejects an empty address', () => {
@@ -156,51 +156,60 @@ describe('sendTextMessage recipient shapes', () => {
     expect(body.context).toBeUndefined()
   })
 
-  it('routes a namespaced BSUID through "recipient", keeping the namespace', async () => {
-    await sendTextMessage({
-      phoneNumberId: 'PNID',
-      accessToken: 'TOKEN',
-      to: 'CO.9988776655443322',
-      text: 'hola',
-      contextMessageId: 'wamid.HBgL_INBOUND',
-    })
-    const body = sentBody(fetchMock)
-    // Meta reads an opaque BSUID from `recipient`; in `to` it is rejected
-    // with (#131009) "the phone number format is incorrect".
-    expect(body.recipient).toBe('CO.9988776655443322')
-    expect(body.to).toBeUndefined()
-    // The reply anchor is still attached when available.
-    expect(body.context).toEqual({ message_id: 'wamid.HBgL_INBOUND' })
+  it('REFUSES a namespaced BSUID even with an anchor — CASO C', async () => {
+    await expect(
+      sendTextMessage({
+        phoneNumberId: 'PNID',
+        accessToken: 'TOKEN',
+        to: 'CO.9988776655443322',
+        text: 'hola',
+        contextMessageId: 'wamid.HBgL_INBOUND',
+      }),
+    ).rejects.toBeInstanceOf(InvalidRecipientError)
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it('routes a bare long numeric id through "recipient" without requiring an anchor', async () => {
-    // The production failure: phone="unknown", the only identity is Meta's
-    // numeric id, and it was sent in `to` → (#131009) "el formato del número
-    // de teléfono es incorrecto". A real opaque id goes in `recipient` and
-    // needs no inbound wamid to quote.
+  it('routes an opaque wa_id through "to" only when anchored (CASO B)', async () => {
+    // The production failure: phone="unknown", the only address is Meta's
+    // numeric wa_id. It travels in `to`, but ONLY anchored to a recent inbound
+    // wamid — sent cold it is dropped, so the guard refuses locally.
     await sendTextMessage({
       phoneNumberId: 'PNID',
       accessToken: 'TOKEN',
       to: '1008477715690681',
       text: 'hola',
+      contextMessageId: 'wamid.HBgL_INBOUND',
     })
     const body = sentBody(fetchMock)
-    expect(body.recipient).toBe('1008477715690681')
-    expect(body.to).toBeUndefined()
+    expect(body.to).toBe('1008477715690681')
+    expect(body.recipient).toBeUndefined()
+    expect(body.context).toEqual({ message_id: 'wamid.HBgL_INBOUND' })
+  })
+
+  it('refuses an opaque wa_id with no anchor to quote (CASO B)', async () => {
+    await expect(
+      sendTextMessage({
+        phoneNumberId: 'PNID',
+        accessToken: 'TOKEN',
+        to: '1008477715690681',
+        text: 'hola',
+      }),
+    ).rejects.toBeInstanceOf(InvalidRecipientError)
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it('supports the alternate "recipient" field as an explicit retry', async () => {
     await sendTextMessage({
       phoneNumberId: 'PNID',
       accessToken: 'TOKEN',
-      to: 'CO.9988776655443322',
+      to: '1008477715690681',
       text: 'hola',
       contextMessageId: 'wamid.HBgL_INBOUND',
       recipientField: 'recipient',
     })
     const body = sentBody(fetchMock)
     // Escape hatch keeps the address intact for Meta's alternate shape.
-    expect(body.recipient).toBe('CO.9988776655443322')
+    expect(body.recipient).toBe('1008477715690681')
     expect(body.to).toBeUndefined()
     expect(body.context).toEqual({ message_id: 'wamid.HBgL_INBOUND' })
   })

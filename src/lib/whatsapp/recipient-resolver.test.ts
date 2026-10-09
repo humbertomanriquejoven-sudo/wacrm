@@ -412,26 +412,30 @@ describe('resolveRecipient - one ladder for all senders', () => {
     })
   })
 
-  it('falls back to wa_id when no number exists anywhere', async () => {
+  it('falls back to an opaque wa_id when no number exists anywhere', async () => {
     const r = await resolveRecipient(
-      { id: 'c1', phone: null, wa_id: '5511999999999' },
+      { id: 'c1', phone: null, wa_id: '1486998326437295' },
       'acct-1',
     )
-    expect(r.to).toBe('5511999999999')
+    expect(r.to).toBe('1486998326437295')
     expect(r.isPhone).toBe(false)
+    expect(r.source).toBe('wa_id')
   })
 
   it('falls back to recipient_id when wa_id and the BSUID are absent', async () => {
     const r = await resolveRecipient(
-      { id: 'c1', phone: null, wa_user_id: null, recipient_id: '99887766' },
+      { id: 'c1', phone: null, wa_user_id: null, recipient_id: '1486998326437295' },
       'acct-1',
     )
-    expect(r.to).toBe('99887766')
+    expect(r.to).toBe('1486998326437295')
+    expect(r.source).toBe('wa_id')
   })
 
-  it('still resolves a @handle stored in the phone column', async () => {
+  it('REFUSES a @handle stored in the phone column (CASO C)', async () => {
     const r = await resolveRecipient({ id: 'c1', phone: '@tienda' }, 'acct-1')
-    expect(r).toMatchObject({ to: '@tienda', source: 'username', isPhone: false })
+    expect(r.to).toBe('')
+    expect(r.source).toBe('wa_id')
+    expect(r.isPhone).toBe(false)
   })
 
   it('recovers a real number from the contact own thread before any id', async () => {
@@ -491,12 +495,12 @@ describe('resolveRecipient - one ladder for all senders', () => {
     )
     expect(r).toEqual({
       to: '1486998326437295',
-      source: 'bsuid',
+      source: 'wa_id',
       isPhone: false,
     })
   })
 
-  it('falls through to the @handle when the payload id resolves to nothing', async () => {
+  it('REFUSES a @handle when the payload id resolves to nothing (CASO C)', async () => {
     mocks.fromAny.mockImplementation((table: string) => {
       const rows =
         table === 'conversations'
@@ -518,7 +522,7 @@ describe('resolveRecipient - one ladder for all senders', () => {
       'acct-1',
       'conv-1',
     )
-    expect(r).toMatchObject({ to: '@usuario', source: 'username', isPhone: false })
+    expect(r).toMatchObject({ to: '', source: 'wa_id', isPhone: false })
   })
 })
 
@@ -536,7 +540,7 @@ describe('recipientAddressQueue - shared by the AI and the manual sender', () =>
     })
   })
 
-  it('includes opaque ids, which the old AI-only queue filtered out', async () => {
+  it('includes dialable and opaque numeric ids, but never a BSUID or handle', async () => {
     const queue = await recipientAddressQueue(
       {
         id: 'c1',
@@ -551,11 +555,14 @@ describe('recipientAddressQueue - shared by the AI and the manual sender', () =>
       'conv-1',
     )
 
+    // The namespaced primary is kept as-is (retry hatch); the numeric wa_id
+    // and recipient_id become CASO A/B destinations.
     expect(queue[0]).toBe('CO.9988776655443322')
     expect(queue).toContain('5511999999999')
-    expect(queue).toContain('9988776655443322')
     expect(queue).toContain('99887766')
-    expect(queue).toContain('@tienda')
+    // A BSUID and a username are identity markers, never queued.
+    expect(queue).not.toContain('9988776655443322')
+    expect(queue).not.toContain('@tienda')
   })
 
   it('de-duplicates, so an unchanged contact yields one entry', async () => {

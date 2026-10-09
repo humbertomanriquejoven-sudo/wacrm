@@ -426,8 +426,8 @@ function resetState() {
   h.state.conversation = { follow_up_enabled: null, response_wait_enabled: true }
   h.state.contacts = {
     'contact-1': {
-      username: '@han411',
-      phone: null,
+      username: null,
+      phone: '573001234567',
       wa_id: null,
       wa_user_id: null,
       recipient_id: null,

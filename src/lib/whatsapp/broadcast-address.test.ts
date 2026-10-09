@@ -1014,10 +1014,10 @@ describe('resolveRecipientAddresses - the pipeline shared by creation and retry'
     expect(l.selects).toEqual([])
   })
 
-  it('classifies destinations: numbers and opaque ids yes, handles no', () => {
+  it('classifies destinations: numbers and numeric opaque ids yes, namespaced ids and handles no', () => {
     expect(isDeliverableAddress('573001234567')).toBe(true)
     expect(isDeliverableAddress('1486998326437295')).toBe(true)
-    expect(isDeliverableAddress('CO.09988776655443322')).toBe(true)
+    expect(isDeliverableAddress('CO.09988776655443322')).toBe(false)
     expect(isDeliverableAddress('@juanpablo')).toBe(false)
     expect(isDeliverableAddress('unknown')).toBe(false)
     expect(isDeliverableAddress('')).toBe(false)

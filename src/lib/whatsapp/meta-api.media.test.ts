@@ -81,14 +81,9 @@ describe("sendMediaMessage — payload shape", () => {
 });
 
 // ---------------------------------------------------------------
-// Recipient addressing — an opaque Meta id travels in `recipient`,
-// a phone number in `to`.
-//
-// Putting an opaque id (a BSUID / long numeric id) in `to` is what
-// makes Meta answer (#131009) "el formato del número de teléfono es
-// incorrecto" and drop the message. Media shares the SAME routing as
-// text/template (`canonicalToField`), so all three address an opaque
-// id identically.
+// Recipient addressing — a phone number (CASO A) and a numeric opaque
+// wa_id (CASO B) both travel in `to`; a namespaced BSUID / handle is
+// refused (CASO C).
 // ---------------------------------------------------------------
 describe("sendMediaMessage — recipient addressing", () => {
   beforeEach(() => {
@@ -105,25 +100,25 @@ describe("sendMediaMessage — recipient addressing", () => {
     expect(captured?.recipient).toBeUndefined();
   });
 
-  it("puts a numeric BSUID in `recipient`, never in `to`", async () => {
-    // The contact's ONLY identity is the 16-digit id the `@user`/`@lid`
-    // sender resolves to. Meta reads it from `recipient`; in `to` it is
-    // rejected with (#131009).
+  it("puts a numeric opaque wa_id in `to` (CASO B)", async () => {
+    // The contact's ONLY identity is the 16-digit id the privacy-shielded
+    // sender resolves to. It travels in `to`, anchored to a context quote.
     await sendMediaMessage({ ...BASE, to: "1486998326437295", kind: "image" });
-    expect(captured?.recipient).toBe("1486998326437295");
-    expect(captured?.to).toBeUndefined();
+    expect(captured?.to).toBe("1486998326437295");
+    expect(captured?.recipient).toBeUndefined();
   });
 
-  it("keeps a CO./WAID. namespace intact and sends it in `recipient`", async () => {
-    await sendMediaMessage({ ...BASE, to: "CO.1486998326437295", kind: "document" });
-    expect(captured?.recipient).toBe("CO.1486998326437295");
-    expect(captured?.to).toBeUndefined();
+  it("REFUSES a CO./WAID. namespaced BSUID — identity, never a destination", async () => {
+    await expect(
+      sendMediaMessage({ ...BASE, to: "CO.1486998326437295", kind: "document" }),
+    ).rejects.toBeInstanceOf(InvalidRecipientError);
+    expect(captured).toBeNull();
   });
 
   it("drops an `@user` / `@lid` routing suffix before addressing", async () => {
     await sendMediaMessage({ ...BASE, to: "1486998326437295@lid", kind: "image" });
-    expect(captured?.recipient).toBe("1486998326437295");
-    expect(captured?.to).toBeUndefined();
+    expect(captured?.to).toBe("1486998326437295");
+    expect(captured?.recipient).toBeUndefined();
   });
 
   it("NEVER sends a handle — ESCENARIO C refuses before the wire", async () => {

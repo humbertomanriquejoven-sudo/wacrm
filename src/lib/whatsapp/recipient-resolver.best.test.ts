@@ -34,7 +34,7 @@ describe('resolveBestRecipient — generic identifier priority', () => {
     })
     expect(r.to).toBe('123456789012345')
     expect(r.isPhone).toBe(false)
-    expect(r.source).toBe('bsuid')
+    expect(r.source).toBe('wa_id')
   })
 
   it('normalizes a phone carrying + and spaces down to digits', async () => {
@@ -51,12 +51,13 @@ describe('resolveBestRecipient — generic identifier priority', () => {
     expect(r.to).toBe('123456789012345')
   })
 
-  it('falls back to the BSUID when there is no wa_id', async () => {
+  it('REFUSES a BSUID when there is no wa_id (CASO C)', async () => {
     const r = await resolveBestRecipient({
       phone: 'unknown',
       wa_user_id: 'CO.999',
     })
-    expect(r.to).toBe('CO.999')
+    expect(r.to).toBe('')
+    expect(r.source).toBe('wa_id')
   })
 
   it('uses recipient_id when neither phone, wa_id nor BSUID is present', async () => {
@@ -67,13 +68,13 @@ describe('resolveBestRecipient — generic identifier priority', () => {
     expect(r.to).toBe('99887766')
   })
 
-  it('uses the username as the last resort', async () => {
+  it('REFUSES a username — display data is never a destination (CASO C)', async () => {
     const r = await resolveBestRecipient({
       phone: 'unknown',
       username: 'someone',
     })
-    expect(r.to).toBe('@someone')
-    expect(r.source).toBe('username')
+    expect(r.to).toBe('')
+    expect(r.source).toBe('wa_id')
   })
 
   it('treats a bare digit-run stored in phone as an opaque id, not a number', async () => {

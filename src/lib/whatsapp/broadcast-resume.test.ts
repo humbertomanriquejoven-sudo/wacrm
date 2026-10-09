@@ -249,10 +249,11 @@ function identifierRecipient(
 }
 
 describe('planBroadcastResume', () => {
-  it('resumes a BSUID recipient instead of failing it as unphoneable', async () => {
+  it('resumes a numeric opaque wa_id recipient instead of failing it as unphoneable', async () => {
     // The gap this closes: resume read only contacts.phone and gated it on
     // isValidE164, so a campaign could deliver on the first pass and then
-    // stamp every identifier recipient failed on resume.
+    // stamp every identifier recipient failed on resume. A numeric opaque
+    // wa_id (CASO B) is a valid `to`; a namespaced BSUID is NOT (CASO C).
     const writes: PlanWrites = {};
     const { plan, unsendable } = await planBroadcastResume(
       planDb(
@@ -262,7 +263,7 @@ describe('planBroadcastResume', () => {
           recipients: [
             identifierRecipient('r1', {
               phone: 'unknown',
-              wa_user_id: 'CO.9988776655443322',
+              wa_id: '1486998326437295',
             }),
           ],
         },
@@ -277,7 +278,7 @@ describe('planBroadcastResume', () => {
     expect(plan.planned).toEqual([
       {
         recipientRowId: 'r1',
-        phone: 'CO.9988776655443322',
+        phone: '1486998326437295',
         params: ['A123'],
         contactId: 'c-r1',
       },
@@ -356,7 +357,7 @@ describe('planBroadcastResume', () => {
     ]);
   });
 
-  it('recovers a BSUID from the recipient history payload', async () => {
+  it('recovers a numeric opaque wa_id from the recipient history payload', async () => {
     // Same row, but the address only exists inside the stored Meta payload
     // because Meta disclosed no number on the inbound message.
     const writes: PlanWrites = {};
@@ -374,7 +375,7 @@ describe('planBroadcastResume', () => {
               conversation_id: 'cv-1',
               sender_phone: null,
               raw_meta_payload: {
-                message: { from: 'unknown', from_user_id: 'CO.9988776655443322' },
+                message: { from: 'unknown', from_user_id: '1486998326437295' },
                 contact: { wa_id: '' },
               },
             },
@@ -388,10 +389,9 @@ describe('planBroadcastResume', () => {
     );
 
     expect(unsendable).toBe(0);
-    // Namespaced form is kept verbatim: 	oMetaTargetId strips the 'CO.'
-    // at the payload boundary, and stripping it here would lose the
-    // namespace that distinguishes a BSUID from a phone number.
-    expect(plan.planned[0].phone).toBe('CO.9988776655443322');
+    // A numeric id is forwarded verbatim; a namespaced BSUID is identity
+    // data and would be refused (CASO C).
+    expect(plan.planned[0].phone).toBe('1486998326437295');
   });
 
   it('anchors each resumed template to that contact\'s own inbound wamid', async () => {

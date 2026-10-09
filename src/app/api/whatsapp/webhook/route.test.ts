@@ -1482,25 +1482,22 @@ describe('inbound webhook: Meta identity columns (migration 053)', () => {
     for (const cb of h.state.afterCallbacks) await cb()
 
     const insert = h.state.contactInsertCalls[0]
-    // The BSUID is carried by its own column instead of being pushed into
-    // `wa_id`, which is where Meta's 'unknown' placeholder would otherwise
-    // land.
+    // CASO C: the BSUID is carried by its OWN column only. It must never be
+    // pushed into `wa_id` / `recipient_id` — those are destinations, and a
+    // namespaced BSUID in `to` is rejected by Meta (#131009).
     expect(insert).toMatchObject({
       wa_user_id: '9988776655443322',
       identity_type: 'BSUID',
       phone_number_id: 'pn-1',
     })
     // `phone` is NOT NULL and this sender disclosed no number, so the row
-    // legitimately holds the placeholder there — pre-existing behavior, and
-    // precisely why the numerical-identity columns have to carry the address.
+    // legitimately holds the placeholder there.
     expect(insert.phone).toBe('unknown')
-    // `wa_id` / `recipient_id` are hydrated from the BSUID rather than left
-    // NULL, so a row created by a hidden-number sender is deliverable on the
-    // very first broadcast attempt with no backfill pass in between. What this
-    // test still forbids is the PLACEHOLDER reaching them: idx_contacts_wa_id
-    // indexes any non-empty value as a real id.
-    expect(insert.wa_id).toBe('9988776655443322')
-    expect(insert.recipient_id).toBe('9988776655443322')
+    // `wa_id` / `recipient_id` are numeric destinations only; the BSUID is
+    // NOT hydrated into them, and the 'unknown' placeholder never reaches
+    // them (idx_contacts_wa_id indexes any non-empty value as a real id).
+    expect(insert.wa_id ?? null).toBeNull()
+    expect(insert.recipient_id ?? null).toBeNull()
     expect(
       JSON.stringify([
         insert.wa_id,

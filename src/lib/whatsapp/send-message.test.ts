@@ -991,12 +991,10 @@ describe('sendMessageToConversation - destination cascade (S3/S4/S5 conversation
     );
   });
 
-  it('falls back to the shared ladder for a namespaced id too short for the digits-only cascade', async () => {
-    // UNIFIED RESOLUTION. `WAID.1234567` is a valid namespaced Meta id, but its
-    // payload is under the cascade's 8-digit floor, so the waterfall finds
-    // nothing. The shared `resolveRecipient` ladder (the one the timers and
-    // broadcast use) keeps the prefix and delivers it. A bare `@handle` would
-    // still be rejected by the 422 below.
+  it('REFUSES a namespaced BSUID at the shared ladder (CASO C)', async () => {
+    // `WAID.1234567` is a namespaced Meta id: identity data, never a
+    // destination. Even with an inbound wamid available, the send is refused
+    // locally (422) before Meta sees anything.
     const db = sendPathDb(
       [],
       {},
@@ -1011,19 +1009,16 @@ describe('sendMessageToConversation - destination cascade (S3/S4/S5 conversation
       }
     );
 
-    await sendMessageToConversation(db, 'acct-1', {
+    const err = await sendMessageToConversation(db, 'acct-1', {
       conversationId: 'cv-1',
       messageType: 'text',
       contentText: 'Hola',
-    });
+    }).catch((e: unknown) => e);
 
+    expect(err).toBeInstanceOf(SendMessageError);
+    expect((err as SendMessageError).code).toBe('no_delivery_destination');
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
-    expect(sendTextMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        to: 'WAID.1234567',
-        contextMessageId: 'wamid.INBOUND',
-      })
-    );
+    expect(sendTextMessage).not.toHaveBeenCalled();
   });
 });
 

@@ -29,7 +29,6 @@ import {
   sendInteractiveList,
   InvalidRecipientError,
   MetaApiError,
-  isOpaqueMetaId,
   type MediaKind,
 } from '@/lib/whatsapp/meta-api';
 import {
@@ -46,6 +45,7 @@ import {
   toDialable,
   isRecipientNotAllowedError,
   isPlaceholderValue,
+  isOpaqueWaId,
 } from '@/lib/whatsapp/phone-utils';
 import {
   isDialablePhone,
@@ -470,14 +470,16 @@ export async function sendMessageToConversation(
 
   const accessToken = decrypt(config.access_token);
 
-  // Sender phone_number_id. Preference: the account config, then the number
-  // the webhook recorded on THIS contact (migration 053), then — enforced
-  // inside meta-api's `messagesUrl` — the process env (WHATSAPP_PHONE_NUMBER_ID
-  // / META_PHONE_NUMBER_ID). The `'unknown'` placeholder is never accepted and
-  // the send is refused before any HTTP call, so a POST to
-  // `/{unknown}/messages` is impossible.
+  // Sender phone_number_id. Preference per the recipient engine (rule 1):
+// 1. the number the webhook recorded on THIS conversation (migration 071),
+// 2. the account config, 3. the number recorded on THIS contact (migration
+// 053), then — enforced inside meta-api's `messagesUrl` — the process env
+// (WHATSAPP_PHONE_NUMBER_ID / META_PHONE_NUMBER_ID). The `'unknown'`
+// placeholder is never accepted and the send is refused before any HTTP
+// call, so a POST to `/{unknown}/messages` is impossible.
   const senderPhoneNumberId =
     [
+      (conversation as { phone_number_id?: string | null }).phone_number_id,
       config.phone_number_id,
       (contact as { phone_number_id?: string | null }).phone_number_id,
     ]
@@ -522,11 +524,10 @@ export async function sendMessageToConversation(
   // (`conversations.wa_id`, a channel BSUID, the last inbound `from`) the
   // contact row does not carry. When it lands NOTHING, the SHARED ladder
   // (`resolveRecipient`) — the exact resolver the follow-up timers and the
-  // broadcast path use — gets the final word: a namespaced `WAID.`/`CO.` id
-  // whose payload is too short for the digits-only cascade, or an id Meta left
-  // only in the inbound `raw_meta_payload`, is delivered here exactly as the
-  // timers would deliver it. A bare `@handle` is still not a deliverable
-  // destination (ESCENARIO C) and keeps the structured 422.
+  // broadcast path use — gets the final word under CASO A/B/C: a real E.164
+  // number (CASO A) or a numeric opaque wa_id the contact row does not carry
+  // (CASO B). A namespaced BSUID or a `@username` is NEVER a destination
+  // (CASO C) and keeps the structured 422.
   let resolved: ResolvedRecipient;
   const cascadeTo = cascadeReport.finalTo;
   if (cascadeTo && isDialablePhone(cascadeTo)) {
@@ -538,26 +539,27 @@ export async function sendMessageToConversation(
           : cascadeReport.chosen === 'contacts_phone' ||
               cascadeReport.chosen === 'contacts_metadata'
             ? 'phone'
-            : 'bsuid',
+            : 'wa_id',
       isPhone: true,
     };
   } else {
-    // The cascade landed an OPAQUE id (or nothing). A real number is always
-    // the better destination — Meta accepts it directly in `to`, while an
-    // opaque id has to travel in `recipient`. So before accepting the opaque
-    // id, ask the SHARED ladder: it can recover a number Meta already used on
-    // this contact's OWN inbound thread (`messages.sender_phone`). Prefer that
-    // number; fall back to the cascade's opaque id, then to the ladder's id.
+    // The cascade landed an OPAQUE numeric id (or nothing). A real number is
+    // always the better destination — Meta accepts it directly in `to`, while
+    // an opaque id needs a `context.message_id` anchor (CASO B). So before
+    // accepting the opaque id, ask the SHARED ladder: it can recover a number
+    // Meta already used on this contact's OWN inbound thread
+    // (`messages.sender_phone`). Prefer that number; fall back to the
+    // cascade's opaque id, then to the ladder's numeric id.
     const ladder = await resolveRecipient(contact, accountId, conversationId);
     if (isDialablePhone(ladder.to)) {
       resolved = ladder;
     } else if (cascadeTo) {
       resolved = {
         to: cascadeTo,
-        source: cascadeReport.chosen === 'latest_inbound_from' ? 'recovered' : 'bsuid',
+        source: cascadeReport.chosen === 'latest_inbound_from' ? 'recovered' : 'wa_id',
         isPhone: false,
       };
-    } else if (ladder.to && isOpaqueMetaId(ladder.to)) {
+    } else if (ladder.to && isOpaqueWaId(ladder.to)) {
       resolved = ladder;
     } else {
       // B) Sin ningún destinatario entregable en NINGUNA fuente: se CANCELA la
@@ -567,7 +569,7 @@ export async function sendMessageToConversation(
       const technical =
         `No destination could be resolved for conversation ${conversationId} / contact ${contact.id}: ` +
         `every cascade source was missing, placeholder or non-numeric, and the shared ` +
-        `recipient ladder found no deliverable number, wa_id, BSUID, recipient_id or handle. ` +
+        `recipient ladder found no deliverable number or numeric wa_id (CASO A/B). ` +
         `No HTTP request was sent to Meta.`;
       console.error(
         `[send-message] INVALID RECIPIENT for conversation ${conversationId} / contact ${contact.id}: ${technical}`,
@@ -592,7 +594,7 @@ export async function sendMessageToConversation(
     }
   }
 
-  // VENTANA DE 24 HORAS (BSUID / leads redactados por privacidad de Meta).
+  // VENTANA DE 24 HORAS (contactos opacos / redactados por privacidad de Meta).
   // Un contacto sin teléfono real solo puede recibir mensajes de texto/libre
   // citando SU propio mensaje entrante — y eso exige que haya escrito en las
   // últimas 24h. `latest_inbound_at` no es una columna: se deriva del
@@ -610,13 +612,13 @@ export async function sendMessageToConversation(
     Boolean(resolved.to) && !resolved.isPhone && messageType !== 'template';
   if (needsWindow && !windowOpen) {
     const technical =
-      `BSUID-only contact ${contact.id} (to="${resolved.to}", source=${resolved.source}) ` +
+      `Opaque-id contact ${contact.id} (to="${resolved.to}", source=${resolved.source}) ` +
       `has no inbound customer message within the last 24h ` +
       `(latest_inbound_at=${cascadeReport.latestInboundAt ?? 'none'}) — the ` +
       `customer-service window is closed. Templates are still allowed. ` +
       `No HTTP request was sent to Meta.`;
     console.error(
-      `[send-message] BSUID WINDOW CLOSED for conversation ${conversationId}: ${technical}`,
+      `[send-message] OPAQUE WINDOW CLOSED for conversation ${conversationId}: ${technical}`,
     );
     await recordSendFailure(db, {
       conversationId,
@@ -677,49 +679,66 @@ export async function sendMessageToConversation(
     }
   }
 
-  // A contact we can only identify by an opaque id — a `@user` display id, a
-  // BSUID, a `WAID.`/`LID.` id — CANNOT be addressed as a cold destination in
-  // Meta's `to`: sent bare it has been observed to come back as (#131009)
-  // "Recipient phone number not in allowed list" while the message is dropped.
-  // WhatsApp accepts such a message only as a QUOTE of one of that person's own
-  // messages. The AI path always supplied that anchor, which is why the bot
-  // could answer these contacts while an operator typing the same thing in the
-  // INBOX got a 200 and no delivery.
+  // A contact addressed by a numeric opaque wa_id (CASO B) cannot be sent as
+  // a cold destination in Meta's `to`: sent bare it has been observed to come
+  // back as (#131009) "Recipient phone number not in allowed list" while the
+  // message is dropped. WhatsApp accepts an opaque id only as a QUOTE of one
+  // of that person's own messages. The AI path always supplied that anchor,
+  // which is why the bot could answer these contacts while an operator typing
+  // the same thing in the INBOX got a 200 and no delivery.
   //
   // So when the resolved address is opaque, anchor to the newest inbound wamid
   // in this thread — exactly what `engineSendAiReply` does with the inbound it
   // was answering. Only for opaque addresses: a contact with a dialable number
-  // is addressed directly and is left completely untouched, so the ordinary
-  // case is byte-identical to before. A NUMERIC BSUID / wa_id inside the 24h
-  // window is still sent even when the thread has no inbound wamid to quote —
-  // the anchor improves the send when present, but its absence is no longer
-  // fatal. Nothing is refused here: any other address simply anchors to the
-  // inbound wamid, or Meta rejects it and the mapping returns the structured
-  // 422. (Outside the window the BSUID gate above already refused free-form
-  // sends, so this block only runs while the window is open.)
-  if (!contextMessageId && resolved.to && !resolved.isPhone) {
-    // Meta rechaza un `@handle`/letras con (#131009), pero la escalera ya solo
-    // emite destinos numéricos; cualquier no-numérico que llegue aquí se ancla
-    // al wamid entrante (abajo) o la propia Meta lo rechaza y el mapeo lo
-    // convierte en el 422 estructurado con `how_to_fix`. (Los BSUID/wa_id
-    // numéricos siguen siendo CAMINO B legítimo.)
+  // (CASO A) is addressed directly and is left completely untouched, so the
+  // ordinary case is byte-identical to before. A TEMPLATE is Meta's
+  // business-initiated, out-of-window channel: it is exempt (as it is from the
+  // 24h gate above), because it does not need a customer message to quote. A
+  // numeric wa_id whose thread has NO inbound wamid to quote is REFUSED here
+  // (log + stop, CASO B): Meta only authorizes opaque destinations through
+  // `context`, so a cold send would be a doomed probe.
+  if (
+    !contextMessageId &&
+    resolved.to &&
+    !resolved.isPhone &&
+    messageType !== 'template'
+  ) {
     // `messages` can be RLS-blocked for a user-scoped client, so the anchor is
     // read with the service role — the lookup must never be held hostage by RLS.
     contextMessageId =
       (await latestInboundAnchorId(supabaseAdmin(), conversationId)) ?? undefined;
     if (contextMessageId) {
       console.log(
-        `[send-message] contact ${contact.id} is addressed by an opaque id (${resolved.source}); ` +
+        `[send-message] contact ${contact.id} is addressed by an opaque wa_id (${resolved.source}); ` +
           `anchoring the send to inbound message ${contextMessageId} so WhatsApp accepts it`
       );
     } else {
-      // No inbound wamid to quote, but the address is a strictly numeric
-      // BSUID / wa_id: Meta accepts such a bare id as `to`, so the send is
-      // ALLOWED to go cold (no `context`). A genuinely bad destination is
-      // rejected by Meta itself and mapped to a structured 422.
-      console.warn(
-        `[send-message] contact ${contact.id} is addressed by the numeric id ${resolved.to} (source: ${resolved.source}) ` +
-          `and conversation ${conversationId} has NO inbound wamid to quote — sending WITHOUT a context anchor`
+      // CASO B: an opaque wa_id is deliverable only as a reply to one of the
+      // customer's own messages. With no inbound wamid in the thread there is
+      // nothing to quote, so the send is REFUSED — logging the error and
+      // stopping, exactly as the recipient engine dictates.
+      const technical =
+        `Opaque destination ${resolved.to} (source: ${resolved.source}) for conversation ` +
+        `${conversationId} / contact ${contact.id} has NO inbound customer wamid to quote — ` +
+        `CASO B requires a context.message_id anchor, so the send is refused. ` +
+        `No HTTP request was sent to Meta.`;
+      console.error(`[send-message] CASO B NO ANCHOR: ${technical}`);
+      await recordSendFailure(db, {
+        conversationId,
+        senderType: params.senderType ?? 'agent',
+        messageType,
+        contentText: contentText ?? null,
+        mediaUrl: mediaUrl || null,
+        errorDetail: technical,
+      });
+      throw new SendMessageError(
+        'no_delivery_destination',
+        'Error de entrega de mensaje',
+        422,
+        {
+          diagnosticReport: toDiagnosticHttp(cascadeReport),
+          howToFix: HOW_TO_FIX_BSUID_WINDOW,
+        },
       );
     }
   }
