@@ -561,7 +561,7 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
     expect(sendError.status).toBe(422);
     expect(sendError.code).toBe('bsuid_window_closed');
     expect(sendError.message).toBe(
-      'Ventana de 24h cerrada. El usuario debe enviar un nuevo mensaje para habilitar la respuesta por BSUID.'
+      'Ventana de atención de 24 horas cerrada para este contacto. Para iniciar conversación con un número protegido por Meta se requiere enviar una Plantilla (Template).'
     );
     expect(sendError.windowClosed).toBe(true);
     expect(sendError.howToFix).toBeTruthy();

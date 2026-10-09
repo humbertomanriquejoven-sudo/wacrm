@@ -224,6 +224,22 @@ describe('sendTextMessage recipient shapes', () => {
     expect(body.text).toEqual({ preview_url: false, body: 'respuesta IA' })
   })
 
+  it('NEVER sends an @handle even when an anchor is quoted (ESCENARIO C)', async () => {
+    // The architecture bans a `@username` outright as a `to` value: Meta
+    // answers (#100) Invalid parameter in `to` whether or not `context` is
+    // present, so the refusal happens locally and nothing reaches the wire.
+    await expect(
+      sendTextMessage({
+        phoneNumberId: 'PNID',
+        accessToken: 'TOKEN',
+        to: '@jjuanpablo22222',
+        text: 'respuesta IA',
+        contextMessageId: 'wamid.HBgL_INBOUND',
+      }),
+    ).rejects.toBeInstanceOf(InvalidRecipientError)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('logs the verbatim Meta error envelope under META_API_SEND_ERROR and META_API_REJECTED', async () => {
     fetchMock.mockResolvedValue({
       ok: false,

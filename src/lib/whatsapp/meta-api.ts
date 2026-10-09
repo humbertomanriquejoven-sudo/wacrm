@@ -225,8 +225,10 @@ function recipientFields(address: string): Record<string, string> {
 /**
  * The address field Meta expects for one recipient:
  *
- *   A. `CO.<digits>` / `WAID.<digits>` (or any namespaced Meta id)
- *      — kept INTACT, sent as `recipient`. Never run through
+ *   A. `CO.<digits>` / `WAID.<digits>` (or any namespaced Meta id with a
+ *      NUMERIC payload) — kept INTACT, sent as `recipient`. The payload must
+ *      contain a digit, so a letter-only handle like `acme.store` can never
+ *      masquerade as a namespace (ESCENARIO C). Never run through
  *      `replace(/\D/g,'')`-style sanitizers: stripping the letters and
  *      the dot turns it into a fake phone number.
  *   B. bare digits longer than 14 chars — a numeric BSUID (e.g.
@@ -241,8 +243,9 @@ export function recipientAddressField(destination: string): Record<string, strin
   // InvalidRecipientError instead of putting `unknown` on the wire (Meta
   // answers #100 — or silently drops after a 200).
   if (!value || isPlaceholderValue(value)) return { to: '' }
-  // Case A — namespaced BSUID: keep the prefix and dot intact.
-  if (/^[A-Za-z]+\.[\w.-]+$/.test(value)) {
+  // Case A — namespaced BSUID: keep the prefix and dot intact. The payload
+  // must carry a digit: a letter-only `Name.store` is a handle, not an id.
+  if (/^[A-Za-z]+\.[\w.-]*\d[\w.-]*$/.test(value)) {
     return { recipient: value }
   }
   const digitsOnly = /^\+?\d+$/.test(value)
@@ -258,14 +261,15 @@ export function recipientAddressField(destination: string): Record<string, strin
   // Fallback: treat as a Meta id and send via `recipient`.
   //
   // A digits-only value is forwarded as those digits — even a short run,
-  // because that is genuinely the id we hold. A value containing letters is
-  // forwarded INTACT instead. This used to prefer the stripped digits
-  // (`digits || value`), which reduced an @handle to the few digits it
-  // happened to contain: '@jjuanpablo22222' was sent as recipient:"22222",
-  // and Meta answered "(#100) Invalid parameter". Handing Meta a number we
-  // invented from someone's display name is strictly worse than handing it
-  // the value we actually hold.
-  return { recipient: digitsOnly ? digits : value }
+  // because that is genuinely the id we hold. A value containing digits but
+  // also letters that are NOT a recognized namespace (`jjuanpablo22222`) is
+  // refused by ESCENARIO C: it is a username handle, and handing Meta a
+  // number we invented from someone's display name is strictly worse than
+  // refusing it outright. (Historically the '@' was dropped and the value
+  // forwarded INTACT, and Meta answered "(#100) Invalid parameter".)
+  if (digitsOnly) return { recipient: digits }
+  assertDeliverableDestination(value)
+  return { recipient: value }
 }
 
 /**
@@ -284,11 +288,12 @@ export function recipientAddressField(destination: string): Record<string, strin
  * (`CO.1486998326437295` → `1486998326437295`), which is what
  * `toMetaTargetId` produces.
  *
- * A bare handle is deliberately NOT run through `toMetaTargetId`: that
- * function returns only digits, so it would reduce `@jjuanpablo22222` to
- * `22222` — a number invented from a display name, aimed at whoever owns
- * it. The handle is forwarded as held; what actually makes such a send
- * deliverable is the accompanying `context` quoting a message they wrote.
+ * A bare handle is REFUSED (ESCENARIO C). Historically it was forwarded as
+ * held (never run through `toMetaTargetId`, which returns only digits and
+ * would reduce `@jjuanpablo22222` to `22222` — a number invented from a
+ * display name, aimed at whoever owns it); WhatsApp answers (#100) Invalid
+ * parameter in `to` whether or not `context` is quoted, so refusing here
+ * keeps a doomed request off the wire and surfaces a typed 422.
  *
  * Returns `{ to: '' }` for an empty address and for the placeholder
  * `contacts.phone` is NOT NULL forces the webhook to write (`'unknown'`) —
@@ -300,15 +305,19 @@ export function canonicalToField(destination: string): Record<string, string> {
   const bare = cleanRecipientAddress(destination);
   if (!bare) return { to: '' };
   if (isPlaceholderValue(bare)) return { to: '' };
-  // A real number in any formatting, or an opaque Meta id (namespaced, or a
-  // pure digit run). Both go through the Inbox's canonical form.
+  // A real number in any formatting, or an opaque Meta id (namespaced with a
+  // numeric payload, or a pure digit run). Both go through the Inbox's
+  // canonical form — which never leaves letters in `to`.
   if (
     isDialablePhone(bare) ||
-    /^[A-Za-z]+\.[\w.-]+$/.test(bare) ||
+    /^[A-Za-z]+\.[\w.-]*\d[\w.-]*$/.test(bare) ||
     /^\+?\d+$/.test(bare)
   ) {
-    return { to: toMetaTargetId(bare) };
+    const to = toMetaTargetId(bare);
+    assertDeliverableDestination(to);
+    return { to };
   }
+  assertDeliverableDestination(bare);
   return { to: bare };
 }
 
@@ -392,6 +401,35 @@ export function cleanRecipientAddress(address: string): string {
   const unsuffixed = value.replace(/@(lid|user|c.us)\b/gi, '').trim()
   const bare = unsuffixed.startsWith('@') ? unsuffixed.slice(1).trim() : unsuffixed
   return bare
+}
+
+/** ESCENARIO C copy — a `@username` is NEVER a deliverable destination. */
+const USERNAME_HANDLE_REFUSED =
+  'un @username (handle) nunca es un destinatario válido: WhatsApp no ' +
+  'entrega a "@usuario" ni a identificadores con letras sin dígitos en `to` ' +
+  '(ESCENARIO C). Usa un número E.164 real o un BSUID numérico válido ' +
+  '(wa_id / wa_user_id). No se envió ninguna petición HTTP a Meta.';
+
+/**
+ * ESCENARIO C — refuses any destination that is not a deliverable identifier
+ * BEFORE it can reach Meta. The only two shapes WhatsApp Cloud API can ever
+ * address are a numeric id (`^\d+$`, in `to` — digits-only; bare `recipient`.
+ * `recipient` may also carry a namespaced id) and a namespaced id with a
+ * numeric payload (`CO.1008…`, `WAID.…`, `LID.…`). Anything else — an
+ * `@handle` whose letters survive normalization (`@jjuanpablo22222` →
+ * `jjuanpablo22222`), a letter-only run (`acme.store`, `tienda`) — is display
+ * data, not an address: Meta answers (#100) Invalid parameter in `to` whether
+ * or not `context` is quoted, or silently drops it. Refusing here keeps the
+ * doomed request off the wire and lets every caller surface a typed 422 that
+ * says "the contact has no sendable identifier" instead of a Meta probe.
+ */
+function assertDeliverableDestination(fieldValue: string): void {
+  const value = (fieldValue ?? '').trim()
+  if (!value) return // empty is the caller's `{ to: '' }` signal
+  const numeric = /^\d+$/.test(value)
+  const namespaced = /^[A-Za-z]+\.[\w.-]*\d[\w.-]*$/.test(value)
+  if (numeric || namespaced) return
+  throw new InvalidRecipientError(value, USERNAME_HANDLE_REFUSED)
 }
 
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
@@ -708,13 +746,12 @@ export interface SendTextMessageArgs {
  *      non-dialable destination that arrives WITHOUT an anchor is refused
  *      here, before any HTTP request.
  *
- * Refused locally: an EMPTY address, the `unknown` placeholder, and any
- * non-dialable destination without a `contextMessageId` (the #131009 guard).
- * One thing quoting still does NOT rescue is a bare `@handle`: Meta answers
- * (#100) Invalid parameter for a handle in `to` whether or not `context` is
- * present, so the resolvers (`resolveRecipient` / `resolveBroadcastAddress`)
- * remain responsible for never producing one — a handle that DOES arrive
- * with an anchor is forwarded and judged by Meta.
+ * Refused locally: an EMPTY address, the `unknown` placeholder, any
+ * non-dialable destination without a `contextMessageId` (the #131009 guard),
+ * and ANY `@handle` — ESCENARIO C. A bare `@username` can never be rescued
+ * by quoting: Meta answers (#100) Invalid parameter for a handle in `to`
+ * whether or not `context` is present, so it is refused here before any HTTP
+ * request, and the senders surface a typed 422 in place of a doomed probe.
  */
 export async function sendTextMessage(
   args: SendTextMessageArgs
@@ -809,12 +846,12 @@ export async function sendTextMessage(
   // removed (`CO.1486998326437295` -> `1486998326437295`) — exactly what
   // `canonicalToField` produces.
   //
-  // A bare handle is deliberately NOT run through `toMetaTargetId`: that
-  // function returns only digits, so it reduced `@jjuanpablo22222` to
-  // `22222` — a number invented from someone's display name, aimed at
-  // whoever owns it. The handle is forwarded exactly as held, so Meta's
-  // (#100) (when it declines it) is a truthful statement about the contact
-  // instead of a delivery attempt addressed to a stranger.
+  // ESCENARIO C: a handle is NEVER sent. `canonicalToField` refuses it (an
+  // `@username` survives normalization as letters, and toMetaTargetId would
+  // reduce `@jjuanpablo22222` to `22222` — a number invented from someone's
+  // display name, aimed at whoever owns it). The guard below covers the
+  // alternate `recipient` escape hatch too, so no letter-only value ever
+  // reaches the wire.
   const addressField: Record<string, string> =
     args.recipientField === 'recipient'
       ? // Escape hatch for the alternate Meta shape (an unstripped id in
@@ -831,6 +868,7 @@ export async function sendTextMessage(
       'no destination is available for this contact after normalization. No HTTP request was sent.',
     )
   }
+  assertDeliverableDestination(targetId)
 
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
   const body: Record<string, unknown> = {

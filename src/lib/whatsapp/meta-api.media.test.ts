@@ -125,16 +125,20 @@ describe("sendMediaMessage — recipient addressing (text-path parity)", () => {
     expect(captured?.recipient).toBeUndefined();
   });
 
-  it("strips a leading @ from a handle and forwards the rest intact", async () => {
-    await sendMediaMessage({ ...BASE, to: "@acme.store", kind: "image" });
-    expect(captured?.to).toBe("acme.store");
-    expect(captured?.recipient).toBeUndefined();
-  });
-
-  it("never reduces a digits-bearing handle to a number we invented", async () => {
-    await sendMediaMessage({ ...BASE, to: "@jjuanpablo22222", kind: "image" });
-    expect(captured?.to).toBe("jjuanpablo22222");
-    expect(captured?.to).not.toMatch(/^\d+$/);
+  it("NEVER sends a handle — ESCENARIO C refuses before the wire", async () => {
+    // A bare `@username` in `to` answers (#100) Invalid parameter whether or
+    // not an anchor is quoted. Media now refuses both handle spellings
+    // locally (InvalidRecipientError) instead of probing Meta.
+    await expect(
+      sendMediaMessage({ ...BASE, to: "@acme.store", kind: "image" }),
+    ).rejects.toBeInstanceOf(InvalidRecipientError);
+    await expect(
+      sendMediaMessage({ ...BASE, to: "@jjuanpablo22222", kind: "image" }),
+    ).rejects.toBeInstanceOf(InvalidRecipientError);
+    await expect(
+      sendMediaMessage({ ...BASE, to: "jjuanpablo22222", kind: "image" }),
+    ).rejects.toBeInstanceOf(InvalidRecipientError);
+    expect(captured).toBeNull();
   });
 
   it("refuses a placeholder recipient without sending a request", async () => {

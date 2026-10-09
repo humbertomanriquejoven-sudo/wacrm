@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { recipientAddressField, templateRecipientField } from '@/lib/whatsapp/meta-api'
+import {
+  InvalidRecipientError,
+  recipientAddressField,
+  templateRecipientField,
+} from '@/lib/whatsapp/meta-api'
 
 describe('templateRecipientField', () => {
   // A template addresses an opaque id through `to`, like the Inbox's
@@ -25,15 +29,20 @@ describe('templateRecipientField', () => {
     })
   })
 
-  it('never reduces a handle to the digits it happens to contain', () => {
-    // toMetaTargetId returns digits only, so applying it to a handle
-    // manufactures a number out of someone's display name.
-    expect(templateRecipientField('@jjuanpablo22222')).toEqual({
-      to: 'jjuanpablo22222',
-    })
-    expect(templateRecipientField('jjuanpablo22222')).toEqual({
-      to: 'jjuanpablo22222',
-    })
+  it('NEVER sends a handle — ESCENARIO C refuses it locally', () => {
+    // A bare `@username` is display data, not an address: WhatsApp answers
+    // (#100) Invalid parameter in `to` whether or not the send quotes the
+    // customer's own message. Both spellings (with and without the leading
+    // '@') must be refused before any HTTP request.
+    expect(() => templateRecipientField('@jjuanpablo22222')).toThrow(
+      InvalidRecipientError
+    )
+    expect(() => templateRecipientField('jjuanpablo22222')).toThrow(
+      InvalidRecipientError
+    )
+    expect(() => templateRecipientField('@acme.store')).toThrow(
+      InvalidRecipientError
+    )
   })
 
   it('never emits a "recipient" key', () => {
@@ -43,7 +52,6 @@ describe('templateRecipientField', () => {
       '573044556788',
       'CO.1486998326437295',
       '1486998326437295',
-      '@jjuanpablo22222',
     ]) {
       expect(templateRecipientField(value).recipient).toBeUndefined()
       expect(templateRecipientField(value).to).toBeTruthy()
@@ -94,15 +102,33 @@ describe('recipientAddressField', () => {
     expect(field.recipient).toContain('.')
   })
 
-  it('never reduces an @handle to the digits it happens to contain', () => {
+  it('NEVER sends an @handle — ESCENARIO C refuses it locally', () => {
     // THE "#100 Invalid parameter" bug: the fallback used `digits || value`,
     // so '@jjuanpablo22222' was sent as recipient:"22222" — a number we
-    // invented from someone's display name, which Meta rejects.
-    expect(recipientAddressField('@jjuanpablo22222')).toEqual({
-      recipient: '@jjuanpablo22222',
+    // invented from someone's display name, which Meta rejects. Now no
+    // handle reaches Meta in any form.
+    expect(() => recipientAddressField('@jjuanpablo22222')).toThrow(
+      InvalidRecipientError
+    )
+    expect(() => recipientAddressField('jjuanpablo22222')).toThrow(
+      InvalidRecipientError
+    )
+    expect(() => recipientAddressField('@acme.store')).toThrow(
+      InvalidRecipientError
+    )
+  })
+
+  it('still accepts a BSUID in "recipient": digits or a namespaced numeric id', () => {
+    // ESCENARIO C only bans handles — a real numeric BSUID (bare or
+    // `CO.`/`WAID.`/`LID.`-prefixed) stays deliverable via `recipient`.
+    expect(recipientAddressField('1486998326437295')).toEqual({
+      recipient: '1486998326437295',
     })
-    expect(recipientAddressField('jjuanpablo22222')).toEqual({
-      recipient: 'jjuanpablo22222',
+    expect(recipientAddressField('WAID.987654321')).toEqual({
+      recipient: 'WAID.987654321',
+    })
+    expect(recipientAddressField('LID.99887766')).toEqual({
+      recipient: 'LID.99887766',
     })
   })
 

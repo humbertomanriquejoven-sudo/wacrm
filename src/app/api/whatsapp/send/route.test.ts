@@ -468,7 +468,7 @@ describe('POST /api/whatsapp/send — media recipient + failure mapping', () => 
     expect(json.code).toBe('bsuid_window_closed')
     expect(json.window_closed).toBe(true)
     expect(json.error).toBe(
-      'Ventana de 24h cerrada. El usuario debe enviar un nuevo mensaje para habilitar la respuesta por BSUID.'
+      'Ventana de atención de 24 horas cerrada para este contacto. Para iniciar conversación con un número protegido por Meta se requiere enviar una Plantilla (Template).'
     )
     expect(json.how_to_fix).toBeTruthy()
     expect(json.diagnostic_report).toBeTruthy()

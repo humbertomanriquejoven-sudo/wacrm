@@ -84,7 +84,11 @@ export const REDACTED_BSUID_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h
  * all quote the exact same copy.
  */
 export const HOW_TO_FIX_BSUID_WINDOW =
-  'CÓMO SOLUCIONARLO: 1. Pídele al cliente que envíe un nuevo mensaje por WhatsApp (así se reabre la ventana de 24 h y podrás responderle por BSUID). 2. Si el contacto tiene un teléfono, escríbelo con código de país en el panel derecho y presiona Guardar para poder responder fuera de la ventana con una plantilla.';
+  'CÓMO SOLUCIONARLO: envía una Plantilla (Template) — aunque la ventana de ' +
+  '24 h esté cerrada, una plantilla aprobada inicia una conversación con un ' +
+  'número protegido por Meta. Si además conoces el teléfono real del ' +
+  'contacto, escríbelo con código de país en el panel derecho y presiona ' +
+  'Guardar para habilitar la respuesta libre fuera de la ventana.';
 
 /**
  * Typed failure with a machine `code` and a suggested HTTP `status`.
@@ -574,7 +578,7 @@ export async function sendMessageToConversation(
     });
     throw new SendMessageError(
       'bsuid_window_closed',
-      'Ventana de 24h cerrada. El usuario debe enviar un nuevo mensaje para habilitar la respuesta por BSUID.',
+      'Ventana de atención de 24 horas cerrada para este contacto. Para iniciar conversación con un número protegido por Meta se requiere enviar una Plantilla (Template).',
       422,
       {
         diagnosticReport: toDiagnosticHttp(cascadeReport),
