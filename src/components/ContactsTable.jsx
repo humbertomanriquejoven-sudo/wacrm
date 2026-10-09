@@ -3,19 +3,36 @@ import { supabase } from '@/lib/supabase/client';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Table, TableHeader, TableRow, TableCell, TableBody } from '@/components/ui/table';
-import { AlertTriangle, ChevronDown, X } from 'lucide-react';
+import { ChevronDown, X } from 'lucide-react';
 
 export function ContactsTable() {
   const [contacts, setContacts] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedTab, setSelectedTab] = useState('all');
+
+  const fetchContacts = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      let query = supabase.from('contacts').select('*');
+
+      if (searchQuery) {
+        query = query.or(`name.ilike.%${searchQuery}%,phone.ilike.%${searchQuery}%,wa_id.ilike.%${searchQuery}%,wa_user.ilike.%${searchQuery}%`);
+      }
+
+      const { data, error } = await query.order('created', { ascending: false });
+
+      if (error) throw error;
+      setContacts(data);
+    } catch (err) {
+      console.error('Error fetching contacts:', err);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [searchQuery]);
 
   useEffect(() => {
     fetchContacts();
-  }, []);
-
-  const fetchContacts = async () => {
+  }, [fetchContacts]);
     setIsLoading(true);
     try {
       let query = supabase.from('contacts').select('*');
@@ -53,7 +70,7 @@ export function ContactsTable() {
     { key: 'company', label: 'Company' },
     { key: 'tags', label: 'Tags' },
     { key: 'created', label: 'Created' },
-    { key: 'actions', label: 'Acciones', cell: ({ row }) => (
+    { key: 'actions', label: 'Acciones', cell: () => (
       <div className="flex items-center gap-2">
         <button className="text-gray-400 hover:text-purple-400 transition">
           <X className="h-4 w-4" />
