@@ -477,17 +477,18 @@
       "selectedCount": "{count} selected",
       "clearSelection": "Clear",
       "deleteSelected": "Delete selected",
-      "tableColumns": {
+"tableColumns": {
         "name": "Name",
         "phone": "Phone",
         "username": "Username",
         "waId": "WhatsApp ID",
-        "waUser": "WhatsApp User",
+        "bsuid": "BSUID",
+        "recipientAddress": "Dirección de entrega",
+        "recipientType": "Tipo de envío",
         "email": "Email",
         "company": "Company",
         "tags": "Tags",
-        "createdAt": "Created",
-        "direccionEntrega": "Dirección de entrega"
+        "createdAt": "Created"
       },
       "loading": "Loading contacts...",
       "noContactsMatch": "No contacts match your filters.",

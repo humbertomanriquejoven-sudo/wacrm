@@ -541,12 +541,13 @@ export default function ContactsPage() {
                   aria-label="Select all contacts on this page"
                 />
               </TableHead>
-              <TableHead className="text-muted-foreground">{t('tableColumns.name')}</TableHead>
+<TableHead className="text-muted-foreground">{t('tableColumns.name')}</TableHead>
               <TableHead className="text-muted-foreground">{t('tableColumns.phone')}</TableHead>
               <TableHead className="text-muted-foreground">{t('tableColumns.username')}</TableHead>
               <TableHead className="text-muted-foreground">{t('tableColumns.waId')}</TableHead>
-              <TableHead className="text-muted-foreground">{t('tableColumns.waUser')}</TableHead>
-              <TableHead className="text-muted-foreground">{t('tableColumns.direccionEntrega')}</TableHead>
+              <TableHead className="text-muted-foreground">{t('tableColumns.bsuid')}</TableHead>
+              <TableHead className="text-muted-foreground">{t('tableColumns.recipientAddress')}</TableHead>
+              <TableHead className="text-muted-foreground">{t('tableColumns.recipientType')}</TableHead>
               <TableHead className="text-muted-foreground hidden md:table-cell">{t('tableColumns.email')}</TableHead>
               <TableHead className="text-muted-foreground hidden lg:table-cell">{t('tableColumns.company')}</TableHead>
               <TableHead className="text-muted-foreground hidden md:table-cell">{t('tableColumns.tags')}</TableHead>

@@ -477,17 +477,18 @@
       "selectedCount": "{count}개 선택됨",
       "clearSelection": "지우기",
       "deleteSelected": "선택 항목 삭제",
-      "tableColumns": {
+"tableColumns": {
         "name": "이름",
         "phone": "전화번호",
         "username": "사용자명",
         "waId": "와이파이 ID",
-        "waUser": "와이파이 사용자",
+        "bsuid": "BSUID",
+        "recipientAddress": "Dirección de entrega",
+        "recipientType": "유형 선택",
         "email": "이메일",
         "company": "회사",
         "tags": "태그",
-        "createdAt": "생성일",
-        "direccionEntrega": "Dirección de entrega"
+        "createdAt": "생성일"
       },
       "loading": "연락처를 불러오는 중...",
       "noContactsMatch": "필터와 일치하는 연락처가 없습니다.",
