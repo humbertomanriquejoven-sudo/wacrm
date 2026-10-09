@@ -6,6 +6,11 @@ const h = vi.hoisted(() => {
     followUps: [] as Record<string, unknown>[],
     waitTimers: [] as Record<string, unknown>[],
     messages: [] as Record<string, unknown>[],
+    // Rows the shared recipient ladder reads through its OWN service-role
+    // client (`@/lib/flows/admin-client`) when recovering an identifier from
+    // a contact's thread. `null` / `[]` = nothing recoverable.
+    recoveryConversation: null as Record<string, unknown> | null,
+    recoveryMessages: [] as Record<string, unknown>[],
     aiConfig: { created_by: 'user-owner' } as Record<string, unknown> | null,
     // conversations.follow_up_enabled — null = inherit the account switch.
     // conversations.response_wait_enabled — the Timer 2 ON/OFF switch.
@@ -20,6 +25,7 @@ const h = vi.hoisted(() => {
     contacts: {} as Record<
       string,
       {
+        id?: string | null
         username?: string | null
         phone?: string | null
         wa_id?: string | null
@@ -351,6 +357,34 @@ vi.mock('@/lib/ai/admin-client', () => ({
   }),
 }))
 
+// The shared recipient ladder (`resolveRecipient`) opens its OWN service-role
+// client from `@/lib/flows/admin-client` to recover an address from a contact's
+// thread. Without this mock that client has no env and throws (which the ladder
+// swallows as "nothing recovered"); with it, a test can seed the inbound message
+// that carries the only usable identifier.
+vi.mock('@/lib/flows/admin-client', () => ({
+  supabaseAdmin: () => ({
+    from: (table: string) => {
+      const b: Record<string, unknown> = {}
+      const chain = () => b
+      for (const m of ['select', 'eq', 'in', 'not', 'order']) b[m] = chain
+      b.limit = () =>
+        Promise.resolve({
+          data: table === 'messages' ? h.state.recoveryMessages : [],
+          error: null,
+        })
+      b.maybeSingle = () =>
+        Promise.resolve({
+          data: table === 'conversations' ? h.state.recoveryConversation : null,
+          error: null,
+        })
+      b.then = (resolve: (v: unknown) => unknown) =>
+        resolve({ data: [], error: null })
+      return b
+    },
+  }),
+}))
+
 vi.mock('@/lib/whatsapp/send-message', () => ({
   sendMessageToConversation: h.state.sendMessageToConversation,
 }))
@@ -386,6 +420,8 @@ function resetState() {
   h.state.followUps = []
   h.state.waitTimers = []
   h.state.messages = []
+  h.state.recoveryConversation = null
+  h.state.recoveryMessages = []
   h.state.aiConfig = { created_by: 'user-owner' }
   h.state.conversation = { follow_up_enabled: null, response_wait_enabled: true }
   h.state.contacts = {
@@ -1570,6 +1606,81 @@ describe('follow-ups do NOT depend on a public @handle', () => {
     })
 
     expect(res.scheduled).toBe(true)
+  })
+
+  it('runDueFollowUps SENDS when the id lives only in the inbound payload', async () => {
+    resetState()
+    // No phone, no wa_id, no BSUID, no recipient_id and no @handle: the only
+    // usable identifier is the one Meta attached to the customer's own
+    // message (`raw_meta_payload`). Before the ladder read that source, this
+    // contact resolved to an empty destination and the timer was closed as
+    // `no_response` even though the send core could deliver to it.
+    h.state.contacts['contact-1'] = {
+      id: 'contact-1',
+      username: null,
+      phone: null,
+      wa_id: null,
+      wa_user_id: null,
+      recipient_id: null,
+    }
+    h.state.recoveryConversation = { id: 'conv-1' }
+    h.state.recoveryMessages = [
+      {
+        sender_phone: '@usuario',
+        raw_meta_payload: { contact: { user_id: '1486998326437295' } },
+      },
+    ]
+    h.state.followUps = [
+      {
+        id: 'fu-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        type: '10m',
+        status: 'pending',
+        execute_at: '2026-10-06T12:09:00.000Z',
+      },
+    ]
+    h.state.messages = [{ sender_type: 'bot', content_text: '¡Hola!' }]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
+
+    expect(res).toMatchObject({ scanned: 1, sent: 1, noResponse: 0 })
+    expect(h.state.sendMessageToConversation).toHaveBeenCalledTimes(1)
+    expect(h.state.noResponse).toEqual([])
+  })
+
+  it('still closes the timer when NO source anywhere carries an identifier', async () => {
+    resetState()
+    h.state.contacts['contact-1'] = {
+      username: null,
+      phone: null,
+      wa_id: null,
+      wa_user_id: null,
+      recipient_id: null,
+    }
+    // A bare @handle is not addressable, and the payload holds nothing else.
+    h.state.recoveryConversation = { id: 'conv-1' }
+    h.state.recoveryMessages = [{ sender_phone: '@usuario' }]
+    h.state.followUps = [
+      {
+        id: 'fu-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        type: '10m',
+        status: 'pending',
+        execute_at: '2026-10-06T12:09:00.000Z',
+      },
+    ]
+    h.state.messages = [{ sender_type: 'bot', content_text: '¡Hola!' }]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
+
+    expect(res).toMatchObject({ scanned: 1, sent: 0, noResponse: 1 })
+    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
   })
 })
 

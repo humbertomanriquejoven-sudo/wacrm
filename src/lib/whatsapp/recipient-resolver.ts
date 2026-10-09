@@ -5,6 +5,7 @@ import {
   passthroughMetaId,
   toDialable,
 } from './phone-utils'
+import { metaIdFromRawPayload } from './broadcast-address'
 import { InvalidRecipientError, MetaApiError } from './meta-api'
 import { supabaseAdmin } from '@/lib/flows/admin-client'
 import type { SupabaseClient } from '@supabase/supabase-js'
@@ -49,6 +50,8 @@ export interface RecipientCandidate {
   recipient_id?: string | null
   /** Numeric id Meta used as the inbound `from`. */
   wa_id?: string | null
+  /** The contact's stored `metadata` bag (may hold a `wa_id` / `bsuid`). */
+  metadata?: unknown
 }
 
 /** Where the chosen address came from — useful for logging and tests. */
@@ -194,6 +197,113 @@ async function findPhoneInMessageHistory(
   return null
 }
 
+/** First value in `values` that Meta accepts as an id/number, or null. */
+function firstDeliverableIdentifier(values: readonly unknown[]): string | null {
+  for (const value of values) {
+    const id = passthroughMetaId(typeof value === 'string' ? value : null)
+    if (id) return id
+  }
+  return null
+}
+
+/**
+ * The newest deliverable Meta identifier this contact has ever been addressed
+ * by, from its OWN thread: the id Meta itself attached to the customer's
+ * inbound message.
+ *
+ * `findRecoverablePhone` only surfaces a real NUMBER and only reads
+ * `messages.sender_phone`. A privacy-redacted sender (`@user` / `@lid`) has no
+ * number anywhere, and Meta records their numeric id in
+ * `messages.raw_meta_payload` (`{ message, contact }`) instead. A contact
+ * reachable ONLY through that id was therefore invisible to the shared ladder
+ * while the send core's waterfall could still see it — so a follow-up timer
+ * closed a row the core would have delivered. This reads the SAME sources the
+ * waterfall reads (the conversation-level `wa_id` / `channel_id`, the newest
+ * inbound `sender_phone`, and the stored payload), so every sender resolves
+ * the same address.
+ *
+ * Best-effort by design: any failure yields null and the caller falls through
+ * to the username branch. Never reads another contact's thread.
+ */
+export async function findRecoverableIdentifier(
+  contact: RecipientCandidate,
+  accountId: string,
+  conversationId?: string | null,
+): Promise<string | null> {
+  if (!contact.id) return null
+
+  // The contact row's own `metadata` bag can carry the id when it never made
+  // it into a dedicated column.
+  const meta =
+    contact.metadata && typeof contact.metadata === 'object'
+      ? (contact.metadata as Record<string, unknown>)
+      : null
+  const fromContactMeta = firstDeliverableIdentifier([
+    meta?.wa_id,
+    meta?.bsuid,
+    meta?.channel_id,
+  ])
+  if (fromContactMeta) return fromContactMeta
+
+  const db = supabaseAdmin()
+
+  let ids: string[]
+  if (conversationId) {
+    const { data: conversation } = await db
+      .from('conversations')
+      .select('id, wa_id, channel_id, metadata')
+      .eq('id', conversationId)
+      .eq('account_id', accountId)
+      .eq('contact_id', contact.id)
+      .maybeSingle()
+    if (!conversation) return null
+    const convo = conversation as {
+      id: string
+      wa_id?: string | null
+      channel_id?: string | null
+      metadata?: Record<string, unknown> | null
+    }
+    const fromConversation = firstDeliverableIdentifier([
+      convo.wa_id,
+      convo.channel_id,
+      convo.metadata?.wa_id,
+      convo.metadata?.bsuid,
+      convo.metadata?.channel_id,
+    ])
+    if (fromConversation) return fromConversation
+    ids = [convo.id]
+  } else {
+    const { data: conversations } = await db
+      .from('conversations')
+      .select('id')
+      .eq('account_id', accountId)
+      .eq('contact_id', contact.id)
+      .limit(20)
+    ids = ((conversations ?? []) as Array<{ id: string }>).map((c) => c.id)
+  }
+  if (ids.length === 0) return null
+
+  const { data } = await db
+    .from('messages')
+    .select('sender_phone, raw_meta_payload')
+    .in('conversation_id', ids)
+    .eq('sender_type', 'customer')
+    .order('created_at', { ascending: false })
+    .limit(50)
+
+  for (const row of (data ?? []) as Array<{
+    sender_phone?: string | null
+    raw_meta_payload?: unknown
+  }>) {
+    const id = firstDeliverableIdentifier([
+      row.sender_phone,
+      metaIdFromRawPayload(row.raw_meta_payload),
+    ])
+    if (id) return id
+  }
+  return null
+}
+
 /**
  * Resolve the value Meta should receive in `to`, for any contact.
  *
@@ -208,6 +318,9 @@ async function findPhoneInMessageHistory(
  *   4. `wa_user_id` — the BSUID. Meta accepts a BSUID as the recipient for
  *      BSUID/Threads/API conversations.
  *   5. `recipient_id` — the alternative Meta identifier.
+ *   5b. A numeric id recovered from THIS contact's own inbound message
+ *      (`sender_phone` / `raw_meta_payload`) or its conversation row — the
+ *      trace a `@user`/`@lid` sender leaves without ever touching a column.
  *   6. `username`, as a last resort.
  *
  * `wa_id` and `recipient_id` used to be consulted only by `resolveBestRecipient`,
@@ -254,6 +367,19 @@ export async function resolveRecipient(
   // 5. `recipient_id` — the alternative Meta identifier.
   const recipientId = passthroughMetaId(contact.recipient_id)
   if (recipientId) return { to: recipientId, source: 'bsuid', isPhone: false }
+
+  // 5b. The id Meta left on this contact's OWN inbound message — the only
+  //     trace a privacy-redacted `@user`/`@lid` sender leaves when it never
+  //     made it onto the contact row. Same sources as the send core's
+  //     waterfall, so a timer never closes a row dispatch could deliver.
+  const recoveredId = await findRecoverableIdentifier(
+    contact,
+    accountId,
+    conversationId,
+  ).catch(() => null)
+  if (recoveredId) {
+    return { to: recoveredId, source: 'bsuid', isPhone: false }
+  }
 
   // 6. The public handle, as `@user`.
   const storedHandle =
@@ -326,6 +452,15 @@ export async function recipientAddressQueue(
       )
     }
   }
+
+  // An opaque id recovered from this contact's own inbound payload — the
+  // privacy-redacted `@user` case, where no number exists anywhere.
+  const recoveredId = await findRecoverableIdentifier(
+    contact,
+    accountId,
+    conversationId,
+  ).catch(() => null)
+  push(recoveredId)
 
   push(toDialable(contact.phone))
   push(passthroughMetaId(contact.wa_id))

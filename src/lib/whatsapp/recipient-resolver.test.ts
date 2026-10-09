@@ -8,6 +8,7 @@ import {
   identityFilterParts,
   isRecipientRejection,
   findRecoverablePhone,
+  findRecoverableIdentifier,
   resolveRecipient,
   recipientAddressQueue,
   latestInboundAnchorId,
@@ -278,6 +279,84 @@ describe('findRecoverablePhone', () => {
     expect(queriedTables).not.toContain('contacts')
   })
 })
+
+describe('findRecoverableIdentifier - the @user trace in the inbound payload', () => {
+  function mockTables(tables: Record<string, unknown[]>) {
+    mocks.fromAny.mockImplementation((table: string) => {
+      const rows = tables[table] ?? []
+      const b: Record<string, unknown> = {}
+      const chain = () => b
+      for (const m of ['select', 'eq', 'in', 'not', 'order']) b[m] = vi.fn(chain)
+      b.limit = vi.fn(() => Promise.resolve({ data: rows, error: null }))
+      b.maybeSingle = vi.fn(() =>
+        Promise.resolve({ data: rows[0] ?? null, error: null }),
+      )
+      b.then = (resolve: (v: unknown) => unknown) =>
+        resolve({ data: rows, error: null })
+      return b
+    })
+  }
+
+  it('reads a BSUID out of the newest inbound raw_meta_payload', async () => {
+    // The exact failing shape: no number, no contact column — the id Meta
+    // attached to the customer's own message is the only address there is.
+    mockTables({
+      conversations: [{ id: 'conv-1' }],
+      messages: [
+        {
+          sender_phone: '@usuario',
+          raw_meta_payload: { contact: { user_id: '1486998326437295' } },
+        },
+      ],
+    })
+
+    const id = await findRecoverableIdentifier(
+      { id: 'contact-1', phone: null, username: null },
+      'acct-1',
+      'conv-1',
+    )
+    expect(id).toBe('1486998326437295')
+  })
+
+  it('prefers a namespaced id over a bare handle on the same message', async () => {
+    mockTables({
+      conversations: [{ id: 'conv-1' }],
+      messages: [{ sender_phone: 'WAID.12345678' }],
+    })
+
+    const id = await findRecoverableIdentifier(
+      { id: 'contact-1', phone: null },
+      'acct-1',
+      'conv-1',
+    )
+    expect(id).toBe('WAID.12345678')
+  })
+
+  it('returns null for a pure @handle, which is not addressable', async () => {
+    mockTables({
+      conversations: [{ id: 'conv-1' }],
+      messages: [{ sender_phone: '@usuario', raw_meta_payload: { contact: {} } }],
+    })
+
+    const id = await findRecoverableIdentifier(
+      { id: 'contact-1', phone: null, username: null },
+      'acct-1',
+      'conv-1',
+    )
+    expect(id).toBeNull()
+  })
+
+  it('reads an id stored on the contact metadata bag, needing no query', async () => {
+    mockTables({})
+    const id = await findRecoverableIdentifier(
+      { id: 'contact-1', phone: null, metadata: { wa_id: '1486998326437295' } },
+      'acct-1',
+      'conv-1',
+    )
+    expect(id).toBe('1486998326437295')
+    expect(mocks.fromAny).not.toHaveBeenCalled()
+  })
+})
 // ============================================================
 // One ladder, one queue, for every sender.
 //
@@ -378,6 +457,68 @@ describe('resolveRecipient - one ladder for all senders', () => {
       'conv-1',
     )
     expect(r).toMatchObject({ to: '573001234567', source: 'recovered', isPhone: true })
+  })
+
+  it('recovers an opaque id Meta left only in the inbound payload (@user)', async () => {
+    // No number, no wa_id, no BSUID column, no recipient_id, no handle —
+    // only the id inside the customer's own message. Before this step the
+    // ladder returned nothing and a follow-up timer closed the row.
+    mocks.fromAny.mockImplementation((table: string) => {
+      const rows =
+        table === 'conversations'
+          ? [{ id: 'conv-1' }]
+          : table === 'messages'
+            ? [
+                {
+                  sender_phone: '@usuario',
+                  raw_meta_payload: { contact: { user_id: '1486998326437295' } },
+                },
+              ]
+            : []
+      const b: Record<string, unknown> = {}
+      const chain = () => b
+      for (const m of ['select', 'eq', 'in', 'not', 'order']) b[m] = vi.fn(chain)
+      b.limit = vi.fn(() => Promise.resolve({ data: rows, error: null }))
+      b.maybeSingle = vi.fn(() => Promise.resolve({ data: rows[0] ?? null, error: null }))
+      b.then = (resolve: (v: unknown) => unknown) => resolve({ data: rows, error: null })
+      return b
+    })
+
+    const r = await resolveRecipient(
+      { id: 'c1', phone: null, username: null },
+      'acct-1',
+      'conv-1',
+    )
+    expect(r).toEqual({
+      to: '1486998326437295',
+      source: 'bsuid',
+      isPhone: false,
+    })
+  })
+
+  it('falls through to the @handle when the payload id resolves to nothing', async () => {
+    mocks.fromAny.mockImplementation((table: string) => {
+      const rows =
+        table === 'conversations'
+          ? [{ id: 'conv-1' }]
+          : table === 'messages'
+            ? [{ sender_phone: '@usuario' }]
+            : []
+      const b: Record<string, unknown> = {}
+      const chain = () => b
+      for (const m of ['select', 'eq', 'in', 'not', 'order']) b[m] = vi.fn(chain)
+      b.limit = vi.fn(() => Promise.resolve({ data: rows, error: null }))
+      b.maybeSingle = vi.fn(() => Promise.resolve({ data: rows[0] ?? null, error: null }))
+      b.then = (resolve: (v: unknown) => unknown) => resolve({ data: rows, error: null })
+      return b
+    })
+
+    const r = await resolveRecipient(
+      { id: 'c1', phone: null, username: 'usuario' },
+      'acct-1',
+      'conv-1',
+    )
+    expect(r).toMatchObject({ to: '@usuario', source: 'username', isPhone: false })
   })
 })
 

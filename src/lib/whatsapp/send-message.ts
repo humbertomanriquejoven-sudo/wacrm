@@ -29,6 +29,7 @@ import {
   sendInteractiveList,
   InvalidRecipientError,
   MetaApiError,
+  isOpaqueMetaId,
   type MediaKind,
 } from '@/lib/whatsapp/meta-api';
 import {
@@ -48,6 +49,7 @@ import {
 import {
   isDialablePhone,
   isRecipientRejection,
+  resolveRecipient,
   sendWithRecipientFallback,
   latestInboundAnchorId,
   createAnchorResolver,
@@ -499,48 +501,68 @@ export async function sendMessageToConversation(
   });
   printDestinationCascadeReport(cascadeReport);
 
-  // B) Sin ningún destinatario numérico en las cinco fuentes: se CANCELA la
-  // llamada a Meta y se responde 422 estructurado con el informe + la guía de
-  // solución — sin gastar un request que Meta solo iba a rechazar o a
-  // tragarse en silencio.
-  if (!cascadeReport.finalTo) {
-    const technical =
-      `No destination could be resolved for conversation ${conversationId} / contact ${contact.id}: ` +
-      `every cascade source was missing, placeholder or non-numeric. ` +
-      `No HTTP request was sent to Meta.`;
-    console.error(
-      `[send-message] INVALID RECIPIENT for conversation ${conversationId} / contact ${contact.id}: ${technical}`,
-    );
-    await recordSendFailure(db, {
-      conversationId,
-      senderType: params.senderType ?? 'agent',
-      messageType,
-      contentText: contentText ?? null,
-      mediaUrl: mediaUrl || null,
-      errorDetail: technical,
-    });
-    throw new SendMessageError(
-      'no_delivery_destination',
-      'Error de entrega de mensaje',
-      422,
-      {
-        diagnosticReport: toDiagnosticHttp(cascadeReport),
-        howToFix: HOW_TO_FIX_DESTINATION,
-      },
-    );
+  // UNIFIED DESTINATION. The waterfall only ever emits a digits-only id. When
+  // it lands one, that wins — it may have seen a conversational source
+  // (`conversations.wa_id`, a channel BSUID, the last inbound `from`) the
+  // contact row does not carry. When it lands NOTHING, the SHARED ladder
+  // (`resolveRecipient`) — the exact resolver the follow-up timers and the
+  // broadcast path use — gets the final word: a namespaced `WAID.`/`CO.` id
+  // whose payload is too short for the digits-only cascade, or an id Meta left
+  // only in the inbound `raw_meta_payload`, is delivered here exactly as the
+  // timers would deliver it. A bare `@handle` is still not a deliverable
+  // destination (ESCENARIO C) and keeps the structured 422.
+  let resolved: ResolvedRecipient;
+  if (cascadeReport.finalTo) {
+    resolved = {
+      to: cascadeReport.finalTo,
+      source:
+        cascadeReport.chosen === 'latest_inbound_from'
+          ? 'recovered'
+          : cascadeReport.chosen === 'contacts_phone' ||
+              cascadeReport.chosen === 'contacts_metadata'
+            ? 'phone'
+            : 'bsuid',
+      isPhone: isDialablePhone(cascadeReport.finalTo),
+    };
+  } else {
+    const ladder = await resolveRecipient(contact, accountId, conversationId);
+    if (
+      ladder.to &&
+      (isDialablePhone(ladder.to) || isOpaqueMetaId(ladder.to))
+    ) {
+      resolved = ladder;
+    } else {
+      // B) Sin ningún destinatario entregable en NINGUNA fuente: se CANCELA la
+      // llamada a Meta y se responde 422 estructurado con el informe + la guía
+      // de solución — sin gastar un request que Meta solo iba a rechazar o a
+      // tragarse en silencio.
+      const technical =
+        `No destination could be resolved for conversation ${conversationId} / contact ${contact.id}: ` +
+        `every cascade source was missing, placeholder or non-numeric, and the shared ` +
+        `recipient ladder found no deliverable number, wa_id, BSUID, recipient_id or handle. ` +
+        `No HTTP request was sent to Meta.`;
+      console.error(
+        `[send-message] INVALID RECIPIENT for conversation ${conversationId} / contact ${contact.id}: ${technical}`,
+      );
+      await recordSendFailure(db, {
+        conversationId,
+        senderType: params.senderType ?? 'agent',
+        messageType,
+        contentText: contentText ?? null,
+        mediaUrl: mediaUrl || null,
+        errorDetail: technical,
+      });
+      throw new SendMessageError(
+        'no_delivery_destination',
+        'Error de entrega de mensaje',
+        422,
+        {
+          diagnosticReport: toDiagnosticHttp(cascadeReport),
+          howToFix: HOW_TO_FIX_DESTINATION,
+        },
+      );
+    }
   }
-
-  const resolved: ResolvedRecipient = {
-    to: cascadeReport.finalTo,
-    source:
-      cascadeReport.chosen === 'latest_inbound_from'
-        ? 'recovered'
-        : cascadeReport.chosen === 'contacts_phone' ||
-            cascadeReport.chosen === 'contacts_metadata'
-          ? 'phone'
-          : 'bsuid',
-    isPhone: isDialablePhone(cascadeReport.finalTo),
-  };
 
   // VENTANA DE 24 HORAS (BSUID / leads redactados por privacidad de Meta).
   // Un contacto sin teléfono real solo puede recibir mensajes de texto/libre
