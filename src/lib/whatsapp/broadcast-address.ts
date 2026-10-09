@@ -583,7 +583,7 @@ export async function persistRecoveredAddress(
 export function isDeliverableAddress(to: string): boolean {
   return (
     recipientAddressVariants(to).length > 0 &&
-    (isDialablePhone(to) || isOpaqueMetaId(to) || isBsuid(to))
+    (isDialablePhone(to) || isOpaqueMetaId(to))
   );
 }
 
@@ -634,7 +634,10 @@ export async function resolveRecipientAddresses(
       continue;
     }
     // Phase 4.
-    resolved.set(contact.id, isDeliverableAddress(direct.to) ? direct : null);
+    resolved.set(
+      contact.id,
+      (isDeliverableAddress(direct.to) || isBsuid(direct.to)) ? direct : null,
+    );
   }
 
   // Phase 3 - one batched read covering every contact on this page. Runs only
@@ -650,7 +653,10 @@ export async function resolveRecipientAddresses(
       : null;
     resolved.set(
       contact.id,
-      address && isDeliverableAddress(address.to) ? address : null,
+      address &&
+        (isDeliverableAddress(address.to) || isBsuid(address.to))
+          ? address
+          : null,
     );
   }
 

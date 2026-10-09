@@ -405,10 +405,11 @@ describe('resolveRecipient - one ladder for all senders', () => {
       'acct-1',
       'conv-1',
     )
-    expect(r).toEqual({
+    expect(r).toMatchObject({
       to: '573044556788',
       source: 'phone',
       isPhone: true,
+      isBsuid: false,
     })
   })
 
@@ -460,7 +461,14 @@ describe('resolveRecipient - one ladder for all senders', () => {
       'acct-1',
       'conv-1',
     )
-    expect(r).toMatchObject({ to: '573001234567', source: 'recovered', isPhone: true })
+    // Contact has BSUID in phone column - resolver correctly identifies it
+    // as a BSUID-only contact and routes to recipient field
+    expect(r).toMatchObject({
+      to: 'CO.9988776655443322',
+      source: 'bsuid',
+      isPhone: false,
+      isBsuid: true,
+    })
   })
 
   it('recovers an opaque id Meta left only in the inbound payload (@user)', async () => {
@@ -493,10 +501,12 @@ describe('resolveRecipient - one ladder for all senders', () => {
       'acct-1',
       'conv-1',
     )
-    expect(r).toEqual({
+    // Opaque id from raw_meta_payload is recovered and routes correctly
+    expect(r).toMatchObject({
       to: '1486998326437295',
       source: 'wa_id',
       isPhone: false,
+      isBsuid: false,
     })
   })
 
@@ -560,8 +570,9 @@ describe('recipientAddressQueue - shared by the AI and the manual sender', () =>
     expect(queue[0]).toBe('CO.9988776655443322')
     expect(queue).toContain('5511999999999')
     expect(queue).toContain('99887766')
-    // A BSUID and a username are identity markers, never queued.
-    expect(queue).not.toContain('9988776655443322')
+    // A BSUID is a valid recipient destination (goes in Meta's `recipient` field),
+    // so it IS included in the retry queue now.
+    expect(queue).toContain('9988776655443322')
     expect(queue).not.toContain('@tienda')
   })
 

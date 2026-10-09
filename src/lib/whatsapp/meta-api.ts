@@ -829,7 +829,7 @@ export async function sendTextMessage(
   // (CASO C) travels in `recipient` and needs NO anchor; a phone (CASO A)
   // needs none either. A bare `@handle` is refused later by
   // `canonicalToField`.
-  if (!contextMessageId && !isDialablePhone(address) && !isBsuid(address)) {
+  if (!contextMessageId && !isDialablePhone(address)) {
     console.error(
       `[send] MISSING CONTEXT (#131009 guard): opaque destination "${address}" without a contextMessageId anchor — no HTTP request was sent. CASO B requires quoting one of the customer's own messages; anchor via this conversation's newest inbound wamid.`,
     )
@@ -838,6 +838,22 @@ export async function sendTextMessage(
       'CASO B: an opaque wa_id is deliverable only as a reply to one of ' +
         "the customer's own messages — no inbound wamid was supplied to " +
         'quote (#131009). No HTTP request was sent.',
+    )
+  }
+  // CASO C — a namespaced BSUID / user id must not be placed in `to`, either
+  // with or without an anchor. It must travel in Meta's `recipient` field.
+  // Refuse it locally so the caller routes it through `recipientField: 'recipient'`
+  // or fixes the contact's address.
+  if (isBsuid(address)) {
+    console.error(
+      '[send] blocked: namespaced BSUID in "to" field — ' +
+        'BSUID must travel in Meta\'s `recipient` field, not `to`. ' +
+        'No HTTP request was sent to Meta.',
+    )
+    throw new InvalidRecipientError(
+      address,
+      'namespaced BSUID (e.g. \'CO.<id>\') must be sent in the ' +
+        '`recipient` field, not `to`. No HTTP request was sent.',
     )
   }
 

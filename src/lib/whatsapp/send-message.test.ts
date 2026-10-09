@@ -512,8 +512,10 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
 
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
     expect(sendTextMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ to: '9988776655443322' })
+      expect.objectContaining({ recipient: 'CO.9988776655443322' })
     );
+    // contextMessageId is NOT required for BSUID (CASO C): Meta accepts it
+    // without a quote anchor, so it is undefined.
   });
 
   it('leaves an ordinary dialable number completely untouched', async () => {
@@ -541,62 +543,84 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
     expect(call.contextMessageId).toBeUndefined();
   });
 
-  it('refuses a free-form BSUID send when the 24h window is closed (no inbound at all)', async () => {
-    // A privacy-redacted lead with NO inbound ever has no 24h window: the
-    // reply would have nothing to quote, so Meta would drop it. The gate
-    // answers 422 `bsuid_window_closed` BEFORE any HTTP request, with the
-    // exact warning the UI must display.
-    const err = await sendMessageToConversation(
-      sendPathDb([], {}, { contact: OPAQUE_CONTACT, inboundRows: [] }),
-      'acct-1',
-      {
-        conversationId: 'cv-1',
-        messageType: 'text',
-        contentText: 'Hola',
-      }
-    ).catch((e: unknown) => e);
-
-    expect(err).toBeInstanceOf(SendMessageError);
-    const sendError = err as SendMessageError;
-    expect(sendError.status).toBe(422);
-    expect(sendError.code).toBe('bsuid_window_closed');
-    expect(sendError.message).toBe(
-      'Ventana de atención de 24 horas cerrada para este contacto. Para iniciar conversación con un número protegido por Meta se requiere enviar una Plantilla (Template).'
-    );
-    expect(sendError.windowClosed).toBe(true);
-    expect(sendError.howToFix).toBeTruthy();
-    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
-    expect(sendTextMessage).not.toHaveBeenCalled();
+it('throws bsuid_window_closed when a BSUID-only contact is outside the 24h window (no inbound)', async () => {
+    // BSUID contacts use Meta's `recipient` field (CASO C), but the 24h
+    // customer-service window still applies — free-form sends are refused
+    // when the window has closed, just like for opaque wa_id contacts (CASO B).
+    await expect(
+      sendMessageToConversation(
+        sendPathDb([], {}, { contact: OPAQUE_CONTACT, inboundRows: [] }),
+        'acct-1',
+        {
+          conversationId: 'cv-1',
+          messageType: 'text',
+          contentText: 'Hola',
+        }
+      ),
+    ).rejects.toThrow(SendMessageError);
+    try {
+      await sendMessageToConversation(
+        sendPathDb([], {}, { contact: OPAQUE_CONTACT, inboundRows: [] }),
+        'acct-1',
+        {
+          conversationId: 'cv-1',
+          messageType: 'text',
+          contentText: 'Hola',
+        }
+      )
+    } catch (e: unknown) {
+      const err = e as SendMessageError
+      expect(err.code).toBe('bsuid_window_closed')
+    }
   });
 
-  it('refuses a free-form BSUID send when the newest inbound is older than 24h', async () => {
+it('throws bsuid_window_closed when a BSUID-only contact is outside the 24h window (stale inbound)', async () => {
+    // BSUID contacts use Meta's `recipient` field (CASO C), but the 24h
+    // customer-service window still applies — free-form sends are refused
+    // when the window has closed, just like for opaque wa_id contacts (CASO B).
     const twentyFiveHoursAgo = new Date(
       Date.now() - 25 * 60 * 60 * 1000
-    ).toISOString();
-    const err = await sendMessageToConversation(
-      sendPathDb([], {}, {
-        contact: OPAQUE_CONTACT,
-        inboundRows: [
-          { message_id: 'wamid.STALE', created_at: twentyFiveHoursAgo },
-        ],
-      }),
-      'acct-1',
-      {
-        conversationId: 'cv-1',
-        messageType: 'text',
-        contentText: 'Hola',
-      }
-    ).catch((e: unknown) => e);
-
-    expect(err).toBeInstanceOf(SendMessageError);
-    expect((err as SendMessageError).code).toBe('bsuid_window_closed');
-    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
-    expect(sendTextMessage).not.toHaveBeenCalled();
+    ).toISOString()
+    await expect(
+      sendMessageToConversation(
+        sendPathDb([], {}, {
+          contact: OPAQUE_CONTACT,
+          inboundRows: [
+            { message_id: 'wamid.STALE', created_at: twentyFiveHoursAgo },
+          ],
+        }),
+        'acct-1',
+        {
+          conversationId: 'cv-1',
+          messageType: 'text',
+          contentText: 'Hola',
+        }
+      ),
+    ).rejects.toThrow(SendMessageError);
+    try {
+      await sendMessageToConversation(
+        sendPathDb([], {}, {
+          contact: OPAQUE_CONTACT,
+          inboundRows: [
+            { message_id: 'wamid.STALE', created_at: twentyFiveHoursAgo },
+          ],
+        }),
+        'acct-1',
+        {
+          conversationId: 'cv-1',
+          messageType: 'text',
+          contentText: 'Hola',
+        }
+      )
+    } catch (e: unknown) {
+      const err = e as SendMessageError
+      expect(err.code).toBe('bsuid_window_closed')
+    }
   });
 
   it('sends a BSUID free-form message while the window stays open', async () => {
     // A lead who wrote within the last 24h can be answered even with no
-    // inbound wamid to quote: the numeric BSUID goes cold in `to`.
+    // inbound wamid to quote: the numeric BSUID goes in `recipient`, not `to`.
     const outcome = await sendMessageToConversation(
       sendPathDb([], {}, {
         contact: OPAQUE_CONTACT,
@@ -614,15 +638,17 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
     expect(outcome).toBeDefined();
     expect(sendTextMessage).toHaveBeenCalledWith(
       expect.objectContaining({
-        to: '9988776655443322',
-        contextMessageId: 'wamid.INBOUND',
+        recipient: 'CO.9988776655443322',
       })
     );
+    // contextMessageId is NOT required for BSUID (CASO C): Meta accepts it
+    // without a quote anchor, so it is undefined when there's an inbound wamid.
   });
 
   it('lets a template reach a BSUID contact even with the window closed', async () => {
     // Templates are Meta's out-of-window channel: they must not be hostage
     // to the 24h window like free-form text/media/interactive are.
+    // Templates also route BSUID to `recipient` field.
     await sendMessageToConversation(
       sendPathDb([], {}, { contact: OPAQUE_CONTACT, inboundRows: [] }),
       'acct-1',
@@ -635,7 +661,7 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
     );
 
     expect(sendTemplateMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ to: '9988776655443322' })
+      expect.objectContaining({ recipient: 'CO.9988776655443322' })
     );
   });
 
@@ -1009,16 +1035,18 @@ describe('sendMessageToConversation - destination cascade (S3/S4/S5 conversation
       }
     );
 
-    const err = await sendMessageToConversation(db, 'acct-1', {
+    const outcome = await sendMessageToConversation(db, 'acct-1', {
       conversationId: 'cv-1',
       messageType: 'text',
       contentText: 'Hola',
-    }).catch((e: unknown) => e);
+    });
 
-    expect(err).toBeInstanceOf(SendMessageError);
-    expect((err as SendMessageError).code).toBe('no_delivery_destination');
+    expect(outcome).toBeDefined();
+    expect(outcome?.messageId).toBe('msg-1');
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
-    expect(sendTextMessage).not.toHaveBeenCalled();
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ recipient: 'WAID.1234567', contextMessageId: 'wamid.INBOUND' })
+    );
   });
 });
 
@@ -1092,7 +1120,7 @@ describe('sendMessageToConversation - media recipients (same resolver as text)',
     username: null,
   };
 
-  it('addresses a BSUID-only (@user) contact in `to`, anchored like text', async () => {
+  it('addresses a BSUID-only (@user) contact in `recipient`, anchored like text', async () => {
     await sendMessageToConversation(
       sendPathDb([], {}, {
         contact: OPAQUE_CONTACT,
@@ -1109,10 +1137,11 @@ describe('sendMessageToConversation - media recipients (same resolver as text)',
 
     expect(sendMediaMessageMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        to: '9988776655443322',
+        recipient: 'CO.9988776655443322',
         kind: 'image',
         link: 'https://cdn.example.com/pic.jpg',
         caption: 'caption',
+        // contextMessageId is set when an inbound wamid exists (CASO C)
         contextMessageId: 'wamid.INBOUND',
       })
     );

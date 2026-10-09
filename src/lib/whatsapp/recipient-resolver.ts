@@ -804,8 +804,11 @@ export async function resolveBestRecipient(
   }
 
   // 3. wa_user_id — the BSUID / user id Meta disclosed when the sender had no
-  //    number. It travels in Meta's `recipient` field (CASO C).
-  const bsuid = deliverableDestination(contact.wa_user_id)
+  //    number. It travels in Meta's `recipient` field (CASO C). Only return
+  //    the BSUID in `to` when a wa_id is also present (CASO B+C combined).
+  //    When the BSUID is the only identifier (no wa_id, no phone), refuse it
+  //    by falling through to the deeper pass / final return.
+  const bsuid = contact.wa_id ? deliverableDestination(contact.wa_user_id) : null
   if (bsuid) {
     return {
       to: bsuid.to,

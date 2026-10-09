@@ -108,11 +108,11 @@ describe("sendMediaMessage — recipient addressing", () => {
     expect(captured?.recipient).toBeUndefined();
   });
 
-  it("REFUSES a CO./WAID. namespaced BSUID — identity, never a destination", async () => {
-    await expect(
-      sendMediaMessage({ ...BASE, to: "CO.1486998326437295", kind: "document" }),
-    ).rejects.toBeInstanceOf(InvalidRecipientError);
-    expect(captured).toBeNull();
+  it("accepts a CO./WAID. namespaced BSUID in `to`, routed to `recipient` (CASO C)", async () => {
+    await sendMediaMessage({ ...BASE, to: "CO.1486998326437295", kind: "document" });
+    expect(captured?.recipient).toBe("CO.1486998326437295");
+    expect(captured?.to).toBeUndefined();
+    expect(captured?.type).toBe("document");
   });
 
   it("drops an `@user` / `@lid` routing suffix before addressing", async () => {

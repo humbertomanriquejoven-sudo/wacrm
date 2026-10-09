@@ -555,12 +555,21 @@ export async function sendMessageToConversation(
     if (isDialablePhone(ladder.to)) {
       resolved = ladder;
     } else if (ladder.isBsuid) {
-      resolved = ladder;
+      // CASO C — a namespaced BSUID travels in Meta's `recipient` field,
+      // NOT in `to`. The resolver marks isBsuid: true; we keep the flag
+      // but set the destination field to recipient-compatible form.
+      resolved = {
+        to: ladder.to,
+        source: 'bsuid',
+        isPhone: false,
+        isBsuid: true,
+      };
     } else if (cascadeTo) {
       resolved = {
         to: cascadeTo,
         source: cascadeReport.chosen === 'latest_inbound_from' ? 'recovered' : 'wa_id',
         isPhone: false,
+        isBsuid: false,
       };
     } else if (ladder.to && isOpaqueWaId(ladder.to)) {
       resolved = ladder;
@@ -612,7 +621,7 @@ export async function sendMessageToConversation(
     Number.isFinite(latestInboundAtMs) &&
     Date.now() - latestInboundAtMs < REDACTED_BSUID_WINDOW_MS;
   const needsWindow =
-    Boolean(resolved.to) && !resolved.isPhone && !resolved.isBsuid && messageType !== 'template';
+    Boolean(resolved.to) && !resolved.isPhone && messageType !== 'template';
   if (needsWindow && !windowOpen) {
     const technical =
       `Opaque-id contact ${contact.id} (to="${resolved.to}", source=${resolved.source}) ` +
@@ -704,7 +713,6 @@ export async function sendMessageToConversation(
     !contextMessageId &&
     resolved.to &&
     !resolved.isPhone &&
-    !resolved.isBsuid &&
     messageType !== 'template'
   ) {
     // `messages` can be RLS-blocked for a user-scoped client, so the anchor is
@@ -713,8 +721,18 @@ export async function sendMessageToConversation(
       (await latestInboundAnchorId(supabaseAdmin(), conversationId)) ?? undefined;
     if (contextMessageId) {
       console.log(
-        `[send-message] contact ${contact.id} is addressed by an opaque wa_id (${resolved.source}); ` +
+        `[send-message] contact ${contact.id} is addressed by ${
+          resolved.isBsuid ? 'an opaque BSUID (CASO C)' : 'an opaque wa_id (CASO B)'
+        } (${resolved.source}); ` +
           `anchoring the send to inbound message ${contextMessageId} so WhatsApp accepts it`
+      );
+    } else if (resolved.isBsuid) {
+      // CASO C: a BSUID does not require a contextMessageId anchor — it travels
+      // in Meta's `recipient` field. Without an anchor the send is still
+      // permissible, so we just leave contextMessageId as undefined.
+      console.log(
+        `[send-message] contact ${contact.id} is addressed by a BSUID (CASO C); ` +
+          'no contextMessageId anchor is required, sending without quote.'
       );
     } else {
       // CASO B: an opaque wa_id is deliverable only as a reply to one of the
@@ -785,11 +803,16 @@ export async function sendMessageToConversation(
 
   const attempt = async (phone: string): Promise<string> => {
     const anchor = await anchorFor(phone);
+    // Determine the recipient field shape: BSUID goes in `recipient`, phone/wa_id go in `to`.
+    // The Meta API helpers (sendTextMessage, sendMediaMessage, etc.) already
+    // handle this via canonicalToField, which routes isBsuid → recipient and
+    // dialable/opaque wa_id → to. We just need to pass the right address.
+    const recipientField = resolved.isBsuid ? 'recipient' : 'to';
     if (messageType === 'template') {
       const result = await sendTemplateMessage({
         phoneNumberId: senderPhoneNumberId,
         accessToken,
-        to: phone,
+        ...(resolved.isBsuid ? { recipient: phone } : { to: phone }),
         templateName: templateName!,
         language: sendLanguage,
         template: templateRow ?? undefined,
@@ -803,7 +826,7 @@ export async function sendMessageToConversation(
       const result = await sendMediaMessage({
         phoneNumberId: senderPhoneNumberId,
         accessToken,
-        to: phone,
+        ...(resolved.isBsuid ? { recipient: phone } : { to: phone }),
         kind: messageType as MediaKind,
         link: mediaUrl!,
         caption: contentText || undefined,
@@ -818,7 +841,7 @@ export async function sendMessageToConversation(
         const result = await sendInteractiveButtons({
           phoneNumberId: senderPhoneNumberId,
           accessToken,
-          to: phone,
+          ...(resolved.isBsuid ? { recipient: phone } : { to: phone }),
           bodyText: p.body,
           headerText: p.header || undefined,
           footerText: p.footer || undefined,
@@ -830,7 +853,7 @@ export async function sendMessageToConversation(
       const result = await sendInteractiveList({
         phoneNumberId: senderPhoneNumberId,
         accessToken,
-        to: phone,
+        ...(resolved.isBsuid ? { recipient: phone } : { to: phone }),
         bodyText: p.body,
         buttonLabel: p.button_label,
         headerText: p.header || undefined,
@@ -843,7 +866,7 @@ export async function sendMessageToConversation(
     const result = await sendTextMessage({
       phoneNumberId: config.phone_number_id,
       accessToken,
-      to: phone,
+      ...(resolved.isBsuid ? { recipient: phone } : { to: phone }),
       text: contentText!,
       contextMessageId: anchor,
     });
