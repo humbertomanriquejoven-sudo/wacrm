@@ -132,10 +132,11 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
 
   const displayName =
     contact.name ||
+    contact.username?.replace(/^@/, "") ||
     (contact.phone && contact.phone !== "unknown"
       ? contact.phone
-      : contact.wa_user_id || contact.recipient_id || contact.username || "unknown");
-  const initials = displayName.charAt(0).toUpperCase();
+      : contact.wa_user_id || contact.recipient_id || "unknown");
+  const initials = displayName.trim().charAt(0).toUpperCase() || "U";
 
   return (
     <div className="flex h-full w-70 flex-col border-l border-border bg-card">
@@ -143,16 +144,9 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
         <div className="p-4">
           {/* Contact Info */}
           <div className="flex flex-col items-center text-center">
-            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-muted text-lg font-semibold text-foreground">
-              {contact.recipient_id ? (
-                // Simple avatar using the first 2 chars of recipient_id
-                <span className="rounded-full bg-primary text-primary-foreground text-xs font-semibold">
-                  {contact.recipient_id?.charAt(0)?.charAt(0).toUpperCase() || 'U'}
-                </span>
-              ) : (
-                initials
-              )}
-            </div>
+            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-primary text-lg font-semibold text-primary-foreground">
+                {initials}
+              </div>
             <h3 className="mt-3 text-sm font-semibold text-foreground">
               {displayName}
             </h3>

@@ -437,7 +437,15 @@ function ConversationItem({
   t,
 }: ConversationItemProps) {
   const contact = conversation.contact;
-  const displayName = contact?.name || contact?.phone || t("unknown");
+  // Prefer a real name, then the public @username (without the @), then
+  // the phone. The avatar initial is derived from the same source so the
+  // letter always matches the label the operator sees.
+  const displayName =
+    contact?.name ||
+    contact?.username?.replace(/^@/, "") ||
+    contact?.phone ||
+    t("unknown");
+  const initials = displayName.trim().charAt(0).toUpperCase() || "U";
 
   const handleClick = useCallback(() => {
     onSelect(conversation);
@@ -457,16 +465,12 @@ function ConversationItem({
         isActive && "border-l-2 border-primary bg-muted/70"
       )}
     >
-      {/* Avatar */}
-<div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-medium text-foreground">
-        {contact?.recipient_id ? (
-          // Simple avatar using first char of recipient_id
-          <span className="rounded-full bg-primary text-primary-foreground text-xs font-semibold">
-            {contact.recipient_id?.charAt(0)?.toUpperCase() || 'U'}
-          </span>
-        ) : (
-          <span className="text-muted-foreground text-xs">Sin avatar</span>
-        )}
+      {/* Avatar — default letter mark: first char of the display name
+          (name or @username), uppercased. Restored after 090675a removed
+          the `initials` computation and left the recipient_id digits on
+          screen (a BSUID shows 'C' from 'CO.…', not the sender's letter). */}
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary text-sm font-semibold text-primary-foreground">
+        {initials}
       </div>
 
       {/* Content */}
