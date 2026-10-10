@@ -28,9 +28,21 @@ export interface ExistingContact {
 
 /**
  * Find an existing contact in `accountId` whose phone matches `phone`,
- * or null. Pre-filters in SQL by the last-8-digit suffix (so we don't
- * pull every contact), then applies the strict `phonesMatch` in JS on
- * the small candidate set — the exact approach the webhook has used.
+ * or null.
+ *
+ * Two passes:
+ *   1. Exact — `phone_normalized` is a STORED generated column (migration
+ *      022) with a UNIQUE partial index on (account_id, phone_normalized),
+ *      so the common case (the same digits already on file) resolves in a
+ *      single indexed lookup. This is the hot path: every inbound from a
+ *      known number runs it.
+ *   2. Fuzzy — trunk-prefix tolerance (last-8-digit match, `phonesMatch`)
+ *      for duplicates that differ only by country/trunk prefix, e.g.
+ *      stored '37063949836' vs inbound '+370 063 949 836'. Reached only
+ *      when no row holds the exact digits. Pre-filters in SQL by the
+ *      last-8-digit suffix (a leading-wildcard LIKE that can't use a
+ *      B-tree), then applies the strict `phonesMatch` in JS on the small
+ *      candidate set.
  */
 export async function findExistingContact(
   db: SupabaseClient,
@@ -39,6 +51,22 @@ export async function findExistingContact(
 ): Promise<ExistingContact | null> {
   const normalized = normalizePhone(phone);
   if (!normalized) return null;
+
+  const { data: exact, error: exactErr } = await db
+    .from("contacts")
+    .select("*")
+    .eq("account_id", accountId)
+    .eq("phone_normalized", normalized)
+    .limit(1);
+
+  if (
+    !exactErr &&
+    (exact as ExistingContact[] | null | undefined)?.find((c) =>
+      phonesMatch(c.phone, phone)
+    )
+  ) {
+    return (exact as ExistingContact[])[0];
+  }
 
   const suffix = normalized.length >= 8 ? normalized.slice(-8) : normalized;
 

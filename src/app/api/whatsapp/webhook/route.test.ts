@@ -373,7 +373,8 @@ vi.mock('@supabase/supabase-js', () => ({
           return {
             // Three different read chains land here, told apart by the count
             // option and by WHICH column is filtered:
-            //   - priorCustomerMsgCount (head request)
+            //   - priorCustomerMsgCount (existence check, filters
+            //     conversation_id + sender_type, resolves via limit)
             //   - lookupInternalIdByMetaId  → eq('message_id').eq('conversation_id')
             //   - status fan-out lookup     → eq('message_id').limit()
             select: (_columns: string, options?: { head?: boolean }) => {
@@ -396,7 +397,19 @@ vi.mock('@supabase/supabase-js', () => ({
                   filters[col] = val
                   return chain
                 },
-                limit: () => chain,
+                limit: () => {
+                  // isFirstInboundMessage existence check: select().eq().
+                  // eq('sender_type').limit(1) — resolve rows off the
+                  // configured prior count. Any other limit chain (status
+                  // fan-out) keeps chaining into `.maybeSingle()`.
+                  if ('sender_type' in filters) {
+                    return Promise.resolve({
+                      data: h.state.priorCustomerMsgCount > 0 ? [{ id: 'msg-earlier' }] : [],
+                      error: null,
+                    })
+                  }
+                  return chain
+                },
                 maybeSingle: () => {
                   if ('conversation_id' in filters) {
                     return Promise.resolve({
@@ -556,7 +569,7 @@ vi.mock('@/lib/flows/meta-send', () => ({
   engineSendAiReply: vi.fn(),
 }))
 
-import { POST, __resetRawMetaPayloadColumnForTests } from './route'
+import { POST, _setInboundMaintenanceGate, __resetRawMetaPayloadColumnForTests } from './route'
 import { getMediaUrl, downloadMedia, sendTypingIndicator } from '@/lib/whatsapp/meta-api'
 import { transcribeAudio } from '@/lib/ai/transcribe'
 import { engineSendText } from '@/lib/flows/meta-send'
@@ -682,6 +695,10 @@ async function runStatusWebhook(status: Record<string, unknown>) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // The opportunistic maintenance pass (repair / sanitize / purge) is
+  // gated per window in production. The suite asserts on those passes, so
+  // default to "always run"; the dedicated gate test re-enables it.
+  _setInboundMaintenanceGate(false)
   h.state.messageUpsertResult = [{ id: 'msg-1' }]
   h.state.priorCustomerMsgCount = 0
   h.state.replyContextParent = null
@@ -2239,5 +2256,47 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
       wa_user_id: '9988776655443322',
       username: '@anaruiz',
     })
+  })
+})
+
+describe('inbound webhook: opportunistic maintenance is gated per window', () => {
+  it('runs the hygiene pass once per interval, not on every delivery', async () => {
+    mockFindExistingContact.mockResolvedValue(null)
+    _setInboundMaintenanceGate(true, 60 * 60 * 1000)
+
+    try {
+      // First delivery inside the window: the pass must run and repair.
+      h.state.bsuidPhoneContacts = [
+        {
+          id: 'gate-broken-1',
+          account_id: 'acc-1',
+          phone: 'CO.9988776655443322',
+          name: 'Gate One',
+        },
+      ]
+      await runWebhook()
+      expect(
+        h.state.contactUpdateCalls.some((c) => c.id === 'gate-broken-1'),
+      ).toBe(true)
+
+      // Second delivery inside the same window: the pass is skipped, so
+      // the newly-broken row is left for a future window to repair while
+      // the message itself still processes.
+      h.state.contactUpdateCalls = []
+      h.state.bsuidPhoneContacts = [
+        {
+          id: 'gate-broken-2',
+          account_id: 'acc-1',
+          phone: 'WAID.1122334455667788',
+          name: 'Gate Two',
+        },
+      ]
+      await runWebhook()
+      expect(
+        h.state.contactUpdateCalls.some((c) => c.id === 'gate-broken-2'),
+      ).toBe(false)
+    } finally {
+      _setInboundMaintenanceGate(false)
+    }
   })
 })

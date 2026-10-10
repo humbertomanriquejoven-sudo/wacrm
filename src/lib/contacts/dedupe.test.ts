@@ -67,12 +67,16 @@ describe("dedupeByPhone", () => {
 });
 
 describe("findExistingContact", () => {
-  // Minimal SupabaseClient stub: resolves the .from().select().eq().like()
-  // chain to a fixed candidate set.
+  // Minimal SupabaseClient stub: resolves the .from().select().eq().eq().
+  // limit() chain (exact phone_normalized path) and the
+  // .from().select().eq().like() chain (fuzzy suffix path) to the same
+  // fixed candidate set. The caller still applies `phonesMatch` in JS, so
+  // returning every row regardless of filter keeps the fuzzy semantics.
   function stubDb(rows: Array<{ id: string; phone: string }>): SupabaseClient {
     const builder = {
       select: () => builder,
       eq: () => builder,
+      limit: () => Promise.resolve({ data: rows, error: null }),
       like: () => Promise.resolve({ data: rows, error: null }),
     };
     return { from: () => builder } as unknown as SupabaseClient;

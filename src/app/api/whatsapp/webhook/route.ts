@@ -524,19 +524,15 @@ export async function POST(request: Request) {
   after(async () => {
     const startedAt = Date.now()
     try {
-      // Move any identifier that landed in `phone` to `wa_user_id` and
-      // adopt a real number where a sibling contact has one.
-      await repairBsuidPhoneContacts()
-      // Normalize any stored phone that isn't digits-only (e.g. a legacy
-      // '+57 315 566 7789') so outbound `to` is always clean.
-      await sanitizeStoredPhones()
-      // Remove orphan contacts left by pre-BSUID versions of this handler,
-      // which could insert a row with no usable `phone`. Those rows are
-      // undeliverable and they also break `findExistingContact`'s
-      // suffix pre-filter, so they get swept once per delivery — cheap
-      // (an indexed `is.null` + `eq('')` on a normally-tiny set), and
-      // self-limiting since the count drops to zero after the first run.
-      await purgeEmptyPhoneContacts()
+      // Opportunistic hygiene (BSUID-as-phone repair, phone
+      // normalization, empty-phone purge). Each pass is a full
+      // `contacts` scan, so running them on EVERY delivery adds a table
+      // sweep to the critical path before the customer's message row is
+      // even committed — and the inbox can't show the message until that
+      // insert lands. They self-limit (the broken rows drop to zero after
+      // the first pass), so the pass is gated to once per window instead
+      // of once per delivery.
+      await runInboundMaintenanceIfDue()
       await processWebhook(body)
       console.log(
         `[webhook] delivery processed in ${Date.now() - startedAt}ms`
@@ -550,6 +546,49 @@ export async function POST(request: Request) {
   })
 
   return NextResponse.json({ status: 'received' }, { status: 200 })
+}
+
+/**
+ * Run the opportunistic maintenance pass — BSUID-as-phone repair, phone
+ * normalization, empty-phone purge — at most once per time window rather
+ * than on every delivery.
+ *
+ * All three functions are self-limiting: after the first pass the broken
+ * rows they hunt for are gone, so re-scanning the entire `contacts` table
+ * on every inbound is pure latency (the message row isn't committed — and
+ * therefore can't reach the inbox via realtime — until they finish). The
+ * gate is in-memory: on a single-instance server the pass is skipped for
+ * the whole window after the first delivery; on serverless, each warm
+ * instance runs it at most once per window. Overlapping runs across
+ * instances are safe because the operations are idempotent and swallow
+ * their own errors.
+ *
+ * `_setInboundMaintenanceGate` is exported so tests can force the
+ * "always run" behavior (the default in the suite) or drive a window.
+ */
+const DEFAULT_MAINTENANCE_INTERVAL_MS = 10 * 60 * 1000
+let maintenanceIntervalMs = DEFAULT_MAINTENANCE_INTERVAL_MS
+let lastMaintenanceRunAt = 0
+let maintenanceGated = true
+
+export function _setInboundMaintenanceGate(
+  gated: boolean,
+  intervalMs: number = DEFAULT_MAINTENANCE_INTERVAL_MS
+): void {
+  maintenanceGated = gated
+  maintenanceIntervalMs = intervalMs
+  lastMaintenanceRunAt = 0
+}
+
+async function runInboundMaintenanceIfDue(): Promise<void> {
+  if (maintenanceGated) {
+    const now = Date.now()
+    if (now - lastMaintenanceRunAt < maintenanceIntervalMs) return
+    lastMaintenanceRunAt = now
+  }
+  await repairBsuidPhoneContacts()
+  await sanitizeStoredPhones()
+  await purgeEmptyPhoneContacts()
 }
 
 async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
@@ -1303,15 +1342,22 @@ async function processMessage(
   // this message is.
 
   // Determine whether this is the contact's very first inbound message
-  // BEFORE we insert, so the count is accurate. Covers the case where
+  // BEFORE we insert, so the check is accurate. Covers the case where
   // the contact row already exists (manual add / CSV import) but they've
   // never messaged us before — which new_contact_created wouldn't catch.
-  const { count: priorCustomerMsgCount } = await supabaseAdmin()
+  //
+  // Existence check (LIMIT 1) instead of an exact COUNT(*): only a
+  // boolean is consumed downstream, and Postgres can stop at the first
+  // matching customer row instead of scanning every row in the thread —
+  // this query runs on every inbound message.
+  const { data: priorCustomerMsgs } = await supabaseAdmin()
     .from('messages')
-    .select('id', { count: 'exact', head: true })
+    .select('id')
     .eq('conversation_id', conversation.id)
     .eq('sender_type', 'customer')
-  const isFirstInboundMessage = (priorCustomerMsgCount ?? 0) === 0
+    .limit(1)
+  const isFirstInboundMessage =
+    !priorCustomerMsgs || priorCustomerMsgs.length === 0
 
   const messageRow = {
     conversation_id: conversation.id,
