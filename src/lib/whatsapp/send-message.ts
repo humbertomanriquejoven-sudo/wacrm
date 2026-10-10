@@ -802,19 +802,19 @@ export async function sendMessageToConversation(
   );
 
   const attempt = async (phone: string): Promise<string> => {
-    // Evaluar direccionEntrega del contacto para determinar campo de destinatario
-    const deliveryAddress = contact.direccion_entrega || ''
-    const isBsuid = deliveryAddress && !isDialablePhone(deliveryAddress) && !isOpaqueWaId(deliveryAddress)
     const anchor = await anchorFor(phone)
-    // Determine the recipient field shape: BSUID goes in `recipient`, phone/wa_id go in `to`.
-    // The Meta API helpers (sendTextMessage, sendMediaMessage, etc.) already
-    // handle this via canonicalToField, which routes isBsuid → recipient and
-    // dialable/opaque wa_id → to. We just need to pass the right address.
+    // The resolved address travels in `to`, whatever its shape. The Meta
+    // senders route it to the right field via `canonicalToField`: a dialable
+    // number (CASO A) and a numeric opaque wa_id (CASO B) go in `to`, and a
+    // namespaced BSUID (CASO C) is moved into Meta's `recipient` field
+    // automatically. The caller never pre-splits the address, so every send
+    // path — text, media, template, interactive — resolves and routes
+    // identically from the single shared resolver above.
     if (messageType === 'template') {
       const result = await sendTemplateMessage({
         phoneNumberId: senderPhoneNumberId,
         accessToken,
-        ...(isBsuid ? { recipient: deliveryAddress } : { to: deliveryAddress }),
+        to: phone,
         templateName: templateName!,
         language: sendLanguage,
         template: templateRow ?? undefined,
@@ -828,7 +828,7 @@ export async function sendMessageToConversation(
       const result = await sendMediaMessage({
         phoneNumberId: senderPhoneNumberId,
         accessToken,
-        ...(resolved.isBsuid ? { recipient: phone } : { to: phone }),
+        to: phone,
         kind: messageType as MediaKind,
         link: mediaUrl!,
         caption: contentText || undefined,
@@ -843,7 +843,7 @@ export async function sendMessageToConversation(
         const result = await sendInteractiveButtons({
           phoneNumberId: senderPhoneNumberId,
           accessToken,
-          ...(resolved.isBsuid ? { recipient: phone } : { to: phone }),
+          to: phone,
           bodyText: p.body,
           headerText: p.header || undefined,
           footerText: p.footer || undefined,
@@ -855,7 +855,7 @@ export async function sendMessageToConversation(
       const result = await sendInteractiveList({
         phoneNumberId: senderPhoneNumberId,
         accessToken,
-        ...(resolved.isBsuid ? { recipient: phone } : { to: phone }),
+        to: phone,
         bodyText: p.body,
         buttonLabel: p.button_label,
         headerText: p.header || undefined,
@@ -866,9 +866,9 @@ export async function sendMessageToConversation(
       return result.messageId;
     }
     const result = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
+      phoneNumberId: senderPhoneNumberId,
       accessToken,
-      ...(resolved.isBsuid ? { recipient: phone } : { to: phone }),
+      to: phone,
       text: contentText!,
       contextMessageId: anchor,
     });

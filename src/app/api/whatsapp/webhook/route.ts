@@ -30,6 +30,7 @@ import {
 } from '@/lib/ai/unblock'
 import { transcribeAudio } from '@/lib/ai/transcribe'
 import { cancelPendingFollowUps, resetResponseWaitOnInbound } from '@/lib/whatsapp/follow-up-worker'
+import { bumpConversationOnInbound } from '@/lib/whatsapp/bump-conversation-on-inbound'
 import {
   describeInboundContent,
   normalizeContentType,
@@ -1407,15 +1408,15 @@ async function processMessage(
   // CASO B anchor: `recipient-resolver` hands it back to Meta as
   // `context.message_id` when the only deliverable destination is an opaque
   // wa_id. `last_inbound_at` is stamped server-side inside the same UPDATE,
-  // so concurrent inbound deliveries cannot lose the anchor.
-  const { error: convError } = await supabaseAdmin().rpc(
-    'bump_conversation_on_inbound',
-    {
-      p_conversation_id: conversation.id,
-      p_last_message_text: contentText || `[${message.type}]`,
-      p_last_inbound_wamid: message.id ?? null,
-    }
-  )
+  // so concurrent inbound deliveries cannot lose the anchor. If the deployed
+  // database predates migration 072 only the 2-arg signature exists;
+  // `bumpConversationOnInbound` falls back to it (logging a warning) instead
+  // of failing the webhook on an unapplied migration.
+  const { error: convError } = await bumpConversationOnInbound(supabaseAdmin(), {
+    conversationId: conversation.id,
+    lastMessageText: contentText || `[${message.type}]`,
+    lastInboundWamid: message.id ?? null,
+  })
 
   if (convError) {
     console.error('Error updating conversation:', convError)

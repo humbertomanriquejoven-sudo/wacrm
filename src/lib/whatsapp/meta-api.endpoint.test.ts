@@ -179,7 +179,8 @@ describe('valid E.164 destination', () => {
 })
 
 // PRUEBA B — an opaque numeric wa_id goes in `to`, anchored to the inbound
-// wamid; a namespaced BSUID is refused outright (CASO C).
+// wamid; a namespaced BSUID (CASO C) is routed to Meta's `recipient` field
+// with `to` omitted and needs no anchor.
 describe('opaque wa_id destination', () => {
   it('addresses a numeric wa_id in `to` and attaches the context', async () => {
     await sendTextMessage({
@@ -195,16 +196,16 @@ describe('opaque wa_id destination', () => {
     expect(body.context).toEqual({ message_id: 'wamid.HBgL_INBOUND' })
   })
 
-  it('refuses a namespaced BSUID even with an anchor (CASO C)', async () => {
-    await expect(
-      sendTextMessage({
-        phoneNumberId: CONFIG_ID,
-        accessToken: 'TOKEN',
-        to: 'CO.1008477715690681',
-        text: 'hola',
-        contextMessageId: 'wamid.HBgL_INBOUND',
-      }),
-    ).rejects.toBeInstanceOf(InvalidRecipientError)
-    expect(fetchMock).not.toHaveBeenCalled()
+  it('routes a namespaced BSUID to `recipient` even with an anchor (CASO C)', async () => {
+    await sendTextMessage({
+      phoneNumberId: CONFIG_ID,
+      accessToken: 'TOKEN',
+      to: 'CO.1008477715690681',
+      text: 'hola',
+      contextMessageId: 'wamid.HBgL_INBOUND',
+    })
+    const body = sentBody(fetchMock)
+    expect(body.recipient).toBe('CO.1008477715690681')
+    expect(body.to).toBeUndefined()
   })
 })

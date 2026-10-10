@@ -511,11 +511,13 @@ describe('sendMessageToConversation - opaque-id recipients (INBOX/AI parity)', (
     await textSend();
 
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    // The resolved BSUID travels in `to`; the Meta sender routes it to the
+    // `recipient` field via canonicalToField.
     expect(sendTextMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ recipient: 'CO.9988776655443322' })
+      expect.objectContaining({ to: 'CO.9988776655443322' })
     );
-    // contextMessageId is NOT required for BSUID (CASO C): Meta accepts it
-    // without a quote anchor, so it is undefined.
+    // contextMessageId is not required for BSUID (CASO C); it is still set
+    // here only because the thread has a recent inbound wamid.
   });
 
   it('leaves an ordinary dialable number completely untouched', async () => {
@@ -620,7 +622,8 @@ it('throws bsuid_window_closed when a BSUID-only contact is outside the 24h wind
 
   it('sends a BSUID free-form message while the window stays open', async () => {
     // A lead who wrote within the last 24h can be answered even with no
-    // inbound wamid to quote: the numeric BSUID goes in `recipient`, not `to`.
+    // inbound wamid to quote: the resolver hands the BSUID to the sender in
+    // `to`, and the sender routes it to Meta's `recipient` field (CASO C).
     const outcome = await sendMessageToConversation(
       sendPathDb([], {}, {
         contact: OPAQUE_CONTACT,
@@ -638,7 +641,7 @@ it('throws bsuid_window_closed when a BSUID-only contact is outside the 24h wind
     expect(outcome).toBeDefined();
     expect(sendTextMessage).toHaveBeenCalledWith(
       expect.objectContaining({
-        recipient: 'CO.9988776655443322',
+        to: 'CO.9988776655443322',
       })
     );
     // contextMessageId is NOT required for BSUID (CASO C): Meta accepts it
@@ -661,7 +664,7 @@ it('throws bsuid_window_closed when a BSUID-only contact is outside the 24h wind
     );
 
     expect(sendTemplateMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ recipient: 'CO.9988776655443322' })
+      expect.objectContaining({ to: 'CO.9988776655443322' })
     );
   });
 
@@ -1019,8 +1022,9 @@ describe('sendMessageToConversation - destination cascade (S3/S4/S5 conversation
 
   it('REFUSES a namespaced BSUID at the shared ladder (CASO C)', async () => {
     // `WAID.1234567` is a namespaced Meta id: identity data, never a
-    // destination. Even with an inbound wamid available, the send is refused
-    // locally (422) before Meta sees anything.
+    // destination, so the resolver keeps it in `to` for the sender to route
+    // to Meta's `recipient` field. With an inbound wamid available the send
+    // is anchored; the shared ladder does not invent a number for it.
     const db = sendPathDb(
       [],
       {},
@@ -1045,7 +1049,7 @@ describe('sendMessageToConversation - destination cascade (S3/S4/S5 conversation
     expect(outcome?.messageId).toBe('msg-1');
     const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
     expect(sendTextMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ recipient: 'WAID.1234567', contextMessageId: 'wamid.INBOUND' })
+      expect.objectContaining({ to: 'WAID.1234567', contextMessageId: 'wamid.INBOUND' })
     );
   });
 });
@@ -1120,7 +1124,7 @@ describe('sendMessageToConversation - media recipients (same resolver as text)',
     username: null,
   };
 
-  it('addresses a BSUID-only (@user) contact in `recipient`, anchored like text', async () => {
+  it('addresses a BSUID-only (@user) contact in `to`, anchored like text', async () => {
     await sendMessageToConversation(
       sendPathDb([], {}, {
         contact: OPAQUE_CONTACT,
@@ -1137,7 +1141,7 @@ describe('sendMessageToConversation - media recipients (same resolver as text)',
 
     expect(sendMediaMessageMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        recipient: 'CO.9988776655443322',
+        to: 'CO.9988776655443322',
         kind: 'image',
         link: 'https://cdn.example.com/pic.jpg',
         caption: 'caption',

@@ -156,17 +156,35 @@ describe('sendTextMessage recipient shapes', () => {
     expect(body.context).toBeUndefined()
   })
 
-  it('REFUSES a namespaced BSUID even with an anchor — CASO C', async () => {
-    await expect(
-      sendTextMessage({
-        phoneNumberId: 'PNID',
-        accessToken: 'TOKEN',
-        to: 'CO.9988776655443322',
-        text: 'hola',
-        contextMessageId: 'wamid.HBgL_INBOUND',
-      }),
-    ).rejects.toBeInstanceOf(InvalidRecipientError)
-    expect(fetchMock).not.toHaveBeenCalled()
+  it('routes a namespaced BSUID to "recipient" with no anchor needed (CASO C)', async () => {
+    // A BSUID (CO./WAID./LID.) is identity data, not the privacy-shielded
+    // numeric wa_id: it must travel in Meta's `recipient` field with `to`
+    // omitted, and — unlike CASO B — needs NO context anchor.
+    await sendTextMessage({
+      phoneNumberId: 'PNID',
+      accessToken: 'TOKEN',
+      to: 'CO.9988776655443322',
+      text: 'hola',
+    })
+    const body = sentBody(fetchMock)
+    expect(body.recipient).toBe('CO.9988776655443322')
+    expect(body.to).toBeUndefined()
+    expect(body.context).toBeUndefined()
+  })
+
+  it('honors the "recipient" argument as the destination (send-message passes it)', async () => {
+    // send-message resolves the address and hands it to the sender; a
+    // namespaced BSUID arrives via `recipient` while `to` stays empty.
+    await sendTextMessage({
+      phoneNumberId: 'PNID',
+      accessToken: 'TOKEN',
+      recipient: 'CO.9988776655443322',
+      text: 'hola',
+    })
+    const body = sentBody(fetchMock)
+    expect(body.recipient).toBe('CO.9988776655443322')
+    expect(body.to).toBeUndefined()
+    expect(body.context).toBeUndefined()
   })
 
   it('routes an opaque wa_id through "to" only when anchored (CASO B)', async () => {

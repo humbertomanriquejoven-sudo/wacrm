@@ -10,9 +10,10 @@ import {
 //   A. a dialable E.164 number travels in `to`;
 //   B. a numeric opaque wa_id (the canonical privacy-shielded id) travels in
 //      `to` too — the send path anchors it with `context.message_id`;
-//   C. a namespaced BSUID (`CO.`/`WAID.`/`LID.`) and an `@handle` are IDENTITY
-//      markers and are REFUSED: sending a BSUID in `to` is answered with
-//      (#131009) and dropped; a handle with (#100).
+//   C. a namespaced BSUID (`CO.`/`WAID.`/`LID.`) is an IDENTITY marker that
+//      must travel in Meta's `recipient` field (`to` omitted), needing NO
+//      anchor. Only an `@handle` is refused (#100), and a bare placeholder
+//      like "unknown" is stopped locally instead of silently dropped.
 
 describe('templateRecipientField', () => {
   it('routes a namespaced BSUID to "recipient" (CASO C)', () => {

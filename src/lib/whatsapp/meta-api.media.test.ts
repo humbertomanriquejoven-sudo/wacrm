@@ -82,8 +82,9 @@ describe("sendMediaMessage — payload shape", () => {
 
 // ---------------------------------------------------------------
 // Recipient addressing — a phone number (CASO A) and a numeric opaque
-// wa_id (CASO B) both travel in `to`; a namespaced BSUID / handle is
-// refused (CASO C).
+// wa_id (CASO B) both travel in `to`; a namespaced BSUID (CASO C) is
+// routed to Meta's `recipient` field with `to` omitted. A handle is
+// refused and a placeholder is stopped locally.
 // ---------------------------------------------------------------
 describe("sendMediaMessage — recipient addressing", () => {
   beforeEach(() => {
@@ -113,6 +114,20 @@ describe("sendMediaMessage — recipient addressing", () => {
     expect(captured?.recipient).toBe("CO.1486998326437295");
     expect(captured?.to).toBeUndefined();
     expect(captured?.type).toBe("document");
+  });
+
+  it("honors the `recipient` argument even when `to` is empty", async () => {
+    // `send-message` passes the resolved address; a BSUID arrives via
+    // `recipient` while `to` stays unset — the sender must not drop it.
+    await sendMediaMessage({
+      ...BASE,
+      to: "",
+      recipient: "WAID.987654321",
+      kind: "image",
+    });
+    expect(captured?.recipient).toBe("WAID.987654321");
+    expect(captured?.to).toBeUndefined();
+    expect(captured?.type).toBe("image");
   });
 
   it("drops an `@user` / `@lid` routing suffix before addressing", async () => {

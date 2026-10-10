@@ -768,6 +768,12 @@ export async function sendTextMessage(
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, text, contextMessageId } = args
 
+  // The destination may arrive in either field: the canonical CASO A/B/C
+  // callers pass it in `to`, while a legacy retry may pass the id in
+  // `recipient` (see `recipientField`). Both name the SAME address, and
+  // `canonicalToField` below routes it to the right Meta field by shape.
+  const rawAddress = (args.recipient ?? to ?? '').trim()
+
   // CREDENTIAL AUDIT — runs for EVERY send path (manual, bot, worker
   // timers). A missing WABA credential must never be lost as a confusing
   // network 4xx from Meta (or worse, a latently misconfigured env that
@@ -787,8 +793,7 @@ export async function sendTextMessage(
     )
   }
 
-  const recipient = cleanRecipientAddress(to ?? '')
-  const address = recipient || (to ?? '').trim()
+  const address = cleanRecipientAddress(rawAddress) || rawAddress
   if (!address) {
     // The ONE case that is still refused locally: there is no address at all
     // to put in the request. An empty `to` is a guaranteed 400 with no
@@ -830,7 +835,7 @@ export async function sendTextMessage(
   // (CASO C) travels in `recipient` and needs NO anchor; a phone (CASO A)
   // needs none either. A bare `@handle` is refused later by
   // `canonicalToField`.
-  if (!contextMessageId && !isDialablePhone(address)) {
+  if (!contextMessageId && isOpaqueWaId(address)) {
     console.error(
       `[send] MISSING CONTEXT (#131009 guard): opaque destination "${address}" without a contextMessageId anchor — no HTTP request was sent. CASO B requires quoting one of the customer's own messages; anchor via this conversation's newest inbound wamid.`,
     )
@@ -841,22 +846,10 @@ export async function sendTextMessage(
         'quote (#131009). No HTTP request was sent.',
     )
   }
-  // CASO C — a namespaced BSUID / user id must not be placed in `to`, either
-  // with or without an anchor. It must travel in Meta's `recipient` field.
-  // Refuse it locally so the caller routes it through `recipientField: 'recipient'`
-  // or fixes the contact's address.
-  if (isBsuid(address)) {
-    console.error(
-      '[send] blocked: namespaced BSUID in "to" field — ' +
-        'BSUID must travel in Meta\'s `recipient` field, not `to`. ' +
-        'No HTTP request was sent to Meta.',
-    )
-    throw new InvalidRecipientError(
-      address,
-      'namespaced BSUID (e.g. \'CO.<id>\') must be sent in the ' +
-        '`recipient` field, not `to`. No HTTP request was sent.',
-    )
-  }
+  // CASO C — a namespaced BSUID / user id must not be placed in `to`: it
+  // travels in Meta's `recipient` field (canonicalToField routes it there),
+  // and needs NO `context` anchor. It is not an opaque wa_id, so the guard
+  // above never fires for it — no refusal here.
 
   // Destination field, routed by shape: a phone (CASO A) or numeric opaque
   // wa_id (CASO B) travels in `to`; a namespaced BSUID (CASO C) travels in
@@ -968,13 +961,13 @@ export async function sendMediaMessage(
   // layer answers 422 instead of letting an unresolvable contact surface
   // as a generic 502. `canonicalToField` already refuses a namespaced
   // BSUID / handle (CASO C); `{ to: '' }` covers the empty/placeholder case.
-  const addressField = canonicalToField(to ?? '')
+  const addressField = canonicalToField(args.recipient ?? to ?? '')
   if (!addressField.to && !addressField.recipient) {
     console.warn(
       '[send] blocked: media recipient could not be resolved, no HTTP request was made to Meta.',
     )
     throw new InvalidRecipientError(
-      (to ?? '').trim(),
+      (args.recipient ?? to ?? '').trim(),
       'no destination is available for this contact: the resolved address is ' +
         'empty or a placeholder ("unknown"). No HTTP request was sent.',
     )
@@ -1070,7 +1063,7 @@ export async function sendTemplateMessage(
     messageParams,
     contextMessageId,
 } = args
-  const recipient = assertDialableRecipient(to ?? '')
+  const recipient = assertDialableRecipient(args.recipient ?? to ?? '')
   const url = messagesUrl(phoneNumberId)
 
   const templatePayload: Record<string, unknown> = {
@@ -1499,7 +1492,7 @@ export async function sendInteractiveButtons(
     phoneNumberId, accessToken, to,
     bodyText, headerText, footerText, buttons, contextMessageId,
   } = args
-  const recipient = assertDialableRecipient(to ?? '')
+  const recipient = assertDialableRecipient(args.recipient ?? to ?? '')
   validateInteractiveBody(bodyText)
   validateInteractiveHeaderFooter(headerText, footerText)
   if (buttons.length < 1 || buttons.length > INTERACTIVE_LIMITS.maxButtons) {
@@ -1603,7 +1596,7 @@ export async function sendInteractiveList(
     phoneNumberId, accessToken, to,
     bodyText, buttonLabel, headerText, footerText, sections, contextMessageId,
   } = args
-  const recipient = assertDialableRecipient(to ?? '')
+  const recipient = assertDialableRecipient(args.recipient ?? to ?? '')
   validateInteractiveBody(bodyText)
   validateInteractiveHeaderFooter(headerText, footerText)
   if (!buttonLabel) throw new Error('Interactive list requires a buttonLabel.')

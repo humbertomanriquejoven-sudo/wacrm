@@ -1054,13 +1054,26 @@ describe('inbound webhook: clean creation after a wiped database', () => {
       message: 'function bump_conversation_on_inbound does not exist',
     }
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
     await runWebhook()
 
     // The metadata RPC failing is logged, not fatal: the message row exists.
     expect(h.state.upsertCalls).toHaveLength(1)
     expect(h.state.rpcCalls.length).toBeGreaterThan(0)
+
+    // A missing 3-arg function triggers the legacy 2-arg fallback so the
+    // unread bump still happens on a database that predates migration 072.
+    const bumps = h.state.rpcCalls.filter(
+      (c) => c.name === 'bump_conversation_on_inbound',
+    )
+    expect(bumps).toHaveLength(2)
+    expect(bumps[0].args).toHaveProperty('p_last_inbound_wamid')
+    expect(bumps[1].args).not.toHaveProperty('p_last_inbound_wamid')
+    expect(warnSpy).toHaveBeenCalled()
+
     errorSpy.mockRestore()
+    warnSpy.mockRestore()
   })
 })
 
