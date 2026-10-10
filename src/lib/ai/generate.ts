@@ -4,6 +4,7 @@ import {
   type AiUsage,
   type ChatMessage,
   type GenerateResult,
+  type ToolChoice,
   type ToolDefinition,
 } from './types';
 import { HANDOFF_SENTINEL, aiRequestTimeoutMs } from './defaults';
@@ -17,6 +18,8 @@ export interface GenerateArgs {
   systemPrompt: string;
   messages: ChatMessage[];
   tools?: ToolDefinition[];
+  /** Override the adapters' default `'auto'` tool selection. */
+  toolChoice?: ToolChoice;
 }
 
 /**
@@ -27,7 +30,7 @@ export interface GenerateArgs {
 export async function generateReply(
   args: GenerateArgs
 ): Promise<GenerateResult> {
-  const { config, systemPrompt, messages, tools } = args;
+  const { config, systemPrompt, messages, tools, toolChoice } = args;
   const timeoutMs = aiRequestTimeoutMs();
   const providerArgs = {
     apiKey: config.apiKey,
@@ -36,6 +39,7 @@ export async function generateReply(
     messages,
     timeoutMs,
     tools,
+    toolChoice,
   };
 
   let result: {

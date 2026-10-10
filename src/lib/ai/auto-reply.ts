@@ -6,6 +6,7 @@ import { retrieveKnowledge } from './knowledge';
 import { generateReply, stripInternalReasoning } from './generate';
 import { buildSystemPrompt } from './defaults';
 import { logAiUsage } from './usage';
+import { analyzeDealFromConversation } from './deal-analysis';
 import { latestUserMessage } from './query';
 import {
   AI_TOOLS,
@@ -1488,6 +1489,23 @@ export async function dispatchInboundToAiReply(
 
     console.log('[AUTO-REPLY] Mensaje enviado con éxito a WhatsApp:', enviado);
     replyDispatched = true;
+
+    // AI lead scoring + automatic pipeline movement. This runs AFTER the
+    // customer reply is on the wire, so it can never delay or block it;
+    // it is best-effort (its own try/catch) and NEVER throws. It reuses
+    // the same conversation context and AI config, forcing a structured
+    // `evaluate_lead` tool call — the analysis is persisted on the deal,
+    // never sent to WhatsApp.
+    await analyzeDealFromConversation({
+      db,
+      accountId,
+      userId: configOwnerUserId,
+      conversationId,
+      contactId,
+      config,
+      messages,
+      contactName: contactCtx?.name,
+    });
 
     // SISTEMA DE SEGUIMIENTOS: el bot acaba de responder. Timer 1 es
     // manual-only: esta llamada SIEMPRE queda en `disabled` (lo registra

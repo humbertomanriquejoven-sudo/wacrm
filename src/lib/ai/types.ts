@@ -64,6 +64,21 @@ export interface ToolCall {
   arguments: Record<string, unknown>
 }
 
+/**
+ * Provider-agnostic tool-selection directive.
+ *
+ * `'auto'` (the default) lets the model choose; `'required'` forces at
+ * least one tool call; `'none'` disables tools; and the object form
+ * forces ONE named function. Each adapter maps this to its own wire
+ * shape (OpenAI/OpenRouter take it verbatim, Anthropic is translated in
+ * `providers/anthropic.ts`).
+ */
+export type ToolChoice =
+  | 'auto'
+  | 'required'
+  | 'none'
+  | { type: 'function'; function: { name: string } }
+
 /** Schema definition for a tool the model can invoke. */
 export interface ToolDefinition {
   name: string

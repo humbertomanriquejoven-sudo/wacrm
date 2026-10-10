@@ -11,6 +11,7 @@ const h = vi.hoisted(() => ({
   engineSendAiReply: vi.fn(),
   executeToolCall: vi.fn(),
   loadContactContext: vi.fn(),
+  analyzeDealFromConversation: vi.fn(),
   state: {
     conv: null as Record<string, unknown> | null,
     autoResponders: [] as { id: string }[],
@@ -71,6 +72,12 @@ vi.mock('./tools', async () => {
 vi.mock('@/lib/flows/meta-send', () => ({
   engineSendText: h.engineSendText,
   engineSendAiReply: h.engineSendAiReply,
+}));
+// Lead scoring runs after a successful send; stubbed here so these
+// dispatch tests stay focused on reply behaviour (its own unit tests
+// cover the scoring pass).
+vi.mock('./deal-analysis', () => ({
+  analyzeDealFromConversation: h.analyzeDealFromConversation,
 }));
 // The real limiter is a module-level singleton with a 30/min budget, so a
 // suite that dispatches more than 30 inbounds would start failing purely on
@@ -245,6 +252,8 @@ beforeEach(() => {
   }));
   h.engineSendText.mockResolvedValue({ whatsapp_message_id: 'm1' });
   h.engineSendAiReply.mockResolvedValue({ whatsapp_message_id: 'm1' });
+  h.analyzeDealFromConversation.mockReset();
+  h.analyzeDealFromConversation.mockResolvedValue(undefined);
 });
 
 describe('dispatchInboundToAiReply — eligibility gates', () => {
@@ -259,6 +268,16 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     ]);
     expect(h.engineSendAiReply).toHaveBeenCalledWith(
       expect.objectContaining({ conversationId: 'conv-1', text: 'Hello!' })
+    );
+    // Lead scoring is kicked off (best-effort) right after the send, with
+    // the same conversation context.
+    expect(h.analyzeDealFromConversation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: 'acct-1',
+        conversationId: 'conv-1',
+        contactId: 'contact-1',
+        userId: 'user-1',
+      })
     );
   });
 

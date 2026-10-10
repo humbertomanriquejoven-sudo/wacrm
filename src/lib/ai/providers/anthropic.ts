@@ -1,4 +1,10 @@
-import { AiError, type ChatMessage, type ProviderResult, type ToolCall } from '../types'
+import {
+  AiError,
+  type ChatMessage,
+  type ProviderResult,
+  type ToolCall,
+  type ToolChoice,
+} from '../types'
 import { MAX_OUTPUT_TOKENS } from '../defaults'
 import {
   mergeConsecutive,
@@ -26,6 +32,21 @@ interface AnthropicResponse {
   content?: AnthropicContent[]
   usage?: { input_tokens?: number; output_tokens?: number }
   stop_reason?: string
+}
+
+/**
+ * Translate the provider-agnostic `ToolChoice` into Anthropic's
+ * `tool_choice` object. Anthropic has no string form and no 'none'
+ * value, so `'auto'` → `{type:'auto'}`, `'required'` → `{type:'any'}`,
+ * and a named function → `{type:'tool', name}`.
+ */
+function toAnthropicToolChoice(choice: ToolChoice): Record<string, unknown> {
+  if (choice === 'required') return { type: 'any' }
+  if (choice === 'none') return { type: 'auto' }
+  if (typeof choice === 'object' && choice.type === 'function') {
+    return { type: 'tool', name: choice.function.name }
+  }
+  return { type: 'auto' }
 }
 
 function normalizeForAnthropic(messages: ChatMessage[]): ChatMessage[] {
@@ -139,7 +160,9 @@ export async function generateAnthropic(
     }))
     // Let the model decide when to invoke a tool (Anthropic's explicit
     // "auto" default), so it emits tool_use blocks rather than prose.
-    body.tool_choice = { type: 'auto' }
+    // Callers may override (e.g. the lead-scoring pass forces
+    // `evaluate_lead`).
+    body.tool_choice = toAnthropicToolChoice(args.toolChoice ?? 'auto')
   }
 
   let res: Response

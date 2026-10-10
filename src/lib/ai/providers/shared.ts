@@ -1,4 +1,10 @@
-import { AiError, type AiUsage, type ChatMessage, type ToolDefinition } from '../types'
+import {
+  AiError,
+  type AiUsage,
+  type ChatMessage,
+  type ToolChoice,
+  type ToolDefinition,
+} from '../types'
 
 // ============================================================
 // Bits shared by the OpenAI + Anthropic adapters.
@@ -11,6 +17,13 @@ export interface ProviderArgs {
   messages: ChatMessage[]
   timeoutMs: number
   tools?: ToolDefinition[]
+  /**
+   * Tool-selection directive. Defaults to `'auto'` in every adapter so
+   * existing callers are unaffected; the lead-scoring pass forces the
+   * `evaluate_lead` function so the model MUST return structured data
+   * instead of prose.
+   */
+  toolChoice?: ToolChoice
 }
 
 /**

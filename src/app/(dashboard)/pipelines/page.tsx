@@ -214,6 +214,33 @@ export default function PipelinesPage() {
     setDeals(await loadDeals(selectedPipelineId));
   }, [loadDeals, selectedPipelineId]);
 
+  // Realtime: the AI lead-scoring pass updates deals (score + stage
+  // move) in the background right after it answers a customer. Subscribe
+  // to changes for the selected pipeline so the board reflects a new
+  // score or an automatic stage move without a manual reload. `deals`
+  // is in the `supabase_realtime` publication (migration 075).
+  useEffect(() => {
+    if (!selectedPipelineId) return;
+    const channel = supabase
+      .channel(`deals:${selectedPipelineId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "deals",
+          filter: `pipeline_id=eq.${selectedPipelineId}`,
+        },
+        () => {
+          refreshDeals();
+        },
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [supabase, selectedPipelineId, refreshDeals]);
+
   const handleDealMoved = useCallback(
     async (dealId: string, newStageId: string) => {
       // Optimistic update — board already animated; just persist.

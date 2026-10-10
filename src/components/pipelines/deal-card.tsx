@@ -1,7 +1,7 @@
 "use client";
 
 import type { Deal, PipelineStage } from "@/types";
-import { Calendar, Check, X } from "lucide-react";
+import { Calendar, Check, Star, X } from "lucide-react";
 import { formatCurrency } from "@/lib/currency";
 import { useTranslations } from "next-intl";
 
@@ -30,6 +30,14 @@ export function DealCard({ deal, stage, onEdit, isOverlay }: DealCardProps) {
   const t = useTranslations("Pipelines.card");
   const contactLabel = deal.contact?.name || deal.contact?.phone || t("noContact");
   const assigneeLabel = deal.assignee?.full_name || null;
+  // AI lead score (0-10), set by the post-reply analysis pass. Null until
+  // the first pass runs, so the row is simply omitted.
+  const aiScore =
+    typeof deal.ai_score === "number" &&
+    Number.isFinite(deal.ai_score) &&
+    deal.ai_score >= 0
+      ? Math.min(10, Math.round(deal.ai_score))
+      : null;
 
   return (
     <button
@@ -71,6 +79,32 @@ export function DealCard({ deal, stage, onEdit, isOverlay }: DealCardProps) {
           </span>
         )}
       </div>
+
+      {/* AI lead score */}
+      {aiScore !== null && (
+        <div
+          className="mt-2 flex items-center gap-1.5"
+          title={`${aiScore}/10`}
+          aria-label={`Lead score ${aiScore} out of 10`}
+        >
+          <span className="flex items-center gap-px">
+            {Array.from({ length: 10 }).map((_, i) => (
+              <Star
+                key={i}
+                aria-hidden
+                className={`h-3 w-3 ${
+                  i < aiScore
+                    ? "fill-amber-400 text-amber-400"
+                    : "text-muted-foreground/30"
+                }`}
+              />
+            ))}
+          </span>
+          <span className="text-[10px] font-semibold text-muted-foreground">
+            {aiScore}/10
+          </span>
+        </div>
+      )}
 
       {/* Contact row */}
       <div className="mt-2 flex items-center gap-2">

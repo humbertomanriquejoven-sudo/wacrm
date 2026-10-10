@@ -496,6 +496,17 @@ export interface Deal {
   notes?: string;
   expected_close_date?: string;
   status?: DealStatus;
+  /**
+   * AI lead-scoring columns (migration 075). Nullable: a deal has no
+   * score until the post-reply analysis pass has run at least once.
+   */
+  ai_score?: number | null;
+  ai_temperature?: string | null;
+  ai_summary?: string | null;
+  /** Stage the AI suggested; validated against the deal's pipeline. */
+  ai_stage_id?: string | null;
+  ai_analyzed_at?: string | null;
+  ai_analysis_model?: string | null;
   created_at: string;
   updated_at?: string;
   contact?: Contact;

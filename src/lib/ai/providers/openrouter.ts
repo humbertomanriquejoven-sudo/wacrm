@@ -88,7 +88,9 @@ export async function generateOpenRouter(
     // Let the model decide when to invoke a tool; without this some
     // models (Gemini via OpenRouter) narrate the call as plain text
     // instead of emitting the structured tool_calls the runtime expects.
-    body.tool_choice = 'auto'
+    // Callers may override (e.g. the lead-scoring pass forces
+    // `evaluate_lead`).
+    body.tool_choice = args.toolChoice ?? 'auto'
   }
 
   let res: Response
