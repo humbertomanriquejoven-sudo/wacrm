@@ -558,7 +558,7 @@ export default function ContactsPage() {
           <TableBody>
             {loading ? (
               <TableRow className="border-border">
-                <TableCell colSpan={10} className="text-center py-12">
+                <TableCell colSpan={13} className="text-center py-12">
                   <div className="flex flex-col items-center gap-2">
                     <Loader2 className="size-6 animate-spin text-primary" />
                     <p className="text-sm text-muted-foreground">{t('loading')}</p>
@@ -567,7 +567,7 @@ export default function ContactsPage() {
               </TableRow>
             ) : contacts.length === 0 ? (
               <TableRow className="border-border">
-                <TableCell colSpan={10} className="text-center py-12">
+                <TableCell colSpan={13} className="text-center py-12">
                   <div className="flex flex-col items-center gap-2">
                     <Users className="size-8 text-muted-foreground" />
                     <p className="text-sm text-muted-foreground">
@@ -621,7 +621,17 @@ export default function ContactsPage() {
                     {contact.bsuid || <span className="text-muted-foreground">-</span>}
                   </TableCell>
                   <TableCell className="text-muted-foreground text-sm">
-                    {contact.recipient_address || <span className="text-muted-foreground">-</span>}
+                    {contact.recipient_address || contact.wa_id || contact.bsuid || (
+                      <span className="text-muted-foreground">-</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-muted-foreground text-sm">
+                    {contact.recipient_type ||
+                      (contact.wa_id
+                        ? 'phone'
+                        : contact.bsuid
+                          ? 'bsuid'
+                          : <span className="text-muted-foreground">-</span>)}
                   </TableCell>
                   <TableCell className="text-muted-foreground hidden md:table-cell text-sm">
                     {contact.email || <span className="text-muted-foreground">-</span>}

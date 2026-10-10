@@ -116,8 +116,8 @@ export function ContactDetailView({
       setEditEmail(data.email ?? '');
       setEditCompany(data.company ?? '');
       setEditWaId(data.wa_id ?? '');
-      setEditWaUser(data.wa_user_id ?? '');
-      setEditDireccionEntrega(data.direccion_entrega ?? '');
+      setEditWaUser(data.bsuid ?? data.wa_user_id ?? '');
+      setEditDireccionEntrega(data.recipient_address ?? '');
     }
     setLoading(false);
   }, [contactId, supabase]);
@@ -239,8 +239,20 @@ export function ContactDetailView({
         email: editEmail.trim() || null,
         company: editCompany.trim() || null,
         wa_id: editWaId.trim() || null,
+        // BSUID is written to both the canonical column and the legacy
+        // `wa_user_id` the outbound address ladders still read.
+        bsuid: editWaUser.trim() || null,
         wa_user_id: editWaUser.trim() || null,
-        direccion_entrega: editDireccionEntrega.trim() || null,
+        recipient_address:
+          editDireccionEntrega.trim() ||
+          editWaId.trim() ||
+          editWaUser.trim() ||
+          null,
+        recipient_type: editWaId.trim()
+          ? 'phone'
+          : editWaUser.trim()
+            ? 'bsuid'
+            : null,
         updated_at: new Date().toISOString(),
       })
       .eq('id', contactId);
@@ -562,7 +574,7 @@ export function ContactDetailView({
                     />
                   </div>
                   <div className="space-y-1.5">
-                    <Label className="text-muted-foreground text-xs">WA User ID</Label>
+                    <Label className="text-muted-foreground text-xs">BSUID</Label>
                     <Input
                       value={editWaUser}
                       onChange={(e) => setEditWaUser(e.target.value)}
@@ -570,7 +582,7 @@ export function ContactDetailView({
                     />
                   </div>
                   <div className="space-y-1.5">
-                    <Label className="text-muted-foreground text-xs">Direccion de entrega</Label>
+                    <Label className="text-muted-foreground text-xs">Dirección de entrega</Label>
                     <Input
                       value={editDireccionEntrega}
                       onChange={(e) => setEditDireccionEntrega(e.target.value)}
