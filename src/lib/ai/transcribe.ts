@@ -7,7 +7,7 @@ const GEMINI_TRANSCRIBE_MODEL = 'google/gemini-2.5-flash-lite'
 // The exact instruction sent to the multimodal model with the audio bytes.
 // Kept in Spanish and unquoted so transcripts come back as plain text.
 const TRANSCRIBE_INSTRUCTION =
-  'Escucha este audio y transcribe con exactitud lo que dice el cliente en texto plano.'
+  'Escucha este audio y transcribe con exactitud lo que dice el cliente en texto plano. Es una conversación informal en español de Colombia para un servicio de arquitectura y remodelación. Usa contexto de expresiones colombianas: qué más, parce, cómo vas, bacano, chévere, Bogotá, Cajicá, Chía, remodelación, obra nueva, obra, cotización, presupuesto.'
 
 // Strict ceilings so a stuck provider can't hang the WhatsApp webhook.
 // Transcription is on the inbound hot path — every second here delays
@@ -166,6 +166,13 @@ async function callWhisper(
   const form = new FormData()
   form.append('file', new Blob([new Uint8Array(buffer)], { type: mimeType }), filename)
   form.append('model', WHISPER_MODEL)
+  // Force Spanish to reduce dialectal hallucinations; Whisper also
+  // accepts a prompt for rare terms/colloquial phrases.
+  form.append('language', 'es')
+  form.append(
+    'prompt',
+    'Conversación informal en español de Colombia para un servicio de arquitectura y remodelación. Se usan: qué más, parce, cómo vas, bacano, chévere, Bogotá, Cajicá, Chía, remodelación, obra nueva, cotización, presupuesto.'
+  )
 
   const res = await fetch(endpoint, {
     method: 'POST',
