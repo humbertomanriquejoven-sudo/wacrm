@@ -913,15 +913,17 @@ describe('inbound webhook: identity persistence (migration 072)', () => {
     for (const cb of h.state.afterCallbacks) await cb()
 
     const insert = h.state.contactInsertCalls[0]
-    // CASO C: the opaque BSUID is identity data in `wa_user_id` AND the
-    // final delivery address in `recipient_id` (rule: wa_id ? wa_id : wa_user_id).
+    // CASO C: the opaque BSUID is identity data in `wa_user_id` (normalized,
+    // prefix-stripped) AND the final delivery address in `recipient_id`
+    // (rule: wa_id ? wa_id : wa_user_id). The delivery address keeps the FULL
+    // namespaced value — `CO.` — which is the only form Meta accepts (#131009).
     expect(insert.wa_user_id).toBe('9988776655443322')
     expect(insert.identity_type).toBe('BSUID')
     expect(insert.phone_number_id).toBe('pn-1')
     // It must not be promoted into the numeric destination column.
     expect(insert.wa_id ?? null).toBeNull()
-    // ...but it IS the delivery address, so recipient_id carries it.
-    expect(insert.recipient_id ?? null).toBe('9988776655443322')
+    // ...but it IS the delivery address, so recipient_id carries it whole.
+    expect(insert.recipient_id ?? null).toBe('CO.9988776655443322')
     // No number was disclosed, so `phone` persists SQL NULL — the literal
     // 'unknown' placeholder must never reach the database.
     expect(insert.phone).toBeNull()
@@ -1794,8 +1796,9 @@ describe('inbound webhook: Meta identity columns (migration 053)', () => {
     // it, and the 'unknown' placeholder never reaches it (idx_contacts_wa_id
     // indexes any non-empty value as a real id).
     expect(insert.wa_id ?? null).toBeNull()
-    // `recipient_id` IS the delivery address, so the BSUID fills it.
-    expect(insert.recipient_id ?? null).toBe('9988776655443322')
+    // `recipient_id` IS the delivery address, so the BSUID fills it — with its
+    // namespace prefix intact (the only form Meta accepts, #131009).
+    expect(insert.recipient_id ?? null).toBe('CO.9988776655443322')
     expect(
       JSON.stringify([
         insert.wa_id,
@@ -2150,6 +2153,40 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     for (const cb of h.state.afterCallbacks) await cb()
 
     expect(h.state.contactInsertCalls).toHaveLength(0)
+  })
+
+  it('upgrades a legacy prefix-stripped recipient_id to the full BSUID', async () => {
+    // Legacy rows stored the BSUID WITHOUT its namespace (`9988776655443322`).
+    // Meta rejects that shape (#131009) — only the full `CO.…` value is
+    // accepted in its `recipient` field. The next inbound, which discloses the
+    // complete id, must repair the stored delivery address so outbound sends
+    // route to `recipient`.
+    mockFindExistingContact.mockResolvedValue(null)
+    h.state.bsuidLookupResponse = {
+      id: 'contact-existing',
+      account_id: 'acc-1',
+      user_id: 'user-1',
+      phone: null,
+      name: 'Ana Ruiz',
+      username: '@anaruiz',
+      wa_id: null,
+      wa_user_id: '9988776655443322',
+      recipient_id: '9988776655443322',
+      identity_type: 'BSUID',
+      phone_number_id: null,
+      display_name: null,
+    }
+
+    await POST(bsuidInboundRequest())
+    for (const cb of h.state.afterCallbacks) await cb()
+
+    // No duplicate row: the BSUID matched the existing contact.
+    expect(h.state.contactInsertCalls).toHaveLength(0)
+    // The delivery address is repaired to the FULL namespaced form.
+    const patch = h.state.contactUpdateCalls[0]?.patch
+    expect(patch?.recipient_id).toBe('CO.9988776655443322')
+    // The identity/dedupe column keeps its normalized form.
+    expect(patch?.wa_user_id).toBeUndefined()
   })
 
   it('repairs a contact whose phone holds a CO.-prefixed BSUID', async () => {

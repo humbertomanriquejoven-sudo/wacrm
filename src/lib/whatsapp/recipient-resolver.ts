@@ -358,9 +358,15 @@ export async function findRecoverableIdentifier(
  *   3. `wa_id` — the numeric opaque id Meta used as the inbound `from`, i.e.
  *      the address that demonstrably reached us (CASO B, always anchored to a
  *      `context.message_id` by the senders).
- *   4. `wa_user_id` — the BSUID / user id Meta disclosed in place of a number
- *      (CASO C). It travels in Meta's `recipient` field and needs no anchor.
- *   5. `recipient_id` — the alternative numeric Meta identifier (CASO B).
+ *   4. `recipient_id` — the curated delivery address. For a BSUID sender the
+ *      webhook stores the FULL namespaced id here (`CO.…`, CASO C, travels in
+ *      Meta's `recipient` field); for a numeric sender it holds the
+ *      alternative opaque wa_id (CASO B).
+ *   5. `wa_user_id` — the normalized (prefix-stripped) BSUID / user id Meta
+ *      disclosed in place of a number (CASO C). Checked LAST because its
+ *      namespace was stripped at storage, so a bare numeric value here is
+ *      indistinguishable from an opaque wa_id — never route that shape to
+ *      `to`.
  *   5b. An id recovered from THIS contact's own inbound message
  *      (`sender_phone` / `raw_meta_payload`) or its conversation row — the
  *      trace a privacy-shielded sender leaves without ever touching a column.
@@ -419,19 +425,12 @@ export async function resolveRecipient(
     }
   }
 
-  // 4. `wa_user_id` — the BSUID / user id Meta disclosed when the sender had
-  //    no number. It travels in Meta's `recipient` field (CASO C).
-  const bsuid = deliverableDestination(contact.wa_user_id)
-  if (bsuid) {
-    return {
-      to: bsuid.to,
-      source: 'bsuid',
-      isPhone: false,
-      isBsuid: true,
-    }
-  }
-
-  // 5. `recipient_id` — the alternative numeric Meta identifier.
+  // 4. `recipient_id` — the curated DELIVERY address. Since the webhook
+  //    stores the FULL namespaced BSUID here (`CO.1008477715690681`, the
+  //    prefix Meta requires, #131009), it outranks the normalized identity
+  //    value in `wa_user_id`: a namespaced value travels in Meta's
+  //    `recipient` field (CASO C), while a bare numeric here is the
+  //    alternative opaque wa_id (CASO B).
   const recipientId = deliverableDestination(contact.recipient_id)
   if (recipientId) {
     return {
@@ -439,6 +438,22 @@ export async function resolveRecipient(
       source: recipientId.isBsuid ? 'bsuid' : recipientId.isPhone ? 'phone' : 'wa_id',
       isPhone: recipientId.isPhone,
       isBsuid: recipientId.isBsuid,
+    }
+  }
+
+  // 5. `wa_user_id` — the normalized (prefix-stripped) BSUID / user id Meta
+  //    disclosed when the sender had no number. Checked only after the
+  //    curated `recipient_id`: the identity value is stored without its
+  //    namespace, and a bare numeric BSUID is indistinguishable from an
+  //    opaque wa_id — exactly what made a stripped BSUID reach `to` and get
+  //    rejected (#131009).
+  const bsuid = deliverableDestination(contact.wa_user_id)
+  if (bsuid) {
+    return {
+      to: bsuid.to,
+      source: 'bsuid',
+      isPhone: false,
+      isBsuid: true,
     }
   }
 
@@ -752,9 +767,13 @@ export async function sendWithRecipientFallback<T>(args: {
  *      normalized away by `toDialable`).
  *   2. `wa_id` — the numeric opaque id Meta used as the inbound `from`. This
  *      is the field that carries a privacy-shielded sender's underlying id.
- *   3. `wa_user_id` — the BSUID / user id Meta disclosed in place of a number
- *      (CASO C). It travels in Meta's `recipient` field.
- *   4. `recipient_id` — the alternative numeric Meta identifier.
+ *   3. `recipient_id` — the curated delivery address: a full namespaced BSUID
+ *      (`CO.…`, CASO C, travels in Meta's `recipient` field) for a BSUID
+ *      sender, or the alternative numeric Meta identifier (CASO B).
+ *   4. `wa_user_id` — the normalized (prefix-stripped) BSUID / user id Meta
+ *      disclosed in place of a number (CASO C). Checked after `recipient_id`
+ *      because its namespace is stripped at storage, so a bare numeric value
+ *      is indistinguishable from an opaque wa_id; it is never placed in `to`.
  *   5. (optional deeper pass) a real number recovered from this contact's
  *      own conversation history.
  *
@@ -803,21 +822,12 @@ export async function resolveBestRecipient(
     }
   }
 
-  // 3. wa_user_id — the BSUID / user id Meta disclosed when the sender had no
-  //    number. It travels in Meta's `recipient` field (CASO C).
-  //    Se revisa de forma independiente: un contacto puede tener wa_user_id
-  //    sin tener wa_id (ej. remitente por número no registrado).
-  const bsuid = deliverableDestination(contact.wa_user_id)
-  if (bsuid) {
-    return {
-      to: bsuid.to,
-      source: 'bsuid',
-      isPhone: false,
-      isBsuid: true,
-    }
-  }
-
-  // 4. recipient_id — the alternative numeric Meta identifier.
+  // 3. recipient_id — the curated DELIVERY address. For a BSUID sender the
+  //    webhook stores the FULL namespaced id here (`CO.…`, CASO C, travels in
+  //    Meta's `recipient` field); for a numeric sender it holds the
+  //    alternative opaque Meta identifier (CASO B). Outranks `wa_user_id`
+  //    because the identity value is stored prefix-stripped (indistinguishable
+  //    from an opaque wa_id at send time).
   const recipientId = deliverableDestination(contact.recipient_id)
   if (recipientId) {
     return {
@@ -825,6 +835,21 @@ export async function resolveBestRecipient(
       source: recipientId.isBsuid ? 'bsuid' : recipientId.isPhone ? 'phone' : 'wa_id',
       isPhone: recipientId.isPhone,
       isBsuid: recipientId.isBsuid,
+    }
+  }
+
+  // 4. wa_user_id — the normalized (prefix-stripped) BSUID / user id Meta
+  //    disclosed when the sender had no number. Checked only after the
+  //    curated `recipient_id`. A namespaced value here also covers the legacy
+  //    case of a BSUID written into `phone` before migration 051 normalised
+  //    that column.
+  const bsuid = deliverableDestination(contact.wa_user_id)
+  if (bsuid) {
+    return {
+      to: bsuid.to,
+      source: 'bsuid',
+      isPhone: false,
+      isBsuid: true,
     }
   }
 

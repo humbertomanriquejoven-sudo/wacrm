@@ -92,6 +92,22 @@ it('preserves full BSUID CO.1486998326437295 without truncation', async () => {
     expect(r.to).toBe('99887766')
   })
 
+  it('prefers the FULL namespaced recipient_id over the stripped wa_user_id (CASO C)', async () => {
+    // The webhook stores the normalized BSUID in `wa_user_id` and the full
+    // `CO.…` value in `recipient_id`. Only the full value is accepted by Meta
+    // (#131009), so it must win over the stripped identity value — never
+    // surface the stripped digits as a `to` address.
+    const r = await resolveBestRecipient({
+      phone: 'unknown',
+      wa_user_id: '1008477715690681',
+      recipient_id: 'CO.1008477715690681',
+    })
+    expect(r.to).toBe('CO.1008477715690681')
+    expect(r.isBsuid).toBe(true)
+    expect(r.isPhone).toBe(false)
+    expect(r.source).toBe('bsuid')
+  })
+
   it('REFUSES a username — display data is never a destination (CASO C)', async () => {
     const r = await resolveBestRecipient({
       phone: 'unknown',

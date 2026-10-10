@@ -245,8 +245,8 @@ export function isOpaqueWaId(value: string | null | undefined): boolean {
 export interface MetaRecipientFields {
   /** A phone number or a numeric opaque wa_id goes here. */
   to?: string
-  /** A BSUID/handle would go here — but those are REFUSED (CASO C), so this
-   *  is now reserved for legacy callers; deliverable addresses always use `to`. */
+  /** A namespaced BSUID / user id (`CO.…`/`WAID.…`) goes here, with `to`
+   *  omitted — the field Meta's Cloud API documents for business-scoped ids. */
   recipient?: string
 }
 
@@ -254,10 +254,10 @@ export interface MetaRecipientFields {
  * Route an outbound address to the field Meta actually reads.
  *
  * A dialable number keeps going in `to` exactly as before (CASO A), and a
- * numeric opaque wa_id also travels in `to` (CASO B). Only a namespaced
- * BSUID or an `@handle` — identity markers that are NEVER a destination
- * (CASO C) — would land in `recipient`; the send path refuses those before
- * this helper is ever reached.
+ * numeric opaque wa_id also travels in `to` (CASO B). A namespaced BSUID
+ * (`CO.…`/`WAID.…`) — a valid destination — travels in `recipient` (CASO C).
+ * A bare `@handle` would also land in `recipient`, but the send path refuses
+ * it before this helper is ever reached.
  */
 export function metaRecipientFields(address: string): MetaRecipientFields {
   const value = (address ?? '').trim()

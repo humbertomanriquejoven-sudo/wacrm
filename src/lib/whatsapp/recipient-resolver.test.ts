@@ -432,6 +432,27 @@ describe('resolveRecipient - one ladder for all senders', () => {
     expect(r.source).toBe('wa_id')
   })
 
+  it('prefers the FULL namespaced recipient_id over the stripped wa_user_id (CASO C)', async () => {
+    // A BSUID-only contact stores the prefix-stripped id in `wa_user_id` and
+    // the full `CO.…` value in `recipient_id` (the delivery address). Only the
+    // full value is accepted by Meta (#131009), so resolution must surface it
+    // — never the stripped digits as `to`.
+    const r = await resolveRecipient(
+      {
+        id: 'c1',
+        phone: null,
+        wa_id: null,
+        wa_user_id: '1008477715690681',
+        recipient_id: 'CO.1008477715690681',
+      },
+      'acct-1',
+    )
+    expect(r.to).toBe('CO.1008477715690681')
+    expect(r.isBsuid).toBe(true)
+    expect(r.isPhone).toBe(false)
+    expect(r.source).toBe('bsuid')
+  })
+
   it('REFUSES a @handle stored in the phone column (CASO C)', async () => {
     const r = await resolveRecipient({ id: 'c1', phone: '@tienda' }, 'acct-1')
     expect(r.to).toBe('')

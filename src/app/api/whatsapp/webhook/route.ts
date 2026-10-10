@@ -1000,6 +1000,17 @@ async function processMessage(
     !isPhoneLike(contact.wa_id ?? '') ? contact.wa_id : null,
     !isPhoneLike(message.from ?? '') ? message.from : null,
   )
+  // The SAME identifiers, kept VERBATIM — namespace prefix (`CO.`/`WAID.`)
+  // intact. Meta rejects a prefix-stripped BSUID (#131009) and reads the full
+  // value from its `recipient` field, so this is what the delivery column
+  // (`recipient_id`) must store. `senderUserId` (normalized) still feeds the
+  // `wa_user_id` identity/dedupe column.
+  const senderUserIdFull = firstNamespacedMetaId(
+    contact.user_id,
+    message.from_user_id,
+    !isPhoneLike(contact.wa_id ?? '') ? contact.wa_id : null,
+    !isPhoneLike(message.from ?? '') ? message.from : null,
+  )
   const senderUsername = withAtSign(
     contact.profile.username || (contact as { username?: string }).username,
   )
@@ -1148,6 +1159,7 @@ async function processMessage(
     {
       phone: rawPhone,
       waUserId: senderUserId,
+      recipientId: senderUserIdFull,
       username: senderUsername,
       name: senderName ?? contact.profile.name,
     },
@@ -2134,6 +2146,27 @@ function firstOpaqueId(...candidates: Array<string | null | undefined>): string 
 }
 
 /**
+ * Extract a NAMESPACED Meta identifier (`CO.…`/`WAID.…`) VERBATIM, keeping
+ * its namespace prefix, or null when no candidate carries one.
+ *
+ * Meta requires the WHOLE value — country/namespace prefix, dot and all — to
+ * address a BSUID: "Omitting or changing the country code, period, or
+ * alphanumeric characters will cause your request to fail" (#131009).
+ * `firstOpaqueId` normalizes the id for the identity/dedupe column
+ * (`wa_user_id`); this helper preserves it for the DELIVERY address
+ * (`recipient_id`), which is the value the outbound sender routes into Meta's
+ * `recipient` field. A bare opaque wa_id (no prefix) yields null here.
+ */
+function firstNamespacedMetaId(...candidates: Array<string | null | undefined>): string | null {
+  for (const candidate of candidates) {
+    const trimmed = candidate?.trim()
+    if (!trimmed) continue
+    if (BSUID_PREFIX_RE.test(trimmed)) return trimmed
+  }
+  return null
+}
+
+/**
  * Categorize which kind of identifier identifies this sender, for
  * `contacts.identity_type` (migration 053).
  *
@@ -2667,6 +2700,15 @@ interface SenderIdentity {
    * BSUID.
    */
   waUserId: string | null
+  /**
+   * The same BSUID, but VERBATIM — namespace prefix (`CO.`/`WAID.`) intact.
+   *
+   * Meta refuses a prefix-stripped BSUID (#131009) and expects the full value
+   * in its `recipient` field, so this is what the `recipient_id` DELIVERY
+   * column stores. Null for a sender that disclosed no namespaced id (a real
+   * phone, or a bare opaque wa_id with no prefix).
+   */
+  recipientId: string | null
   /** Public @username, WITH the leading '@'. */
   username: string | null
   /** WhatsApp profile name. */
@@ -2709,7 +2751,11 @@ async function findOrCreateContact(
   }
 ): Promise<ContactOutcome | null> {
   const db = supabaseAdmin()
-  const { phone, waUserId, username, name } = sender
+  const { phone, waUserId, recipientId, username, name } = sender
+  // The FINAL delivery address, when this payload disclosed a BSUID: the FULL
+  // namespaced value (`CO.1008477715690681`) rather than the normalized
+  // identity form. Falls back to the normalized id for a bare opaque wa_id.
+  const deliveryId = recipientId ?? waUserId
 
   // 1. BSUID — exact, and unique per (account, BSUID) by migration 048.
   let existingContact: ContactRow | null = null
@@ -2885,11 +2931,34 @@ async function findOrCreateContact(
     const storedWaId = (existingContact.wa_id ?? '').trim()
     const storedRecipientId = (existingContact.recipient_id ?? '').trim()
     const metaIdForContact = metaIdentity?.wa_id ?? null
-    const targetRecipientId = metaIdForContact ?? waUserId ?? null
+    // Prefer Meta's canonical numeric id; otherwise the BSUID — the FULL
+    // namespaced value when the payload carried one (`deliveryId`), so the
+    // stored delivery address keeps the prefix Meta requires (#131009).
+    const targetRecipientId = metaIdForContact ?? deliveryId ?? null
     if (metaIdForContact && (!storedWaId || isPlaceholderValue(storedWaId))) {
       updates.wa_id = metaIdForContact
     }
-    if (targetRecipientId && (!storedRecipientId || isPlaceholderValue(storedRecipientId))) {
+    // Fill when the row has no delivery address (or only the 'unknown'
+    // placeholder). ALSO upgrade a prefix-STRIPPED BSUID to its full
+    // namespaced form: legacy rows stored `1008477715690681` where Meta now
+    // discloses `CO.1008477715690681`, and only the FULL value is accepted.
+    // The digit runs must match (so a legitimately different address is never
+    // overwritten) and the stored value must not be a real phone (a BSUID
+    // must never demote a dialable number).
+    const digitsOnly = (v: string) => v.replace(/\D/g, '')
+    const recipientNeedsFullPrefix =
+      Boolean(recipientId) &&
+      storedRecipientId !== '' &&
+      storedRecipientId !== recipientId &&
+      !isPhoneLike(storedRecipientId) &&
+      digitsOnly(recipientId ?? '') !== '' &&
+      digitsOnly(recipientId ?? '') === digitsOnly(storedRecipientId)
+    if (
+      targetRecipientId &&
+      (!storedRecipientId ||
+        isPlaceholderValue(storedRecipientId) ||
+        recipientNeedsFullPrefix)
+    ) {
       updates.recipient_id = targetRecipientId
     }
 
@@ -2927,10 +2996,13 @@ async function findOrCreateContact(
       username: username ?? undefined,
       wa_user_id: waUserId ?? undefined,
       // The final delivery address (DESTINATION_ENVIO): `wa_id` when Meta
-      // disclosed one, otherwise the BSUID. Same rule the update path
-      // applies: `recipient_id = wa_id ? wa_id : wa_user_id`. This is what
-      // the Contacts table's "Dirección de entrega" column renders.
-      recipient_id: metaIdentity?.wa_id ?? waUserId ?? undefined,
+      // disclosed one, otherwise the BSUID — the FULL namespaced value when
+      // the payload carried one (`deliveryId`). Meta rejects a stripped
+      // BSUID (#131009) and reads the full `CO.…`/`WAID.…` value from its
+      // `recipient` field. Same rule the update path applies —
+      // `recipient_id = wa_id ? wa_id : deliveryId`. This is what the
+      // Contacts table's "Dirección de entrega" column renders.
+      recipient_id: metaIdentity?.wa_id ?? deliveryId ?? undefined,
       // `wa_id` is a numeric DESTINATION column hydrated from the CANONICAL
       // Meta id (Meta's `contacts[0].wa_id` / `messages[0].from`), never from
       // the BSUID: a namespaced BSUID in `wa_id` is rejected by Meta
