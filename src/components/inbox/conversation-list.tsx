@@ -469,7 +469,7 @@ function ConversationItem({
           (name or @username), uppercased. Restored after 090675a removed
           the `initials` computation and left the recipient_id digits on
           screen (a BSUID shows 'C' from 'CO.…', not the sender's letter). */}
-      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary text-sm font-semibold text-primary-foreground">
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-neutral-900 text-sm font-semibold text-white">
         {initials}
       </div>
 

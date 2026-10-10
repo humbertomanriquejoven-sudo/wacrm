@@ -144,7 +144,7 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
         <div className="p-4">
           {/* Contact Info */}
           <div className="flex flex-col items-center text-center">
-            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-primary text-lg font-semibold text-primary-foreground">
+            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-neutral-900 text-lg font-semibold text-white">
                 {initials}
               </div>
             <h3 className="mt-3 text-sm font-semibold text-foreground">
