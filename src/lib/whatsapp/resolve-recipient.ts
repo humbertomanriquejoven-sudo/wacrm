@@ -70,8 +70,6 @@ export function resolveWhatsAppRecipient(
  * Obtiene el destinatario formateado para enviar a Meta Cloud API.
  *
  * @param contact - Datos del contacto de Supabase
- * @param conversationId - ID de la conversación (opcional)
- * @param inboundMessageId - ID del mensaje entrante (opcional, para anclar wa_id)
  * @returns Objeto con recipient_id y recipient_type, o null si no hay destinatario
  */
 export function getMetaRecipient(
@@ -82,9 +80,7 @@ export function getMetaRecipient(
     username?: string | null;
     recipient_id?: string | null;
     identity_type?: string | null;
-  },
-  conversationId?: string,
-  inboundMessageId?: string
+  }
 ): { recipient_id: string; recipient_type: "phone" | "bsuid" } | null {
   // Primero intentar usar recipient_id / identity_type si ya están guardados.
   // identity_type vale 'PHONE_E164' (→ phone) o 'BSUID' (→ bsuid).
@@ -158,13 +154,11 @@ export function validateRecipient(
  *
  * @param recipientId - El ID (wa_id o BSUID) a enviar
  * @param recipientType - 'phone' usa campo 'to', 'bsuid' usa campo 'recipient'
- * @param phoneNumberId - ID del número de teléfono de Meta (necesario para 'to')
  * @returns Objeto con el campo de destinatario formateado
  */
 export function formatMetaRecipient(
   recipientId: string,
-  recipientType: "phone" | "bsuid",
-  phoneNumberId?: string
+  recipientType: "phone" | "bsuid"
 ): { to?: string; recipient?: string } {
   if (recipientType === "phone") {
     // Para phone: el campo 'to' espera el número completo

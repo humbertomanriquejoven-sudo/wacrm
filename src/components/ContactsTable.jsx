@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { supabase } from '@/lib/supabase/client';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -33,24 +33,6 @@ export function ContactsTable() {
   useEffect(() => {
     fetchContacts();
   }, [fetchContacts]);
-    setIsLoading(true);
-    try {
-      let query = supabase.from('contacts').select('*');
-
-      if (searchQuery) {
-        query = query.or(`name.ilike.%${searchQuery}%,phone.ilike.%${searchQuery}%,wa_id.ilike.%${searchQuery}%,wa_user.ilike.%${searchQuery}%`);
-      }
-
-      const { data, error } = await query.order('created', { ascending: false });
-
-      if (error) throw error;
-      setContacts(data);
-    } catch (err) {
-      console.error('Error fetching contacts:', err);
-    } finally {
-      setIsLoading(false);
-    }
-  };
 
   const columns = [
     { key: 'name', label: 'Name' },
