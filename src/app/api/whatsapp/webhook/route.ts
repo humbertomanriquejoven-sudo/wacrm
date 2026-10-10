@@ -499,14 +499,6 @@ export async function POST(request: Request) {
     }, ${inboundMessageCount} inbound message(s)`
   )
 
-  // Raw payload dump. The identity fields Meta sends have changed shape
-  // more than once (wa_id → user_id/BSUID → profile.username), and when
-  // an inbound is mishandled the only way to know what we actually got is
-  // the exact JSON. Logged in full so the phone/identity fields of a
-  // privacy-shielded (BSUID) sender can be verified end-to-end.
-  console.log('=== RAW META WEBHOOK PAYLOAD ===')
-  console.log(JSON.stringify(body, null, 2))
-
   // Process AFTER the response so we ack Meta within their ~20s timeout
   // (a slow ack triggers Meta retries + duplicate inserts), while still
   // guaranteeing the work runs to completion.
@@ -524,9 +516,15 @@ export async function POST(request: Request) {
   after(async () => {
     const startedAt = Date.now()
     try {
+      // Raw payload dump (deferred so we ack Meta immediately). Logged in
+      // background; verbose but useful for BSUID/username debugging.
+      try {
+        console.log('=== RAW META WEBHOOK PAYLOAD ===')
+        console.log(JSON.stringify(body, null, 2))
+      } catch {}
       // Opportunistic hygiene (BSUID-as-phone repair, phone
       // normalization, empty-phone purge). Each pass is a full
-      // `contacts` scan, so running them on EVERY delivery adds a table
+      // contacts table scan, so running them on EVERY delivery adds a table
       // sweep to the critical path before the customer's message row is
       // even committed — and the inbox can't show the message until that
       // insert lands. They self-limit (the broken rows drop to zero after
