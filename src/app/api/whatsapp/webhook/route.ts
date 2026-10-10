@@ -515,6 +515,7 @@ export async function POST(request: Request) {
   // maxDuration).
   after(async () => {
     const startedAt = Date.now()
+    console.time('webhook:after_total')
     try {
       // Raw payload dump (deferred so we ack Meta immediately). Logged in
       // background; verbose but useful for BSUID/username debugging.
@@ -530,16 +531,25 @@ export async function POST(request: Request) {
       // insert lands. They self-limit (the broken rows drop to zero after
       // the first pass), so the pass is gated to once per window instead
       // of once per delivery.
+      console.time('webhook:maintenance')
       await runInboundMaintenanceIfDue()
+      console.timeEnd('webhook:maintenance')
+
+      console.time('webhook:process')
       await processWebhook(body)
+      console.timeEnd('webhook:process')
+
+      const ms = Date.now() - startedAt
       console.log(
-        `[webhook] delivery processed in ${Date.now() - startedAt}ms`
+        `[webhook] delivery processed in ${ms}ms (target ack<500ms from POST start)`
       )
     } catch (error) {
       console.error(
         `[webhook] processWebhook threw after ${Date.now() - startedAt}ms — remaining messages in this delivery were dropped:`,
         error
       )
+    } finally {
+      console.timeEnd('webhook:after_total')
     }
   })
 
@@ -1484,12 +1494,14 @@ async function processMessage(
   // separate conditional statement rather than a `status` field on the
   // update above so the write can be gated on the row's CURRENT status in
   // SQL — see the helper for why that matters.
+  console.time('webhook:persist_message')
   await reopenClosedConversation(supabaseAdmin(), conversation)
 
   // If this contact was a recent broadcast recipient, flag the reply
   // so the broadcast's `replied_count` advances (via the aggregate
   // trigger installed in migration 003).
   await flagBroadcastReplyIfAny(accountId, contactRecord.id)
+  console.timeEnd('webhook:persist_message')
 
   // No deliverable address for this sender? Learn one from what they just
   // typed, or tell the bot to ask for it. Runs BEFORE the flow / automation /
@@ -1520,10 +1532,12 @@ async function processMessage(
 
   if (isVoiceNote) {
     if (pendingAudio) {
+      console.time('webhook:stt')
       const transcript = await transcribeAudio(
         pendingAudio.buffer,
         pendingAudio.mimeType
       )
+      console.timeEnd('webhook:stt')
       if (!transcript) {
         console.error(
           '[webhook][audio] transcription failed across all providers:',
@@ -1708,6 +1722,7 @@ async function processMessage(
   console.log(
     `[webhook] message ${message.id}: dispatching to AI auto-reply (type=${message.type}, text="${inboundText.trim().slice(0, 80)}")`
   )
+  console.time('webhook:ai_dispatch')
   await dispatchInboundToAiReply({
     accountId,
     conversationId: conversation.id,
@@ -1723,6 +1738,7 @@ async function processMessage(
     // learns about it without putting a second message on the wire.
     suppressReply: flowConsumed || message.type === 'reaction',
   })
+  console.timeEnd('webhook:ai_dispatch')
 
 
   // message.received webhook (public API). Awaited — not fire-and-forget
