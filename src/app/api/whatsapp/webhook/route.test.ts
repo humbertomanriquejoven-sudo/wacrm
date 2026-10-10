@@ -922,7 +922,9 @@ describe('inbound webhook: identity persistence (migration 072)', () => {
     expect(insert.wa_id ?? null).toBeNull()
     // ...but it IS the delivery address, so recipient_id carries it.
     expect(insert.recipient_id ?? null).toBe('9988776655443322')
-    expect(insert.phone).toBe('unknown')
+    // No number was disclosed, so `phone` persists SQL NULL — the literal
+    // 'unknown' placeholder must never reach the database.
+    expect(insert.phone).toBeNull()
   })
 
   it('records the inbound wamid on the conversation for every message type', async () => {
@@ -1785,9 +1787,9 @@ describe('inbound webhook: Meta identity columns (migration 053)', () => {
       identity_type: 'BSUID',
       phone_number_id: 'pn-1',
     })
-    // `phone` is NOT NULL and this sender disclosed no number, so the row
-    // legitimately holds the placeholder there.
-    expect(insert.phone).toBe('unknown')
+    // `phone` is nullable (migration 051) and this sender disclosed no
+    // number, so the row persists SQL NULL — never the 'unknown' literal.
+    expect(insert.phone).toBeNull()
     // `wa_id` is a numeric destination only; the BSUID is NOT hydrated into
     // it, and the 'unknown' placeholder never reaches it (idx_contacts_wa_id
     // indexes any non-empty value as a real id).
@@ -1948,11 +1950,11 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
     })
   })
 
-  it('stores the numeric BSUID in phone and keeps the handle @-prefixed', async () => {
+  it('keeps phone NULL for a number-less sender and stores the handle @-prefixed', async () => {
     // Senders on numbers NOT registered on WhatsApp arrive with a
-    // namespaced BSUID ('CO.…') instead of `wa_id`. The contact keeps an
-    // EMPTY `phone` — never the Meta id — and the BSUID lives only in
-    // `wa_user_id`.
+    // namespaced BSUID ('CO.…') instead of `wa_id`. The contact keeps
+    // `phone` NULL — never the Meta id and never the 'unknown' placeholder
+    // — and the BSUID lives only in `wa_user_id`.
     mockFindExistingContact.mockResolvedValue(null)
 
     await POST(bsuidInboundRequest())
@@ -1960,9 +1962,9 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     expect(h.state.contactInsertCalls).toHaveLength(1)
     expect(h.state.contactInsertCalls[0]).toMatchObject({
-      // No dialable number disclosed: the @handle becomes the destination,
-      // `phone` is never blank, and the BSUID lives in wa_user_id.
-      phone: 'unknown',
+      // No dialable number disclosed: the @handle is the only display
+      // identity, `phone` stays NULL, and the BSUID lives in wa_user_id.
+      phone: null,
       wa_user_id: '9988776655443322',
       // Username keeps the '@' so it renders as WhatsApp shows it.
       username: '@anaruiz',
@@ -2057,7 +2059,7 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     expect(h.state.contactInsertCalls).toHaveLength(1)
     expect(h.state.contactInsertCalls[0]).toMatchObject({
-      phone: 'unknown',
+      phone: null,
       wa_user_id: '9988776655443322',
     })
     expect(
@@ -2124,7 +2126,8 @@ describe('inbound webhook: contact auto-creation / backfill', () => {
 
     const row = h.state.contactInsertCalls[0]
     expect(row.username).toBeUndefined()
-    expect(row.phone).toBe('unknown')
+    // A BSUID-only sender has no disclosed number: NULL, never 'unknown'.
+    expect(row.phone).toBeNull()
     expect(row.wa_user_id).toBe('999')
   })
 

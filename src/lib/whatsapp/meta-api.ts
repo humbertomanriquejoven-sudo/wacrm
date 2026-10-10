@@ -329,7 +329,9 @@ export function recipientAddressField(destination: string): Record<string, strin
  * display data and is REFUSED with a typed `InvalidRecipientError`.
  *
  * Returns `{ to: '' }` for an empty address and for the placeholder
- * `contacts.phone` is NOT NULL forces the webhook to write ('unknown') —
+ * values older webhook rows wrote to `contacts.phone` ('unknown' — the
+ * column is nullable since migration 051, but legacy rows are not yet
+ * cleaned) —
  * both are undeliverable, and failing identically here lets the caller
  * raise a typed `InvalidRecipientError` instead of sending Meta a request
  * that reads like a malformed API call.
@@ -823,9 +825,10 @@ export async function sendTextMessage(
         'No HTTP request was sent.',
     )
   }
-  // The second refusal: the destination IS the webhook's 'unknown'
-  // placeholder (contacts.phone is NOT NULL, so that literal is what a
-  // contact with no disclosed number holds). Forwarding it puts
+  // The second refusal: the destination is the webhook's 'unknown'
+  // placeholder. Newer rows persist SQL NULL for a contact with no
+  // disclosed number, but legacy rows written before migration 051 still
+  // hold the literal 'unknown'; forwarding it puts
   // `to: "unknown"` on the wire, which Meta has been observed to ACK with
   // 200 while dropping the message — indistinguishable from success here.
   // The address for such a contact must be the `wa_id` / `recipient_id`

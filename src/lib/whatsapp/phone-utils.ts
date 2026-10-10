@@ -330,12 +330,14 @@ export function isRecipientNotAllowedError(message: string): boolean {
 }
 
 /**
- * Placeholder values that older rows and webhook defaults are known to carry.
+ * Placeholder values that legacy rows and older webhook defaults are known
+ * to carry.
  *
- * `contacts.phone` is `NOT NULL` (migration 001), so a contact whose sender
- * never disclosed a number cannot store null — the webhook writes the literal
- * string `'unknown'` instead. Every reader must therefore treat it as the
- * absence of a value, never as a phone number.
+ * `contacts.phone` is nullable since migration 051, and the webhook now
+ * stores SQL NULL for a sender who never disclosed a number. Rows written
+ * before that (and any other stray default) can still hold the literal
+ * string `'unknown'`. Every reader must therefore treat it as the absence
+ * of a value, never as a phone number.
  *
  * The phone path already rejects these structurally (`isDialablePhone` only
  * admits digits and punctuation), but the identifier paths do not: `'unknown'`

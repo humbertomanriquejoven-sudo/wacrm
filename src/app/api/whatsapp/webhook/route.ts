@@ -502,12 +502,10 @@ export async function POST(request: Request) {
   // Raw payload dump. The identity fields Meta sends have changed shape
   // more than once (wa_id → user_id/BSUID → profile.username), and when
   // an inbound is mishandled the only way to know what we actually got is
-  // the exact JSON. Truncated: media payloads can carry long ids and the
-  // dump exists for shape, not archival.
-  console.log(
-    '=== META WEBHOOK BODY ===',
-    JSON.stringify(body, null, 2).slice(0, 4000),
-  )
+  // the exact JSON. Logged in full so the phone/identity fields of a
+  // privacy-shielded (BSUID) sender can be verified end-to-end.
+  console.log('=== RAW META WEBHOOK PAYLOAD ===')
+  console.log(JSON.stringify(body, null, 2))
 
   // Process AFTER the response so we ack Meta within their ~20s timeout
   // (a slow ack triggers Meta retries + duplicate inserts), while still
@@ -983,9 +981,12 @@ async function processMessage(
   // Pick the real, dialable number Meta gave us — `messages[].from`,
   // `contacts[0].wa_id`, or `contacts[0].profile.phone`, whichever is the
   // first one that is genuinely phone-shaped. When Meta discloses NO number
-  // (only a BSUID / `@handle`), `phone` is set to the literal 'unknown'
-  // placeholder: `phone` must stay a clean E.164 column and NEVER absorb a
-  // BSUID or an `@handle`. The opaque id is kept in `wa_user_id` instead.
+  // (only a BSUID / `@handle`), `phone` resolves to the literal 'unknown'
+  // placeholder so the callers below can detect the absence of a number.
+  // Nothing persists it: `findOrCreateContact` maps any placeholder to SQL
+  // NULL (migration 051 made the column nullable). `phone` must stay a
+  // clean E.164 column and NEVER absorb a BSUID or an `@handle`. The opaque
+  // id is kept in `wa_user_id` instead.
   const trimmedFrom = (message.from ?? '').trim()
   const trimmedWaId = (contact.wa_id ?? '').trim()
   const trimmedProfilePhone = (
@@ -1012,10 +1013,11 @@ async function processMessage(
   //
   // This value MUST survive into `contacts.wa_id` / `contacts.recipient_id`.
   // It is the destination every outbound ladder consults the moment
-  // `phone` is 'unknown' — which is exactly the state a privacy-shielded
-  // sender lives in. The BSUID (`contacts[0].user_id`) NEVER lands here:
-  // it is stored in its own `wa_user_id` column by rule 2 of the recipient
-  // engine, so no ladder can ever mistake it for a sendable address.
+  // `phone` is NULL (or a legacy 'unknown') — which is exactly the state a
+  // privacy-shielded sender lives in. The BSUID (`contacts[0].user_id`)
+  // NEVER lands here: it is stored in its own `wa_user_id` column by rule 2
+  // of the recipient engine, so no ladder can ever mistake it for a
+  // sendable address.
   const metaSendId =
     [trimmedWaId, trimmedFrom].find(
       (value) =>
@@ -2389,7 +2391,7 @@ async function sanitizeStoredPhones(): Promise<void> {
         wa_user_id: string | null
       }>) {
         const patch: Record<string, unknown> = {
-          phone: row.wa_user_id ?? 'unknown',
+          phone: row.wa_user_id ?? null,
           updated_at: new Date().toISOString(),
         }
         if (!row.username) patch.username = row.phone.startsWith('@') ? row.phone : `@${row.phone}`
@@ -2660,9 +2662,9 @@ interface SenderIdentity {
   phone: string
   /**
    * BSUID, when the sender isn't on a registered number. Stored in the
-   * `wa_user_id` column; a bare BSUID may also be promoted into a new
-   * contact's `phone` as a placeholder (that column is NOT NULL) until a
-   * real number is known.
+   * `wa_user_id` column only — `phone` is nullable (migration 051) and
+   * holds NULL for such a sender, never a placeholder and never the
+   * BSUID.
    */
   waUserId: string | null
   /** Public @username, WITH the leading '@'. */
@@ -2795,10 +2797,24 @@ async function findOrCreateContact(
     const storedIsDialable = isPhoneLike(currentPhone)
     if (
       phone &&
+      !isPlaceholderValue(phone) &&
       currentPhone !== phone &&
       (incomingIsDialable || !storedIsDialable)
     ) {
       updates.phone = phone
+    }
+
+    // Legacy rows written before migration 051 stored the literal 'unknown'
+    // (the column was NOT NULL back then). Clear it to SQL NULL on the next
+    // inbound so the placeholder can never seed an outbound address. Runs
+    // only when the stored value is a non-empty placeholder, so a row that
+    // is already NULL does not get rewritten on every message.
+    if (
+      !updates.phone &&
+      currentPhone !== '' &&
+      isPlaceholderValue(currentPhone)
+    ) {
+      updates.phone = null
     }
 
     // If this payload disclosed no number (rawPhone came back as the
@@ -2892,11 +2908,14 @@ async function findOrCreateContact(
   // created" it — we attribute to the WhatsApp config owner as a stable
   // default).
   //
-  // `phone` is NOT NULL, so an empty string fills it when Meta disclosed
-  // no dialable number. The BSUID and @username columns (`wa_user_id`,
-  // `username`) carry the identity — never promote them into `phone`,
-  // because `phone` must stay a clean E.164 number for outbound sends.
-  const phoneForRow = phone
+  // `phone` is nullable (migration 051): a sender Meta shielded behind a
+  // BSUID / @handle gets SQL NULL here, NEVER the literal 'unknown'. The
+  // placeholder is undeliverable and has been contaminating outbound
+  // addresses, so it is mapped to NULL at the persistence boundary. The
+  // BSUID and @username columns (`wa_user_id`, `username`) carry the
+  // identity — never promote them into `phone`, because `phone` must stay
+  // a clean E.164 number for outbound sends.
+  const phoneForRow = phone && !isPlaceholderValue(phone) ? phone : null
 
   const { data: newContact, error: createError } = await insertTolerant(
     'contacts',
@@ -2939,7 +2958,7 @@ async function findOrCreateContact(
       const raced = await findExistingContact(
         supabaseAdmin(),
         accountId,
-        phoneForRow,
+        phoneForRow ?? '',
       )
       if (raced) return { contact: raced, wasCreated: false }
     }
