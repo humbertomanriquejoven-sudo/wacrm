@@ -157,6 +157,51 @@ describe('sender endpoint is never /unknown/messages', () => {
     )
     expect(sentUrl(fetchMock)).not.toContain('/unknown/')
   })
+
+  it('logs the REAL endpoint in META_API_REJECTED — never a fabricated /unknown', async () => {
+    // The log line that framed a healthy URL as
+    // "https://graph.facebook.com/v26.0/unknown/messages": the endpoint string
+    // used to be synthesized from an error fallback that held no digits. Now
+    // the diagnostic echoes the URL the network layer actually hit
+    // (`response.url`), so a rejection like 131009 points at the true path and
+    // a real endpoint regression is never masked behind the word "unknown".
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 433,
+      url: `https://graph.facebook.com/v26.0/${CONFIG_ID}/messages`,
+      text: async () =>
+        JSON.stringify({
+          error: {
+            message: 'Recipient phone number not in allowed list',
+            code: 131009,
+          },
+        }),
+    } as unknown as Response)
+
+    await expect(
+      sendTextMessage({
+        phoneNumberId: CONFIG_ID,
+        accessToken: 'TOKEN',
+        to: '1008477715690681',
+        text: 'hola',
+        contextMessageId: 'wamid.HBgL_INBOUND',
+      }),
+    ).rejects.toThrow()
+
+    const rejected = vi.mocked(console.error).mock.calls.find(
+      (c) => c[0] === 'META_API_REJECTED:',
+    )
+    expect(rejected).toBeDefined()
+    const parsed = JSON.parse(String(rejected![1])) as {
+      endpoint: string
+      status: number
+    }
+    expect(parsed.status).toBe(433)
+    expect(parsed.endpoint).toBe(
+      `https://graph.facebook.com/v26.0/${CONFIG_ID}/messages`,
+    )
+    expect(parsed.endpoint).not.toContain('/unknown/')
+  })
 })
 
 // PRUEBA A — a valid E.164 number is sent directly in `to`.

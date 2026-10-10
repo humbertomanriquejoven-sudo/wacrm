@@ -470,22 +470,23 @@ export async function sendMessageToConversation(
 
   const accessToken = decrypt(config.access_token);
 
-  // Sender phone_number_id. Preference per the recipient engine (rule 1):
-// 1. the number the webhook recorded on THIS conversation (migration 071),
-// 2. the account config, 3. the number recorded on THIS contact (migration
-// 053), then — enforced inside meta-api's `messagesUrl` — the process env
-// (WHATSAPP_PHONE_NUMBER_ID / META_PHONE_NUMBER_ID). The `'unknown'`
-// placeholder is never accepted and the send is refused before any HTTP
-// call, so a POST to `/{unknown}/messages` is impossible.
-  const senderPhoneNumberId =
-    [
-      (conversation as { phone_number_id?: string | null }).phone_number_id,
-      config.phone_number_id,
-      (contact as { phone_number_id?: string | null }).phone_number_id,
-    ]
-      .map((value) => (typeof value === 'string' ? value.trim() : ''))
-      .find((value) => value && !isPlaceholderValue(value)) ??
-    config.phone_number_id;
+  // Sender phone_number_id — strict fallback chain, never `'unknown'`:
+  //   1. the number the webhook recorded on THIS conversation (migration 071),
+  //   2. the account config, 3. the number recorded on THIS contact (migration
+  //   053). Each step drops `'unknown'` and the other literal placeholders, so
+  //   a contact whose phone_number_id is really stored (e.g. 1247536128449000)
+  //   is never overridden by a stale placeholder. The value is then handed to
+  //   meta-api, whose `messagesUrl` enforces a final process-env fallback
+  //   (WHATSAPP_PHONE_NUMBER_ID / META_PHONE_NUMBER_ID) and throws BEFORE any
+  //   HTTP call when nothing real exists — a POST to `/{unknown}/messages` is
+  //   impossible and reported as a FATAL misconfig.
+  const senderPhoneNumberId = [
+    (conversation as { phone_number_id?: string | null }).phone_number_id,
+    config.phone_number_id,
+    (contact as { phone_number_id?: string | null }).phone_number_id,
+  ]
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .find((value) => value && !isPlaceholderValue(value)) ?? '';
 
   // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
   if (isLegacyFormat(config.access_token)) {

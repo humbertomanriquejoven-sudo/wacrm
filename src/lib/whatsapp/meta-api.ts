@@ -34,6 +34,12 @@ const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`
 export function resolveMetaPhoneNumberId(
   value: string | null | undefined,
 ): string {
+  // Strict sender-id fallback chain — every step rejects the `'unknown'`
+  // placeholder (and the other literal placeholders):
+  //   1. the id the caller resolved (conversation → whatsapp_config → contact),
+  //   2. the process env id the worker was launched with
+  //      (WHATSAPP_PHONE_NUMBER_ID, then META_PHONE_NUMBER_ID).
+  // Whatever this returns is guaranteed safe to place in a Graph URL.
   const candidates = [
     value,
     process.env.WHATSAPP_PHONE_NUMBER_ID,
@@ -60,12 +66,14 @@ export function requireMetaPhoneNumberId(
   const id = resolveMetaPhoneNumberId(value)
   if (!id) {
     console.error(
-      '[send] MISSING CREDENTIAL: phone_number_id resolved to ""/"unknown" and neither WHATSAPP_PHONE_NUMBER_ID nor META_PHONE_NUMBER_ID is set. Refusing to POST to /unknown/messages — no HTTP request was sent.',
+      '[send] FATAL: phone_number_id resolved to ""/"unknown" — the caller, the contact and the process env (WHATSAPP_PHONE_NUMBER_ID / META_PHONE_NUMBER_ID) all failed to provide a real id. Refusing to POST to /unknown/messages — no HTTP request was sent.',
     )
     throw new InvalidRecipientError(
       '',
-      'phone_number_id is missing or "unknown", and no fallback env ' +
-        '(WHATSAPP_PHONE_NUMBER_ID / META_PHONE_NUMBER_ID) is set. No HTTP request was sent.',
+      'FATAL: no valid sender phone_number_id found to build the Meta API endpoint ' +
+        '(caller placeholder "unknown" with no contact id and no ' +
+        'WHATSAPP_PHONE_NUMBER_ID / META_PHONE_NUMBER_ID env). ' +
+        'No HTTP request was sent.',
     )
   }
   return id
@@ -485,11 +493,20 @@ async function throwMetaError(response: Response, fallback: string): Promise<nev
   // The earlier `[Meta API] HTTP…` line prints the body as text; these make it
   // greppable and copy-pasteable into Meta's debugger.
   console.error('META_API_SEND_ERROR:', JSON.stringify(data))
+  // `endpoint` MUST be the URL the network layer actually requested — `fetch`
+  // echoes it back on `response.url`. A synthesized fallback used to print
+  // `/{unknown}/messages` for a perfectly HEALTHY endpoint, which framed a
+  // recipient-routing rejection (e.g. 131009) as if the URL were the problem.
+  // Mocked responses have no `response.url`; those fall back to deriving the
+  // id from the numeric fallback string.
+  const realEndpoint =
+    (response.url && response.url.trim()) ||
+    `${META_API_BASE}/${(fallback.match(/\d{6,}/) ?? ['unknown'])[0]}/messages`
   console.error(
     'META_API_REJECTED:',
     JSON.stringify({
       status: response.status,
-      endpoint: `${META_API_BASE}/${(fallback.match(/\d{6,}/) ?? ['unknown'])[0]}/messages`,
+      endpoint: realEndpoint,
       response: data,
     }),
   )

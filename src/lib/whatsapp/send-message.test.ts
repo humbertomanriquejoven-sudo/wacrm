@@ -288,6 +288,8 @@ function sendPathDb(
     conversation?: Record<string, unknown>;
     /** Row returned when the send resolves an explicit `reply_to_message_id`. */
     replyParent?: { message_id?: string | null };
+    /** Override whatsapp_config fields (e.g. a stale 'unknown' phone_number_id). */
+    config?: Record<string, unknown>;
   }
 ): SupabaseClient {
   const conversation = {
@@ -299,6 +301,7 @@ function sendPathDb(
     id: 'cfg-1',
     phone_number_id: 'pn-1',
     access_token: 'token',
+    ...(opts?.config ?? {}),
   };
   // Inbound rows returned by the anchor lookup. `latestInboundAnchorId` reads
   // the newest customer wamid so a send to an opaque-id contact can be quoted.
@@ -1181,6 +1184,127 @@ describe('sendMessageToConversation - media recipients (same resolver as text)',
 // that reads like a Meta outage. 422 carries the typed cause; 502
 // stays reserved for Meta actually failing upstream.
 // ============================================================
+describe('sendMessageToConversation - sender phone_number_id never "unknown"', () => {
+  // Production report: logs showed an endpoint with the literal "unknown" and
+  // 131009 rejections while the CONTACT really stored phone_number_id
+  // 1247536128449000. The strict chain below is conversation → config →
+  // contact, each step dropping the 'unknown' placeholder, so a real stored id
+  // always wins over a stale placeholder.
+  it('uses the contact phone_number_id when config holds the "unknown" placeholder', async () => {
+    const captured: CapturedWrites = {};
+    await sendMessageToConversation(
+      sendPathDb([], captured, {
+        contact: {
+          id: 'ct-1',
+          phone: '+15551234567',
+          phone_number_id: '1247536128449000',
+        },
+        config: { phone_number_id: 'unknown' },
+        inboundRows: [{ message_id: 'wamid.IN' }],
+      }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'Hola',
+      },
+    );
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ phoneNumberId: '1247536128449000' }),
+    );
+  });
+
+  it('prefers the conversation phone_number_id (migration 071) over config/contact', async () => {
+    const captured: CapturedWrites = {};
+    await sendMessageToConversation(
+      sendPathDb([], captured, {
+        contact: {
+          id: 'ct-1',
+          phone: '+15551234567',
+          phone_number_id: '1247536128449000',
+        },
+        conversation: { id: 'cv-1', phone_number_id: '9888777666555444' },
+        config: { phone_number_id: 'pn-1' },
+        inboundRows: [{ message_id: 'wamid.IN' }],
+      }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'Hola',
+      },
+    );
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ phoneNumberId: '9888777666555444' }),
+    );
+  });
+
+  it('hands meta-api an empty id (NOT the "unknown" placeholder) when every level is stale', async () => {
+    // The sender itself MUST NOT emit 'unknown': it resolves to '' so
+    // meta-api's requireMetaPhoneNumberId either uses the env fallback or
+    // throws a FATAL typed error before any HTTP call.
+    const captured: CapturedWrites = {};
+    await sendMessageToConversation(
+      sendPathDb([], captured, {
+        contact: {
+          id: 'ct-1',
+          phone: '+15551234567',
+          phone_number_id: 'unknown',
+        },
+        conversation: { id: 'cv-1', phone_number_id: 'unknown' },
+        config: { phone_number_id: 'unknown' },
+        inboundRows: [{ message_id: 'wamid.IN' }],
+      }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'Hola',
+      },
+    );
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ phoneNumberId: '' }),
+    );
+    const call = vi.mocked(sendTextMessage).mock.calls[0][0];
+    expect(String(call.phoneNumberId)).not.toContain('unknown');
+  });
+
+  it('routes a BSUID send with the real sender id — not "/unknown/messages"', async () => {
+    // The automated-send case: a namespaced BSUID contact whose contact row
+    // holds the true sender id gets addressed via `recipient` AND the Graph
+    // endpoint uses that same real id.
+    const captured: CapturedWrites = {};
+    await sendMessageToConversation(
+      sendPathDb([], captured, {
+        contact: {
+          id: 'ct-1',
+          phone: 'CO.9988776655443322',
+          wa_user_id: '9988776655443322',
+          phone_number_id: '1247536128449000',
+        },
+        config: { phone_number_id: 'unknown' },
+        inboundRows: [{ message_id: 'wamid.INBOUND' }],
+      }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'Hola',
+      },
+    );
+    const { sendTextMessage } = await import('@/lib/whatsapp/meta-api');
+    expect(sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        phoneNumberId: '1247536128449000',
+        to: 'CO.9988776655443322',
+      }),
+    );
+  });
+})
+
 describe('sendMessageToConversation - Meta failure mapping', () => {
   const restoreMediaSend = () =>
     sendMediaMessageMock.mockImplementation(async () => ({
