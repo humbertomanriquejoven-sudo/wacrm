@@ -91,11 +91,11 @@ describe('contactPhone', () => {
     ).toBe('573266778890')
   })
 
-  it('never treats username or bsuid as a phone number', () => {
+  it('never treats username or wa_user_id as a phone number', () => {
     // A broadcast `to` field takes a number. A BSUID there returns HTTP
     // 200 from Meta and silently drops the message.
     expect(
-      contactPhone(contact({ username: '@usuario', bsuid: '9988776655443322' })),
+      contactPhone(contact({ username: '@usuario', wa_user_id: '9988776655443322' })),
     ).toBeNull()
   })
 
@@ -123,7 +123,7 @@ describe('resolveBroadcastAddress � the exact row that failed in production', 
   //   phone       'unknown'          <- literal placeholder, NOT NULL column
   //   wa_id       NULL               <- what the failed send had
   //   recipient_id NULL
-  //   bsuid  '1486998326437295' <- the BSUID WAS already on the row
+  //   wa_user_id  '1486998326437295' <- the BSUID WAS already on the row
   //   username    '@juanpablo22222'
   //
   // The broadcast marked this recipient `failed`. The row carried a usable
@@ -133,7 +133,7 @@ describe('resolveBroadcastAddress � the exact row that failed in production', 
     phone: 'unknown',
     wa_id: null,
     recipient_id: null,
-    bsuid: '1486998326437295',
+    wa_user_id: '1486998326437295',
     username: '@juanpablo22222',
   }
 
@@ -177,7 +177,7 @@ describe('resolveBroadcastAddress � the exact row that failed in production', 
     ).toEqual({ to: 'CO.1486998326437295', isPhone: false })
   })
 
-  it('orders the id columns wa_id -> recipient_id -> bsuid', () => {
+  it('orders the id columns wa_id -> recipient_id -> wa_user_id', () => {
     // Each value has to be a shape `passthroughMetaId` accepts: a namespaced
     // id, or a bare digit run. A word like 'ccc' is rejected there and the
     // test would be asserting nothing. Each case is spelled out in full
@@ -188,7 +188,7 @@ describe('resolveBroadcastAddress � the exact row that failed in production', 
         phone: null,
         wa_id: 'CO.111',
         recipient_id: 'CO.222',
-        bsuid: '333333333333333',
+        wa_user_id: '333333333333333',
       })?.to,
     ).toBe('CO.111')
 
@@ -196,12 +196,12 @@ describe('resolveBroadcastAddress � the exact row that failed in production', 
       resolveBroadcastAddress({
         phone: null,
         recipient_id: 'CO.222',
-        bsuid: '333333333333333',
+        wa_user_id: '333333333333333',
       })?.to,
     ).toBe('CO.222')
 
     expect(
-      resolveBroadcastAddress({ phone: null, bsuid: '333333333333333' })
+      resolveBroadcastAddress({ phone: null, wa_user_id: '333333333333333' })
         ?.to,
     ).toBe('333333333333333')
   })
@@ -424,7 +424,7 @@ describe('recoverAddressesFromHistory', () => {
         [{ id: 'conv-1', contact_id: 'contact-1' }],
         [{ conversation_id: 'conv-1', sender_phone: '573266778890' }],
       ),
-      [contact({ username: '@usuario', bsuid: '9988776655443322' })],
+      [contact({ username: '@usuario', wa_user_id: '9988776655443322' })],
     )
 
     expect(recovered.get('contact-1')).toBe('573266778890')
@@ -578,7 +578,7 @@ describe('resolveBroadcastAddress', () => {
       contact({
         phone: 'unknown',
         username: '@jjuanpablo22222',
-        bsuid: 'CO.9988776655443322',
+        wa_user_id: 'CO.9988776655443322',
       }),
     )
     expect(resolved).toEqual({ to: 'CO.9988776655443322', isPhone: false })
@@ -629,7 +629,7 @@ it('never uses a bare @handle as the destination', () => {
     // A recovered dialable number is still the strongest signal.
     expect(
       resolveBroadcastAddress(
-        contact({ phone: 'unknown', bsuid: 'CO.9988776655443322' }),
+        contact({ phone: 'unknown', wa_user_id: 'CO.9988776655443322' }),
         '573266778890',
       ),
     ).toEqual({ to: '573266778890', isPhone: true })
@@ -648,14 +648,14 @@ it('never uses a bare @handle as the destination', () => {
     expect(resolveBroadcastAddress(contact({ phone: 'null' }))).toBeNull()
     expect(resolveBroadcastAddress(contact({ wa_id: 'unknown' }))).toBeNull()
     expect(
-      resolveBroadcastAddress(contact({ bsuid: 'undefined' })),
+      resolveBroadcastAddress(contact({ wa_user_id: 'undefined' })),
     ).toBeNull()
   })
 
   it('prefers a real number over an identifier on the same row', () => {
     // An opaque id must not pre-empt a number sitting further down the list.
     const resolved = resolveBroadcastAddress(
-      contact({ phone: '573266778890', bsuid: 'CO.9988776655443322' }),
+      contact({ phone: '573266778890', wa_user_id: 'CO.9988776655443322' }),
     )
     expect(resolved).toEqual({ to: '573266778890', isPhone: true })
   })
@@ -665,7 +665,7 @@ it('never uses a bare @handle as the destination', () => {
       contact({
         phone: 'unknown',
         wa_id: '1486998326437295',
-        bsuid: 'CO.9988776655443322',
+        wa_user_id: 'CO.9988776655443322',
       }),
     )
     expect(resolved?.to).toBe('1486998326437295')
@@ -993,7 +993,7 @@ describe('resolveRecipientAddresses - the pipeline shared by creation and retry'
           },
         ],
       ),
-      [{ id: 'c1', phone: 'unknown', bsuid: '1486998326437295' }],
+      [{ id: 'c1', phone: 'unknown', wa_user_id: '1486998326437295' }],
     )
 
     expect(out.get('c1')?.to).toBe('1486998326437295')

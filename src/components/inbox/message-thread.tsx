@@ -921,7 +921,7 @@ export function MessageThread({
     contact.name ||
     (contact.phone && contact.phone !== "unknown"
       ? contact.phone
-      : contact.bsuid || contact.recipient_address || "unknown");
+      : contact.wa_user_id || contact.recipient_id || "unknown");
   const messageGroups = groupMessagesByDate(messages);
   const currentStatus = STATUS_OPTIONS.find(
     (s) => s.value === conversation.status
@@ -966,7 +966,7 @@ export function MessageThread({
             <p className="truncate text-xs text-muted-foreground">
               {contact.phone && contact.phone !== "unknown"
                 ? contact.phone
-                : contact.bsuid || contact.recipient_address || contact.phone}
+                : contact.wa_user_id || contact.recipient_id || contact.phone}
             </p>
           </div>
           {/* Session timer badge â€” hidden on the narrowest phones so

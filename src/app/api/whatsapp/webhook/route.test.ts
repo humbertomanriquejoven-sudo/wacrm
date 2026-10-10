@@ -905,7 +905,7 @@ describe('inbound webhook: identity persistence (migration 072)', () => {
     expect(insert.wa_user_id).toBeUndefined()
   })
 
-  it('keeps a BSUID out of phone/wa_id and inside wa_user_id only', async () => {
+  it('stores a BSUID in wa_user_id + recipient_id and keeps it out of phone/wa_id', async () => {
     h.state.existingContactResult = null
     mockFindExistingContact.mockResolvedValue(null)
 
@@ -913,13 +913,15 @@ describe('inbound webhook: identity persistence (migration 072)', () => {
     for (const cb of h.state.afterCallbacks) await cb()
 
     const insert = h.state.contactInsertCalls[0]
-    // CASO C: the opaque BSUID is identity data, never a destination.
+    // CASO C: the opaque BSUID is identity data in `wa_user_id` AND the
+    // final delivery address in `recipient_id` (rule: wa_id ? wa_id : wa_user_id).
     expect(insert.wa_user_id).toBe('9988776655443322')
     expect(insert.identity_type).toBe('BSUID')
     expect(insert.phone_number_id).toBe('pn-1')
-    // It must not be promoted into any address column.
+    // It must not be promoted into the numeric destination column.
     expect(insert.wa_id ?? null).toBeNull()
-    expect(insert.recipient_id ?? null).toBeNull()
+    // ...but it IS the delivery address, so recipient_id carries it.
+    expect(insert.recipient_id ?? null).toBe('9988776655443322')
     expect(insert.phone).toBe('unknown')
   })
 
@@ -1761,9 +1763,10 @@ describe('inbound webhook: Meta identity columns (migration 053)', () => {
     for (const cb of h.state.afterCallbacks) await cb()
 
     const insert = h.state.contactInsertCalls[0]
-    // CASO C: the BSUID is carried by its OWN column only. It must never be
-    // pushed into `wa_id` / `recipient_id` — those are destinations, and a
-    // namespaced BSUID in `to` is rejected by Meta (#131009).
+    // CASO C: the BSUID is carried by `wa_user_id` and, as the final delivery
+    // address, by `recipient_id`. It must never be pushed into `wa_id` —
+    // that is a numeric destination column and a namespaced BSUID there is
+    // rejected by Meta (#131009).
     expect(insert).toMatchObject({
       wa_user_id: '9988776655443322',
       identity_type: 'BSUID',
@@ -1772,11 +1775,12 @@ describe('inbound webhook: Meta identity columns (migration 053)', () => {
     // `phone` is NOT NULL and this sender disclosed no number, so the row
     // legitimately holds the placeholder there.
     expect(insert.phone).toBe('unknown')
-    // `wa_id` / `recipient_id` are numeric destinations only; the BSUID is
-    // NOT hydrated into them, and the 'unknown' placeholder never reaches
-    // them (idx_contacts_wa_id indexes any non-empty value as a real id).
+    // `wa_id` is a numeric destination only; the BSUID is NOT hydrated into
+    // it, and the 'unknown' placeholder never reaches it (idx_contacts_wa_id
+    // indexes any non-empty value as a real id).
     expect(insert.wa_id ?? null).toBeNull()
-    expect(insert.recipient_id ?? null).toBeNull()
+    // `recipient_id` IS the delivery address, so the BSUID fills it.
+    expect(insert.recipient_id ?? null).toBe('9988776655443322')
     expect(
       JSON.stringify([
         insert.wa_id,

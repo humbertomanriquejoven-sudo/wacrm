@@ -168,11 +168,6 @@ export function metaIdFromRawPayload(payload: unknown): string | null {
 export interface BroadcastIdentity {
   phone?: string | null;
   wa_id?: string | null;
-  /**
-   * The BSUID (Business Scoped User ID). Canonical column (migration 073);
-   * mirrors the legacy `wa_user_id` store every outbound ladder predates.
-   */
-  bsuid?: string | null;
   wa_user_id?: string | null;
   username?: string | null;
   recipient_id?: string | null;
@@ -223,7 +218,7 @@ export interface BroadcastAddress {
  *   contact's OWN message history (`sender_phone`, then `raw_meta_payload`).
  *   Always deliverable on its own.
  *
- * Tier B — a numeric Meta id: `wa_id`, then `bsuid`/`wa_user_id` (or a legacy
+ * Tier B — a numeric Meta id: `wa_id`, then `wa_user_id` (or a legacy
  *   `phone` still holding a BSUID), then `recipient_id`. These exist because
  *   a sender who has never messaged from a registered number has no phone
  *   number *anywhere* in the database — Meta discloses an identifier instead.
@@ -281,13 +276,10 @@ export function resolveBroadcastAddress(
   const recipientId = passthroughMetaId(contact.recipient_id);
   if (recipientId) return { to: recipientId, isPhone: false };
 
-  // `bsuid` (canonical, migration 073) and `wa_user_id` (legacy) also cover
-  // the historical case of a BSUID written into `phone` before migration 051
-  // normalised that column.
+  // `wa_user_id` also covers the legacy case of a BSUID written into `phone`
+  // before migration 051 normalised that column.
   const bsuid =
-    passthroughMetaId(contact.bsuid) ??
-    passthroughMetaId(contact.wa_user_id) ??
-    passthroughMetaId(contact.phone);
+    passthroughMetaId(contact.wa_user_id) ?? passthroughMetaId(contact.phone);
   if (bsuid) return { to: bsuid, isPhone: false };
 
   // 4. Last resort: the id recovered from this contact's own inbound history,

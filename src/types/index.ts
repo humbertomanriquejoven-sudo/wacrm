@@ -109,12 +109,8 @@ export interface Contact {
   username?: string | null;
   /** WhatsApp ID nativo de Meta Cloud API webhook (migración 053). */
   wa_id?: string | null;
-  /** BSUID (Business Scoped User ID) confirmado en el campo correspondiente del webhook. */
-  bsuid?: string | null;
-  /** Identificador seleccionado para enviar el mensaje: wa_id si se envía por teléfono, o bsuid si el endpoint lo admite. */
-  recipient_address?: string | null;
-  /** Tipo de identificador seleccionado: 'phone' si recipient_address es wa_id, o 'bsuid' si es bsuid. */
-  recipient_type?: 'phone' | 'bsuid' | null;
+  /** BSUID (Business Scoped User ID) revelado por Meta en el webhook, ej. "1008742182330901". */
+  wa_user_id?: string | null;
   email?: string;
   /** Arreglo de etiquetas asociadas al contacto. */
   tags?: Tag[];

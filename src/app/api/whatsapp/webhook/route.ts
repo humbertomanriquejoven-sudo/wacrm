@@ -99,14 +99,7 @@ const OPTIONAL_CONTACT_COLUMNS = [
   'username',
   'wa_id',
   'wa_user_id',
-  // Canonical BSUID column (migration 073) read by the dashboard and the
-  // recipient resolver; mirror of `wa_user_id`.
-  'bsuid',
   'recipient_id',
-  // Resolved delivery address + which identifier it holds (migration 073).
-  // Written on every inbound so the Contacts table is never blank.
-  'recipient_address',
-  'recipient_type',
   'identity_type',
   'phone_number_id',
   'display_name',
@@ -2271,8 +2264,6 @@ async function repairBsuidPhoneContacts(): Promise<void> {
       const bsuid = firstOpaqueId(row.phone, row.wa_user_id)
       if (bsuid && !row.wa_user_id) {
         patch.wa_user_id = bsuid
-        // Mirror into the canonical column (migration 073).
-        patch.bsuid = bsuid
       }
 
       // Derive the @-prefixed handle from the stored name when we can.
@@ -2829,51 +2820,28 @@ async function findOrCreateContact(
     if (username && !existingContact.username) updates.username = username
     // The BSUID is the sender's stable identity, so it backfills whenever
     // it's missing — including when the row is currently holding the BSUID
-    // in `phone` and we're about to write a real number there. It is written
-    // to BOTH `wa_user_id` (legacy, read by the outbound address ladders) and
-    // `bsuid` (canonical, read by the dashboard's BSUID column).
+    // in `phone` and we're about to write a real number there. It lives in
+    // `wa_user_id` only (read by the outbound address ladders and the
+    // dashboard's BSUID column).
     if (waUserId && !existingContact.wa_user_id) updates.wa_user_id = waUserId
-    if (waUserId && !existingContact.bsuid) updates.bsuid = waUserId
 
-    // LÓGICA DE DIRECCIÓN DE ENTREGA (recipient_address / recipient_type)
+    // LÓGICA DE IDENTIFICADOR DE ENVÍO (recipient_id / identity_type)
     // Reglas de negocio:
-    // 1. Si hay wa_id, la dirección de entrega es el wa_id y el tipo 'phone'.
+    // 1. Si hay wa_id, la dirección final de envío es el wa_id y el tipo es
+    //    'PHONE_E164'.
     // 2. Si no hay wa_id pero sí BSUID, la dirección es el BSUID y el tipo
-    //    'bsuid'.
-    // 3. Un wa_id/phone ya guardado nunca se degrada a BSUID.
-    // 4. NUNCA usar username como dirección de entrega.
+    //    es 'BSUID'.
+    // 3. Una dirección ya guardada nunca se pisa: solo se rellena el hueco.
     const incomingWaId = metaIdentity?.wa_id?.trim() || null
     const incomingBsuid = waUserId?.trim() || null
-    // What the row already resolves to today (covers rows written before the
-    // column existed, where `recipient_type` is still NULL).
-    const storedRecipientType =
-      existingContact.recipient_type ??
-      (existingContact.wa_id
-        ? 'phone'
-        : existingContact.wa_user_id
-          ? 'bsuid'
-          : null)
 
-    if (incomingWaId) {
-      // A disclosed/organic wa_id always wins and refreshes the stored one.
-      if (existingContact.recipient_address !== incomingWaId) {
-        updates.recipient_address = incomingWaId
-      }
-      if (existingContact.recipient_type !== 'phone') {
-        updates.recipient_type = 'phone'
-      }
-    } else if (incomingBsuid && storedRecipientType !== 'phone') {
-      // Only fall back to the BSUID when the row has no phone-shaped address.
-      if (existingContact.recipient_address !== incomingBsuid) {
-        updates.recipient_address = incomingBsuid
-      }
-      if (existingContact.recipient_type !== 'bsuid') {
-        updates.recipient_type = 'bsuid'
-      }
+    if (!existingContact.identity_type) {
+      updates.identity_type =
+        metaIdentity?.identity_type ??
+        (incomingWaId ? 'PHONE_E164' : incomingBsuid ? 'BSUID' : null)
     }
 
     if (metaIdentity?.phone_number_id && !existingContact.phone_number_id) updates.phone_number_id = metaIdentity.phone_number_id
-    if (metaIdentity?.identity_type && !existingContact.identity_type) updates.identity_type = metaIdentity.identity_type
     if (metaIdentity?.display_name && !existingContact.display_name) updates.display_name = metaIdentity.display_name
 
     // Same hydration rule as the insert path: an existing row that is
@@ -2883,11 +2851,15 @@ async function findOrCreateContact(
     // contact look undeliverable on the first attempt and fine after the
     // next inbound filled them in — the "works after a refresh" symptom.
     //
-    // Filled from `metaIdentity.wa_id` — Meta's `contacts[0].wa_id` /
-    // `messages[0].from` (rule 2). A BSUID is NEVER used as the fallback:
-    // it is identity data (CASO C) that lives only in `wa_user_id`, and
-    // writing it into `wa_id` is how a destination that Meta silently drops
-    // (#131009) got persisted in the first place.
+    // `wa_id` is filled from `metaIdentity.wa_id` — Meta's
+    // `contacts[0].wa_id` / `messages[0].from` (rule 2) — and never from a
+    // BSUID: `wa_id` is a numeric destination column, and a namespaced
+    // BSUID in it is rejected by Meta (#131009).
+    //
+    // `recipient_id` is the FINAL delivery address, so it falls back to the
+    // BSUID when there is no `wa_id` (rule: wa_id ? wa_id : wa_user_id).
+    // That is what populates the Contacts table for a BSUID-only sender
+    // instead of leaving the column NULL.
     //
     // A stored value that is itself Meta's 'unknown' placeholder counts as
     // missing: the placeholder is truthy, so a plain `!existingContact.wa_id`
@@ -2896,11 +2868,12 @@ async function findOrCreateContact(
     const storedWaId = (existingContact.wa_id ?? '').trim()
     const storedRecipientId = (existingContact.recipient_id ?? '').trim()
     const metaIdForContact = metaIdentity?.wa_id ?? null
+    const targetRecipientId = metaIdForContact ?? waUserId ?? null
     if (metaIdForContact && (!storedWaId || isPlaceholderValue(storedWaId))) {
       updates.wa_id = metaIdForContact
     }
-    if (metaIdForContact && (!storedRecipientId || isPlaceholderValue(storedRecipientId))) {
-      updates.recipient_id = metaIdForContact
+    if (targetRecipientId && (!storedRecipientId || isPlaceholderValue(storedRecipientId))) {
+      updates.recipient_id = targetRecipientId
     }
 
     if (Object.keys(updates).length > 0) {
@@ -2933,36 +2906,21 @@ async function findOrCreateContact(
       name: name || username || phoneForRow || waUserId || 'unknown',
       username: username ?? undefined,
       wa_user_id: waUserId ?? undefined,
-      // Canonical BSUID column (migration 073) read by the dashboard's
-      // "BSUID" column; mirror of the legacy `wa_user_id` above.
-      bsuid: waUserId ?? undefined,
-      // Precomputed delivery address/type (migration 073). Same rule the
-      // update path applies: a disclosed wa_id wins, otherwise the BSUID.
-      recipient_address: metaIdentity?.wa_id ?? waUserId ?? undefined,
-      recipient_type: metaIdentity?.wa_id
-        ? 'phone'
-        : waUserId
-          ? 'bsuid'
-          : undefined,
-      // Hydrate the numerical-identity columns from the CANONICAL wa_id
-      // (Meta's `contacts[0].wa_id` / `messages[0].from`), never from the
-      // BSUID.
-      //
-      // A BSUID is identity data, not a destination (rule 2 / CASO C): it is
-      // stored only in `wa_user_id`. Writing it into `wa_id`/`recipient_id`
-      // is exactly what made senders resolve to an id Meta silently drops
-      // (#131009) once `phone` holds 'unknown'.
-      //
-      // `recipient_id` was never written on insert at all, at any version;
-      // both columns now carry the SAME canonical Meta id so no resolver
-      // tier is left empty.
-      recipient_id: metaIdentity?.wa_id ?? undefined,
-      // Filled whenever a real canonical wa_id exists; a hidden-number sender
-      // with no disclosed id keeps these two NULL and relies on `wa_user_id`
-      // for identity only.
+      // The final delivery address (DESTINATION_ENVIO): `wa_id` when Meta
+      // disclosed one, otherwise the BSUID. Same rule the update path
+      // applies: `recipient_id = wa_id ? wa_id : wa_user_id`. This is what
+      // the Contacts table's "Dirección de entrega" column renders.
+      recipient_id: metaIdentity?.wa_id ?? waUserId ?? undefined,
+      // `wa_id` is a numeric DESTINATION column hydrated from the CANONICAL
+      // Meta id (Meta's `contacts[0].wa_id` / `messages[0].from`), never from
+      // the BSUID: a namespaced BSUID in `wa_id` is rejected by Meta
+      // (#131009). A hidden-number sender with no disclosed id keeps it NULL.
       wa_id: metaIdentity?.wa_id ?? undefined,
+      // Authoritative classifier when available, otherwise the
+      // `wa_id ? PHONE_E164 : wa_user_id ? BSUID : null` rule.
       identity_type:
-        metaIdentity?.identity_type ?? (waUserId ? 'BSUID' : undefined),
+        metaIdentity?.identity_type ??
+        (metaIdentity?.wa_id ? 'PHONE_E164' : waUserId ? 'BSUID' : undefined),
       ...(metaIdentity && {
         phone_number_id: metaIdentity.phone_number_id,
         display_name: metaIdentity.display_name,

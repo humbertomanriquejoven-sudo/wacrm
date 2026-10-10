@@ -53,8 +53,8 @@ const contactFields = [
   { value: 'name', labelKey: 'name' },
   { value: 'phone', labelKey: 'phone' },
   { value: 'email', labelKey: 'email' },
-  { value: 'recipient_address', labelKey: 'recipientAddress' },
-  { value: 'recipient_type', labelKey: 'recipientType' },
+  { value: 'recipient_id', labelKey: 'recipientAddress' },
+  { value: 'identity_type', labelKey: 'recipientType' },
 ];
 
 const SAMPLE_CONTACT: Contact = {
@@ -65,9 +65,9 @@ const SAMPLE_CONTACT: Contact = {
   phone: '+1234567890',
   email: 'john@example.com',
   wa_id: '1234567890',
-  bsuid: 'CO.1234567890',
-  recipient_address: '1234567890',
-  recipient_type: 'phone' as 'phone',
+  wa_user_id: 'CO.1234567890',
+  recipient_id: '1234567890',
+  identity_type: 'PHONE_E164',
   created_at: new Date().toISOString(),
   updated_at: new Date().toISOString(),
 };
@@ -217,6 +217,10 @@ export function Step3Personalize({
             phone: contact.phone ?? '',
             email: contact.email ?? undefined,
             company: contact.company ?? undefined,
+            wa_id: contact.wa_id ?? undefined,
+            wa_user_id: contact.wa_user_id ?? undefined,
+            recipient_id: contact.recipient_id ?? undefined,
+            identity_type: contact.identity_type ?? undefined,
           };
           replacement = fieldMap[mapping.value] ?? placeholder;
         } else if (mapping.type === 'custom_field' && mapping.value) {

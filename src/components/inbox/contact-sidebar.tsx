@@ -134,7 +134,7 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
     contact.name ||
     (contact.phone && contact.phone !== "unknown"
       ? contact.phone
-      : contact.bsuid || contact.recipient_address || contact.username || "unknown");
+      : contact.wa_user_id || contact.recipient_id || contact.username || "unknown");
   const initials = displayName.charAt(0).toUpperCase();
 
   return (
@@ -144,10 +144,10 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
           {/* Contact Info */}
           <div className="flex flex-col items-center text-center">
             <div className="flex h-16 w-16 items-center justify-center rounded-full bg-muted text-lg font-semibold text-foreground">
-              {contact.recipient_address ? (
-                // Simple avatar using the first 2 chars of recipient_address
+              {contact.recipient_id ? (
+                // Simple avatar using the first 2 chars of recipient_id
                 <span className="rounded-full bg-primary text-primary-foreground text-xs font-semibold">
-                  {contact.recipient_address?.charAt(0)?.charAt(0).toUpperCase() || 'U'}
+                  {contact.recipient_id?.charAt(0)?.charAt(0).toUpperCase() || 'U'}
                 </span>
               ) : (
                 initials
@@ -171,7 +171,7 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
                 <span className="flex-1 text-left">
                   {contact.phone && contact.phone !== "unknown"
                     ? contact.phone
-                    : contact.bsuid || contact.recipient_address || contact.phone}
+                    : contact.wa_user_id || contact.recipient_id || contact.phone}
                 </span>
                 {copied ? (
                   <Check className="h-3 w-3 text-primary" />
@@ -189,9 +189,9 @@ export function ContactSidebar({ contact, onPhoneSaved }: ContactSidebarProps) {
               {/* When no real phone is on file, surface the BSUID so the
                   operator can still tell who they're talking to — replies
                   go out through the `recipient` parameter of the Meta API. */}
-              {(!contact.phone || contact.phone === "unknown") && (contact.bsuid || contact.recipient_address) && (
+              {(!contact.phone || contact.phone === "unknown") && (contact.wa_user_id || contact.recipient_id) && (
                 <div className="flex items-center gap-2 px-3 py-1 text-xs text-muted-foreground font-mono">
-                  <span className="flex-1 text-left">{contact.bsuid || contact.recipient_address}</span>
+                  <span className="flex-1 text-left">{contact.wa_user_id || contact.recipient_id}</span>
                 </div>
               )}
 

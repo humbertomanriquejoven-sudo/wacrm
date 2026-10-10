@@ -116,8 +116,8 @@ export function ContactDetailView({
       setEditEmail(data.email ?? '');
       setEditCompany(data.company ?? '');
       setEditWaId(data.wa_id ?? '');
-      setEditWaUser(data.bsuid ?? data.wa_user_id ?? '');
-      setEditDireccionEntrega(data.recipient_address ?? '');
+      setEditWaUser(data.wa_user_id ?? '');
+      setEditDireccionEntrega(data.recipient_id ?? '');
     }
     setLoading(false);
   }, [contactId, supabase]);
@@ -239,19 +239,18 @@ export function ContactDetailView({
         email: editEmail.trim() || null,
         company: editCompany.trim() || null,
         wa_id: editWaId.trim() || null,
-        // BSUID is written to both the canonical column and the legacy
-        // `wa_user_id` the outbound address ladders still read.
-        bsuid: editWaUser.trim() || null,
+        // BSUID lives in `wa_user_id` (the column the outbound address
+        // ladders and the dashboard read).
         wa_user_id: editWaUser.trim() || null,
-        recipient_address:
+        recipient_id:
           editDireccionEntrega.trim() ||
           editWaId.trim() ||
           editWaUser.trim() ||
           null,
-        recipient_type: editWaId.trim()
-          ? 'phone'
+        identity_type: editWaId.trim()
+          ? 'PHONE_E164'
           : editWaUser.trim()
-            ? 'bsuid'
+            ? 'BSUID'
             : null,
         updated_at: new Date().toISOString(),
       })

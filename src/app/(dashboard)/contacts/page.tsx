@@ -618,20 +618,15 @@ export default function ContactsPage() {
                     {contact.wa_id || <span className="text-muted-foreground">-</span>}
                   </TableCell>
                   <TableCell className="text-muted-foreground">
-                    {contact.bsuid || <span className="text-muted-foreground">-</span>}
+                    {contact.wa_user_id || <span className="text-muted-foreground">-</span>}
                   </TableCell>
                   <TableCell className="text-muted-foreground text-sm">
-                    {contact.recipient_address || contact.wa_id || contact.bsuid || (
+                    {contact.recipient_id || contact.wa_user_id || contact.wa_id || (
                       <span className="text-muted-foreground">-</span>
                     )}
                   </TableCell>
                   <TableCell className="text-muted-foreground text-sm">
-                    {contact.recipient_type ||
-                      (contact.wa_id
-                        ? 'phone'
-                        : contact.bsuid
-                          ? 'bsuid'
-                          : <span className="text-muted-foreground">-</span>)}
+                    {contact.identity_type || <span className="text-muted-foreground">-</span>}
                   </TableCell>
                   <TableCell className="text-muted-foreground hidden md:table-cell text-sm">
                     {contact.email || <span className="text-muted-foreground">-</span>}

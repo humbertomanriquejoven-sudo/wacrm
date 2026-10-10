@@ -128,39 +128,6 @@ BEGIN
       'follow_ups.execute_at is missing — migration 062 did not apply';
   END IF;
 
-  -- The contacts delivery columns (073). The Contacts table renders
-  -- `bsuid`, `recipient_address` and `recipient_type` directly, so an
-  -- unapplied 073 shows every contact as "-" with no error anywhere — the
-  -- exact "applies cleanly and does nothing" failure this file exists to
-  -- catch.
-  IF NOT EXISTS (
-       SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'contacts'
-          AND column_name = 'bsuid'
-     ) THEN
-    RAISE EXCEPTION
-      'contacts.bsuid is missing — migration 073 did not apply; the BSUID column stays empty in the UI';
-  END IF;
-  IF NOT EXISTS (
-       SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'contacts'
-          AND column_name = 'recipient_address'
-     ) THEN
-    RAISE EXCEPTION
-      'contacts.recipient_address is missing — migration 073 did not apply';
-  END IF;
-  IF NOT EXISTS (
-       SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'contacts'
-          AND column_name = 'recipient_type'
-     ) THEN
-    RAISE EXCEPTION
-      'contacts.recipient_type is missing — migration 073 did not apply';
-  END IF;
-
   RAISE NOTICE 'schema verification passed';
 END
 $$;
