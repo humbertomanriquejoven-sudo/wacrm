@@ -609,12 +609,47 @@ function hasBookingIntent(messages: ChatMessage[]): boolean {
   );
 }
 
+/**
+ * Scheduling nouns a claim can be about. `\bcita\b` alone was too narrow: the
+ * model also confirms a "reunión", an "agenda" or a "videollamada", and those
+ * confirmations used to slip past the guard entirely (the word "cita" simply
+ * never appeared), letting a fabricated booking reach the customer.
+ */
+const SCHEDULE_NOUN_RE =
+  /\b(?:cita|reuni[oó]n|agenda|videollamada|horario|espacio|campo)\b/i;
+
+/** Verbs that assert a booking/move/confirmation actually happened. */
+const BOOKING_VERB_RE =
+  /agend(?:[aeéo]|amos|ar|ad[oa]|amiento)|reagend|reserv|separ(?:[eé]|amos|ar|ad[oa])|program(?:[eé]|amos|ar|ad[oa])|confirm(?:[eéó]|amos|ar|ad[oa]|ada)|qued(?:ó|o)\s/i;
+
+/** Day/hour reference — tells a real availability claim apart from the
+ *  generic "estoy disponible para ayudarte" courtesy phrase. */
+const TIME_DAY_REF_RE =
+  /\b(?:lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo|hoy|ma[nñ]ana|pasado\s+ma[nñ]ana|esta\s+semana|pr[oó]xima\s+semana|\d{1,2}(?::\d{2})?\s*(?:a\.?\s*m\.?|p\.?\s*m\.?|am|pm|hs|horas)|\d{1,2}\s+de\s+\w+)\b/i;
+
 function looksLikeBookingConfirmation(text: string): boolean {
-  if (!/\bcita\b/i.test(text)) return false;
-  if (FAKE_LINK_DETECT.test(text)) return true;
-  return /agend(?:ad[oa]|é|amos)|confirm(?:ad[oa]|ada)|qued(?:ó|o)\s+/i.test(
-    text
-  );
+  if (FAKE_LINK_DETECT.test(text)) {
+    return SCHEDULE_NOUN_RE.test(text);
+  }
+  return BOOKING_VERB_RE.test(text) && SCHEDULE_NOUN_RE.test(text);
+}
+
+/**
+ * The model asserting a specific slot is FREE ("ese horario está disponible",
+ * "tengo disponibilidad el viernes", "está libre a las 3"). Such a claim is
+ * only trustworthy when a real availability check actually ran this turn;
+ * otherwise those hours were invented. The bare courtesy "estoy disponible
+ * para ayudarte" is NOT a claim (no day/hour, no scheduling noun).
+ */
+function looksLikeAvailabilityClaim(text: string): boolean {
+  if (
+    !/\b(?:disponib\w*|libre?s?|hay\s+(?:espacio|campo)|tengo\s+(?:espacio|campo|disponibilidad)|se\s+puede\s+(?:agendar|reservar|separar))\b/i.test(
+      text
+    )
+  ) {
+    return false;
+  }
+  return SCHEDULE_NOUN_RE.test(text) || TIME_DAY_REF_RE.test(text);
 }
 
 /**
@@ -643,7 +678,17 @@ function looksLikeBookingConfirmation(text: string): boolean {
 export function guardBookingReply(
   raw: string,
   booking: BookingToolResult | null,
-  opts: { bookingContext?: boolean; authoritative?: boolean } = {}
+  opts: {
+    bookingContext?: boolean;
+    authoritative?: boolean;
+    /**
+     * True when a REAL availability check (`ver_disponibilidad`) ran and
+     * produced a usable result this turn. Only then may the model's text
+     * assert that a slot is free; otherwise the claim is an invention and is
+     * dropped, because no tool ever verified those hours.
+     */
+    availabilityChecked?: boolean;
+  } = {}
 ): string | null {
   if (!raw) return raw;
 
@@ -673,7 +718,15 @@ export function guardBookingReply(
   if (LINK_PROMISE_RE.test(text)) return null;
   if (INTERMEDIATE_ACK_RE.test(text)) return null;
   if (opts.bookingContext ?? false) {
+    // A booking/move/confirmation claim without a real tool success is a
+    // hallucination — regardless of the noun the model chose (no longer only
+    // the literal word "cita").
     if (looksLikeBookingConfirmation(text)) return null;
+    // Asserting a slot is free without having consulted the agenda is the
+    // same class of invention: dropped unless `ver_disponibilidad` really ran.
+    if (!opts.availabilityChecked && looksLikeAvailabilityClaim(text)) {
+      return null;
+    }
   }
   return text.replace(FAKE_LINK_RE, '');
 }
@@ -1081,6 +1134,11 @@ export async function dispatchInboundToAiReply(
     // reported truthfully instead of leaving the customer on silence (or, far
     // worse, letting the model's prose confirm a move that never happened).
     let bookingFailure: BookingToolResult | null = null;
+    // True once a REAL availability check (`ver_disponibilidad`) returned a
+    // usable result this turn. The only evidence that authorises the model to
+    // state which slots are free; without it, any "está disponible a las X"
+    // is an invention.
+    let availabilityChecked = false;
     /** True once `finalText` came from the backend, not from the model. */
     let finalTextIsDeterministic = false;
     const conversationMessages: ChatMessage[] = [...messages];
@@ -1161,6 +1219,17 @@ export async function dispatchInboundToAiReply(
             } else if (parsed && parsed.exito === false) {
               bookingFailure = parsed;
             }
+          }
+          // Evidence of a real availability check: only a non-error result
+          // (free slots, or an explicit "no hay horarios") authorises the
+          // model to assert availability afterwards. An `Error:` return or a
+          // thrown tool leaves this false, so the guard drops any invented
+          // hours.
+          if (
+            tc.name === 'ver_disponibilidad' &&
+            !output.startsWith('Error')
+          ) {
+            availabilityChecked = true;
           }
           toolResults.push({
             role: 'tool',
@@ -1307,6 +1376,9 @@ export async function dispatchInboundToAiReply(
         calendarFailed ? null : realBooking,
         {
           bookingContext: hasBookingIntent(messages),
+          // A real availability check this turn is the ONLY thing that makes
+          // the model's "hay disponibilidad a las X" trustworthy.
+          availabilityChecked,
           // Backend-composed text is already grounded; suppressing it would
           // swallow the accurate answer to a refused move.
           authoritative: finalTextIsDeterministic,
