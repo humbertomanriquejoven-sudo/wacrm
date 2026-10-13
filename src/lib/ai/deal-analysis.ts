@@ -10,6 +10,13 @@ import {
   mergeAiNotes,
   parseDealEvaluation,
 } from './deal-scoring'
+import {
+  LEAD_TAG_SUGGESTIONS,
+  applyLeadTags,
+  formatLeadNote,
+  normalizeTagNames,
+  recordContactNote,
+} from './lead-crm'
 
 // ============================================================
 // AI lead scoring + automatic pipeline movement.
@@ -107,16 +114,60 @@ function buildTranscript(messages: ChatMessage[]): string {
     .join('\n')
 }
 
+async function loadAccountTagNames(
+  db: SupabaseClient,
+  accountId: string,
+): Promise<string[]> {
+  const { data, error } = await db
+    .from('tags')
+    .select('name')
+    .eq('account_id', accountId)
+  if (error) return []
+  const seen = new Set<string>()
+  const names: string[] = []
+  for (const tag of data ?? []) {
+    const name = String(tag.name ?? '').trim()
+    if (!name) continue
+    const key = name.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    names.push(name)
+  }
+  return names
+}
+
 function buildEvaluationPrompt(
   stages: PipelineStage[],
-  contactName?: string | null,
+  contactName: string | null | undefined,
+  tagNames: string[],
 ): string {
   const stageList = stages.map((s, i) => `${i + 1}. ${s.name}`).join('\n')
+  // Suggested vocabulary first (funnel rules), then any other tag the
+  // account already owns, de-duplicated case-insensitively.
+  const seen = new Set<string>()
+  const allowedTags: string[] = []
+  for (const name of [...LEAD_TAG_SUGGESTIONS, ...tagNames]) {
+    const key = name.trim().toLowerCase()
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    allowedTags.push(name)
+  }
   return [
     'Eres un analista comercial experto de un CRM de ventas por WhatsApp. ' +
       'Evalúa la intención de compra del prospecto a partir del historial de la conversación.',
     contactName ? `Cliente: ${contactName}` : null,
     `Etapas del embudo — elige EXACTAMENTE una por su nombre, tal cual aparece:\n${stageList}`,
+    `Etiquetas permitidas para el campo "tags" — usa EXACTAMENTE estos nombres, tal cual aparecen:\n${allowedTags
+      .map((t) => `- ${t}`)
+      .join('\n')}`,
+    'Reglas de etiquetado: agrega en "tags" SOLO las etiquetas que correspondan al estado actual de la conversación ' +
+      '(p. ej. "En conversacion" en cuanto el lead responde; la de diseño/remodelación si el interés es ese; ' +
+      'la de cotización cuando se envía un presupuesto; la de agendamiento o llamada si se pacta un seguimiento; ' +
+      'la de no contestó si aplica). No devuelvas etiquetas que no correspondan y no intentes quitar etiquetas previas.',
+    'En "note" registra una nota interna corta y directa SOLO si aparece un dato clave nuevo: ' +
+      'tipo de proyecto (diseño desde cero, remodelación o construcción), ubicación del proyecto, ' +
+      'cita agendada (fecha, hora y estado) o resumen del requerimiento/presupuesto. ' +
+      'Deja "note" vacío si no hay información nueva.',
     'Llama a la herramienta evaluate_lead exactamente UNA vez con tu evaluación. ' +
       'No respondas con texto libre.',
   ]
@@ -187,9 +238,11 @@ export async function analyzeDealFromConversation(
     const transcript = buildTranscript(messages)
     if (!transcript.trim()) return
 
+    const accountTags = await loadAccountTagNames(db, accountId)
+
     const result = await generateReply({
       config,
-      systemPrompt: buildEvaluationPrompt(stages, args.contactName),
+      systemPrompt: buildEvaluationPrompt(stages, args.contactName, accountTags),
       messages: [
         {
           role: 'user',
@@ -286,6 +339,31 @@ export async function analyzeDealFromConversation(
         '[ai deal-analysis] could not persist the evaluation:',
         updateErr.message,
       )
+    }
+
+    // CRM side-effects: funnel tags + the mandatory contextual note. They
+    // only act on the model's structured fields; both helpers are
+    // best-effort and never throw, so they cannot affect the customer
+    // reply (which is already on the wire by the time this pass runs).
+    const tagNames = normalizeTagNames(call?.arguments?.tags)
+    if (tagNames.length > 0) {
+      await applyLeadTags(db, {
+        accountId,
+        userId: args.userId,
+        contactId,
+        tagNames,
+      })
+    }
+    const noteText = formatLeadNote(
+      typeof call?.arguments?.note === 'string' ? call.arguments.note : '',
+    )
+    if (noteText) {
+      await recordContactNote(db, {
+        accountId,
+        userId: args.userId,
+        contactId,
+        noteText,
+      })
     }
 
     void logAiUsage(db, {

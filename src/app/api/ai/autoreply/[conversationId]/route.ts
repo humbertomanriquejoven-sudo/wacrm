@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
+import { recordResumeNote } from '@/lib/ai/resume-note'
 
 type Params = { params: Promise<{ conversationId: string }> }
 
@@ -50,7 +51,7 @@ export async function POST(request: Request, { params }: Params) {
     // Confirm the conversation is in the caller's account before writing.
     const { data: conv, error: convErr } = await supabase
       .from('conversations')
-      .select('id')
+      .select('id, contact_id')
       .eq('id', conversationId)
       .eq('account_id', accountId)
       .maybeSingle()
@@ -91,6 +92,22 @@ export async function POST(request: Request, { params }: Params) {
         { error: 'Failed to update conversation' },
         { status: 500 },
       )
+    }
+
+    // "Resume AI": before the bot takes the thread back, leave a short
+    // internal note summarizing what the human discussed while the bot
+    // was paused, so the AI and the next agent inherit the context.
+    // Best-effort: recordResumeNote never throws.
+    if (!paused) {
+      const contactId = (conv as { contact_id?: string | null }).contact_id
+      if (contactId) {
+        await recordResumeNote(supabase, {
+          accountId,
+          userId,
+          contactId,
+          conversationId,
+        })
+      }
     }
 
     return NextResponse.json({ success: true, paused })

@@ -74,6 +74,23 @@ export const EVALUATE_LEAD_TOOL: ToolDefinition = {
         description:
           'Objeciones o bloqueos detectados, separados por punto y coma (vacío si no hay).',
       },
+      tags: {
+        type: 'array',
+        description:
+          'Etiquetas del embudo a aplicar al contacto según el estado de la conversación. ' +
+          'Usa EXACTAMENTE los nombres de la lista de etiquetas permitidas entregada en el prompt. ' +
+          'Agrega solo las que correspondan al momento actual (p. ej. "En conversacion" cuando el lead responde). ' +
+          'No quites ni borres etiquetas previas: el sistema solo agrega.',
+        items: { type: 'string' },
+      },
+      note: {
+        type: 'string',
+        description:
+          'Nota interna corta y directa para el perfil del contacto cuando aparezca un dato clave nuevo: ' +
+          'tipo de proyecto (diseño, remodelación, construcción), ubicación (ciudad/barrio), ' +
+          'cita acordada (fecha, hora, estado) y resumen del requerimiento o presupuesto. ' +
+          'Deja vacío si no hay información nueva que registrar.',
+      },
     },
     required: ['score', 'stage', 'summary'],
   },

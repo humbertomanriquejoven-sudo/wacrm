@@ -21,6 +21,7 @@ const h = vi.hoisted(() => ({
     notes: null,
   } as { id: string; stage_id: string; notes: string | null },
   inserts: [] as Record<string, unknown>[],
+  insertsByTable: [] as { table: string; arg: unknown }[],
   updates: [] as Record<string, unknown>[],
 }))
 
@@ -54,6 +55,7 @@ function makeDb(): SupabaseClient {
       if (name === 'insert') {
         didInsert = true
         h.inserts.push(arg as Record<string, unknown>)
+        h.insertsByTable.push({ table, arg })
       }
       if (name === 'update') {
         h.updates.push(arg as Record<string, unknown>)
@@ -137,6 +139,7 @@ beforeEach(() => {
   h.generateReply.mockReset()
   h.logAiUsage.mockReset()
   h.inserts = []
+  h.insertsByTable = []
   h.updates = []
   h.pipeline = { id: 'pipe-1' }
   h.stages = [
@@ -249,6 +252,42 @@ describe('analyzeDealFromConversation', () => {
 
     expect(h.updates[0].stage_id).toBe('stage-a')
     expect(h.updates[0].ai_stage_id).toBeNull()
+  })
+
+  it('applies the evaluation tags and records the contextual note', async () => {
+    h.generateReply.mockResolvedValue({
+      text: '',
+      handoff: false,
+      usage: null,
+      toolCalls: [
+        {
+          id: 't1',
+          name: 'evaluate_lead',
+          arguments: {
+            score: 7,
+            stage: 'Qualified',
+            summary: 'Interesado en remodelar',
+            tags: ['En conversacion'],
+            note: 'Remodelación en Chía, presupuesto 30M',
+          },
+        },
+      ],
+    })
+    await analyzeDealFromConversation(baseArgs())
+
+    const tagInsert = h.insertsByTable.find((r) => r.table === 'tags')
+    const tagRows = tagInsert
+      ? ((Array.isArray(tagInsert.arg) ? tagInsert.arg : [tagInsert.arg]) as {
+          name: string
+        }[])
+      : []
+    expect(tagRows.map((t) => t.name)).toContain('En conversacion')
+
+    const noteInsert = h.insertsByTable.find((r) => r.table === 'contact_notes')
+    expect(noteInsert).toBeTruthy()
+    expect(String((noteInsert?.arg as { note_text?: string }).note_text)).toContain(
+      'Remodelación en Chía, presupuesto 30M',
+    )
   })
 
   it('no-ops when the account has no pipeline', async () => {

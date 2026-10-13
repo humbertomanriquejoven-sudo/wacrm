@@ -91,6 +91,8 @@ export interface ToolDefinition {
         type: string
         description?: string
         enum?: string[]
+        /** JSON-Schema item descriptor for `type: 'array'` properties. */
+        items?: { type: string; description?: string; enum?: string[] }
       }
     >
     required?: string[]
