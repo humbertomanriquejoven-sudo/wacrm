@@ -18,6 +18,7 @@ import {
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
 import { splitAiReply } from '@/lib/ai/split-reply'
+import { assertConversationNotPaused } from '@/lib/ai/pause'
 import { supabaseAdmin } from './admin-client'
 import { armResponseWaitIfIdle } from '@/lib/whatsapp/response-wait'
 import {
@@ -428,6 +429,15 @@ export async function engineSendAiReply(
   // one WhatsApp bubble so a mandatory URL can never be cut off or split
   // into a separate message.
   const fragments = args.single ? [normalized] : splitAiReply(normalized)
+
+  // LAST-CHECKPOINT (pre-send, race-safe): re-read the persisted human
+  // takeover flag one final time, immediately before the first HTTP call to
+  // Meta. A human can press "Take over" at any point after the dispatch gate
+  // (or while a Timer 1/Timer 2 job is in flight); nothing below this line
+  // may send AI text to a conversation that is currently paused. Throws
+  // `AiReplySuppressedError` so callers record "nothing was sent" instead of
+  // a delivery failure.
+  await assertConversationNotPaused(db, args.conversationId)
 
   let waMessageId = ''
   let workingPhone = sanitized

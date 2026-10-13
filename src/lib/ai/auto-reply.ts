@@ -26,10 +26,7 @@ import {
 } from '@/lib/flows/meta-send';
 import { isRecipientRejection } from '@/lib/whatsapp/recipient-resolver';
 import { scheduleFollowUp } from '@/lib/whatsapp/follow-up-worker';
-import {
-  autoUnblockConversation,
-  autoUnblockEnabled,
-} from './unblock';
+import { isConversationAiPaused } from './pause';
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { AiError, AiKeyDecryptError, type ChatMessage } from './types';
@@ -954,38 +951,23 @@ export async function dispatchInboundToAiReply(
       }
       return;
     }
-    // Único criterio de silencio: un humano que tomó el control. No existe
-    // flag de pausa ni de handoff (ai_autoreply_disabled) ni límite de
-    // respuestas: mientras no haya agente asignado, la IA responde SIEMPRE
-    // cada mensaje entrante ("Hola", "?", etc.) sin dejar en visto.
+    // ABSOLUTE SILENCE CRITERION: a human who took the thread over. While an
+    // agent is assigned the AI must NOT answer — not on this inbound, not
+    // from a timer, not from any background job — and nothing on this path
+    // may clear the assignment. Only a manual "Resume AI" lifts it (see
+    // src/lib/ai/pause.ts). No legacy flag or reply cap can pause the bot;
+    // those are cleared as residue below.
     if (conv.assigned_agent_id) {
-      // Last-chance auto-unlock. The webhook already clears this on inbound
-      // (see autoUnblockConversation), so reaching this point with an
-      // assignment still set means the thread was taken over BETWEEN the
-      // webhook's unblock and this gate — or the webhook unblock was
-      // disabled. Diagnostic names the contact so the operator can act.
-      const phone = await contactPhoneFor(db, contactId);
-      if (autoUnblockEnabled()) {
-        const unblocked = await autoUnblockConversation(
-          db,
-          conversationId,
-          phone
-        );
-        if (unblocked.changed) {
-          console.warn(
-            `[ai auto-reply] phone ${phone ?? 'unknown'}: took over a thread that was assigned and is now answering it (cleared: ${unblocked.reasons.join(', ')})`
-          );
-        } else {
-          console.warn(
-            `[ai auto-reply] phone ${phone ?? 'unknown'}: auto-unblock did not clear the assignment; answering anyway under auto-unblock.`
-          );
-        }
-      } else {
+      if (!bypass) {
+        const phone = await contactPhoneFor(db, contactId);
         console.warn(
-          `[ai auto-reply] SKIPPED — phone ${phone ?? 'unknown'} (conversation ${conversationId}) is assigned to agent ${conv.assigned_agent_id}: a human took this thread over. Unassign it, or set AI_AUTOREPLY_AUTO_UNBLOCK=false/undefined to keep this behaviour.`
+          `[ai auto-reply] SKIPPED — phone ${phone ?? 'unknown'} (conversation ${conversationId}) is assigned to agent ${conv.assigned_agent_id}: a human took this thread over. Only a manual "Resume AI" (or unassigning it) hands it back to the bot.`
         );
         return;
       }
+      console.warn(
+        '[ai auto-reply] BYPASS: ignoring the human-takeover gate.'
+      );
     }
 
     // Cada mensaje entrante arranca con el contador en cero y sin flags
@@ -1418,6 +1400,19 @@ export async function dispatchInboundToAiReply(
       console.warn(
         `[ai auto-reply] claim_ai_reply_slot returned false for conversation ${conversationId}; sending anyway. The installed DB function may predate migration 046.`
       );
+    }
+
+    // LAST-CHECKPOINT (pre-send): the reply was just generated, but a human
+    // may have pressed "Take over" while the model was thinking. Re-read the
+    // persisted pause and abort BEFORE the reply reaches WhatsApp. This is
+    // the race the top-of-dispatch gate cannot cover; `engineSendAiReply`
+    // re-checks once more immediately before the HTTP send. Skipped under the
+    // explicit diagnostic BYPASS so the pipeline can still be proven.
+    if (!bypass && (await isConversationAiPaused(db, conversationId))) {
+      console.warn(
+        `[ai auto-reply] SUPPRESSED after generation — conversation ${conversationId} was taken over by a human while the reply was being generated; the reply was NOT sent.`
+      );
+      return;
     }
 
     const enviado = await engineSendAiReply({

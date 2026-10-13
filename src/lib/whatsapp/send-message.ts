@@ -39,6 +39,7 @@ import {
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption';
 import { armResponseWaitIfIdle } from '@/lib/whatsapp/response-wait';
 import { supabaseAdmin } from '@/lib/flows/admin-client';
+import { AiReplySuppressedError } from '@/lib/ai/pause';
 import {
   sanitizePhoneForMeta,
   phoneVariants,
@@ -383,6 +384,20 @@ export async function sendMessageToConversation(
       'Contact not found for this conversation',
       400
     );
+  }
+
+  // HUMAN-TAKEOVER GUARD (AI sends only). An AI-generated message must never
+  // reach a conversation that a human took over — including the Timer 1
+  // "seguimiento" and Timer 2 "Esperando respuesta" nudges that run outside
+  // the dispatch gate. Manual sends (senderType 'agent') are unaffected: the
+  // assigned agent IS the one typing. `assigned_agent_id` is the single
+  // persisted pause flag; its re-read here is the last checkpoint before the
+  // provider call.
+  const assignedAgentId =
+    (conversation as { assigned_agent_id?: string | null }).assigned_agent_id ??
+    null;
+  if (params.aiGenerated === true && assignedAgentId) {
+    throw new AiReplySuppressedError(conversationId, assignedAgentId);
   }
 
   // STRICT RECIPIENT OVERRIDE. The address that reaches Meta must come from

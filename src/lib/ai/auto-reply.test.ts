@@ -435,27 +435,27 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     );
   });
 
-  it('auto-unblocks an assigned thread by DEFAULT and answers it', async () => {
-    // Requested behaviour: a thread left muted by an earlier session must
-    // not stay muted when the contact writes again. Only contacts with
-    // prior history can be stuck this way, which is why new numbers always
-    // worked.
+  it('keeps a human takeover sticky by DEFAULT and never clears the assignment', async () => {
+    // A manual "Take over" (or a Flow handoff assignment) is ABSOLUTE: the
+    // next inbound must NOT hand the thread back to the bot, and nothing on
+    // this path may clear `assigned_agent_id`. Only a manual "Resume AI"
+    // lifts it.
     delete process.env.AI_AUTOREPLY_AUTO_UNBLOCK;
     h.state.conv = {
       assigned_agent_id: 'agent-9',
     };
     await dispatchInboundToAiReply(ARGS);
-    expect(h.state.updatePayloads).toContainEqual(
+    expect(h.engineSendAiReply).not.toHaveBeenCalled();
+    expect(h.engineSendText).not.toHaveBeenCalled();
+    expect(h.state.updatePayloads).not.toContainEqual(
       expect.objectContaining({ assigned_agent_id: null })
-    );
-    expect(h.engineSendAiReply).toHaveBeenCalledWith(
-      expect.objectContaining({ conversationId: 'conv-1' })
     );
   });
 
-  it('keeps human takeover sticky when AI_AUTOREPLY_AUTO_UNBLOCK=false', async () => {
-    // The opt-out preserves the original human-wins semantics.
-    process.env.AI_AUTOREPLY_AUTO_UNBLOCK = 'false';
+  it('keeps human takeover sticky even with AI_AUTOREPLY_AUTO_UNBLOCK=true', async () => {
+    // The legacy bulk-unblock switch no longer governs human takeover: it
+    // only gates the legacy-residue cleanup.
+    process.env.AI_AUTOREPLY_AUTO_UNBLOCK = 'true';
     try {
       h.state.conv = {
         assigned_agent_id: 'agent-9',

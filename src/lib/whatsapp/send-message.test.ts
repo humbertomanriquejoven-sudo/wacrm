@@ -1455,4 +1455,45 @@ describe('sendMessageToConversation — Timer 2 auto-arm on send', () => {
 
     expect(result.whatsappMessageId).toBe('wamid.text');
   });
+
+  it('suppresses an AI-generated send when a human took the conversation over', async () => {
+    // Human takeover is absolute: an AI nudge (Timer 1/Timer 2) must never
+    // reach a conversation with an assigned agent, even though the send core
+    // would otherwise deliver it.
+    const captured: CapturedWrites = {};
+    await expect(
+      sendMessageToConversation(
+        sendPathDb([], captured, {
+          conversation: { assigned_agent_id: 'agent-9' },
+        }),
+        'acct-1',
+        {
+          conversationId: 'cv-1',
+          messageType: 'text',
+          contentText: 'nudge',
+          senderType: 'bot',
+          aiGenerated: true,
+        }
+      )
+    ).rejects.toThrow(/human takeover/i);
+    expect(captured.message).toBeUndefined();
+  });
+
+  it('still allows a MANUAL send to an assigned conversation', async () => {
+    // The assigned agent IS the human typing: manual sends must keep working.
+    const captured: CapturedWrites = {};
+    const result = await sendMessageToConversation(
+      sendPathDb([], captured, {
+        conversation: { assigned_agent_id: 'agent-9' },
+      }),
+      'acct-1',
+      {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'hola',
+      }
+    );
+
+    expect(result.whatsappMessageId).toBe('wamid.text');
+  });
 });

@@ -17,7 +17,11 @@ const h = vi.hoisted(() => {
     conversation: {
       follow_up_enabled: null,
       response_wait_enabled: true,
-    } as { follow_up_enabled: boolean | null; response_wait_enabled: boolean } | null,
+    } as {
+      follow_up_enabled: boolean | null
+      response_wait_enabled: boolean
+      assigned_agent_id?: string | null
+    } | null,
     // contacts — identity fields. Follow-ups no longer require a public
     // @handle, so the harness only needs these when a test exercises the
     // send/destination side. `contact-1` defaults to a handle contact for
@@ -1018,6 +1022,37 @@ describe('runDueFollowUps', () => {
     expect(h.state.completed).toEqual(['completed'])
   })
 
+  it('cancels instead of sending when a human took the conversation over', async () => {
+    resetState()
+    // A human pressed "Take over" after the reminder was queued.
+    h.state.conversation = {
+      follow_up_enabled: null,
+      response_wait_enabled: true,
+      assigned_agent_id: 'agent-9',
+    }
+    h.state.followUps = [
+      {
+        id: 'fu-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        type: '10m',
+        status: 'pending',
+        execute_at: '2026-10-06T12:09:00.000Z',
+      },
+    ]
+    h.state.messages = [
+      { sender_type: 'bot', content_text: '¡Hola! ¿En qué te ayudo?' },
+    ]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueFollowUps(db, new Date('2026-10-06T12:10:00.000Z'))
+
+    expect(res).toMatchObject({ scanned: 1, sent: 0, cancelled: 1 })
+    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
+    expect(h.state.cancelled).toEqual(['cancelled'])
+  })
+
   it('cancels instead of sending when the customer replied AFTER it was scheduled', async () => {
     resetState()
     h.state.followUps = [
@@ -1342,6 +1377,40 @@ describe('runDueResponseWaitTimers', () => {
     expect(h.state.waitTimers[0]).toMatchObject({
       status: 'cancelled',
       cancelled_reason: 'anti_race',
+    })
+  })
+
+  it('cancels instead of sending when a human took the conversation over', async () => {
+    resetState()
+    // A human pressed "Take over" after the wait was armed.
+    h.state.conversation = {
+      follow_up_enabled: null,
+      response_wait_enabled: true,
+      assigned_agent_id: 'agent-9',
+    }
+    h.state.waitTimers = [
+      {
+        id: 'wait-1',
+        conversation_id: 'conv-1',
+        contact_id: 'contact-1',
+        account_id: 'account-1',
+        status: 'active',
+        delay_minutes: 5,
+        started_at: '2026-10-06T12:00:00.000Z',
+        expires_at: '2026-10-06T12:05:00.000Z',
+      },
+    ]
+    h.state.messages = [{ sender_type: 'bot', content_text: '¡Hola! ¿En qué te ayudo?' }]
+    const db = (await import('@/lib/ai/admin-client')).supabaseAdmin()
+
+    const res = await runDueResponseWaitTimers(db, new Date('2026-10-06T12:05:01.000Z'))
+
+    expect(res).toMatchObject({ scanned: 1, sent: 0, cancelled: 1 })
+    expect(h.state.sendMessageToConversation).not.toHaveBeenCalled()
+    expect(h.state.waitCancelled).toEqual(['cancelled'])
+    expect(h.state.waitTimers[0]).toMatchObject({
+      status: 'cancelled',
+      cancelled_reason: 'takeover',
     })
   })
 

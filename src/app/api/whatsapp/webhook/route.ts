@@ -1259,12 +1259,14 @@ async function processMessage(
     `[webhook] thread ${conversation.id} (contact ${contactRecord.id}, assigned_agent_id=${(conversation as { assigned_agent_id?: string | null }).assigned_agent_id ?? 'null'}${convResult.created ? ', newly created' : ''})`
   )
 
-  // Auto-unblock BEFORE the flow runner. Threads that already interacted
-  // with a Flow can hold a stranded `active` run, and `dispatchInboundToFlows`
-  // reports `consumed: true` for every inbound while one exists — which is
-  // why the bot answered new numbers but went silent on old ones. Runs must
-  // be cleared before the flow dispatch, and the assignment flag before the
-  // AI gate, so this runs first and never throws.
+  // Clear legacy silence residue BEFORE the flow runner. Threads that already
+  // interacted with a Flow can hold a stranded `active` run, and
+  // `dispatchInboundToFlows` reports `consumed: true` for every inbound while
+  // one exists — which is why the bot answered new numbers but went silent on
+  // old ones. Runs must be cleared before the flow dispatch, and the legacy
+  // residue (ai_autoreply_disabled / ai_reply_count / status=pending) before
+  // the AI gate. NOTE: this deliberately does NOT touch `assigned_agent_id` —
+  // a human "Take over" is absolute and only a manual "Resume AI" lifts it.
   if (autoUnblockEnabled() && !convResult.created) {
     await autoUnblockConversation(supabaseAdmin(), conversation.id, senderPhone)
     await clearStaleFlowRuns(supabaseAdmin(), conversation.id)

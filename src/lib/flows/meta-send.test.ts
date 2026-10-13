@@ -10,6 +10,7 @@ const h = vi.hoisted(() => {
     messageInserts: [] as Record<string, unknown>[],
     conversationUpdates: [] as Record<string, unknown>[],
     contactUpdates: [] as Record<string, unknown>[],
+    assignedAgentId: null as string | null,
     armResponseWaitIfIdle: vi.fn(),
   }
   return {
@@ -59,6 +60,15 @@ vi.mock('./admin-client', () => ({
       }
       if (table === 'conversations') {
         return {
+          select: () => ({
+            eq: () => ({
+              maybeSingle: () =>
+                Promise.resolve({
+                  data: { assigned_agent_id: h.state.assignedAgentId },
+                  error: null,
+                }),
+            }),
+          }),
           update: (payload: Record<string, unknown>) => {
             h.state.conversationUpdates.push(payload)
             return { eq: () => Promise.resolve({ error: null }) }
@@ -111,6 +121,7 @@ beforeEach(() => {
   h.state.messageInserts = []
   h.state.conversationUpdates = []
   h.state.contactUpdates = []
+  h.state.assignedAgentId = null
   h.callMode.mode = 'single'
   mockSendTextMessage.mockReset()
   mockSendTypingIndicator.mockReset()
@@ -251,5 +262,15 @@ describe('engineSendAiReply', () => {
     expect(mockSendTypingIndicator).not.toHaveBeenCalled()
     expect(h.state.messageInserts).toHaveLength(1)
     expect(h.state.messageInserts[0].content_text).toBe(text)
+  })
+
+  it('refuses to send when a human took the conversation over (last-checkpoint guard)', async () => {
+    // The race the dispatch gate cannot cover: the human pressed "Take over"
+    // after the reply was generated. Nothing may reach Meta in that case.
+    h.state.assignedAgentId = 'agent-9'
+
+    await expect(engineSendAiReply(ARGS)).rejects.toThrow(/human takeover/i)
+    expect(mockSendTextMessage).not.toHaveBeenCalled()
+    expect(h.state.messageInserts).toHaveLength(0)
   })
 })

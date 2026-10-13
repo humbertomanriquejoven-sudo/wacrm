@@ -5,6 +5,7 @@ import { resolveRecipient } from '@/lib/whatsapp/recipient-resolver'
 import { loadAiConfig } from '@/lib/ai/config'
 import { generateReply, stripInternalReasoning } from '@/lib/ai/generate'
 import { buildConversationContext } from '@/lib/ai/context'
+import { isConversationAiPaused } from '@/lib/ai/pause'
 import { ARM_DEFAULT_MINUTES, cancelResponseWaitTimers } from './response-wait'
 
 /**
@@ -1176,6 +1177,32 @@ export async function runDueFollowUps(
         continue
       }
 
+      // HUMAN TAKEOVER — an AI nudge must respect a manual pause. If a human
+      // took this conversation over (assigned_agent_id set) after the timer
+      // was armed, close the row as cancelled instead of generating and
+      // sending an AI reminder. This does not change WHEN the timer fires —
+      // only whether a paused chat is nudged. Only a manual "Resume AI"
+      // lifts the pause. (The send core re-checks once more at dispatch.)
+      if (await isConversationAiPaused(client, conversationId)) {
+        const { error: pausedErr } = await client
+          .from('follow_ups')
+          .update({ status: 'cancelled' })
+          .eq('id', id)
+          .eq('status', 'processing')
+        if (pausedErr) {
+          console.error(
+            `[follow-up] could not cancel ${id} (human takeover):`,
+            pausedErr.message,
+          )
+        } else {
+          result.cancelled++
+          console.log(
+            `[follow-up] follow-up ${id} cancelled — conversation ${conversationId} is under human takeover; no AI nudge sent.`,
+          )
+        }
+        continue
+      }
+
       // UNIFIED DESTINATION — the SAME `resolveRecipient` ladder the send
       // core walks at dispatch time (manual inbox send, bot auto-reply and
       // these timers): dialable `phone` → a number recovered from this
@@ -1622,6 +1649,50 @@ export async function runDueResponseWaitTimers(
           result.cancelled++
           console.log(
             `[response-wait] timer ${id} cancelled — the customer replied for conversation ${conversationId}.`,
+          )
+        }
+        continue
+      }
+
+      // HUMAN TAKEOVER — an AI nudge must respect a manual pause. If a human
+      // took this conversation over (assigned_agent_id set) after the wait
+      // started, close the timer instead of generating and sending an AI
+      // nudge. This does not change WHEN the timer fires — only whether a
+      // paused chat is nudged. Only a manual "Resume AI" lifts the pause.
+      // (The send core re-checks once more at dispatch.)
+      if (await isConversationAiPaused(client, conversationId)) {
+        const { error: pausedErr } = await client
+          .from('response_wait_timers')
+          .update({ status: 'cancelled', cancelled_reason: 'takeover' })
+          .eq('id', id)
+          .eq('status', 'processing')
+        if (pausedErr) {
+          // Migration 065 pending (column missing): retry the legacy update
+          // so the one-shot cancel still lands on an un-migrated DB.
+          if (/column .* does not exist|42703|PGRST204|schema cache/i.test(pausedErr.message)) {
+            const { error: legacyErr } = await client
+              .from('response_wait_timers')
+              .update({ status: 'cancelled' })
+              .eq('id', id)
+              .eq('status', 'processing')
+            if (legacyErr) {
+              console.error(
+                `[response-wait] could not cancel ${id} (human takeover):`,
+                legacyErr.message,
+              )
+            } else {
+              result.cancelled++
+            }
+          } else {
+            console.error(
+              `[response-wait] could not cancel ${id} (human takeover):`,
+              pausedErr.message,
+            )
+          }
+        } else {
+          result.cancelled++
+          console.log(
+            `[response-wait] timer ${id} cancelled — conversation ${conversationId} is under human takeover; no AI nudge sent.`,
           )
         }
         continue

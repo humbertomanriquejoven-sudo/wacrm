@@ -2,37 +2,37 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 
 /**
  * ============================================================
- * AUTO-UNBLOCK ON INBOUND
+ * AUTO-UNBLOCK ON INBOUND (LEGACY RESIDUE ONLY)
  * ============================================================
- * Reopens a conversation that an earlier session left muted, the moment the
- * contact writes again.
+ * Reopens a conversation that an earlier session left muted by legacy
+ * state, the moment the contact writes again.
  *
  * The symptom this exists for: the bot answered fine on brand-new numbers
  * but went permanently silent on contacts with prior history. The cause is
- * accumulated per-conversation state that only old threads have:
+ * accumulated per-conversation residue that only old threads have:
  *
- *   * `assigned_agent_id` — set by a Flow `handoff` node with `assign_to`
- *     (flows/engine.ts) or by a manual "Take over", and never cleared
- *     automatically. It is THE pause flag; there is no `is_paused`
- *     column in this schema.
- *   * `status = 'pending'` — written by the same handoff path. Not a gate
+ *   * `status = 'pending'` — written by a Flow `handoff` node. Not a gate
  *     by itself, but it is the fingerprint of a stranded handoff.
  *   * `ai_autoreply_disabled` / `ai_reply_count` — legacy columns from the
  *     capped-replies era that could leave a thread muted.
  *
+ * HUMAN TAKEOVER IS ABSOLUTE — THIS FUNCTION NEVER TOUCHES IT:
+ *   `assigned_agent_id` is THE pause flag (there is no `is_paused` column).
+ *   It is set by a manual "Take over" or a Flow `handoff` node with
+ *   `assign_to`, and it is cleared ONLY by a manual "Resume AI". Clearing
+ *   it on inbound (the old behaviour) meant a deliberate takeover no longer
+ *   held: the next customer message handed the thread straight back to the
+ *   bot. That is why the assignment is deliberately excluded here, and why
+ *   `autoUnblockConversation` now clears only the legacy residue above.
+ *
  * A fresh conversation has none of that, which is exactly why new numbers
  * worked and old threads did not.
- *
- * TRADE-OFF — READ BEFORE ENABLING:
- * clearing `assigned_agent_id` on every inbound means a deliberate human
- * takeover no longer holds: the next customer message hands the thread
- * straight back to the bot. Set `AI_AUTOREPLY_AUTO_UNBLOCK=false` to get
- * the previous human-wins behaviour back.
  */
 
 export function autoUnblockEnabled(): boolean {
-  // Default ON: the requested behaviour. Set the env var to 'false' to
-  // restore human-wins handoff.
+  // Default ON: the legacy-residue cleanup (and stale flow-run sweep) run
+  // on every inbound. Set the env var to 'false' to disable them. This NO
+  // LONGER governs human takeover — that is always respected.
   return process.env.AI_AUTOREPLY_AUTO_UNBLOCK !== 'false'
 }
 
@@ -42,7 +42,13 @@ export interface UnblockResult {
 }
 
 /**
- * Clear every silencing flag on a conversation and report what was stuck.
+ * Clear the LEGACY silencing residue on a conversation and report what was
+ * stuck.
+ *
+ * It deliberately does NOT clear `assigned_agent_id`: a human "Take over"
+ * (or a Flow `handoff` assignment) is an absolute pause that only a manual
+ * "Resume AI" may lift. When the ONLY thing set is the assignment this
+ * returns `{ changed: false }` and touches nothing.
  *
  * Never throws: a failure here must not stop the reply that follows.
  * `phone` is only used for the diagnostic log.
@@ -62,7 +68,7 @@ export async function autoUnblockConversation(
     // itself is the best-effort probe.
     const { data: conv, error: readErr } = await db
       .from('conversations')
-      .select('assigned_agent_id, status')
+      .select('status')
       .eq('id', conversationId)
       .maybeSingle()
 
@@ -76,9 +82,6 @@ export async function autoUnblockConversation(
     if (!conv) return empty
 
     const reasons: string[] = []
-    const assigned = (conv as { assigned_agent_id?: string | null })
-      .assigned_agent_id
-    if (assigned) reasons.push(`assigned_agent_id=${assigned} (human/flow takeover)`)
     const status = (conv as { status?: string | null }).status
     if (status === 'pending') reasons.push('status=pending (flow handoff residue)')
 
@@ -95,7 +98,6 @@ export async function autoUnblockConversation(
     const { error: updErr } = await db
       .from('conversations')
       .update({
-        assigned_agent_id: null,
         status: 'open',
         ai_autoreply_disabled: false,
         ai_reply_count: 0,
@@ -106,11 +108,11 @@ export async function autoUnblockConversation(
       // Retry without the legacy columns in case this install lacks 029.
       const { error: retryErr } = await db
         .from('conversations')
-        .update({ assigned_agent_id: null, status: 'open' })
+        .update({ status: 'open' })
         .eq('id', conversationId)
       if (retryErr) {
         console.error(
-          `[ai unblock] could not unblock conversation ${conversationId}:`,
+          `[ai unblock] could not clear the legacy silence residue on conversation ${conversationId}:`,
           retryErr.message
         )
         return empty
@@ -118,14 +120,14 @@ export async function autoUnblockConversation(
     }
 
     console.warn(
-      `[ai unblock] AUTO-UNBLOCKED conversation ${conversationId} (phone ${phone ?? 'unknown'}) — cleared: ${reasons.join(', ')}. ` +
-        'Set AI_AUTOREPLY_AUTO_UNBLOCK=false to keep human takeover sticky.'
+      `[ai unblock] cleared legacy silence residue on conversation ${conversationId} (phone ${phone ?? 'unknown'}) — cleared: ${reasons.join(', ')}. ` +
+        'A human takeover (assigned_agent_id) is NOT affected: only a manual "Resume AI" lifts it.'
     )
 
     return { changed: true, reasons }
   } catch (err) {
     console.error(
-      `[ai unblock] unexpected failure unblocking ${conversationId}:`,
+      `[ai unblock] unexpected failure clearing residue on ${conversationId}:`,
       err
     )
     return empty
