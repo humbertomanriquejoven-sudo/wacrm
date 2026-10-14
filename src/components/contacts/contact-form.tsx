@@ -47,12 +47,18 @@ export function ContactForm({
   onViewExisting,
 }: ContactFormProps) {
   const t = useTranslations('Contacts.form');
+  const tCols = useTranslations('Contacts.tableColumns');
   const supabase = createClient();
   const { accountId } = useAuth();
   const isEdit = !!contact;
 
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
+  const [username, setUsername] = useState('');
+  const [waId, setWaId] = useState('');
+  const [bsuid, setBsuid] = useState('');
+  const [direccionEntrega, setDireccionEntrega] = useState('');
+  const [tipoEnvio, setTipoEnvio] = useState('');
   const [email, setEmail] = useState('');
   const [company, setCompany] = useState('');
   const [saving, setSaving] = useState(false);
@@ -84,6 +90,11 @@ export function ContactForm({
     if (open) {
       setName(contact?.name ?? '');
       setPhone(contact?.phone ?? '');
+      setUsername(contact?.username ?? '');
+      setWaId(contact?.wa_id ?? '');
+      setBsuid(contact?.wa_user_id ?? '');
+      setDireccionEntrega(contact?.recipient_id ?? '');
+      setTipoEnvio(contact?.identity_type ?? '');
       setEmail(contact?.email ?? '');
       setCompany(contact?.company ?? '');
       setSelectedTagIds(contactTags.map((ct) => ct.tag_id));
@@ -125,8 +136,8 @@ export function ContactForm({
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
 
-    if (!phone.trim()) {
-      toast.error(t('phoneRequired'));
+    if (!name.trim()) {
+      toast.error(t('nameRequired'));
       return;
     }
 
@@ -157,18 +168,30 @@ export function ContactForm({
         //
         // Only when it actually changed — re-saving an unchanged number
         // would re-run the merge and flush on every edit of the name.
-        if (phone.trim() !== (contact.phone ?? '')) {
-          await updateContactPhone(contactId, phone.trim());
+        const nextPhone = phone.trim();
+        const updates: Record<string, unknown> = {
+          name: name.trim() || null,
+          email: email.trim() || null,
+          company: company.trim() || null,
+          username: username.trim() || null,
+          wa_id: waId.trim() || null,
+          wa_user_id: bsuid.trim() || null,
+          recipient_id: direccionEntrega.trim() || null,
+          identity_type: tipoEnvio.trim() || null,
+          updated_at: new Date().toISOString(),
+        };
+
+        if (nextPhone !== (contact.phone ?? '')) {
+          if (nextPhone) {
+            await updateContactPhone(contactId, nextPhone);
+          } else {
+            updates.phone = null;
+          }
         }
 
         const { error } = await supabase
           .from('contacts')
-          .update({
-            name: name.trim() || null,
-            email: email.trim() || null,
-            company: company.trim() || null,
-            updated_at: new Date().toISOString(),
-          })
+          .update(updates)
           .eq('id', contactId);
         if (error) throw error;
       } else {
@@ -178,9 +201,14 @@ export function ContactForm({
             user_id: user.id,
             account_id: accountId,
             name: name.trim() || null,
-            phone: phone.trim(),
+            phone: phone.trim() || null,
             email: email.trim() || null,
             company: company.trim() || null,
+            username: username.trim() || null,
+            wa_id: waId.trim() || null,
+            wa_user_id: bsuid.trim() || null,
+            recipient_id: direccionEntrega.trim() || null,
+            identity_type: tipoEnvio.trim() || null,
           })
           .select('id')
           .single();
@@ -232,7 +260,7 @@ export function ContactForm({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="bg-popover border-border text-popover-foreground sm:max-w-md">
+      <DialogContent className="bg-popover border-border text-popover-foreground sm:max-w-md max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="text-popover-foreground">
             {isEdit ? t('editTitle') : t('addTitle')}
@@ -247,7 +275,7 @@ export function ContactForm({
         <form onSubmit={handleSubmit} className="space-y-4">
           <div className="space-y-2">
             <Label htmlFor="cf-name" className="text-muted-foreground">
-              {t('nameLabel')}
+              {t('nameLabel')} <span className="text-red-400">*</span>
             </Label>
             <Input
               id="cf-name"
@@ -260,7 +288,7 @@ export function ContactForm({
 
           <div className="space-y-2">
             <Label htmlFor="cf-phone" className="text-muted-foreground">
-              {t('phoneLabel')} <span className="text-red-400">*</span>
+              {t('phoneLabel')}
             </Label>
             <Input
               id="cf-phone"
@@ -304,6 +332,76 @@ export function ContactForm({
                 {t('phoneHint')}
               </p>
             )}
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="cf-username" className="text-muted-foreground">
+              {tCols('username')}
+            </Label>
+            <Input
+              id="cf-username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder={t('usernamePlaceholder')}
+              className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="cf-wa-id" className="text-muted-foreground">
+              {tCols('waId')}
+            </Label>
+            <Input
+              id="cf-wa-id"
+              value={waId}
+              onChange={(e) => setWaId(e.target.value)}
+              placeholder={t('waIdPlaceholder')}
+              className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="cf-bsuid" className="text-muted-foreground">
+              {tCols('bsuid')}
+            </Label>
+            <Input
+              id="cf-bsuid"
+              value={bsuid}
+              onChange={(e) => setBsuid(e.target.value)}
+              placeholder={t('bsuidPlaceholder')}
+              className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="cf-recipient-address" className="text-muted-foreground">
+              {tCols('recipientAddress')}
+            </Label>
+            <Input
+              id="cf-recipient-address"
+              value={direccionEntrega}
+              onChange={(e) => setDireccionEntrega(e.target.value)}
+              placeholder={t('recipientAddressPlaceholder')}
+              className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="cf-recipient-type" className="text-muted-foreground">
+              {tCols('recipientType')}
+            </Label>
+            <select
+              id="cf-recipient-type"
+              value={tipoEnvio}
+              onChange={(e) => setTipoEnvio(e.target.value)}
+              className="h-8 w-full rounded-lg border border-input bg-muted px-2.5 py-1 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+            >
+              <option value="">—</option>
+              <option value="PHONE_E164">PHONE_E164</option>
+              <option value="BSUID">BSUID</option>
+              <option value="USERNAME">USERNAME</option>
+              <option value="LID">LID</option>
+            </select>
           </div>
 
           <div className="space-y-2">

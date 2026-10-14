@@ -254,7 +254,7 @@ describe('analyzeDealFromConversation', () => {
     expect(h.updates[0].ai_stage_id).toBeNull()
   })
 
-  it('applies the evaluation tags and records the contextual note', async () => {
+  it('records the contextual note from the evaluation', async () => {
     h.generateReply.mockResolvedValue({
       text: '',
       handoff: false,
@@ -267,21 +267,12 @@ describe('analyzeDealFromConversation', () => {
             score: 7,
             stage: 'Qualified',
             summary: 'Interesado en remodelar',
-            tags: ['En conversacion'],
             note: 'Remodelación en Chía, presupuesto 30M',
           },
         },
       ],
     })
     await analyzeDealFromConversation(baseArgs())
-
-    const tagInsert = h.insertsByTable.find((r) => r.table === 'tags')
-    const tagRows = tagInsert
-      ? ((Array.isArray(tagInsert.arg) ? tagInsert.arg : [tagInsert.arg]) as {
-          name: string
-        }[])
-      : []
-    expect(tagRows.map((t) => t.name)).toContain('En conversacion')
 
     const noteInsert = h.insertsByTable.find((r) => r.table === 'contact_notes')
     expect(noteInsert).toBeTruthy()

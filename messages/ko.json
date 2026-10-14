@@ -542,7 +542,12 @@
       "dupSimilar": "매우 유사한 번호를 가진 연락처가 이미 있습니다.",
       "loadingTags": "태그를 불러오는 중...",
       "noTagsAvailable": "사용 가능한 태그가 없습니다. 설정에서 태그를 만드세요.",
-      "phoneRequired": "전화번호는 필수입니다"
+      "phoneRequired": "전화번호는 필수입니다",
+      "nameRequired": "이름은 필수입니다",
+      "usernamePlaceholder": "@johndoe",
+      "waIdPlaceholder": "1234567890",
+      "bsuidPlaceholder": "1008742182330901",
+      "recipientAddressPlaceholder": "5215555555555"
     },
     "detailView": {
       "tabs": {

@@ -542,7 +542,12 @@
       "dupSimilar": "A contact with a very similar number already exists.",
       "loadingTags": "Loading tags...",
       "noTagsAvailable": "No tags available. Create tags in Settings.",
-      "phoneRequired": "Phone number is required"
+      "phoneRequired": "Phone number is required",
+      "nameRequired": "Name is required",
+      "usernamePlaceholder": "@johndoe",
+      "waIdPlaceholder": "1234567890",
+      "bsuidPlaceholder": "1008742182330901",
+      "recipientAddressPlaceholder": "5215555555555"
     },
     "detailView": {
       "tabs": {
