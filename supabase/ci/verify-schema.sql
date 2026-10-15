@@ -59,6 +59,24 @@ BEGIN
       'service_role may not EXECUTE claim_ai_reply_slot — the auto-reply will silently never send (issue #345)';
   END IF;
 
+  -- The anti-duplicate turn claim (076). Without it the auto-reply has no
+  -- cross-instance guard against two concurrent dispatches answering the
+  -- SAME inbound wamid twice — the exact "duplicate WhatsApp message" class
+  -- of bug. Same failure mode as above: a missing function or a missing
+  -- EXECUTE grant would be invisible until messages doubled (or, with the
+  -- app's fail-open, silently degraded).
+  IF to_regprocedure('public.claim_ai_turn(uuid, text)') IS NULL THEN
+    RAISE EXCEPTION 'public.claim_ai_turn(uuid, text) is missing — migration 076 did not apply';
+  END IF;
+  IF NOT has_function_privilege(
+       'service_role',
+       'public.claim_ai_turn(uuid, text)',
+       'EXECUTE'
+     ) THEN
+    RAISE EXCEPTION
+      'service_role may not EXECUTE claim_ai_turn — the anti-duplicate claim cannot work (mirrors issue #345)';
+  END IF;
+
   -- The knowledge base's optional columns (055). These are the one pair the
   -- app probes for and degrades around, so an unapplied 055 is invisible in
   -- the UI: uploads still succeed, they just silently lose filename/source_type.

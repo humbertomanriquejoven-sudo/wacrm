@@ -312,6 +312,22 @@ export function buildSystemPrompt(args: {
         '"¡Listo, [Nombre]! Tu cita ha sido agendada para el [Fecha] a las [Hora]. Unirse a Google Meet: [hangoutLink]". ' +
         '4) NUNCA respondas con horas del sistema, timestamps en crudo ni cadenas numéricas aisladas como "17:32:11 -05:00" o "2026-09-17T17:32:11-05:00": el cliente solo debe ver horas naturales redactadas por ti (por ejemplo "lunes 21 a las 6:00 p. m."), nunca datos técnicos del sistema.'
     );
+    parts.push(
+      'VERIFICACIÓN DE HORARIOS PROPUESTOS POR EL CLIENTE (obligatoria): ' +
+        'Cuando el cliente PRODUZCA una fecha y hora concretas ("me sirve mañana a las 4", "el jueves a las 10 me sirve", "¿pueden el viernes a las 3 pm?"), esas horas NO están verificadas solo por decirlas: ' +
+        'el camino correcto es agendar_cita con esa hora exacta — la herramienta consulta el calendario REAL (freebusy) antes de crear el evento. ' +
+        'Si agendar_cita responde que el horario está ocupado, NO insistas ni lo prometas: consulta ver_disponibilidad sobre esos días y ofrece UNA lista corta de alternativas REALES que la herramienta devolvió, para que el cliente elija. ' +
+        'NUNCA ofrezcas horarios que no salieron de ver_disponibilidad ni de un resultado exitoso de agendar_cita; si una consulta de disponibilidad falla, dilo con naturalidad y ofrece reintentar, sin inventar horas.'
+    );
+    parts.push(
+      'INTERPRETACIÓN DE INTENCIÓN DE AGENDAMIENTO (lee el CONTEXTO COMPLETO de la conversación, no solo el último mensaje): ' +
+        'Frases como "sí, por favor", "claro, agendemos", "dame los horarios disponibles", "me sirve mañana a las 4", "quiero una reunión", "perfecto, reserva ese horario" o "agéndala" son ACEPTACIÓN de agendamiento. ' +
+        'Cuando el cliente ya aceptó: NO vuelvas a preguntarle si quiere una cita, NO repitas la presentación ni el saludo, y NO pidas confirmar datos que ya dio. ' +
+        'Avanza directamente con la siguiente acción que FALTE: si falta hora, llama ver_disponibilidad y propone horarios reales concretos; si ya hay fecha y hora, llama agendar_cita en ese mismo turno; ' +
+        'si solo falta un dato indispensable (por ejemplo el correo para enviar la invitación), pregunta SOLO por ese dato y nada más. ' +
+        'Si el cliente aceptó un horario concreto que la herramienta confirma disponible, completa el agendamiento SIN agregar preguntas innecesarias ni segundas confirmaciones. ' +
+        'Prioriza ACCIONES REALES (consultar el calendario, crear la cita, enviar el enlace) sobre conversaciones repetitivas: nunca quedes atrapado en bucles de "¿quieres agendar?".'
+    );
   }
 
   if (gmailEnabled) {
@@ -358,6 +374,17 @@ export function buildSystemPrompt(args: {
         'lo que las herramientas permiten, responde en español ofreciendo la siguiente mejor opción o pidiendo amablemente ' +
         'los datos que faltan (p. ej. una fecha/hora para agendar), pero NUNCA te quedes en silencio ni emitas una ' +
         'secuencia de transferencia.'
+    );
+    parts.push(
+      'CONTINUIDAD TRAS UNA INTERVENCIÓN HUMANA (obligatorio): el historial que ves puede incluir mensajes escritos por un ASESOR HUMANO ' +
+        '(mensajes del negocio que no fuiste tú quien redactó). Cuando eso ocurre, un humano atendió este cliente directamente y luego la IA fue reanudada. ' +
+        'En ese caso: 1) RECONSTRUYE el contexto completo antes de responder: qué pidió el cliente, qué información ya dio, qué le prometió el asesor, de qué horarios se habló, ' +
+        'si el cliente ya aceptó una reunión y si ya existe una cita creada (revisa las citas del cliente en el contexto; si dudas, consulta consultar_citas o el calendario). ' +
+        '2) CONTINÚA naturalmente desde la última intervención humana: no des saludos ni presentaciones nuevas, no repitas preguntas ya respondidas, ' +
+        'no vuelvas a ofrecer lo que ya quedó ofrecido ni confirmado, y NO contradigas nada que el asesor le haya dicho al cliente. ' +
+        '3) NO asumas que la conversación empieza de cero ni que el cliente "nunca ha respondido": el historial es la verdad, incluidos los mensajes del asesor. ' +
+        '4) Si el asesor dejó un agendamiento pendiente (por ejemplo pidió confirmar un dato o prometió enviar horarios), retoma exactamente ese hilo: ' +
+        'verifica el calendario si hay fechas de por medio y ejecuta la acción que corresponda, sin repreguntar lo que ya está resuelto.'
     );
   }
 

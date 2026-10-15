@@ -242,11 +242,25 @@ async function sendOutboundProbe(
  */
 async function sendTurnFallback(
   args: DispatchArgs,
-  reason: string
+  reason: string,
+  sinceIso?: string
 ): Promise<boolean> {
   if (args.suppressReply) {
     console.warn(
       `[ai auto-reply] fallback_skipped conversation=${args.conversationId} reason=${reason} (suppressReply=true — something else already owns this message)`
+    );
+    return false;
+  }
+  // ANTI-DUPLICADOS: si el envío del reply REAL ya alcanzó WhatsApp en
+  // este turno (p. ej. Meta lo aceptó pero el insert en `messages`
+  // falló y la excepción llegó hasta aquí), el acuse neutro de
+  // recuperación sería un SEGUNDO mensaje sobre el mismo evento. Se
+  // consulta la persistencia (`messages`) en vez de confiar en una
+  // bandera en memoria, porque el fallo que nos trajo hasta aquí fue
+  // precisamente una señal en memoria engañosa.
+  if (sinceIso && (await botReplyAlreadySentSince(args.conversationId, sinceIso))) {
+    console.warn(
+      `[ai auto-reply] fallback_skipped conversation=${args.conversationId} reason=${reason} (a bot reply for this turn is already on WhatsApp — suppressing the duplicate fallback)`
     );
     return false;
   }
@@ -344,6 +358,100 @@ async function resetAutoReplyCounter(
       `[ai auto-reply] could not reset the reply counter for ${conversationId}:`,
       error.message
     );
+  }
+}
+
+/**
+ * ANTI-DUPLICADOS — capa 1: claim persistente por evento entrante.
+ *
+ * Reclama (atómicamente, vía índice único en Postgres) el turno de IA
+ * para UN mensaje entrante concreto — la clave es (conversación, wamid).
+ * Exactamente un despacho concurrente recibe `true`; el resto se retira
+ * sin llamar al modelo ni enviar nada. Esto cubre la ventana que el
+ * dedupe de replay del webhook NO cubre: dos entregas del mismo wamid
+ * procesándose a la vez (dos instancias serverless, reintento de Meta),
+ * donde ambas ven el mensaje como "nuevo".
+ *
+ * No bloquea mensajes legítimos distintos: cada wamid diferente reclama
+ * su propio turno. Tampoco interfiere con las automatizaciones, los
+ * seguimientos ni los temporizadores — estos no pasan por aquí.
+ *
+ * FALLA ABIERTA: si la migración 076 no está aplicada o el RPC falla,
+ * se devuelve `true` y el despacho continúa (misma filosofía que
+ * `claim_ai_reply_slot`): un claim inaccesible NUNCA debe silenciar al
+ * bot. Sin `composeMessageId` no hay wamid que reclamar y se continúa
+ * igual (rutas de diagnóstico/probe sin mensaje entrante asociado).
+ */
+async function claimAiTurn(
+  db: SupabaseClient,
+  conversationId: string,
+  inboundWamid: string | undefined
+): Promise<boolean> {
+  if (!inboundWamid) return true;
+  try {
+    const { data, error } = await db.rpc('claim_ai_turn', {
+      p_conversation_id: conversationId,
+      p_inbound_wamid: inboundWamid,
+    });
+    if (error) {
+      console.warn(
+        `[ai auto-reply] claim_ai_turn failed for conversation ${conversationId} (wamid ${inboundWamid}) — continuing without the claim:`,
+        error.message
+      );
+      return true;
+    }
+    return data !== false;
+  } catch (err) {
+    console.warn(
+      `[ai auto-reply] claim_ai_turn threw for conversation ${conversationId} (wamid ${inboundWamid}) — continuing without the claim:`,
+      err instanceof Error ? err.message : err
+    );
+    return true;
+  }
+}
+
+/**
+ * ANTI-DUPLICADOS — capa 2: verificación previa al envío.
+ *
+ * Devuelve true si YA existe un mensaje del bot en esta conversación
+ * creado a partir de `sinceIso` (el inicio del turno actual). Se usa en
+ * dos puntos:
+ *   1. antes de enviar el reply final — si el texto idéntico ya salió
+ *      (p. ej. un reintento del propio despacho), no se vuelve a enviar;
+ *   2. antes del acuse neutro de recuperación — si el reply real ya
+ *      llegó a WhatsApp, el acuse sería un segundo mensaje.
+ *
+ * Consulta `messages` (persistencia real) en vez de confiar en banderas
+ * en memoria: el fallo clásico es "Meta aceptó el mensaje pero el insert
+ * en la BD falló", y esa excepción deja la bandera local en false.
+ * `sinceIso` acota la ventana al turno actual para no bloquear replies
+ * legítimos de turnos posteriores. `exactText`, cuando se pasa, restringe
+ * la búsqueda a un bubble con ESE contenido — es la comprobación literal
+ * de "¿esta misma respuesta ya salió?" antes de enviar.
+ */
+async function botReplyAlreadySentSince(
+  conversationId: string,
+  sinceIso: string,
+  exactText?: string
+): Promise<boolean> {
+  try {
+    let query = supabaseAdmin()
+      .from('messages')
+      .select('id')
+      .eq('conversation_id', conversationId)
+      .eq('sender_type', 'bot')
+      .gte('created_at', sinceIso)
+      .limit(1);
+    if (exactText) query = query.eq('content_text', exactText);
+    const { data, error } = await query;
+    if (error) {
+      // Sin lectura confiable no se suprime nada: mejor arriesgar un
+      // acuse repetido que dejar al cliente sin respuesta (REGLA DE ORO).
+      return false;
+    }
+    return (data?.length ?? 0) > 0;
+  } catch {
+    return false;
   }
 }
 
@@ -879,6 +987,12 @@ export async function dispatchInboundToAiReply(
   // reaction can never be answered by accident).
   let replyDispatched = false;
 
+  // Marca de inicio del turno. Acota las ventanas de las comprobaciones
+  // anti-duplicados: cualquier bubble del bot creado DESPUÉS de este
+  // instante en esta conversación pertenece a este turno (o a un turno
+  // concurrente duplicado que queremos suprimir), nunca a uno anterior.
+  const turnStartedAt = new Date().toISOString();
+
   // A suppressed dispatch still walks every gate above (config, assignment,
   // rate limit) purely to keep the logs honest, but never reaches the wire:
   // `sendTurnFallback` refuses to send under `suppressReply`, so neither a
@@ -893,6 +1007,26 @@ export async function dispatchInboundToAiReply(
 
   try {
     const db = supabaseAdmin();
+
+    // ANTI-DUPLICADOS — claim por evento entrante (conversación + wamid).
+    // Se reclama ANTES de cualquier llamada al modelo: dos despachos
+    // concurrentes para el mismo mensaje (reintento de Meta, doble
+    // entrega serverless) ya no pueden generar ni enviar dos respuestas —
+    // solo el claimante continúa. Un fallo del claim es fail-open (log y
+    // continúa) para que una migración ausente jamás silencie al bot.
+    // Bajo BYPASS el resultado se ignora, igual que el resto de los gates.
+    if (!(await claimAiTurn(db, conversationId, args.composeMessageId))) {
+      if (bypass) {
+        console.warn(
+          '[ai auto-reply] BYPASS: ignoring the anti-duplicate turn claim.'
+        );
+      } else {
+        console.warn(
+          `[ai auto-reply] DUPLICATE SUPPRESSED — conversation ${conversationId}, wamid ${args.composeMessageId}: another dispatch already claimed this inbound message; this one sends nothing.`
+        );
+        return;
+      }
+    }
 
     let config: AiConfigLike | null;
     try {
@@ -914,7 +1048,11 @@ export async function dispatchInboundToAiReply(
         contactId,
         message: err instanceof Error ? err.message : String(err),
       });
-      await sendTurnFallback(args, 'ai config could not be loaded/decrypted');
+      await sendTurnFallback(
+        args,
+        'ai config could not be loaded/decrypted',
+        turnStartedAt
+      );
       return;
     }
     if (!config || !config.autoReplyEnabled) {
@@ -956,7 +1094,7 @@ export async function dispatchInboundToAiReply(
         // stay silent as logged. But a row whose switches are ON and whose
         // key has vanished is not: honour the REGLA DE ORO and answer.
         if (row && row.is_active && row.auto_reply_enabled && !row.api_key) {
-          await sendTurnFallback(args, 'ai_configs row has no API key');
+          await sendTurnFallback(args, 'ai_configs row has no API key', turnStartedAt);
         }
         return;
       }
@@ -1042,7 +1180,11 @@ export async function dispatchInboundToAiReply(
         contactId,
         message: err instanceof Error ? err.message : String(err),
       });
-      await sendTurnFallback(args, 'conversation context could not be loaded');
+      await sendTurnFallback(
+        args,
+        'conversation context could not be loaded',
+        turnStartedAt
+      );
       return;
     }
     if (messages.length === 0) {
@@ -1487,12 +1629,32 @@ export async function dispatchInboundToAiReply(
       return;
     }
 
+    // ANTI-DUPLICADOS — verificación previa al envío. El claim de arriba
+    // ya serializó el turno por wamid; este segundo filtro consulta la
+    // persistencia por si acaso: si UN BUBBLE IDENTÉNTICO ya salió en
+    // este turno (p. ej. un reinterno del propio despacho tras un fallo
+    // transitorio), no se vuelve a enviar la misma respuesta.
+    const replyTextToSend = stripInternalReasoning(finalText);
+    if (
+      await botReplyAlreadySentSince(
+        conversationId,
+        turnStartedAt,
+        replyTextToSend
+      )
+    ) {
+      console.warn(
+        `[ai auto-reply] DUPLICATE SUPPRESSED — conversation ${conversationId}: an identical bot reply is already on WhatsApp for this turn; not sending it twice.`
+      );
+      replyDispatched = true;
+      return;
+    }
+
     const enviado = await engineSendAiReply({
       accountId,
       userId: configOwnerUserId,
       conversationId,
       contactId,
-      text: stripInternalReasoning(finalText),
+      text: replyTextToSend,
       aiGenerated: true,
       composeMessageId: args.composeMessageId,
       // La confirmación de una cita REAL va en UNA sola burbuja: se salta
@@ -1636,7 +1798,8 @@ export async function dispatchInboundToAiReply(
     if (!replyDispatched) {
       const sent = await sendTurnFallback(
         args,
-        'dispatch threw after the original error was logged'
+        'dispatch threw after the original error was logged',
+        turnStartedAt
       );
       if (sent) replyDispatched = true;
     }
