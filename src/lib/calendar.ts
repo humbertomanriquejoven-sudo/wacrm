@@ -801,6 +801,68 @@ function toolFailure(
 /** Lifecycle operation a scheduling tool performed. */
 export type CitaAccion = 'crear' | 'reagendar' | 'cancelar';
 
+/** A confirmed, still-upcoming `citas` row for one contact. */
+interface CitaPrevia {
+  id: string;
+  fecha_inicio: string;
+  fecha_fin: string | null;
+  meet_link: string | null;
+}
+
+/**
+ * La cita confirmada y todavía vigente de un contacto (best-effort).
+ *
+ * Es la consulta que hace de red de seguridad anti-duplicados en
+ * `agendar_cita`: sin ella, cada "sí, agéndalo" repetido creaba un evento
+ * nuevo en Google Calendar y una fila nueva en `citas` para la misma
+ * persona. `fecha_fin > now - duración` mantiene una cita que está corriendo
+ * AHORA como vigente (el cliente puede confirmar asistencia) y descarta las
+ * de la semana pasada. Devuelve null ante cualquier fallo de lectura: la
+ * agenda nunca se bloquea por no poder chequear.
+ */
+async function buscarCitaPrevia(
+  db: SupabaseClient,
+  accountId: string,
+  contactId: string
+): Promise<CitaPrevia | null> {
+  try {
+    const desde = new Date(
+      Date.now() - APPOINTMENT_DURATION_MIN * 60_000
+    ).toISOString();
+    const { data, error } = await db
+      .from('citas')
+      .select('id, fecha_inicio, fecha_fin, meet_link')
+      .eq('account_id', accountId)
+      .eq('contact_id', contactId)
+      .eq('estado', 'confirmada')
+      .gt('fecha_fin', desde)
+      .order('fecha_inicio', { ascending: true })
+      .limit(25);
+    if (error || !Array.isArray(data) || data.length === 0) return null;
+    const row = data[0] as {
+      id?: string;
+      fecha_inicio?: string;
+      fecha_fin?: string | null;
+      meet_link?: string | null;
+    };
+    if (typeof row?.fecha_inicio !== 'string' || !row.fecha_inicio) {
+      return null;
+    }
+    return {
+      id: String(row.id ?? ''),
+      fecha_inicio: row.fecha_inicio,
+      fecha_fin: typeof row.fecha_fin === 'string' ? row.fecha_fin : null,
+      meet_link: typeof row.meet_link === 'string' ? row.meet_link : null,
+    };
+  } catch (err) {
+    console.warn(
+      '[calendar] duplicate-check lookup failed — booking anyway:',
+      err instanceof Error ? err.message : err
+    );
+    return null;
+  }
+}
+
 /** agendar_cita — create a 45-minute event and persist the CRM row. */
 export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {  const { db, accountId, contactoId, inicio, nombre, motivo, correoCliente } =
     args;
@@ -812,6 +874,92 @@ export async function agendar_cita(args: AgendarCitaArgs): Promise<string> {  co
   // Motivo por defecto: el flujo nunca debe bloquearse preguntando por el
   // motivo cuando el usuario no lo mencionó.
   const motivoFinal = motivo?.trim() || 'Consulta / Valoración';
+
+  // ANTI-DUPLICADOS — el cliente YA tiene una cita activa.
+  //
+  // Es el guard que faltaba: `agendar_cita` creaba un SEGUNDO evento para el
+  // mismo contacto sin mirar si ya tenía uno (el prompt lo prohibía, pero el
+  // modelo no siempre obedece y el bucle "agendar otra vez" duplicaba la
+  // agenda real de HMA). Se consulta `citas` ANTES del freebusy, porque la
+  // cita previa ocupa el calendario: freebusy devolvería "horario ocupado"
+  // justo para el slot del cliente y el agente insistiría con otra hora.
+  //
+  // Dos salidas deterministas (el modelo solo informa, no decide):
+  //   * MISMO slot → se confirma la cita existente con su fecha, hora y
+  //     enlace reales; NO se crea nada (el cliente ve el resultado que
+  //     esperaba, con cero eventos fantasma).
+  //   * Otro slot → se devuelve la cita existente como información y se le
+  //     pide explícitamente al modelo que use reagendar_cita o consulte al
+  //     cliente; `confirmado:false` evita que el motor envíe una
+  //     confirmación de creación.
+  // Falla abierta: si la lectura falla, se agenda normalmente (nunca se
+  // bloquea una cita por no poder chequear duplicados).
+  const citaPrevia = await buscarCitaPrevia(db, accountId, contactoId);
+  if (citaPrevia) {
+    const name = nombre.trim() || 'Cita';
+    const previaStart = new Date(citaPrevia.fecha_inicio);
+    const previaEnd = new Date(
+      citaPrevia.fecha_fin ??
+        previaStart.getTime() + APPOINTMENT_DURATION_MIN * 60_000
+    );
+    const end = new Date(start.getTime() + APPOINTMENT_DURATION_MIN * 60_000);
+    const solapa =
+      !Number.isNaN(previaStart.getTime()) &&
+      previaStart.getTime() < end.getTime() &&
+      previaEnd.getTime() > start.getTime();
+    const { fecha: fechaPrevia, hora: horaPrevia } =
+      fechaHoraLocal(previaStart);
+    const linkPrevia = citaPrevia.meet_link;
+
+    if (solapa) {
+      return `${`ÉXITO: La cita de ${name} ya estaba agendada para el ${fechaPrevia} a las ${horaPrevia}. Enlace de Google Meet OBLIGATORIO: ${linkPrevia ?? MEET_FALLBACK_LINK}`}\n\n` +
+        `No se creó un evento nuevo: el cliente ya tenía esa reunión reservada.\n\n` +
+        toolResultJson({
+          exito: true,
+          accion: 'crear',
+          motivo: 'cita_ya_agendada',
+          mensaje:
+            'El cliente ya tenía una cita en ese mismo horario; se confirma la existente y NO se creó otra.',
+          fecha: fechaPrevia,
+          hora: horaPrevia,
+          link: linkPrevia,
+          confirmado: true,
+          calendarSynced: true,
+          idCita: citaPrevia.id,
+          estado: 'confirmada',
+          inicio: citaPrevia.fecha_inicio,
+          duracionMin: APPOINTMENT_DURATION_MIN,
+        });
+    }
+
+    return (
+      `El cliente YA TIENE UNA CITA ACTIVA: ${fechaPrevia} a las ${horaPrevia}` +
+      `${linkPrevia ? ` (enlace: ${linkPrevia})` : ''} (idCita="${citaPrevia.id}").\n` +
+      'NO crees una segunda cita: eso duplicaría la agenda del cliente.\n' +
+      '· Si el cliente quiere MANTENERLA → confírmale esa fecha y hora tal cual.\n' +
+      '· Si el cliente quiere CAMBIARLA → usa reagendar_cita con idCita="' +
+      citaPrevia.id +
+      '" (ella mueve el evento real, no llames agendar_cita).\n' +
+      '· Solo si el cliente pide EXPLÍCITAMENTE una segunda reunión en otra fecha, ' +
+      'explícale que un asesor agenda reuniones adicionales.\n' +
+      `Siguiente paso: reagendar_cita con idCita="${citaPrevia.id}", o confirma la existente.` +
+      `\n\n${toolResultJson({
+        exito: true,
+        accion: 'consultar',
+        motivo: 'cita_ya_agendada',
+        mensaje:
+          'El cliente ya tiene una cita activa; no se creó ninguna nueva. Decide entre confirmarla o reagendarla.',
+        fecha: fechaPrevia,
+        hora: horaPrevia,
+        link: linkPrevia,
+        confirmado: false,
+        idCita: citaPrevia.id,
+        estado: 'confirmada',
+        inicio: citaPrevia.fecha_inicio,
+        duracionMin: APPOINTMENT_DURATION_MIN,
+      })}`
+    );
+  }
 
   // La verificación de disponibilidad es best-effort y nunca debe bloquear
   // la cita: si freebusy falla o da timeout, pasamos directo a la creación

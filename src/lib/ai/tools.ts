@@ -99,7 +99,9 @@ export const AGENDAR_CITA_TOOL: ToolDefinition = {
     'Google crea un enlace de Meet (o devuelve la URL del evento del calendario como respaldo) y envía al cliente una invitación por correo. ' +
     'Pasa el correo del cliente cuando lo conozcas, para que reciba la invitación con el enlace. ' +
     'Al éxito, la herramienta devuelve confirmado:true más el enlace exacto (hangoutLink o htmlLink; meet.google.com/new como último respaldo) para compartir con el cliente. ' +
-    'El mensaje de confirmación por WhatsApp al cliente DEBE incluir SIEMPRE el enlace de Google Meet — nunca envíes una confirmación de cita sin él.',
+    'El mensaje de confirmación por WhatsApp al cliente DEBE incluir SIEMPRE el enlace de Google Meet — nunca envíes una confirmación de cita sin él. ' +
+    'ANTI-DUPLICADOS: la herramienta consulta sola las citas activas del cliente. Si ya tiene una cita en ese mismo horario, la confirma y NO crea otra ' +
+    '(motivo "cita_ya_agendada"); si tiene una cita en otro horario, te devuelve sus datos con motivo "cita_ya_agendada" y debes reagendarla con reagendar_cita — nunca insistir con agendar_cita.',
   parameters: {
     type: 'object',
     properties: {
@@ -542,12 +544,22 @@ export interface ContactContext {
   name: string | null
   email: string | null
   location: string | null
-  citas: { id: string; fecha_inicio: string; estado: string }[]
+  citas: {
+    id: string
+    fecha_inicio: string
+    estado: string
+    meet_link?: string | null
+  }[]
 }
 
 /**
  * Load the contact record (profile + active citas) for context
  * injection into the system prompt.
+ *
+ * The citas are ordered oldest-first and carry `meet_link`, because the
+ * prompt renders them as a prioritised "already scheduled" block: the model
+ * must SEE the real date, hour and link of an existing appointment to stop
+ * re-asking for scheduling information the customer already gave.
  */
 export async function loadContactContext(
   db: SupabaseClient,
@@ -561,9 +573,10 @@ export async function loadContactContext(
       .maybeSingle(),
     db
       .from('citas')
-      .select('id, fecha_inicio, estado')
+      .select('id, fecha_inicio, estado, meet_link')
       .eq('contact_id', contactId)
-      .eq('estado', 'confirmada'),
+      .eq('estado', 'confirmada')
+      .order('fecha_inicio', { ascending: true }),
   ])
 
   if (error || !data) return null

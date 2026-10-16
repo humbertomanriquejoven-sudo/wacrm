@@ -32,7 +32,18 @@ export const MAX_OUTPUT_TOKENS = 1024;
 // holding the webhook's `after()` pipeline. Override with
 // `AI_REQUEST_TIMEOUT_MS`.
 const DEFAULT_REQUEST_TIMEOUT_MS = 8_000;
-const DEFAULT_CONTEXT_MESSAGE_LIMIT = 20;
+/**
+ * How many recent messages feed the model by default.
+ *
+ * 20 (≈10 intercambios) era poco para el flujo real de HMA: cuando un
+ * humano intervenía y la IA se reanudaba, o cuando el cliente mandaba una
+ * ráfaga de fotos/textos, el contexto se cortaba y el agente "reiniciaba"
+ * el embudo (volvía a saludar, re-preguntaba por el proyecto). 40 mensajes
+ * mantienen la conversación larga a la vista sin riesgo de contexto (sigue
+ * siendo un presupuesto acotado). Sigue siendo ampliable con
+ * `AI_CONTEXT_MESSAGE_LIMIT`.
+ */
+const DEFAULT_CONTEXT_MESSAGE_LIMIT = 40;
 
 /** Per-call provider timeout. Override with `AI_REQUEST_TIMEOUT_MS`. */
 export function aiRequestTimeoutMs(): number {
@@ -117,6 +128,37 @@ export function todayContextLine(): string {
 }
 
 /**
+ * "2026-09-18 16:00" — una cita renderizada en la hora de pared del negocio,
+ * no en el instante UTC crudo ("2026-09-18T21:00:00.000Z"), que el modelo no
+ * puede comparar mentalmente con "mañana a las 4pm". Devuelve el ISO tal
+ * cual si el instante no es legible.
+ */
+export function formatarCitaEnPunto(inicioIso: string): string {
+  const start = new Date(inicioIso);
+  if (Number.isNaN(start.getTime())) return inicioIso;
+  const timeZone = aiTimeZone();
+  try {
+    const fecha = new Intl.DateTimeFormat('en-CA', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      timeZone,
+    }).format(start);
+    const hora = new Intl.DateTimeFormat('es-CO', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+      timeZone,
+    })
+      .format(start)
+      .replace(/[^\d:]/g, '');
+    return `${fecha} ${hora}`;
+  } catch {
+    return inicioIso;
+  }
+}
+
+/**
  * Build the system prompt shared by draft + auto-reply. The account's
  * own `system_prompt` (business context / persona / tone) is appended
  * to a fixed scaffold so behaviour stays predictable regardless of what
@@ -134,7 +176,12 @@ export function buildSystemPrompt(args: {
   contactLocation?: string | null;
   calendarEnabled?: boolean;
   gmailEnabled?: boolean;
-  citas?: { id: string; fecha_inicio: string; estado: string }[] | null;
+  citas?: {
+    id: string;
+    fecha_inicio: string;
+    estado: string;
+    meet_link?: string | null;
+  }[] | null;
   /**
    * True when the sender reached us on a WhatsApp address that exposes no
    * dialable number (a BSUID, or a public @username). WhatsApp cannot deliver
@@ -355,13 +402,25 @@ export function buildSystemPrompt(args: {
     // about when deciding whether a requested slot overlaps this one.
     parts.push(
       'Este cliente tiene citas registradas en el sistema (para reagendar o cancelar). ' +
+        'BLOQUE PRIORITARIO — el cliente YA TIENE CITA(S) AGENDADA(S): nunca vuelvas ' +
+        'a preguntarle si quiere agendar ni le pidas de nuevo la fecha, la hora ni el ' +
+        'enlace: ya los tiene y están abajo con su estado real. Si escribe algo breve ' +
+        'después de una pregunta tuya («sí», «ok», «perfecto», «gracias», «nos vemos», ' +
+        'un emoji), eso es una confirmación o agradecimiento: avanza con la siguiente ' +
+        'acción pendiente o responde corto, sin reiniciar el flujo ni repetir preguntas. ' +
         'El idCita es OPCIONAL: reagendar_cita y cancelar_cita localizan solas la cita activa de este cliente si lo omites; ' +
         'pásalo solo cuando tenga varias y te refieras a una en concreto. ' +
         'Si necesitas el detalle completo (estado, hora exacta, enlace), llama consultar_citas. ' +
         'NO crees una cita nueva para "arreglar" un cambio de horario: eso le dejaría dos citas. ' +
         'Citas encontradas: ' +
         activeCitas
-          .map((c, i) => `${i + 1}) idCita="${c.id}" — ${c.fecha_inicio}`)
+          .map((c, i) => {
+            const cuando = formatarCitaEnPunto(c.fecha_inicio);
+            const estado =
+              c.estado === 'cancelada' ? 'CANCELADA' : 'CONFIRMADA';
+            const link = c.meet_link ? ` — enlace: ${c.meet_link}` : '';
+            return `${i + 1}) idCita="${c.id}" — cita ${estado}, ${cuando} (${aiTimeZone()})${link}`;
+          })
           .join('; ')
     );
   }
@@ -385,6 +444,15 @@ export function buildSystemPrompt(args: {
         '3) NO asumas que la conversación empieza de cero ni que el cliente "nunca ha respondido": el historial es la verdad, incluidos los mensajes del asesor. ' +
         '4) Si el asesor dejó un agendamiento pendiente (por ejemplo pidió confirmar un dato o prometió enviar horarios), retoma exactamente ese hilo: ' +
         'verifica el calendario si hay fechas de por medio y ejecuta la acción que corresponda, sin repreguntar lo que ya está resuelto.'
+    );
+    parts.push(
+      'REGLAS ANTI-REPETICIÓN (prioritarias — UNA respuesta por mensaje): ' +
+        '1) NO vuelvas a saludar ni a presentarte si el historial ya tiene intercambios: continúa como si la conversación nunca se hubiera interrumpido. ' +
+        '2) NO reinicies el flujo comercial por un mensaje no textual (foto, audio, sticker, emoji): contesta con una frase corta y natural, sin volver a preguntar nombre, proyecto, fecha ni intención. ' +
+        '3) Responde UNA sola vez por mensaje: nunca envíes dos ideas seguidas ni repitas en el segundo mensaje lo que ya dijiste en el primero; no preguntes dos veces lo mismo en la misma conversación. ' +
+        '4) Un «sí», «ok», «perfecto», «gracias», «nos vemos» o un emoji tras una pregunta tuya es una CONFIRMACIÓN: ejecuta la acción pendiente o confirma lo acordado; NO vuelvas a preguntar «¿deseas que agende tu cita ahora?». ' +
+        '5) Si el cliente ya tiene una cita confirmada (mira el bloque de citas de este prompt), responde breve y solo cuando sea necesario: nunca pidas de nuevo la fecha, la hora ni el enlace, y nunca ofrezcas agendar de nuevo. ' +
+        '6) Si el cliente se burla o dice «esto es un robot», «eres un bot» y similar: no lo nieques ni te disculpes en bucle; reconócelo con naturalidad en UNA frase y ofrece pasarle a un asesor humano (sin simular la transferencia ni prometer tiempos).'
     );
   }
 

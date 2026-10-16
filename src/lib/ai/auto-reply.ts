@@ -4,7 +4,7 @@ import { apiKeyFingerprint } from './key-fingerprint';
 import { buildConversationContext } from './context';
 import { retrieveKnowledge } from './knowledge';
 import { generateReply, stripInternalReasoning } from './generate';
-import { buildSystemPrompt } from './defaults';
+import { aiTimeZone, buildSystemPrompt } from './defaults';
 import { logAiUsage } from './usage';
 import { analyzeDealFromConversation } from './deal-analysis';
 import { latestUserMessage } from './query';
@@ -159,6 +159,23 @@ function bypassEnabled(): boolean {
 }
 
 /**
+ * Coalescing de ráfagas (anti-repetición).
+ *
+ * Cuando un cliente manda VARIOS mensajes en pocos segundos ("sí" +
+ * "agéndalo" + foto), cada uno dispara su propio turno de IA. Generados en
+ * paralelo, los tres respondían con la misma idea ("¡Listo! ¿Deseas que
+ * agende tu cita?") y el hilo parecía un bucle. Este flag apaga el chequeo
+ * de "¿apareció un mensaje del cliente más nuevo que el mío?", que hace que
+ * solo el turno del ÚLTIMO mensaje de la ráfaga responda.
+ *
+ * Activado por defecto. `AI_BURST_COALESCE=false` lo desactiva (un mensaje
+ * = una respuesta, aunque se repita la idea) para poder comparar en caliente.
+ */
+function burstCoalesceEnabled(): boolean {
+  return process.env.AI_BURST_COALESCE !== 'false';
+}
+
+/**
  * Config mínima para que el bypass todavía pueda llamar al proveedor y
  * reportar su error real. Se combina sobre la config real cuando ésta
  * existe, así que una key válida nunca se descarta.
@@ -270,7 +287,10 @@ async function sendTurnFallback(
       userId: args.configOwnerUserId,
       conversationId: args.conversationId,
       contactId: args.contactId,
-      text: buildUngroundedAckMessage(),
+      // Acuse context-aware: si el contacto YA tiene una cita vigente, o si
+      // el último bubble del bot ya preguntó "¿deseas agendar?", el acuse no
+      // vuelve a hacer esa pregunta (era la frase más repetida del bot).
+      text: await buildContextAwareAck(supabaseAdmin(), args),
       aiGenerated: true,
       composeMessageId: args.composeMessageId,
       single: true,
@@ -456,6 +476,100 @@ async function botReplyAlreadySentSince(
 }
 
 /**
+ * "¿Este contenido del cliente merece respuesta?"
+ *
+ * Un bubble de SOLO emoji (incluidas las reacciones de Meta, que se
+ * persisten como `content_text` = emoji con `suppressReply`) NO cuenta como
+ * "mensaje más nuevo": si contara, cada reacción apagaría el turno que iba a
+ * responder el texto real y el cliente se quedaría en visto. Un emoji con
+ * texto al lado ("👍 perfecto") sí cuenta.
+ */
+function isAnswerableCustomerContent(text: string | null | undefined): boolean {
+  const t = text?.trim();
+  if (!t) return false;
+  const sinEmoji = t.replace(
+    /[\p{Extended_Pictographic}\p{Emoji_Modifier}\p{Regional_Indicator}\uFE0F\u200D\u20E3\s]/gu,
+    ''
+  );
+  if (sinEmoji.length > 0) return true;
+  // Sin texto restante: solo es "respondible" si hay al menos un emoji
+  // ( mensaje emoji-only de cliente → el siguiente turno del cliente lo
+  // contesta; una fila vacía jamás silencia a nadie).
+  return /\p{Extended_Pictographic}/u.test(t);
+}
+
+/**
+ * Hora en que quedó persistido MI mensaje entrante (best-effort).
+ *
+ * Se usa como ancla de la ventana de ráfaga en vez del reloj del proceso:
+ * `created_at` del propio bubble y el de los bubbles más nuevos vienen del
+ * MISMO reloj (Meta/BD), así que la comparación no se corrompe si el
+ * servidor y Meta tienen el reloj desfasados. Si no se puede leer, se
+ * devuelve null y el llamador cae al inicio del turno.
+ */
+async function myInboundCreatedAt(
+  db: SupabaseClient,
+  conversationId: string,
+  wamid: string
+): Promise<string | null> {
+  try {
+    const { data, error } = await db
+      .from('messages')
+      .select('created_at')
+      .eq('conversation_id', conversationId)
+      .eq('message_id', wamid)
+      .maybeSingle();
+    if (error) return null;
+    const iso = (data as { created_at?: string | null } | null)?.created_at;
+    return typeof iso === 'string' && iso ? iso : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * COALESCING DE RÁFAGAS — capa 3 (anti-repetición, no anti-duplicado).
+ *
+ * True cuando, DESPUÉS de `sinceIso`, ya hay en `messages` OTRO mensaje del
+ * cliente (distinto de `myWamid`) que merece respuesta. En ese caso el turno
+ * actual se retira en silencio: el turno de ese mensaje más nuevo (encadenado
+ * por el mutex por conversación) es el único que responde, una sola vez, con
+ * el contexto completo de la ráfaga.
+ *
+ * Por qué importa el orden: sin esto, los N turnos de una ráfaga se generan
+ * en paralelo y los N replies llegan a WhatsApp en orden arbitrario — todos
+ * responden la misma pregunta y el cliente ve un bucle.
+ *
+ * Falla abierta: cualquier error de lectura devuelve false (se responde). El
+ * peor caso posible es un mensaje de más, nunca un cliente en visto.
+ */
+async function newerCustomerMessageWaiting(
+  db: SupabaseClient,
+  conversationId: string,
+  sinceIso: string,
+  myWamid?: string
+): Promise<boolean> {
+  try {
+    const { data, error } = await db
+      .from('messages')
+      .select('message_id, content_text')
+      .eq('conversation_id', conversationId)
+      .eq('sender_type', 'customer')
+      .gt('created_at', sinceIso)
+      .order('created_at', { ascending: true })
+      .limit(10);
+    if (error) return false;
+    return (data ?? []).some(
+      (m) =>
+        (m.message_id ?? null) !== (myWamid ?? null) &&
+        isAnswerableCustomerContent(m.content_text)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Deterministic, customer-facing reschedule confirmation built from the REAL
  * reagendar_cita result.
  *
@@ -543,18 +657,186 @@ export const REAGENDAR_FALLBACK_MESSAGE =
  * "seen", which is the exact failure mode this whole path exists to prevent.
  * So we send THIS instead of nothing.
  *
- * It deliberately asserts nothing that could be false:
- *   - no confirmed cita, no date, no link (so it can never contradict a real
- *     agendar_cita result);
+ * It is CONTEXT-AWARE (`ctx`), because the old unconditional
+ * "¿Deseas que agende tu cita ahora?" was the single most repeated line of
+ * the whole agent: a customer who ALREADY had a confirmed cita and answered
+ * "sí" / "ok" / "gracias" got that question again on every dropped turn, and
+ * the loop never advanced. Priority order:
+ *
+ *   1. The contact HAS a confirmed, still-upcoming cita → say so, briefly,
+ *      with the real date/time read from `citas`. Never ask to schedule
+ *      something that is already scheduled (never invents a date: the caller
+ *      only passes a cita that really exists).
+ *   2. The last bot bubble already asked "¿deseas agendar?" → advance to the
+ *      next pending step instead of repeating the yes/no question.
+ *   3. Otherwise (no cita, never asked) → the original question, which is a
+ *      legitimate first nudge.
+ *
+ * It still asserts nothing that could be false:
  *   - no promise that a human was assigned — this path NEVER auto-assigns, so
- *     "un asesor te contactará" would be a lie. It asks for the next step
- *     instead, which also keeps the booking flow moving.
+ *     "un asesor te contactará" would be a lie.
  */
-export function buildUngroundedAckMessage(contactName?: string | null): string {
+export function buildUngroundedAckMessage(
+  contactName?: string | null,
+  ctx?: {
+    /** Confirmada y todavía vigente, tal como está guardada en `citas`. */
+    cita?: { fecha_inicio: string } | null;
+    /** true cuando el ÚLTIMO bubble del bot ya hizo la pregunta de agendar. */
+    yaPreguntoAgendar?: boolean;
+  }
+): string {
   const nombre = contactName?.trim();
+  const sujeto = nombre ? `, ${nombre}` : '';
+
+  const citaIso = ctx?.cita?.fecha_inicio;
+  if (citaIso) {
+    const { fechaLarga, hora } = formatCitaNatural(citaIso);
+    if (!fechaLarga) {
+      return `¡Perfecto${sujeto}! Tu cita sigue confirmada 😊`;
+    }
+    return `¡Perfecto${sujeto}! Tu cita está confirmada para el ${fechaLarga} a las ${hora} 😊`;
+  }
+
+  if (ctx?.yaPreguntoAgendar) {
+    return `¡Listo${sujeto}! Dime la fecha y la hora que te quede mejor y te la agendo de una vez 😊`;
+  }
+
   return nombre
     ? `¡Gracias, ${nombre}! Recibí tu información. ¿Deseas que agende tu cita ahora?`
     : '¡Gracias! Recibí tu información. ¿Deseas que agende tu cita ahora?';
+}
+
+/**
+ * "martes 20 de octubre" / "16:00" en hora de Bogotá para una cita.
+ * Devuelve cadenas vacías cuando el instante no es legible, para que la
+ * llamada pueda degradar a un acuse sin fecha en vez de afirmar una hora
+ * inventada.
+ */
+export function formatCitaNatural(inicioIso: string): {
+  fechaLarga: string;
+  hora: string;
+} {
+  const start = new Date(inicioIso);
+  if (Number.isNaN(start.getTime())) return { fechaLarga: '', hora: '' };
+  const timeZone = aiTimeZone();
+  try {
+    const fechaLarga = new Intl.DateTimeFormat('es-CO', {
+      weekday: 'long',
+      day: 'numeric',
+      month: 'long',
+      timeZone,
+    }).format(start);
+    const hora = new Intl.DateTimeFormat('es-CO', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+      timeZone,
+    })
+      .format(start)
+      .replace(/[^\d:]/g, '');
+    return { fechaLarga, hora };
+  } catch {
+    const { fecha, hora } = fechaHoraBogota(inicioIso);
+    return { fechaLarga: fecha, hora };
+  }
+}
+
+/**
+ * The contact's confirmed cita that is still ahead of us (best-effort).
+ *
+ * `fecha_inicio >= now - 5min` keeps a cita that is running RIGHT NOW as
+ * "still valid" (the customer can still confirm attendance) while a booking
+ * from last week never leaks into an acknowledgement.
+ * Returns null on any read failure — an ack must never fail because of it.
+ */
+async function citaVigenteDe(
+  db: SupabaseClient,
+  contactId: string
+): Promise<{ id: string; fecha_inicio: string; meet_link: string | null } | null> {
+  try {
+    const desde = new Date(Date.now() - 5 * 60_000).toISOString();
+    const { data, error } = await db
+      .from('citas')
+      .select('id, fecha_inicio, meet_link')
+      .eq('contact_id', contactId)
+      .eq('estado', 'confirmada')
+      .gte('fecha_inicio', desde)
+      .order('fecha_inicio', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (error || !data) return null;
+    const row = data as {
+      id?: string;
+      fecha_inicio?: string;
+      meet_link?: string | null;
+    };
+    if (typeof row.fecha_inicio !== 'string' || !row.fecha_inicio) return null;
+    return {
+      id: String(row.id ?? ''),
+      fecha_inicio: row.fecha_inicio,
+      meet_link: typeof row.meet_link === 'string' ? row.meet_link : null,
+    };
+  } catch (err) {
+    console.warn(
+      '[ai auto-reply] cita vigente lookup failed (ack stays generic):',
+      err instanceof Error ? err.message : err
+    );
+    return null;
+  }
+}
+
+/** "¿Deseas que agende tu cita ahora?" and its close variants. */
+const PREGUNTA_AGENDAR_RE =
+  /deseas\s+(?:que\s+)?agend|quieres\s+(?:que\s+)?agend|te\s+agendo\s+(?:tu\s+)?cita|agendar\s+tu\s+cita\s+ahora/i;
+
+/**
+ * True when the LAST bubble the bot sent already asked the customer whether
+ * they want an appointment. Used to keep the acknowledgement from asking the
+ * very same question a second time (anti-repetition rule).
+ */
+async function yaPreguntoAgendar(
+  db: SupabaseClient,
+  conversationId: string
+): Promise<boolean> {
+  try {
+    const { data, error } = await db
+      .from('messages')
+      .select('content_text')
+      .eq('conversation_id', conversationId)
+      .eq('sender_type', 'bot')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) return false;
+    const text = (data as { content_text?: string | null } | null)
+      ?.content_text;
+    return typeof text === 'string' && PREGUNTA_AGENDAR_RE.test(text);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Acknowledgement that knows what is already going on: it never re-asks for
+ * an appointment the contact already has, and never repeats a scheduling
+ * question the bot itself just asked. Any lookup failure degrades to the
+ * plain generic ack — the customer always gets a message.
+ */
+async function buildContextAwareAck(
+  db: SupabaseClient,
+  args: { conversationId: string; contactId: string },
+  contactName?: string | null
+): Promise<string> {
+  try {
+    const cita = await citaVigenteDe(db, args.contactId);
+    if (cita) return buildUngroundedAckMessage(contactName, { cita });
+    if (await yaPreguntoAgendar(db, args.conversationId)) {
+      return buildUngroundedAckMessage(contactName, { yaPreguntoAgendar: true });
+    }
+  } catch {
+    // Ninguna de las dos lecturas puede dejar al cliente sin acuse.
+  }
+  return buildUngroundedAckMessage(contactName);
 }
 
 /**
@@ -622,9 +904,18 @@ export function buildMeetLinkResendMessage(
     : base;
 }
 
-/** Phrases where the customer is explicitly asking for their link. */
+/**
+ * Phrases where the customer is explicitly asking for their link.
+ *
+ * Besides the verb forms ("mándame el enlace", "enlace de la reunión", "no
+ * me llegó el link"), it matches a message that is NOTHING BUT the bare
+ * request — "¿el link?", "el enlace", "link?" — which is how customers
+ * actually follow up. The bare form is anchored to the whole message so
+ * something like "no puedo abrir el enlace del correo" never triggers the
+ * deterministic shortcut (there the model must answer, not re-send a URL).
+ */
 const RESEND_LINK_RE =
-  /(?:m[aá]ndame|env[ií]a(?:me)?|p[aá]same|d[aá]me|comparte(?:me)?|r[eé]pite(?:me)?|quiero|necesito)\s+(?:el\s+|mi\s+|nuevamente\s+|otra\s+vez\s+|de\s+nuevo\s+)?(?:enlace|link|url)\b|(?:enlace|link|url)\s+(?:de|del)\s+(?:la\s+|mi\s+|tu\s+)?(?:cita|reuni[oó]n|meet|google\s*meet)\b|no\s+(?:me\s+)?(?:lleg[oó]|recib[ií]|veo)\s+(?:el\s+|mi\s+)?(?:enlace|link|url)\b/i;
+  /(?:m[aá]nd(?:a|e|ame)|env[ií]a(?:me)?|enviar(?:me)?|p[aá]s(?:a|ame)|pasar(?:me)?|d[aá](?:me)?|comparte(?:me)?|r[eé]pit(?:e|ame)|r[eé]pet(?:ir)?(?:me)?|quiero|necesito)\s+(?:el\s+|mi\s+|nuevamente\s+|otra\s+vez\s+|de\s+nuevo\s+)?(?:enlace|link|url)\b|(?:enlace|link|url)\s+(?:de|del)\s+(?:la\s+|mi\s+|tu\s+)?(?:cita|reuni[oó]n|meet|google\s*meet)\b|no\s+(?:me\s+)?(?:lleg[oó]|recib[ií]|veo)\s+(?:el\s+|mi\s+)?(?:enlace|link|url)\b|(?:^|\n)\s*(?:¿\s*)?(?:y\s+)?(?:el\s+|mi\s+|tu\s+)?(?:enlace|link|url)\b(?:\s+de\s+(?:la\s+|mi\s+)?(?:cita|reuni[oó]n))?\s*[?!.]*\s*(?=$|\n)/i;
 
 /** True when the user's latest message asks to be sent their link. */
 function wantsMeetLink(message: string | null | undefined): boolean {
@@ -953,16 +1244,98 @@ async function contactPhoneFor(
 }
 
 /**
+ * SERIALIZACIÓN POR CONVERSACIÓN (anti-bucle en ráfagas).
+ *
+ * Cuando un cliente manda varios mensajes seguidos ("sí", "agéndalo", una
+ * foto), el webhook lanza UN despacho por mensaje y todos corrían en
+ * PARALELO: generaban con un contexto que no incluía a los demás y cada uno
+ * respondía la misma idea. Este mapa encadena los turnos de UNA misma
+ * conversación en orden FIFO (en este proceso), de modo que el turno N+1
+ * carga su contexto DESPUÉS de que el turno N terminó — el último turno ve
+ * la ráfaga completa y responde una sola vez.
+ *
+ * Es un mutex de proceso (el RPC `claim_ai_turn` sigue cubriendo el caso de
+ * dos instancias serverless distintas). La cola nunca retiene errores: cada
+ * turno es dueño de su try/catch y un fallo no puede bloquear a los
+ * siguientes.
+ */
+const aiTurnQueues = new Map<string, Promise<void>>();
+
+/**
+ * Duplicados en el MISMO proceso: dedupe síncrono por (conversación, wamid)
+ * ANTES de encolar, para que un reintento de Meta que entra mientras el
+ * turno original sigue corriendo no genere ni una segunda llamada al modelo.
+ * Clave solo con wamid real; sin él (probes de diagnóstico) no se deduplica.
+ */
+const inFlightAiTurns = new Set<string>();
+
+/**
  * AI auto-reply for a freshly-arrived inbound message.
  *
  * Invoked from the WhatsApp webhook's `after()` block, only when no
  * deterministic flow consumed the message (flows win). Mirrors the flow
  * runner's contract: it owns its try/catch and NEVER throws — a failing
  * or slow LLM call must not affect the webhook's 200 to Meta.
+ *
+ * This exported entrypoint only SERIALISES (per conversation) and
+ * DEDUPLICATES (per inbound wamid); all the actual turn logic lives in
+ * `runInboundAiTurn` below.
  */
 export async function dispatchInboundToAiReply(
   args: DispatchArgs
 ): Promise<void> {
+  const { conversationId, composeMessageId } = args;
+
+  if (composeMessageId) {
+    const flightKey = `${conversationId}::${composeMessageId}`;
+    if (inFlightAiTurns.has(flightKey)) {
+      console.warn(
+        `[ai auto-reply] DUPLICATE SUPPRESSED (in-process) — conversation ${conversationId}, wamid ${composeMessageId}: this inbound is already being answered in this process.`
+      );
+      return;
+    }
+    inFlightAiTurns.add(flightKey);
+    try {
+      await enqueueAiTurn(conversationId, args);
+    } finally {
+      inFlightAiTurns.delete(flightKey);
+    }
+    return;
+  }
+
+  await enqueueAiTurn(conversationId, args);
+}
+
+/** Chains `turn` behind whatever is still running for this conversation. */
+async function enqueueAiTurn(
+  conversationId: string,
+  args: DispatchArgs
+): Promise<void> {
+  const previous = aiTurnQueues.get(conversationId) ?? Promise.resolve();
+  // The chain swallows its own rejection so a failed turn never poisons the
+  // queue; every turn already reports its own failures.
+  const turn = previous.then(() => runInboundAiTurn(args));
+  const settled: Promise<void> = turn.then(
+    () => undefined,
+    () => undefined
+  );
+  aiTurnQueues.set(conversationId, settled);
+  try {
+    await turn;
+  } finally {
+    // Free the map entry once this turn is the last one queued, so an idle
+    // conversation does not keep a promise alive forever.
+    if (aiTurnQueues.get(conversationId) === settled) {
+      aiTurnQueues.delete(conversationId);
+    }
+  }
+}
+
+/**
+ * The real turn. Never throws (owns its try/catch) — see the contract on
+ * `dispatchInboundToAiReply`.
+ */
+async function runInboundAiTurn(args: DispatchArgs): Promise<void> {
   const { accountId, conversationId, contactId, configOwnerUserId } = args;
 
   // Every early return below logs the reason. A gate that returns quietly
@@ -1023,6 +1396,31 @@ export async function dispatchInboundToAiReply(
       } else {
         console.warn(
           `[ai auto-reply] DUPLICATE SUPPRESSED — conversation ${conversationId}, wamid ${args.composeMessageId}: another dispatch already claimed this inbound message; this one sends nothing.`
+        );
+        return;
+      }
+    }
+
+    // COALESCING DE RÁFAGAS — chequeo TEMPRANO (ahorra el modelo). Bajo el
+    // mutex por conversación, cuando este turno arranca los mensajes
+    // anteriores de la ráfaga ya están persistidos; si además YA existe un
+    // mensaje del cliente más nuevo con texto, generar aquí sería producir
+    // una respuesta que acabaría descartada: el turno de ese mensaje más
+    // nuevo es el que contesta toda la ráfaga de una vez.
+    if (!bypass && burstCoalesceEnabled() && !args.suppressReply && args.composeMessageId) {
+      const anchor =
+        (await myInboundCreatedAt(db, conversationId, args.composeMessageId)) ??
+        turnStartedAt;
+      if (
+        await newerCustomerMessageWaiting(
+          db,
+          conversationId,
+          anchor,
+          args.composeMessageId
+        )
+      ) {
+        console.warn(
+          `[ai auto-reply] RÁFAGA COALESCADA (early) — conversation ${conversationId}, wamid ${args.composeMessageId}: a newer text message from the customer is already waiting; this turn skips the model entirely.`
         );
         return;
       }
@@ -1353,8 +1751,21 @@ export async function dispatchInboundToAiReply(
           // the outgoing message can never carry a link the tool didn't
           // return. Ignore tool results that announced an error.
           if (isCitaMutatingTool(tc.name)) {
-            bookingAttempted = true;
             const parsed = extractBookingResult(output);
+            // `motivo: "cita_ya_agendada"` (con `confirmado` distinto de
+            // true) es INFORMATIVO: agendar_cita se negó a crear una segunda
+            // cita porque el cliente ya tenía una activa. No cuenta como
+            // intento de agendaje — si contara, un modelo en silencio
+            // dispararía el fallback "tu cita ha sido procesada, pero tuvimos
+            // un inconveniente generando el enlace", que es falso (no se
+            // procesó nada) y confunde al cliente. Tampoco siembra una
+            // confirmación: el motor solo confirma lo que `confirmado:true`
+            // respalda.
+            const soloInformativo =
+              parsed?.motivo === 'cita_ya_agendada' && parsed.confirmado !== true;
+            if (!soloInformativo) {
+              bookingAttempted = true;
+            }
             if (parsed?.confirmado) {
               realBooking = parsed;
               bookingFailure = null;
@@ -1537,7 +1948,7 @@ export async function dispatchInboundToAiReply(
           await sendOutboundProbe(args, 'model produced only a link promise');
           return;
         }
-        finalText = buildUngroundedAckMessage(contactCtx?.name);
+        finalText = await buildContextAwareAck(db, args, contactCtx?.name);
       }
       if (finalText === null) {
         console.log(
@@ -1547,7 +1958,7 @@ export async function dispatchInboundToAiReply(
           await sendOutboundProbe(args, 'model text failed the grounding guard');
           return;
         }
-        finalText = buildUngroundedAckMessage(contactCtx?.name);
+        finalText = await buildContextAwareAck(db, args, contactCtx?.name);
       }
     }
 
@@ -1575,7 +1986,7 @@ export async function dispatchInboundToAiReply(
         await sendOutboundProbe(args, 'the model returned empty text');
         return;
       }
-      finalText = buildUngroundedAckMessage(contactCtx?.name);
+      finalText = await buildContextAwareAck(db, args, contactCtx?.name);
     }
 
     // The per-conversation slot claim. It exists to keep the row-level lock
@@ -1627,6 +2038,34 @@ export async function dispatchInboundToAiReply(
         `[ai auto-reply] SUPPRESSED after generation — conversation ${conversationId} was taken over by a human while the reply was being generated; the reply was NOT sent.`
       );
       return;
+    }
+
+    // COALESCING DE RÁFAGAS — capa 3, justo antes del envío (dónde la
+    // ventana de "llegó algo más nuevo" es más ancha: la generación tarda
+    // segundos). Si mientras generábamos el cliente mandó OTRO mensaje con
+    // texto, ESTE turno se retira y deja que el turno de ese mensaje más
+    // nuevo responda una sola vez con toda la ráfaga en contexto. Sin esto,
+    // los N turnos de la ráfaga generan N respuestas que se contestan entre
+    // sí ("¿Deseas agendar?" repetido) y el hilo parece un bucle.
+    // El ancla temporal es `created_at` del propio mensaje (mismo reloj que
+    // el de los mensajes más nuevos), no el reloj del proceso.
+    if (!bypass && burstCoalesceEnabled() && args.composeMessageId) {
+      const anchor =
+        (await myInboundCreatedAt(db, conversationId, args.composeMessageId)) ??
+        turnStartedAt;
+      if (
+        await newerCustomerMessageWaiting(
+          db,
+          conversationId,
+          anchor,
+          args.composeMessageId
+        )
+      ) {
+        console.warn(
+          `[ai auto-reply] RÁFAGA COALESCADA — conversation ${conversationId}, wamid ${args.composeMessageId}: the customer already sent a NEWER text message; this turn stays silent and the newest message's turn answers once for the whole burst.`
+        );
+        return;
+      }
     }
 
     // ANTI-DUPLICADOS — verificación previa al envío. El claim de arriba
