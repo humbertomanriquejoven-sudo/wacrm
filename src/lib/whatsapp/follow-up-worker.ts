@@ -884,6 +884,53 @@ async function lastMessage(
 }
 
 /**
+ * True when the contact has an ACTIVE (current or upcoming) appointment.
+ *
+ * Coordination rule: a timed nudge — "Seguimiento automático" (Timer 1) or
+ * "Esperar respuesta" (Timer 2) — must NOT fire on top of a booked meeting.
+ * A customer who just accepted and got a cita confirmed already has their
+ * answer; chasing them 10 minutes later ("¿sigues ahí?") interrupts the
+ * booking flow and repeats questions the agent already resolved, which is
+ * exactly the "the agent keeps interrupting / asking the same thing" the
+ * operators reported. A cita whose `fecha_fin` is still in the future counts
+ * (so an appointment happening right now also blocks the nudge).
+ *
+ * Fail-open: any read error (missing table/column, a DB hiccup, a partial
+ * test mock) returns false so a transient failure NEVER silently cancels a
+ * legitimate reminder. Never throws.
+ */
+async function contactHasUpcomingCita(
+  db: SupabaseClient,
+  contactId: string,
+): Promise<boolean> {
+  try {
+    const nowIso = new Date().toISOString()
+    const { data, error } = await db
+      .from('citas')
+      .select('id')
+      .eq('contact_id', contactId)
+      .eq('estado', 'confirmada')
+      .gte('fecha_fin', nowIso)
+      .limit(1)
+      .maybeSingle()
+    if (error) {
+      console.error(
+        `[follow-up] could not check active citas for contact ${contactId} (defaulting to none):`,
+        error.message,
+      )
+      return false
+    }
+    return !!data
+  } catch (err) {
+    console.error(
+      `[follow-up] could not check active citas for contact ${contactId} (defaulting to none):`,
+      err instanceof Error ? err.message : err,
+    )
+    return false
+  }
+}
+
+/**
  * Re-verify a claimed row is STILL mid-dispatch before the network call.
  *
  * The atomic claim guards overlaps between sweeps, but an agent can turn
@@ -1198,6 +1245,32 @@ export async function runDueFollowUps(
           result.cancelled++
           console.log(
             `[follow-up] follow-up ${id} cancelled — conversation ${conversationId} is under human takeover; no AI nudge sent.`,
+          )
+        }
+        continue
+      }
+
+      // COORDINACIÓN CON CITAS: si el contacto ya tiene una cita vigente
+      // (próxima o en curso), este recordatorio no debe disparar — ya tiene
+      // su reunión agendada, y perseguirlo interrumpiría la gestión de la
+      // cita o repetiría preguntas resueltas. Se cierra como cancelado (no
+      // se reintenta). Fail-open: si no se puede leer `citas`, se procede
+      // como antes en lugar de suprimir el aviso por un fallo transitorio.
+      if (await contactHasUpcomingCita(client, contactId)) {
+        const { error: citaErr } = await client
+          .from('follow_ups')
+          .update({ status: 'cancelled' })
+          .eq('id', id)
+          .eq('status', 'processing')
+        if (citaErr) {
+          console.error(
+            `[follow-up] could not cancel ${id} (contact already has an active appointment):`,
+            citaErr.message,
+          )
+        } else {
+          result.cancelled++
+          console.log(
+            `[follow-up] follow-up ${id} cancelled — contact ${contactId} already has an active appointment; no nudge sent.`,
           )
         }
         continue
@@ -1693,6 +1766,30 @@ export async function runDueResponseWaitTimers(
           result.cancelled++
           console.log(
             `[response-wait] timer ${id} cancelled — conversation ${conversationId} is under human takeover; no AI nudge sent.`,
+          )
+        }
+        continue
+      }
+
+      // COORDINACIÓN CON CITAS: see the follow-up runner. Un contacto con
+      // una cita vigente (próxima o en curso) ya tiene su reunión, así que
+      // el nudge "Esperando respuesta" solo interrumpiría la gestión de la
+      // cita. Se cierra como cancelado (no se reintenta). Fail-open.
+      if (await contactHasUpcomingCita(client, contactId)) {
+        const { error: citaErr } = await client
+          .from('response_wait_timers')
+          .update({ status: 'cancelled' })
+          .eq('id', id)
+          .eq('status', 'processing')
+        if (citaErr) {
+          console.error(
+            `[response-wait] could not cancel ${id} (contact already has an active appointment):`,
+            citaErr.message,
+          )
+        } else {
+          result.cancelled++
+          console.log(
+            `[response-wait] timer ${id} cancelled — contact ${contactId} already has an active appointment; no nudge sent.`,
           )
         }
         continue

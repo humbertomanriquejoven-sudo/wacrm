@@ -17,6 +17,52 @@ const RAW_TIMESTAMP_RES: RegExp[] = [
 ]
 
 /**
+ * Markup that only ever reaches a reply when the model echoes raw
+ * tool/system output, and that no customer may ever see:
+ *  - the scheduling tools' machine trailer
+ *    `JSON_RESULT (no lo repitas en el mensaje al cliente): {...}`,
+ *  - a fenced code block (```…```),
+ *  - tool-call scaffolding printed as text ("step_0:", "print(...)",
+ *    a "tool_calls:" dump).
+ */
+const TECHNICAL_MARKUP_RES: RegExp[] = [
+  /JSON_RESULT[^\n]*/gi,
+  /```[\s\S]*?```/g,
+  /\bstep_\d+\s*:[^\n]*/gi,
+  /\bprint\s*\([^\n]*\)/gi,
+  /\btool_calls?\s*[:=][^\n]*/gi,
+]
+
+/**
+ * A whole message that is unambiguously a machine value rather than human
+ * prose: a bare number (optionally a float, e.g. a leaked epoch like
+ * "1653781000.0"), an ISO instant, a UUID, or an empty JSON object/array.
+ * A bubble made ONLY of such a token is a leaked tool/system value — the
+ * customer sees a naked number instead of an answer — and must never be
+ * sent. Deliberately conservative: the numeric case requires eight or more
+ * digits so an ordinary short quantity ("3", "45", "2026") is never
+ * mistaken for a leak.
+ */
+const BARE_NUMBER_ONLY = /^[-+]?\d{8,}(?:[.,]\d+)?$/
+const ISO_INSTANT_ONLY =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i
+const UUID_ONLY =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const EMPTY_JSON_ONLY = /^[{}[\],\s]*$/
+
+/** True when the whole message is a lone machine token (never human prose). */
+export function isTechnicalOnlyMessage(text: string): boolean {
+  const t = (text ?? '').trim()
+  if (!t) return false
+  return (
+    BARE_NUMBER_ONLY.test(t) ||
+    ISO_INSTANT_ONLY.test(t) ||
+    UUID_ONLY.test(t) ||
+    EMPTY_JSON_ONLY.test(t)
+  )
+}
+
+/**
  * Remove every raw timestamp token from a reply and tidy the leftovers so
  * no empty, colon/comma-only remnants reach WhatsApp. Only lines that
  * actually carried a raw timestamp are cleaned — untouched lines (e.g. a
@@ -69,6 +115,15 @@ export function cleanAiReplyText(raw: string): string {
   //    they can never be carried by a bubble.
   text = stripRawTimestamps(text)
 
+  // 0b) Drop raw tool/system markup (the scheduling tools' JSON_RESULT
+  //     trailer, code fences, tool-call scaffolding). This is the ONLY
+  //     place a leaked JSON_RESULT or a naked tool payload is removed, so
+  //     it runs before the cosmetic passes below.
+  for (const re of TECHNICAL_MARKUP_RES) {
+    re.lastIndex = 0
+    text = text.replace(re, '')
+  }
+
   // 1) Drop a leading "Mensaje N:" / "*Mensaje N:*" / "Mensaje N -" label on
   //    every line (the model sometimes prefixes each WhatsApp bubble).
   text = text
@@ -91,6 +146,22 @@ export function cleanAiReplyText(raw: string): string {
 
   // 4) Collapse 3+ blank lines into one, then trim.
   text = text.replace(/\n{3,}/g, '\n\n').trim()
+
+  // 5) Drop every LINE that is ONLY a machine token (a leaked epoch such as
+  //    "1653781000.0", an ISO instant, a UUID, an empty JSON payload). A
+  //    stray system value must never survive inside an otherwise valid reply.
+  text = text
+    .split(/\r?\n/)
+    .filter((line) => !isTechnicalOnlyMessage(line))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+
+  // 6) If the WHOLE reply was such a token, the model produced nothing the
+  //    customer may see: return empty so the caller never leaks it (the
+  //    auto-reply path turns this into a neutral acknowledgement instead of
+  //    going silent).
+  if (isTechnicalOnlyMessage(text)) return ''
 
   return text
 }

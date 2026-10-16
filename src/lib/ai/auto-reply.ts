@@ -18,7 +18,10 @@ import {
 } from './tools';
 import { calendarConfigured, MEET_FALLBACK_LINK } from '@/lib/calendar';
 import { gmailConfigured } from '@/lib/gmail';
-import { stripRawTimestamps } from '@/lib/whatsapp/clean-ai-text';
+import {
+  isTechnicalOnlyMessage,
+  stripRawTimestamps,
+} from '@/lib/whatsapp/clean-ai-text';
 import {
   engineSendAiReply,
   engineSendText,
@@ -1940,6 +1943,17 @@ async function runInboundAiTurn(args: DispatchArgs): Promise<void> {
       const isWaitOnly =
         (INTERMEDIATE_ACK_RE.test(raw) || LINK_PROMISE_RE.test(raw)) &&
         !looksLikeBookingConfirmation(raw);
+      // A reply that is ONLY a machine token (a leaked JSON_RESULT number,
+      // epoch, UUID or raw payload — e.g. "1653781000.0") is never sent to
+      // the customer. Treated exactly like an empty answer: the ack branches
+      // below answer with a neutral, human acknowledgement instead of
+      // leaking the value or leaving the chat in visto.
+      if (finalText !== null && isTechnicalOnlyMessage(finalText)) {
+        console.warn(
+          '[ai auto-reply] dropped a technical-only reply (leaked system/tool value) — sending a neutral acknowledgement instead.'
+        );
+        finalText = null;
+      }
       if (finalText === null && isWaitOnly) {
         console.log(
           '[ai auto-reply] dropped an empty reply without a link — sending a neutral acknowledgement instead of staying silent.'
