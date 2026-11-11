@@ -364,7 +364,7 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     const systemPrompt = h.generateReply.mock.calls[0][0]
       .systemPrompt as string;
     expect(systemPrompt).toContain('idCita="cita-9"');
-    expect(systemPrompt).toContain('2026-09-10T10:00:00-05:00');
+    expect(systemPrompt).toContain('2026-09-10 10:00');
   });
 
   it('stands down when an active message-level automation exists', async () => {

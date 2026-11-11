@@ -607,7 +607,29 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
     return
   }
 
-  for (const entry of body.entry) {
+  // Outbound work (AI turns and public webhook delivery) is started as soon
+  // as its inbound row is committed, then awaited once every message in this
+  // delivery has been persisted. Previously each message awaited its own LLM
+  // call before the next message was even looked at: one slow provider turn
+  // held up every other conversation in the same Meta batch. The promises
+  // still live inside this function, so `after()` keeps the invocation alive
+  // until they settle.
+  const followUpTasks: Promise<unknown>[] = []
+
+  try {
+    await processWebhookEntries(body.entry, followUpTasks)
+  } finally {
+    if (followUpTasks.length > 0) {
+      await Promise.allSettled(followUpTasks)
+    }
+  }
+}
+
+async function processWebhookEntries(
+  entries: WhatsAppWebhookEntry[],
+  followUpTasks: Promise<unknown>[]
+) {
+  for (const entry of entries) {
     for (const change of entry.changes) {
       // Template-lifecycle events (status / quality / components
       // updates from Meta) come in on a different change.field and
@@ -726,7 +748,10 @@ try {
           // Default ON: the column is NOT NULL DEFAULT TRUE, but a row
           // read before migration 039 lands would have it undefined,
           // and losing attachments is the failure mode worth avoiding.
-          config.mirror_inbound_media !== false
+          config.mirror_inbound_media !== false,
+          // AI turns and public webhook deliveries started by this message.
+          // They are awaited at the end of the delivery, not per message.
+          followUpTasks
         )
       }
     }
@@ -1004,7 +1029,11 @@ async function processMessage(
   phoneNumberId: string,
   // Per-account opt-out for the inbound-media mirror (migration 039).
   // See parseMessageContent for what it turns off.
-  mirrorMedia: boolean
+  mirrorMedia: boolean,
+  // Promise collector owned by `processWebhook`. AI turns and public
+  // webhook deliveries are pushed here instead of being awaited inline, so a
+  // slow provider or subscriber cannot delay the rest of the Meta batch.
+  followUpTasks: Promise<unknown>[]
 ) {
   // ============================================================
   // Sender identity — Meta can identify the same person three ways, and
@@ -1724,39 +1753,54 @@ async function processMessage(
   console.log(
     `[webhook] message ${message.id}: dispatching to AI auto-reply (type=${message.type}, text="${inboundText.trim().slice(0, 80)}")`
   )
-  console.time('webhook:ai_dispatch')
-  await dispatchInboundToAiReply({
-    accountId,
-    conversationId: conversation.id,
-    contactId: contactRecord.id,
-    configOwnerUserId,
-    // The inbound wamid - lets the bot keep WhatsApp's typing
-    // indicator alive while it streams a multi-part reply.
-    composeMessageId: message.id,
-    // Meta disclosed no number for this sender: tell the model to ask for
-    // one, since nothing can be delivered until it arrives.
-    missingPhone,
-    // Already answered upstream (by a Flow, or it's a reaction): the agent
-    // learns about it without putting a second message on the wire.
-    suppressReply: flowConsumed || message.type === 'reaction',
-  })
-  console.timeEnd('webhook:ai_dispatch')
+  //
+  // Started, not awaited inline: the promise is handed to `processWebhook`,
+  // which keeps it inside the route's `after()` scope and awaits it once the
+  // whole delivery has been persisted. The auto-reply entrypoint already
+  // serialises turns per conversation, so starting them as soon as each row
+  // lands preserves ordering on a thread while letting different threads make
+  // progress in parallel.
+  const aiTimerLabel = `webhook:ai_dispatch:${message.id}`
+  console.time(aiTimerLabel)
+  followUpTasks.push(
+    dispatchInboundToAiReply({
+      accountId,
+      conversationId: conversation.id,
+      contactId: contactRecord.id,
+      configOwnerUserId,
+      // The inbound wamid - lets the bot keep WhatsApp's typing
+      // indicator alive while it streams a multi-part reply.
+      composeMessageId: message.id,
+      // Meta disclosed no number for this sender: tell the model to ask for
+      // one, since nothing can be delivered until it arrives.
+      missingPhone,
+      // Already answered upstream (by a Flow, or it's a reaction): the agent
+      // learns about it without putting a second message on the wire.
+      suppressReply: flowConsumed || message.type === 'reaction',
+    })
+      .catch((err) => {
+        console.error('[ai auto-reply] dispatch failed:', err)
+      })
+      .finally(() => console.timeEnd(aiTimerLabel))
+  )
 
-
-  // message.received webhook (public API). Awaited — not fire-and-forget
-  // — because we're inside the route's `after()` block, which only keeps
-  // the function alive for promises it can see; a detached promise could
-  // be frozen before it delivers. `dispatchWebhookEvent` early-exits
-  // when the account has no matching endpoint and never throws.
-  // (conversation.created is emitted earlier, right after the thread is
-  // opened.)
-  await dispatchWebhookEvent(supabaseAdmin(), accountId, 'message.received', {
-    conversation_id: conversation.id,
-    contact_id: contactRecord.id,
-    whatsapp_message_id: message.id,
-    content_type: contentType,
-    text: contentText,
-  })
+  // message.received webhook (public API). Also kept inside `after()` via
+  // `followUpTasks` — a detached promise could be frozen before it delivers.
+  // Scheduled without blocking the rest of the batch;
+  // `dispatchWebhookEvent` early-exits when the account has no matching
+  // endpoint and never throws. (conversation.created is emitted earlier,
+  // right after the thread is opened.)
+  followUpTasks.push(
+    dispatchWebhookEvent(supabaseAdmin(), accountId, 'message.received', {
+      conversation_id: conversation.id,
+      contact_id: contactRecord.id,
+      whatsapp_message_id: message.id,
+      content_type: contentType,
+      text: contentText,
+    }).catch((err) => {
+      console.error('[webhook] message.received dispatch failed:', err)
+    })
+  )
 }
 
 async function parseMessageContent(

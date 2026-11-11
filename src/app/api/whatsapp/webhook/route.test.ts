@@ -868,6 +868,65 @@ describe('inbound webhook: idempotent insert (#367)', () => {
   })
 })
 
+describe('inbound webhook: slow AI turns do not block the rest of a batch', () => {
+  it('persists every inbound before waiting for the AI dispatches', async () => {
+    const body = {
+      entry: [
+        {
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                metadata: { phone_number_id: 'pn-1' },
+                contacts: [
+                  { wa_id: '15551230000', profile: { name: 'Ada' } },
+                  { wa_id: '15551230001', profile: { name: 'Grace' } },
+                ],
+                messages: [
+                  { ...TEXT_MESSAGE, id: 'wamid.BATCH1' },
+                  {
+                    ...TEXT_MESSAGE,
+                    id: 'wamid.BATCH2',
+                    from: '15551230001',
+                    text: { body: 'second' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    }
+
+    let releaseAi!: () => void
+    const aiGate = new Promise<void>((resolve) => {
+      releaseAi = resolve
+    })
+    h.dispatchInboundToAiReply.mockImplementation(() => aiGate)
+
+    await POST({
+      text: async () => JSON.stringify(body),
+      headers: { get: () => 'sha256=stub' },
+    } as unknown as Request)
+
+    const callbacks = [...h.state.afterCallbacks]
+    h.state.afterCallbacks = []
+    const drained = (async () => {
+      for (const cb of callbacks) await cb()
+    })()
+
+    try {
+      await vi.waitFor(() => {
+        expect(h.state.upsertCalls).toHaveLength(2)
+        expect(h.dispatchInboundToAiReply).toHaveBeenCalledTimes(2)
+      })
+    } finally {
+      releaseAi()
+      await drained
+    }
+  })
+})
+
 describe('inbound webhook: atomic unread bump (#369)', () => {
   it('increments unread through the DB-side RPC, not a read-modify-write', async () => {
     await runWebhook()
