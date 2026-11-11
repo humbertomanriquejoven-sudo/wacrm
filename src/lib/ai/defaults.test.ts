@@ -56,40 +56,69 @@ describe('buildSystemPrompt', () => {
     expect(first).toBe(
       'INFORMACIÓN DE FECHA Y HORA ACTUAL: Hoy es lunes, 2026-09-14, hora local 07:00 (America/Bogota)'
     );
+    expect(prompt).toContain('Eres Carlos Pavón, asesor comercial');
+    expect(prompt).toContain('Humberto Manrique Arquitectura');
+  });
+
+  it('defines the natural 3-step conversation flow', () => {
+    const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' });
+    expect(prompt).toContain('FLUJO CONVERSACIONAL EN 3 PASOS');
+    expect(prompt).toContain('PASO 1 — ENTENDER LA NECESIDAD');
+    expect(prompt).toContain('PASO 2 — DIAGNÓSTICO Y VALOR');
     expect(prompt).toContain(
-      'Eres un asistente de mensajería al cliente para un negocio'
+      'PASO 3 — INVITACIÓN A CITA VIRTUAL POR GOOGLE MEET'
+    );
+    expect(prompt).toContain('diseño arquitectónico, remodelación u otro servicio');
+  });
+
+  it('does not invite the customer to book before understanding the need', () => {
+    const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' });
+    expect(prompt).toContain('No pidas cita todavía');
+    expect(prompt).toContain(
+      'Solo después de entender la necesidad y haber aportado valor'
     );
   });
 
-  it('forces Spanish-only replies', () => {
+  it('offers a natural Google Meet invitation once the project is understood', () => {
     const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' });
+    expect(prompt).toContain(
+      '"Claro que sí. Para revisar tu proyecto a mayor profundidad y darte orientación experta, podemos agendar una cita virtual con el arquitecto"'
+    );
+  });
+
+  it('opens with the inviolable rules and forces Spanish-only replies', () => {
+    const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' });
+    expect(prompt).toContain('REGLAS INVIOLABLES');
+    expect(prompt).toContain('RESPONDE SIEMPRE');
+    expect(prompt).toContain('PROHIBIDO INVENTAR');
+    expect(prompt).toContain('SIN REPETICIONES');
     expect(prompt).toContain('responde SIEMPRE en español');
     expect(prompt).toContain(
       'está estrictamente prohibido responder en inglés'
     );
+    // Max priority == it must come before the business context and tools.
+    expect(prompt.indexOf('REGLAS INVIOLABLES')).toBeLessThan(
+      prompt.indexOf('IDENTIDAD Y SERVICIOS DEL ESTUDIO')
+    );
   });
 
-  it('opens with the inviolable golden rule, ahead of every other directive', () => {
+  it('does not invent company data or links', () => {
     const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' });
-    expect(prompt).toContain('REGLA DE ORO INVIOLABLE');
-    expect(prompt).toContain('SIEMPRE RESPONDER');
-    expect(prompt).toContain('EXCELENCIA Y COHERENCIA');
-    expect(prompt).toContain('ATENCIÓN CONTINUA');
-    expect(prompt).toContain('MANEJO DE INFORMACIÓN');
-    // Max priority == it must come first, before the identity/persona and the
-    // tool rules. Only the clock line may precede it.
-    const golden = prompt.indexOf('REGLA DE ORO INVIOLABLE');
-    expect(golden).toBeGreaterThan(-1);
-    expect(golden).toBeLessThan(prompt.indexOf('Eres un asistente de mensajería'));
-    expect(golden).toBeLessThan(prompt.indexOf('REGLAS OBLIGATORIAS (ESTRICTAS)'));
-  });
-
-  it('offers company details only when backed by context, never invented', () => {
-    const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' });
-    // Directive 4 must NOT become a licence to fabricate an address: the
-    // business location is not hardcoded anywhere in the prompt.
-    expect(prompt).toContain('NUNCA lo inventes ni lo adivines');
+    expect(prompt).toContain('no inventes precios, direcciones');
+    expect(prompt).toContain('Solo comparte el enlace exacto');
     expect(prompt).not.toMatch(/calle \d|carrera \d|av\. \d/i);
+  });
+
+  it('forces memory and anti-repetition of greetings and questions', () => {
+    const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' });
+    expect(prompt).toContain('lee todo el historial antes de responder');
+    expect(prompt).toContain('no repitas una pregunta ya respondida');
+    expect(prompt).toContain('no repitas la invitación a agendar si ya la hiciste');
+    expect(prompt).toContain('REGLAS ANTI-REPETICIÓN');
+    expect(prompt).toContain('NO vuelvas a saludar');
+    expect(prompt).toContain(
+      'No propongas la cita virtual en el primer mensaje'
+    );
   });
 
   it('never teaches an automatic handoff and demands a reply to every message', () => {
@@ -102,125 +131,43 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('responder SIEMPRE en español a cada mensaje');
   });
 
-  it('orders direct booking in the same turn once the customer gave a date', () => {
+  it('connects the real calendar and Google Meet tools', () => {
     const prompt = buildSystemPrompt({
       userPrompt: null,
       mode: 'auto_reply',
       calendarEnabled: true,
     });
-    expect(prompt).toContain('EL AGENDAMIENTO DIRECTO ES OBLIGATORIO');
-    expect(prompt).toContain('NO vuelvas a preguntar la fecha');
-    expect(prompt).toContain(
-      'nunca detengas el flujo para preguntar el motivo'
-    );
-    expect(prompt).toContain('confirmado: true');
-    expect(prompt).toContain('un correo faltante nunca debe bloquear la cita');
+    expect(prompt).toContain('AGENDA Y GOOGLE MEET');
+    expect(prompt).toContain('ver_disponibilidad');
+    expect(prompt).toContain('agendar_cita');
+    expect(prompt).toContain('reagendar_cita');
+    expect(prompt).toContain('cancelar_cita');
+    expect(prompt).toContain('enlace real de Google Meet');
+    expect(prompt).toContain('Nunca ofrezcas un horario que no haya devuelto');
   });
 
-  it('forces immediate booking when the customer shares their email', () => {
+  it('books directly once the customer gives a concrete date and time', () => {
     const prompt = buildSystemPrompt({
       userPrompt: null,
       mode: 'auto_reply',
       calendarEnabled: true,
     });
-    expect(prompt).toContain('AGENDAMIENTO INMEDIATO AL RECIBIR EL CORREO');
-    expect(prompt).toContain(
-      'Cuando el usuario te entregue su correo electrónico y tengas la fecha y hora seleccionadas, invoca inmediatamente la función para agendar en Google Calendar.'
-    );
-    expect(prompt).toContain(
-      "Aquí tienes tu enlace para unirte a la videollamada: [LINK]"
-    );
+    expect(prompt).toContain('CÓMO AGENDAR EN EL PASO 3');
+    expect(prompt).toContain('No vuelvas a pedir la hora');
+    expect(prompt).toContain('un correo faltante nunca bloquea la cita');
+    expect(prompt).toContain('ISO de Bogotá');
   });
 
-  it('instructs a WhatsApp notification when Google Calendar creation fails', () => {
+  it('explains how to proceed when Google Calendar fails', () => {
     const prompt = buildSystemPrompt({
       userPrompt: null,
       mode: 'auto_reply',
       calendarEnabled: true,
     });
-    expect(prompt).toContain('COMPENSACIÓN ANTE FALLOS DE GOOGLE CALENDAR');
-    expect(prompt).toContain('NUNCA te quedes en silencio');
     expect(prompt).toContain(
       'Tu cita ha sido registrada. Te contactaremos pronto con los detalles'
     );
-    expect(prompt).toContain('ninguna solicitud de cita puede terminar sin un mensaje');
-  });
-
-  it('forbids re-asking for the date range in the confirmation protocol', () => {
-    const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply' });
-    expect(prompt).toContain(
-      'No debes pedirle a un cliente que ya confirmó una fecha y/o hora'
-    );
-    expect(prompt).toContain('"Consulta / Valoración"');
-  });
-
-  it('teaches single-point availability as a 45-minute range', () => {
-    const prompt = buildSystemPrompt({
-      userPrompt: null,
-      mode: 'auto_reply',
-      calendarEnabled: true,
-    });
-    expect(prompt).toContain(
-      'ver_disponibilidad acepta también una hora puntual'
-    );
-    expect(prompt).toContain(
-      'nunca respondas que no puedes verificar una hora puntual'
-    );
-  });
-
-  it('forbids inventing Meet/calendar URLs and trusts the configured credentials', () => {
-    const prompt = buildSystemPrompt({
-      userPrompt: null,
-      mode: 'auto_reply',
-      calendarEnabled: true,
-    });
-    expect(prompt).toContain('PROHIBIDO inventar URLs');
-    expect(prompt).toContain('meet.google.com/xxx-yyyy-zzz');
-    expect(prompt).toContain('Confía plenamente en que las credenciales');
-    expect(prompt).toContain('ejecuta el tool_call directamente');
-  });
-
-  it('forces the mandatory Meet link in every booking confirmation', () => {
-    const prompt = buildSystemPrompt({
-      userPrompt: null,
-      mode: 'auto_reply',
-      calendarEnabled: true,
-    });
-    expect(prompt).toContain('REGLA OBLIGATORIA DE CONFIRMACIÓN DE CITA');
-    expect(prompt).toContain('Enlace de Google Meet OBLIGATORIO');
-    expect(prompt).toContain('FORMATO EXIGIDO');
-    expect(prompt).toContain('Puedes unirte a la videollamada');
-    expect(prompt).toContain('NUNCA omitas el enlace de Google Meet');
-    expect(prompt).toContain('vuelve a enviarle la URL completa');
-  });
-
-  it('enforces the golden scheduling rules (tool-before-confirmation, hangoutLink, no raw timestamps)', () => {
-    const prompt = buildSystemPrompt({
-      userPrompt: null,
-      mode: 'auto_reply',
-      calendarEnabled: true,
-    });
-    expect(prompt).toContain('REGLAS DE ORO DEL AGENDAMIENTO');
-    expect(prompt).toContain('NUNCA confirmes una cita sin invocar la herramienta');
-    expect(prompt).toContain('DEBES llamar a `ver_disponibilidad`');
-    expect(prompt).toContain('extrae OBLIGATORIAMENTE la URL que devuelve la herramienta');
-    expect(prompt).toContain('Unirse a Google Meet: [hangoutLink]');
-    expect(prompt).toContain('17:32:11 -05:00');
-  });
-
-  it('forces strict Spanish and a single response without internal reasoning', () => {
-    const prompt = buildSystemPrompt({
-      userPrompt: null,
-      mode: 'auto_reply',
-      calendarEnabled: true,
-    });
-    expect(prompt).toContain('español natural y profesional');
-    expect(prompt).toContain('UNA SOLA respuesta');
-    expect(prompt).toContain('chain of thought');
-    expect(prompt).toContain('razonamiento interno');
-    expect(prompt).toContain('SALIDA DIRIGIDA AL CLIENTE');
-    expect(prompt).toContain('Pensamiento:');
-    expect(prompt).toContain('nota de voz');
+    expect(prompt).toContain('Nunca simules un enlace');
   });
 
   it('separates create, reschedule and cancel in one decision table', () => {
@@ -229,17 +176,16 @@ describe('buildSystemPrompt', () => {
       mode: 'auto_reply',
       calendarEnabled: true,
     });
-    expect(prompt).toContain('ELIGE LA HERRAMIENTA CORRECTA');
-    expect(prompt).toContain('NO tiene ninguna cita y quiere una nueva → agendar_cita');
-    expect(prompt).toContain('YA tiene una cita confirmada y pide cambiarla');
-    expect(prompt).toContain('quiere que no haya ninguna → cancelar_cita');
-    // The duplicate-agenda bug: telling the model agendar_cita is forbidden
-    // precisely when a cita already exists.
-    expect(prompt).toContain('PROHIBIDO usar agendar_cita');
-    expect(prompt).toMatch(
-      /nunca "compenses" un reagendamiento fallido[\s\S]*agendar_cita/
+    expect(prompt).toContain(
+      'CITA, REAGENDA Y CANCELACIÓN — ELIGE LA HERRAMIENTA CORRECTA'
     );
+    expect(prompt).toContain('No tiene cita y quiere una nueva → agendar_cita');
+    expect(prompt).toContain(
+      'Ya tiene una cita confirmada y pide cambiarla de fecha u hora → reagendar_cita'
+    );
+    expect(prompt).toContain('Ya tiene cita y quiere cancelarla → cancelar_cita');
     expect(prompt).toContain('consultar_citas primero');
+    expect(prompt).toContain('NUNCA agendar_cita: crearía una segunda cita');
   });
 
   it('makes the reschedule reply conditional on the tool result, never on prose', () => {
@@ -248,20 +194,21 @@ describe('buildSystemPrompt', () => {
       mode: 'auto_reply',
       calendarEnabled: true,
     });
-    expect(prompt).toContain('si devuelve confirmado:true');
-    expect(prompt).toContain('nunca con el anterior');
-    expect(prompt).toContain('si devuelve un error, NO le confirmes nada');
-    expect(prompt).toContain('sigue en el horario original');
-    expect(prompt).toContain('no es un error');
+    expect(prompt).toContain('Si reagendar_cita devuelve confirmado:true');
+    expect(prompt).toContain('nunca el anterior');
+    expect(prompt).toContain('Si devuelve error, no confirmes nada');
+    expect(prompt).toContain('sigue en su horario original');
   });
 
-  it('tells the model it need not remember an idCita', () => {
+  it('forbids raw timestamps and invented links', () => {
     const prompt = buildSystemPrompt({
       userPrompt: null,
       mode: 'auto_reply',
       calendarEnabled: true,
     });
-    expect(prompt).toContain('no necesitas inventar ni recordar un idCita');
+    expect(prompt).toContain('HORAS, ENLACES Y FALLOS');
+    expect(prompt).toContain('17:32:11 -05:00');
+    expect(prompt).toContain('Nunca inventes disponibilidad, horas ni enlaces');
   });
 
   it('marks the injected idCita as optional and points at consultar_citas', () => {
@@ -270,11 +217,35 @@ describe('buildSystemPrompt', () => {
       mode: 'auto_reply',
       calendarEnabled: true,
       citas: [
-        { id: 'cita-7', fecha_inicio: '2026-09-22T09:00:00.000Z', estado: 'confirmada' },
+        {
+          id: 'cita-7',
+          fecha_inicio: '2026-09-22T09:00:00.000Z',
+          estado: 'confirmada',
+        },
       ],
     });
     expect(prompt).toContain('idCita="cita-7"');
-    expect(prompt).toContain('El idCita es OPCIONAL');
-    expect(prompt).toContain('NO crees una cita nueva para "arreglar" un cambio de horario');
+    expect(prompt).toContain('el idCita es opcional');
+    expect(prompt).toContain('llama consultar_citas');
+  });
+
+  it('appends business context without letting it override the safe flow', () => {
+    const prompt = buildSystemPrompt({
+      userPrompt: 'Somos un estudio boutique.',
+      mode: 'auto_reply',
+    });
+    expect(prompt).toContain('Contexto del negocio e instrucciones adicionales');
+    expect(prompt).toContain('Somos un estudio boutique.');
+    expect(prompt).toContain('prevalecen las reglas de arriba');
+  });
+
+  it('appends knowledge extracts for grounding', () => {
+    const prompt = buildSystemPrompt({
+      userPrompt: null,
+      mode: 'auto_reply',
+      knowledge: ['La valoración inicial no tiene costo.'],
+    });
+    expect(prompt).toContain('Base de conocimiento');
+    expect(prompt).toContain('[1] La valoración inicial no tiene costo.');
   });
 });

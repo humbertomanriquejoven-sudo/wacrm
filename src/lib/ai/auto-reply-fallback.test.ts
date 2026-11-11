@@ -134,7 +134,7 @@ const ARGS = {
 };
 
 const ACK_TEXT =
-  '¡Gracias! Recibí tu información. ¿Deseas que agende tu cita ahora?';
+  '¡Gracias! Recibí tu información. Cuéntame un poco más de tu proyecto para orientarte mejor 😊';
 
 /** Minimal structural type so spy callbacks get real parameter types. */
 interface TestSpy {

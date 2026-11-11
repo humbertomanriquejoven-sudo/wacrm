@@ -701,12 +701,12 @@ export function buildUngroundedAckMessage(
   }
 
   if (ctx?.yaPreguntoAgendar) {
-    return `¡Listo${sujeto}! Dime la fecha y la hora que te quede mejor y te la agendo de una vez 😊`;
+    return `¡Listo${sujeto}! Dime qué día y hora te quedan mejor y lo revisamos en el calendario 😊`;
   }
 
   return nombre
-    ? `¡Gracias, ${nombre}! Recibí tu información. ¿Deseas que agende tu cita ahora?`
-    : '¡Gracias! Recibí tu información. ¿Deseas que agende tu cita ahora?';
+    ? `¡Gracias, ${nombre}! Recibí tu información. Cuéntame un poco más de tu proyecto para orientarte mejor 😊`
+    : '¡Gracias! Recibí tu información. Cuéntame un poco más de tu proyecto para orientarte mejor 😊';
 }
 
 /**

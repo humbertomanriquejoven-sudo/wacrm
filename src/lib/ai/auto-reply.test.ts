@@ -519,7 +519,7 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
         conversationId: 'conv-1',
         contactId: 'contact-1',
         single: true,
-        text: '¡Gracias! Recibí tu información. ¿Deseas que agende tu cita ahora?',
+        text: '¡Gracias! Recibí tu información. Cuéntame un poco más de tu proyecto para orientarte mejor 😊',
       })
     );
   });

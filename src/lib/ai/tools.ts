@@ -92,7 +92,8 @@ export const AGENDAR_CITA_TOOL: ToolDefinition = {
     '⚠️ Si el cliente ya tiene una cita confirmada y pide cambiarla de fecha u hora, ' +
     'NO llames esta herramienta: eso crearía un SEGUNDO evento duplicado en la agenda. Usa reagendar_cita. ' +
     'Si no estás seguro de si ya tiene cita, llama antes consultar_citas (solo lectura). ' +
-    'Llámala de inmediato en cuanto el cliente indique una fecha y hora concretas para una cita nueva (p. ej. "mañana a las 6 pm"): ' +
+    'Úsala solo en el paso 3, cuando ya entendiste la necesidad del cliente y aceptó la cita virtual. ' +
+    'Si en ese momento ya dio una fecha y hora concretas (p. ej. "mañana a las 6 pm"), agenda en el mismo turno: ' +
     'no vuelvas a preguntar la fecha, no preguntes "cuál horario prefiere", no pidas un rango de hora de inicio/fin ni pidas confirmar la hora elegida. ' +
     'Convierte la hora del cliente al ISO de Bogotá en el mismo turno (p. ej. "mañana a las 6 pm" → 2026-09-18T18:00:00-05:00). ' +
     'motivo es opcional y por defecto es "Consulta / Valoración" cuando se omite. ' +
